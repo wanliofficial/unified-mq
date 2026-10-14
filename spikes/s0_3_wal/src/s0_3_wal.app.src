@@ -1,0 +1,8 @@
+{application, s0_3_wal,
+ [{description, "S0.3 spike: WAL / segment log with group commit"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, crypto]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Apache-2.0"]}]}.

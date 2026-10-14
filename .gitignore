@@ -15,3 +15,15 @@ deps
 .rebar3
 _build/
 _checkouts/
+
+# spikes artifacts (S0 experiments: data dirs, fetched deps, raw results)
+spikes/*/_build/
+spikes/*/data/
+spikes/*/logs/
+spikes/*/priv/data/
+
+# local overrides
+config/*.secret.config
+.env.local
+erl_crash.dump
+spikes/.data/
