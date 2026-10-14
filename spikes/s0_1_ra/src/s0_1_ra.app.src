@@ -1,0 +1,8 @@
+{application, s0_1_ra,
+ [{description, "S0.1 spike: rabbitmq/ra evaluation"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Apache-2.0"]}]}.
