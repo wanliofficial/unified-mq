@@ -1,0 +1,8 @@
+{application, s0_2_grouping,
+ [{description, "S0.2 spike: Raft grouping model resource scaling"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Apache-2.0"]}]}.

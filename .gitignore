@@ -28,3 +28,4 @@ config/*.secret.config
 
 # spike data dirs (created at runtime)
 spikes/.data/
+spikes/*/.data/
