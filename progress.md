@@ -1,7 +1,7 @@
 # Progress — UnifiedMQ
 
 > 多阶段路线（技术验证 → 原型 → 生产可用）参见 `docs/roadmap.md`。
-> 当前进度：**S0（技术验证）全部完成并已推送 `origin/main`（最新 `b55fd89`）。**
+> 当前进度：**S0 已完成并推送 `origin/main`；S1 进行中——方案设计 v0.4，T0.5 三份 ADR（009/010/011）已评审冻结，待启动 T1。**
 
 ## 环境基线
 
@@ -14,7 +14,7 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | S0 技术验证 | ✅ 完成 | 5 个 spike + Gate ADR-001~008 全部落盘并推送 |
-| S1 MQTT 垂直切片 | ⬜ 未开始 | roadmap 已定义 Gate 与三个待冻结核心抽象 |
+| S1 MQTT 垂直切片 | 🟡 进行中 | 方案设计 v0.4 已定（四轮评审 46 项整改）；**T0.5 ADR-009/010/011 已冻结（状态=已采纳）** → 下一步 T1 实现 |
 | S2/S3 | ⬜ 未开始 | roadmap 标注 S2/S3 可并行，S3 必须早于 S4 |
 | S4+ | ⬜ 未开始 | — |
 
@@ -42,6 +42,28 @@
 1. S0.1 原报告称 ra 仅支持 OTP 27、需锁版本 —— 实测 OTP 28.3.1 完全可用，全项目统一 OTP 28.3.1。
 2. `.gitignore` 修正：新增 `spikes/*/.data/` 忽略规则（S0.2 运行时数据目录此前未被忽略）。
 
+## S1 进展（进行中）
+
+| 步骤 | 状态 | 产物 |
+|---|---|---|
+| 方案设计 | ✅ v0.4 | `docs/design/s1-mqtt-vertical-slice.md`（四轮评审共 46 项整改：B1~4 / C1~6 / S1~6 / D1~13 / E1~12 / F1~6+G1）；§3 已降级为 ADR 摘录 |
+| T0.5 ADR 冻结 | ✅ **已冻结（2026-10-21，状态=已采纳）** | `docs/adr/009-broker-message-record.md`、`010-broker-router-behavior.md`、`011-broker-storage-behavior.md`；三份 API 定义已在 OTP 28.3.1 `erlc` 实测编译通过 |
+| T1~T17 实现 | ⬜ 未开始 | 关键路径约 27 人日；T17 评审会转为"实现 ↔ 冻结 ADR 一致性复核" |
+
+### 第二协议门禁（roadmap §3.4 硬约束）
+
+**Gate S1 未通过前，禁止实现第二个协议适配器。** 执行方式：本文件阶段状态表为唯一门禁状态源——S1 未标记 ✅ 时，任何新增 `apps/broker_proto_*`（`broker_proto_mqtt` 除外）的 PR 一律拒绝合入。
+
+### S1 已定的关键决策（摘自冻结 ADR + 设计文档 v0.4）
+
+- **ADR-009**：`partition_id` 为纯整数无语义；`reliability` 为 per-message；`headers`（公共/CloudEvents）与 `proto_meta`（协议私有）分工判据 = "换协议后该 key 是否仍有意义"；S1 悬空槽位 `expires_at` **恒 `undefined`**（不派生占位值，否则 S2 TTL 会静默丢弃已 ACK 消息）。
+- **ADR-010**：Router 回调**不线程 `State`**，`route/3` 在调用者进程内直接查 ETS（非 `gen_server:call`）——否则全部 publish 串行化，违反 README §7.2；`SubRef` 由 `broker_subscription` 铸造，Router 仅作索引 key；索引不持久化，重启按固定顺序回填后才放开 listener。
+- **ADR-011**：`create/2` 与 `recover/2` **分离**，recover 对缺失分区返回 `{not_found,_}` 且绝不自动创建（防"恢复出空分区并报告健康"的静默数据丢失）；`recover/2` 返回 `CommittedOffset` + `HighOffset`，**不设 `AckRanges`**；水位**只允许偏低**（偏低=重复，允许；偏高=提前 truncate 丢数据，绝对禁止）。
+- WAL 磁盘协议独立于 `#broker_message{}`，带 `Vsn` 版本位（取代原 OQ-1）。
+- Session 持久化分三层：`.subs` 强一致即改即 fsync；`.inflight` 与 `.cursor` 批量刷盘（避免逐条 fsync 归零 group commit 收益）。
+- Gate「订阅位置不丢」措辞解释已复审确认，写入 ADR-011 附录 11.7。
+- 多写者并发 group commit 为 S0.3 §6 遗留待办，列为 T5 前置交付项。
+
 ## 下一步
 
-进入 **S1（MQTT 垂直切片原型）**：读取 `docs/roadmap.md` 的 S1 Gate 与三个待冻结核心抽象，规划实现。
+ADR-009/010/011 已冻结 → 启动 **T1（rebar3 umbrella apps 骨架 + sys.config + vm.args + application master）**，T2~T5 按依赖图并行推进。T17 评审会不再起草 ADR，改为复核"T2~T7 实现 ↔ 冻结 API"一致性；ADR-011 附录 11.7 的 Gate 措辞在会上正式签认。
