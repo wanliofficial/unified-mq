@@ -1,0 +1,67 @@
+%% Release template input for relx (see {sys_config_src, ...} in rebar.config).
+%% Deliberately contains no {{...}} placeholders so that `rebar3 shell` can read
+%% this same file directly; add ejson templates when S6 needs per-host values.
+[
+  {sasl, [
+    {sasl_error_logger, {file, "log/sasl-error.log"}},
+    {errlog_type, error},
+    {error_logger_mf_dir, "log/sasl"},
+    {error_logger_mf_maxbytes, 10485760},
+    {error_logger_mf_maxfiles, 5}
+  ]},
+
+  {broker_storage, [
+    {backend, broker_storage_wal},
+    {data_dir, "data"},
+    %% S0.3 §2.2: batch=32 is the throughput inflection point (17x over
+    %% single-message fsync); 256 caps the latency cost of waiting for a batch.
+    {wal, [
+      {batch_size, 32},
+      {max_batch_size, 256},
+      {batch_delay_ms, #{os_buffer => 0, fsync => 1}},
+      {index_anchor_interval, 256},
+      {segment_max_records, 100000}
+    ]}
+  ]},
+
+  {broker_router, [
+    {backend, broker_router_hash},
+    %% S1 fixes the partition count; elastic partitioning is S4 (ADR-008).
+    {partitions, 4}
+  ]},
+
+  {broker_queue, [
+    {partitions, 4}
+  ]},
+
+  {broker_subscription, [
+    %% Bounded cursor regress window (Gate S1 R3). Setting both to 1/0 selects
+    %% the near-zero-regress tier, which pays a per-ack fsync.
+    {cursor_max_regress, 64},
+    {cursor_flush_interval_ms, 100},
+    {inflight_flush_interval_ms, 100}
+  ]},
+
+  {broker_security, [
+    {users, [
+      {<<"guest">>, #{password => <<"guest">>, tenant_id => <<"t0">>}}
+    ]},
+    {acl, allow}
+  ]},
+
+  {broker_event, [
+    {strategy, pass_through}
+  ]},
+
+  {broker_proto_mqtt, [
+    {listeners, [
+      #{port => 1883,
+        %% Must be 0 whenever broker_storage:backend is broker_storage_memory
+        %% (design §3.3 E12), so QoS 1 is refused at SUBACK instead of failing
+        %% at append time.
+        mqtt_max_qos => 1,
+        num_acceptors => 10,
+        max_keepalive_ms => 60000}
+    ]}
+  ]}
+].

@@ -1,0 +1,8 @@
+{application, broker_router, [
+    {description, "Destination -> partition routing and subscription index"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_router_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core]},
+    {env, []}
+]}.

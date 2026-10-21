@@ -1,0 +1,8 @@
+{application, broker_event, [
+    {description, "CloudEvents layer: pass_through stub in S1, real codec in S3"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_event_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core]},
+    {env, []}
+]}.

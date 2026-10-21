@@ -1,0 +1,8 @@
+{application, broker_queue, [
+    {description, "Partition workers: append/read orchestration and in-flight tracking"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_queue_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core, broker_storage, broker_router]},
+    {env, []}
+]}.

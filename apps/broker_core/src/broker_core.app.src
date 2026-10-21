@@ -1,0 +1,8 @@
+{application, broker_core, [
+    {description, "Shared message model, public types and error codes (no business logic)"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {modules, []},
+    {env, []}
+]}.

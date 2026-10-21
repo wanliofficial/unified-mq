@@ -1,0 +1,8 @@
+{application, broker_security, [
+    {description, "Authentication and authorization: config-driven stub in S1"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_security_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core]},
+    {env, []}
+]}.

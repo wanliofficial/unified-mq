@@ -1,0 +1,8 @@
+{application, broker_storage, [
+    {description, "Storage behavior plus memory and WAL backends"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_storage_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core]},
+    {env, []}
+]}.

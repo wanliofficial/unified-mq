@@ -1,0 +1,20 @@
+## UnifiedMQ S1 VM arguments (relx template input, see {vm_args_src, ...}).
+## No {{...}} placeholders: `rebar3 shell` and `unified_mq/bin/unified_mq start`
+## both consume this file as-is.
+
+-name unified_mq@127.0.0.1
++C multi_scheduling
++sbwt none
++sbwtdcpu none
++sbwtdio none
+
+## Message queue bounds: a runaway partition worker must be killed and restarted
+## rather than absorbing an unbounded backlog.
++Q 1000000
++h 1000000
+
+## Disk-based crash dump only on OOM, keeping restart behaviour deterministic.
++W disabled
+
+## WAL fsync latency budget (ADR-007 L2) depends on scheduler pressure.
+-env ERL_FULLSWEEP_AFTER 100

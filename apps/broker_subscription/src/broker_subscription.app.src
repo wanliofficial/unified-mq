@@ -1,0 +1,8 @@
+{application, broker_subscription, [
+    {description, "Subscriptions, per-subscription cursors, delivery and session persistence"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_subscription_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core, broker_storage, broker_router, broker_queue]},
+    {env, []}
+]}.
