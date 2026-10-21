@@ -54,6 +54,8 @@ roadmap §3.2 的 `ack` **改名为 `advance_committed`**（语义收紧见 11.2
 
 理由：若两者合一（"open 时目录不存在则建空的"），配置里写错一个分区 ID 或挂载点缺失，节点会**恢复出一个空分区并对客户端报告健康**——这是静默数据丢失，不是可观测的启动失败。ADR-008 §8.3 选方案 A 的代价之一就是恢复正确性由本项目自负，此类歧义必须在 API 层堵死。
 
+**【冻结后缺口批注 T4，2026-10-21｜H8——T5 必答】** 分离本身成立，但本 ADR 与 §6 都没规定**首次部署时谁调 `create/2`**。按 §6 boot step 1"逐分区 `recover/2`，缺分区即失败"，干净数据目录启动的 broker **必然**启动失败；内存后端同样无法通过 step 1（它从来没有人 create 过分区）。T5 必须显式选定一种 bootstrap 路径——管理命令 / `partition_bootstrap` 配置 / 用数据目录里的标记文件区分"首次启动"与"恢复"——并保证选择结果**不是**"recover 顺手创建"，否则本节整改作废。在此之前，`broker_storage_sup` 不接任何后端的启动接线。
+
 ### 11.3 storage 只管全局 committed watermark
 
 **决策**：storage 不感知订阅模型，只维护一个**全局 committed watermark** = 所有订阅都已确认的连续前缀。
@@ -72,6 +74,13 @@ roadmap §3.2 的 `ack` **改名为 `advance_committed`**（语义收紧见 11.2
 | **偏高**（声称已确认但未确认） | `truncate` 提前丢弃未消费消息 = **数据丢失** | ❌ 绝对禁止 |
 
 实现必须保证 watermark 只在对应 offset 的 ack 证据落盘后才推进，禁止内存领先。此不对称是 ADR-007 精神在消费侧的对应物。
+
+**【冻结后批注 T4，2026-10-21｜H9/H10】** 上表的两个方向原本只是文字约束，签名层面无从阻止传任意 offset。T4 把它落成可在冻结签名内机械检查的两道守卫（error 项类型是 `term()`，不构成 API 变更）：
+
+- `advance_committed/2` 拒绝 `Offset > High - 1`（尚未写入的 offset 不可能有 ack 证据）与向后退；
+- `truncate/2` 拒绝 `Before > Committed + 1`（等价于"丢弃未确认消息"，正是绝对禁止的那一格）。
+
+`broker_storage_memory` 的 T4 用例已锁这三条；**T5 的 WAL 后端必须通过同一组用例**，否则按缺陷处理。另：offset 基数本 ADR 未冻结，S1 实现定为**从 1 开始**，`Committed = 0` 表示"从未确认过任何一条"，空分区 `recover` 返回 `CommittedOffset = 0, HighOffset = 1`——§8.2 R3 的 `max(0, last_flushed_offset - K)` 按此解释。
 
 **不设 AckRanges（F1 整改）**：storage 只有单一连续前缀，因此 `recover/2` 返回两个标量水位即可。原 `AckRanges`（非连续已 ack 区间集合）在本 ADR 的模型下**没有归属者**——全局水位是标量、per-sub cursor 是标量、逐 offset ack 状态 storage 不持有。故从 API 移除，v0.2 引入它所要解决的"百万级 offset 列表内存爆炸"问题（D10）在此被**结构性消除**而非缓解。`recover/2` 同时补上 `HighOffset`，否则恢复后无法确定追加位置（原 API 缺口）。
 

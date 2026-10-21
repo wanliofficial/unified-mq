@@ -44,6 +44,8 @@ roadmap §3.2 对 Router 的定义是一行：「destination → `{partition, su
 -optional_callbacks [on_partition_change/2].
 ```
 
+**【冻结后批注 T3，2026-10-21｜H6】`route_ctx` 的定义位置**：上面这段把 record 写在 `broker_router.erl` 模块内，编译能过，但 **record 不跨模块可见**——协议 Adapter 与 `broker_queue` 都无法构造 Ctx，§5.1(c) 的调用形式在代码里写不出来。故 record 与 `-type route_ctx()` 原样移入 `apps/broker_router/include/broker_router.hrl`，behavior 模块 include 该头文件。**字段、类型标注、callback 签名一字未动**，仅定义位置变。（`broker_message.hrl` 必须先 include，本头的字段标注复用 `principal()`/`sync_mode()`。）
+
 **回调不接收也不返回 `State`**（F3 整改）：Router 状态由实现自持（S1 = ETS 表），callback 只吃 `router_env()` 这个不透明句柄。这一点必须钉死，因为它锁定了**读路径不得进程串行化**：
 
 > `route/3` 由发布者进程**直接调用**（普通函数调用 + ETS 并发读），**不是** `gen_server:call` 到 Router 进程。若把路由做成单一 gen_server，所有 publish 会串行化过一个进程，直接违反 README §7.2「避免单一 GenServer 成为所有路由和存储请求的全局瓶颈」与 roadmap §4.3 Gate S2 第 4 项。索引写入（register/unregister）才经单一写者进程串行更新 ETS，读侧用 `ets:lookup` 无锁并发。
@@ -118,6 +120,13 @@ Router 的索引状态在内存（ETS），**不落盘**。冷启动顺序固定
 
 - S1 单元测试（T3）：通配符匹配黄金用例——`sport/tennis/player1` vs `sport/tennis/+` vs `sport/+` vs `/#`、`+/+` 与非法 `sport+/` 等 MQTT §4.7 边界。
 - S1 集成测试（T13）：一条消息命中多订阅时 Router 返回列表完整且去重。
+
+  **【冻结后勘误 T3，2026-10-21｜H7】** 这条把两件不同的事记在了 Router 名下，其中一半 Router 做不到：
+  - **能做到且已测**（T3 单元）：结果完整 + 同一 SubRef 不重复。`register/4` 对已登记的 SubRef 再登记第二个 filter 返回 `{already_registered, _}`（否则索引与 `.subs` 会形成两份真相），所以"同一 SubRef 跨 filter 重复"在结构上不可能发生，去重是**平凡成立**的。
+  - **做不到**：同一 client 持有 `sport/#` 与 `sport/tennis/+` 两个重叠订阅时，MQTT §4.8 要求"按 max QoS 投递一次"。这两个订阅是两个 SubRef，合并它们**必须解引用 SubRef**，正被 §10.2 禁止。该职责归 `broker_subscription`（T7 铸造 SubRef 时即知所属 client），Router 只提供完整列表。T13 的断言因此要分两层写。
+
+- **【冻结后实测补充 T3】** `behaviour_info(callbacks)` 返回**含 optional 的全部 5 项**，`optional_callbacks` 返回其子集 `[{on_partition_change,2}]`——核对 optional 语义时以后者为准。`broker_router_hash` 在 S1 不导出 `on_partition_change/2`，由 T3 用例锁定（§10.5）。
+- **【冻结后实测补充 T3｜H9】** `partition_id` 基数冻结文本未定，S1 实现定为 **0-based**（`erlang:phash2(Destination, N)` 天然产出 `0..N-1`，不做 +1 偏移）。`route/3` 只按 destination 决定分区，`Ctx#route_ctx.tenant_id` 在 S1 **不参与路由**（security 是单用户桩），`SubOpts` 亦不入库——多租户的 filter 隔离是 S2 待办，届时 tenant 需进入索引 key。
 - S1 集成测试（T13，F5）：SubRef 由 subscription 生成、Router 原样返回；断言 Router 模块中不存在生成 SubRef 的代码路径。
 - S1 崩溃恢复（T14 R1b，§10.6）：kill -9 重启后索引由 `.subs` 完整重建，且**在索引就绪前 listener 不接受任何连接**（用启动期立即连接的客户端验证被拒或等待）。
 - S1 review（T1）：依赖图检查 `broker_router` 不引用 `broker_subscription`/`broker_storage` 模块（§10.2 边界机械化）。
