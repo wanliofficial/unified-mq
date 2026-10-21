@@ -8,15 +8,9 @@
 -module(broker_router).
 
 -include_lib("broker_core/include/broker_message.hrl").
+-include("broker_router.hrl").
 
 -export_type([router_env/0, sub_ref/0, route_ctx/0]).
-
--record(route_ctx, {
-    tenant_id   :: binary(),
-    publisher   :: principal() | undefined,
-    reliability :: sync_mode()
-}).
--type route_ctx() :: #route_ctx{}.
 
 -type router_env() :: term().
 -type sub_ref()    :: term().
