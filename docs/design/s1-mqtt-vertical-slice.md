@@ -1,11 +1,11 @@
 # S1 方案设计 — MQTT 垂直切片原型
 
-- **文档版本**：v0.5（T3/T4 实现同步版）
+- **文档版本**：v0.6（T3/T4 实现同步版）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §3
 - **前置**：S0 已完成，ADR-001~008 已定稿；ADR-009/010/011（三抽象）**已冻结**（[`docs/adr/`](../adr/)）
 - **目标 Gate**：roadmap §3.4「Gate S1」
 - **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端已实现并实测通过**（27 个 CT 用例，`rebar3 ct`/`xref`/`dialyzer` 干净）→ 下一步 T5
-- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13。ADR 侧只加**冻结后批注**，不动已冻结文本
+- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）。ADR 侧只加**冻结后批注**，不动已冻结文本
 
 ---
 
@@ -408,6 +408,7 @@ ETS 表 `messages` = `{PartitionId, Offset, Msg}`；`append/3` 只支持 `os_buf
 - 代价：两张表必须是 `public`，于是并发读可能看见"offset 已分配、消息尚未插入"的瞬时空洞并把该页提前截断。S1 真实链路里 §5.1(d) 已按分区串行化 append，不会触发；**多写者并发下的这个观察窗口是 T5 并发测试必须对 WAL 明确结论的场景之一**。
 - offset 基数在 ADR-011 中未冻结，本实现定为 **1 起步**：空分区 `recover` 返回 `CommittedOffset = 0`（什么都没有确认过）、`HighOffset = 1`（下一条写入位置）。
 - 在冻结签名内加了两道守卫（error 项是 `term()`，不构成 API 变更）：`advance_committed/2` 拒绝越过 `HighOffset` 与向后退；`truncate/2` 拒绝把边界推到 `Committed + 1` 之后。§11.3 的"偏高绝对禁止"由此从文字变成可机械检查。
+- **契约套件已参数化**（2026-10-21）：13 个用例与全部断言搬到 `apps/broker_storage/test/broker_storage_contract.hrl`，后端套件只提供 `?BACKEND`/`?CAPABILITY` 两个宏与 `backend_setup/1`、`backend_cleanup/1`、`backend_config/1` 三个 hook。头文件里不出现任何后端名、表名或目录名（grep 可验）；漏写 hook 是 `function backend_config/1 undefined` 编译告警，`warnings_as_errors` 直接让构建失败——已实测。于是 Gate「WAL 与内存实现可互换」的检验方式是同一组 13 个用例在两个后端各跑一遍，而不是一句设计意图。
 
 ### 7.2 WAL 后端（`broker_storage_wal`）
 
@@ -497,8 +498,8 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | T1 | rebar3 umbrella apps 骨架 + sys.config + vm.args + application master——**已完成**：8 app、7 顶层 supervisor、`broker_message.hrl` 与两个 behavior 落盘；`rebar3 compile`（warnings_as_errors）与 `rebar3 release` 节点启动均实测通过 | T0.5 | 1 | 目录结构（§2/§6 已按实测修正） |
 | T2 | `broker_core`：`broker_message.hrl` + 公共类型 + 行为定义（仅 header/类型，无函数） | T1 | 0.5 | ADR-009 |
 | T3 | `broker_router` behavior + `broker_router_hash`（含 MQTT 通配符匹配）；**读路径为调用者进程内 ETS 并发查，写路径单一写者**（§3.2 冻结点 2）——**已完成**：14 个 CT 用例通过（§4.7 通配符黄金用例 + 挂起写者后 `route/3` 仍返回正确结果，实测证明读路径不经进程） | T2 | 2 | ADR-010 |
-| T4 | `broker_storage` behavior + `broker_storage_memory`（含 `create/2` 与 `recover/2` 分离）——**已完成**：13 个 CT 用例通过（`recover` 绝不建分区、超能力 sync_mode 报错且不消耗 offset、水位不可偏高、truncate 只设逻辑边界） | T2 | 1.5 | ADR-011 |
-| **T5** | `broker_storage_wal` 重写（segment / writer / reader / recovery / group_committer / **index** / codec 兼容层）；**交付项含（E5）：多 conn_fsm 并发 append 正确性测试——批次内每个 caller 回复严格在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿** | T4 | **6.5** | — |
+| T4 | `broker_storage` behavior + `broker_storage_memory`（含 `create/2` 与 `recover/2` 分离）——**已完成**：13 个 CT 用例通过（`recover` 绝不建分区、超能力 sync_mode 报错且不消耗 offset、水位不可偏高、truncate 只设逻辑边界）；用例已抽为可复用契约头 `broker_storage_contract.hrl`，T5 的 WAL 套件按同一 hook 接口消费 | T2 | 1.5 | ADR-011 |
+| **T5** | `broker_storage_wal` 重写（segment / writer / reader / recovery / group_committer / **index** / codec 兼容层）；**交付项含（E5）：多 conn_fsm 并发 append 正确性测试——批次内每个 caller 回复严格在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿**；**WAL 套件必须先通过 `broker_storage_contract.hrl` 的 13 个契约用例（`?CAPABILITY = [os_buffer, fsync]`）** | T4 | **6.5** | — |
 | T6 | `broker_queue` 分区 Worker（append 串行化 + storage 生命周期 + `capability/1` 查询 API + 通知订阅） | T3, T4 | 2 | — |
 | T7 | `broker_subscription`：per-sub cursor + `.subs`/`.inflight`/`.cursor` 三层持久化（§5.3）+ **SubRef 铸造**与 `register/4` 回填（§3.2 冻结点 3）+ 分发 + advance_committed 聚合 | T6 | 3 | — |
 | T8 | `broker_proto_mqtt` 帧编解码（含黄金样本单测 + proper 模糊测试） | T1 | 3 | — |

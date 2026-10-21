@@ -80,7 +80,7 @@ roadmap §3.2 的 `ack` **改名为 `advance_committed`**（语义收紧见 11.2
 - `advance_committed/2` 拒绝 `Offset > High - 1`（尚未写入的 offset 不可能有 ack 证据）与向后退；
 - `truncate/2` 拒绝 `Before > Committed + 1`（等价于"丢弃未确认消息"，正是绝对禁止的那一格）。
 
-`broker_storage_memory` 的 T4 用例已锁这三条；**T5 的 WAL 后端必须通过同一组用例**，否则按缺陷处理。另：offset 基数本 ADR 未冻结，S1 实现定为**从 1 开始**，`Committed = 0` 表示"从未确认过任何一条"，空分区 `recover` 返回 `CommittedOffset = 0, HighOffset = 1`——§8.2 R3 的 `max(0, last_flushed_offset - K)` 按此解释。
+`broker_storage_memory` 的 T4 用例已锁这三条；**T5 的 WAL 后端必须通过同一组用例**，否则按缺陷处理。同一组用例已抽为可复用契约头 `apps/broker_storage/test/broker_storage_contract.hrl`（后端套件只提供 `?BACKEND`/`?CAPABILITY` 与 `backend_setup/1`、`backend_cleanup/1`、`backend_config/1`；头文件内不出现任何后端名/表名/目录名），所以"必须通过同一组用例"是字面可执行的：T5 交付判据 = 该头文件在 `broker_storage_wal` 上 13/13 通过。另：offset 基数本 ADR 未冻结，S1 实现定为**从 1 开始**，`Committed = 0` 表示"从未确认过任何一条"，空分区 `recover` 返回 `CommittedOffset = 0, HighOffset = 1`——§8.2 R3 的 `max(0, last_flushed_offset - K)` 按此解释。
 
 **不设 AckRanges（F1 整改）**：storage 只有单一连续前缀，因此 `recover/2` 返回两个标量水位即可。原 `AckRanges`（非连续已 ack 区间集合）在本 ADR 的模型下**没有归属者**——全局水位是标量、per-sub cursor 是标量、逐 offset ack 状态 storage 不持有。故从 API 移除，v0.2 引入它所要解决的"百万级 offset 列表内存爆炸"问题（D10）在此被**结构性消除**而非缓解。`recover/2` 同时补上 `HighOffset`，否则恢复后无法确定追加位置（原 API 缺口）。
 

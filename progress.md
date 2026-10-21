@@ -14,7 +14,7 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | S0 技术验证 | ✅ 完成 | 5 个 spike + Gate ADR-001~008 全部落盘并推送 |
-| S1 MQTT 垂直切片 | 🟡 进行中 | 方案设计 v0.4 已定（四轮评审 46 项整改）；ADR 已冻结；**T1/T3/T4 完成**，下一步 T5（WAL，关键路径） |
+| S1 MQTT 垂直切片 | 🟡 进行中 | 方案设计 v0.6（四轮评审 46 项整改 + T1/T3/T4 实现同步 11 项）；ADR 已冻结；**T1/T3/T4 完成**，下一步 T5（WAL，关键路径） |
 | S2/S3 | ⬜ 未开始 | roadmap 标注 S2/S3 可并行，S3 必须早于 S4 |
 | S4+ | ⬜ 未开始 | — |
 
@@ -51,14 +51,14 @@
 | T1 工程骨架 | ✅ **完成（2026-10-21）** | `apps/` 八个 app（broker_core 纯类型 + 7 个带顶层 supervisor 的 app）、`config/sys.config.src`、`config/vm.args.src`、relx 接线；`rebar3 compile`（warnings_as_errors）通过，`rebar3 release` 节点实测 `ping=pong` 且 `application:get_env` 取到配置 |
 | T2 公共类型核对 | ✅ 随 T1/T3/T4 消化 | `broker_message.hrl` 已含类型与错误码约定；两份 behavior 的错误项均为内联元组，无独立错误码模块——**T2 不再有独立工作项，已并入 T3/T4** |
 | T3 `broker_router_hash` | ✅ **完成（2026-10-21）** | `apps/broker_router/src/broker_router_hash.erl` + `_store.erl` + `include/broker_router.hrl`；14 个 CT 用例通过，含"挂起写者进程后 `route/3` 仍返回正确结果"——实测证明读路径不经进程（§3.2 冻结点 2 / README §7.2） |
-| T4 `broker_storage_memory` | ✅ **完成（2026-10-21）** | `apps/broker_storage/src/broker_storage_memory.erl` + `_store.erl`；13 个 CT 用例通过：recover 绝不建分区、超能力 sync_mode 报错且不消耗 offset、水位不可偏高、truncate 只设逻辑边界、20 路并发 append offset 唯一无洞 |
+| T4 `broker_storage_memory` | ✅ **完成（2026-10-21）** | `apps/broker_storage/src/broker_storage_memory.erl` + `_store.erl`；13 个 CT 用例通过：recover 绝不建分区、超能力 sync_mode 报错且不消耗 offset、水位不可偏高、truncate 只设逻辑边界、20 路并发 append offset 唯一无洞。**用例已参数化**为 `apps/broker_storage/test/broker_storage_contract.hrl`（后端只供 `?BACKEND`/`?CAPABILITY` + 三个 hook），T5 的 WAL 套件按同一接口跑同一组断言 |
 | T5~T17 实现 | ⬜ 未开始 | 关键路径剩余约 22 人日；T5（WAL 重写 + 多写者并发）为最长杆 |
 
 ### 第二协议门禁（roadmap §3.4 硬约束）
 
 **Gate S1 未通过前，禁止实现第二个协议适配器。** 执行方式：本文件阶段状态表为唯一门禁状态源——S1 未标记 ✅ 时，任何新增 `apps/broker_proto_*`（`broker_proto_mqtt` 除外）的 PR 一律拒绝合入。
 
-### S1 已定的关键决策（摘自冻结 ADR + 设计文档 v0.4）
+### S1 已定的关键决策（摘自冻结 ADR + 设计文档 v0.6）
 
 - **ADR-009**：`partition_id` 为纯整数无语义；`reliability` 为 per-message；`headers`（公共/CloudEvents）与 `proto_meta`（协议私有）分工判据 = "换协议后该 key 是否仍有意义"；S1 悬空槽位 `expires_at` **恒 `undefined`**（不派生占位值，否则 S2 TTL 会静默丢弃已 ACK 消息）。
 - **ADR-010**：Router 回调**不线程 `State`**，`route/3` 在调用者进程内直接查 ETS（非 `gen_server:call`）——否则全部 publish 串行化，违反 README §7.2；`SubRef` 由 `broker_subscription` 铸造，Router 仅作索引 key；索引不持久化，重启按固定顺序回填后才放开 listener。
@@ -73,4 +73,4 @@
 
 ## 下一步
 
-**T5 `broker_storage_wal` 重写**（关键路径 6.5 人日）：含 S0.3 §6 遗留的多写者并发 group commit 正确性测试，并须先回答 H8（分区 bootstrap 由谁调 `create/2`，不得退化成"recover 顺手创建"）；WAL 后端必须通过 T4 那组水位/truncate 守卫用例。T6 分区 Worker 依赖 T3+T4（均已就绪）；T7 须先定 H11 的 per-`(SubRef, PartitionId)` cursor 形态。T17 评审会不再起草 ADR，改为复核"T2~T7 实现 ↔ 冻结 API"一致性；ADR-011 附录 11.7 的 Gate 措辞在会上正式签认。
+**T5 `broker_storage_wal` 重写**（关键路径 6.5 人日）：含 S0.3 §6 遗留的多写者并发 group commit 正确性测试，并须先回答 H8（分区 bootstrap 由谁调 `create/2`，不得退化成"recover 顺手创建"）；WAL 后端必须通过 T4 那组水位/truncate 守卫用例——用例已参数化，T5 只需新建 `broker_storage_wal_SUITE` 提供 `?BACKEND`/`?CAPABILITY = [os_buffer, fsync]` 与 `backend_setup/1`/`backend_cleanup/1`/`backend_config/1`（tmp 目录生命周期）再 include 契约头，13 个断言一条都不许改或跳过。T6 分区 Worker 依赖 T3+T4（均已就绪）；T7 须先定 H11 的 per-`(SubRef, PartitionId)` cursor 形态。T17 评审会不再起草 ADR，改为复核"T2~T7 实现 ↔ 冻结 API"一致性；ADR-011 附录 11.7 的 Gate 措辞在会上正式签认。
