@@ -29,3 +29,7 @@ config/*.secret.config
 # spike data dirs (created at runtime)
 spikes/.data/
 spikes/*/.data/
+
+# runtime data of the umbrella node (WAL segments, session files)
+/data/
+/log/

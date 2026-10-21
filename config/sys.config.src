@@ -1,14 +1,11 @@
-%% Release template input for relx (see {sys_config_src, ...} in rebar.config).
-%% Deliberately contains no {{...}} placeholders so that `rebar3 shell` can read
-%% this same file directly; add ejson templates when S6 needs per-host values.
+%% Application environment, read with application:get_env/2 (design §2: S1 has
+%% no broker_config app). Copied into the release as releases/Vsn/sys.config by
+%% relx, and read directly by `rebar3 shell'. Contains no {{...}} placeholders,
+%% so the same file serves both paths.
 [
-  {sasl, [
-    {sasl_error_logger, {file, "log/sasl-error.log"}},
-    {errlog_type, error},
-    {error_logger_mf_dir, "log/sasl"},
-    {error_logger_mf_maxbytes, 10485760},
-    {error_logger_mf_maxfiles, 5}
-  ]},
+  %% SASL progress/error reports go to the default logger in S1. File-based
+  %% error logging (and the log/ directory that would back it) belongs to T12's
+  %% dev environment, not to this skeleton.
 
   {broker_storage, [
     {backend, broker_storage_wal},

@@ -48,7 +48,8 @@
 |---|---|---|
 | 方案设计 | ✅ v0.4 | `docs/design/s1-mqtt-vertical-slice.md`（四轮评审共 46 项整改：B1~4 / C1~6 / S1~6 / D1~13 / E1~12 / F1~6+G1）；§3 已降级为 ADR 摘录 |
 | T0.5 ADR 冻结 | ✅ **已冻结（2026-10-21，状态=已采纳）** | `docs/adr/009-broker-message-record.md`、`010-broker-router-behavior.md`、`011-broker-storage-behavior.md`；三份 API 定义已在 OTP 28.3.1 `erlc` 实测编译通过 |
-| T1~T17 实现 | ⬜ 未开始 | 关键路径约 27 人日；T17 评审会转为"实现 ↔ 冻结 ADR 一致性复核" |
+| T1 工程骨架 | ✅ **完成（2026-10-21）** | `apps/` 八个 app（broker_core 纯类型 + 7 个带顶层 supervisor 的 app）、`config/sys.config.src`、`config/vm.args.src`、relx 接线；`rebar3 compile`（warnings_as_errors）通过，`rebar3 release` 节点实测 `ping=pong` 且 `application:get_env` 取到配置 |
+| T2~T17 实现 | ⬜ 未开始 | 关键路径剩余约 26 人日；T2 起可按依赖图并行 |
 
 ### 第二协议门禁（roadmap §3.4 硬约束）
 
@@ -63,7 +64,8 @@
 - Session 持久化分三层：`.subs` 强一致即改即 fsync；`.inflight` 与 `.cursor` 批量刷盘（避免逐条 fsync 归零 group commit 收益）。
 - Gate「订阅位置不丢」措辞解释已复审确认，写入 ADR-011 附录 11.7。
 - 多写者并发 group commit 为 S0.3 §6 遗留待办，列为 T5 前置交付项。
+- **T1 实测修正监督树结构（H1）**：不引入单一 `broker_app_sup`「application master」，改为每 app 一个顶层 supervisor，跨 app 启动顺序由 `.app.src` 的 `applications` 依赖拓扑保证（实测 `sasl → core → storage → router → queue → subscription → event → security → proto_mqtt`）。relx 必须用 `{sys_config,...}`/`{vm_args,...}` 而非 `*_src` 变体，否则 `.src` 原名进 `releases/Vsn/`、启动脚本找不到配置而挂死（H2）。
 
 ## 下一步
 
-ADR-009/010/011 已冻结 → 启动 **T1（rebar3 umbrella apps 骨架 + sys.config + vm.args + application master）**，T2~T5 按依赖图并行推进。T17 评审会不再起草 ADR，改为复核"T2~T7 实现 ↔ 冻结 API"一致性；ADR-011 附录 11.7 的 Gate 措辞在会上正式签认。
+T2（`broker_core` 已随 T1 落盘，T2 余项为错误码/公共类型核对）→ T3 `broker_router_hash` + T4 `broker_storage_memory` 可并行；T5 WAL 重写是关键路径（6.5 人日，含 S0.3 §6 遗留的多写者并发 group commit 正确性测试）。T17 评审会不再起草 ADR，改为复核"T2~T7 实现 ↔ 冻结 API"一致性；ADR-011 附录 11.7 的 Gate 措辞在会上正式签认。

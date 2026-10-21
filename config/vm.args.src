@@ -1,9 +1,16 @@
-## UnifiedMQ S1 VM arguments (relx template input, see {vm_args_src, ...}).
-## No {{...}} placeholders: `rebar3 shell` and `unified_mq/bin/unified_mq start`
-## both consume this file as-is.
+## UnifiedMQ S1 VM arguments. Copied into the release as releases/Vsn/vm.args by
+## relx ({vm_args, ...} in rebar.config); `rebar3 shell` does not read this file.
+## Every flag must be accepted by erts-16.2 (OTP 28.3.1) -- validated by
+## `rebar3 release` followed by actually booting the node, not by documentation.
 
 -name unified_mq@127.0.0.1
-+C multi_scheduling
+
+## Time warp mode for the fsync latency budget of ADR-007 L2.
+## NOTE: the erts flag is `-C`, and its value is `multi_time_warp`.
+## `+C multi_scheduling` is rejected by erts ("Invalid time warp mode").
+-C multi_time_warp
+
+## Do not let busy-waiting schedulers steal CPU from the WAL group committer.
 +sbwt none
 +sbwtdcpu none
 +sbwtdio none
@@ -11,10 +18,5 @@
 ## Message queue bounds: a runaway partition worker must be killed and restarted
 ## rather than absorbing an unbounded backlog.
 +Q 1000000
-+h 1000000
 
-## Disk-based crash dump only on OOM, keeping restart behaviour deterministic.
-+W disabled
-
-## WAL fsync latency budget (ADR-007 L2) depends on scheduler pressure.
 -env ERL_FULLSWEEP_AFTER 100

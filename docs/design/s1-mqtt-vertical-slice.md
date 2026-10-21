@@ -4,7 +4,7 @@
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §3
 - **前置**：S0 已完成，ADR-001~008 已定稿；ADR-009/010/011（三抽象）**已冻结**（[`docs/adr/`](../adr/)）
 - **目标 Gate**：roadmap §3.4「Gate S1」
-- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结；本文 §3 降级为 ADR 摘录，**API 冲突时以 ADR-009/010/011 为准** → 可进入 T1
+- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 工程骨架已落地并实测通过**（§2 配置接线、§6 监督树按实测修正）→ 下一步 T2/T3/T4
 - **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 6 项（F1~F6），关键变更见 §13 变更摘要
 
 ---
@@ -67,6 +67,8 @@ test/
 **应用职责边界**：`broker_core` 只提供 header/类型/behavior 定义，**不含业务函数**；消息构造、时间戳生成、ID 分配下沉到各 app 内部（`broker_proto_mqtt` 构造 `#broker_message{}`，`broker_storage` 分配 offset，`broker_subscription` 维护 cursor）。避免 `.hrl` include 依赖导致 app 循环，防止 `broker_core` 变成"上帝 app"。
 
 **配置读取**：S1 无 `broker_config` app，全部通过 `application:get_env/2` 直读 `sys.config`；监督树无 `broker_config_sup`。roadmap §3.1「Mnesia 只放最小配置」在 S1 进一步降级为「无 Mnesia，纯静态配置」。
+
+**T1 实测的 relx 接线**：`config/sys.config.src` 与 `config/vm.args.src` 必须用 relx 的 `{sys_config, ...}` / `{vm_args, ...}` 键接入。用 `{sys_config_src, ...}` / `{vm_args_src, ...}`（rebar3 3.27）会把文件原名拷进 `releases/Vsn/`（仍是 `*.src`），启动脚本找不到而不拉起节点。两文件均不含 `{{...}}` 占位，因此 `rebar3 shell` 的 `{config, "config/sys.config.src"}` 可直接复用同一份；`vm.args` 则只有 release 节点读，shell 不读（实测为 `nonode@nohost`）。
 
 `spikes/` 只读，S1 阶段不得被 `apps/*` 引用（roadmap §2 硬约束）。S0.3 的 WAL 代码作为参考，需在 `broker_storage` 中重写为生产版本，原因见 §7.2。
 
@@ -354,33 +356,36 @@ mqtt_conn_fsm:handle_publish
 
 ## 6. 监督树（S1 精简版）
 
+**T1 实测修正（原图有单一 `broker_app_sup`）**：S1 不引入伞形 application master。8 个 app 各带自己的顶层 supervisor，跨 app 的启动顺序由 `.app.src` 的 `applications` 依赖列表决定，OTP 按拓扑序启动。原 `broker_app_sup` 那一层没有承载者——它若存在，就必须把别的 app 的 supervisor 当自己的 child 起，那些 app 反而不能再作为 application 启动，等于把 OTP 的依赖机制绕开重造一遍。
+
 ```
-broker_app_sup (application master)                        [permanent]
-├── broker_storage_sup                                     [permanent]
-│   └── broker_storage_wal_sup                             [permanent, one_for_one]
-│         └── wal_writer (per partition，启动时按 config 静态创建)
-├── broker_router_sup                                      [permanent]
-│   └── broker_router_hash
-├── broker_queue_sup                                       [permanent, one_for_one]   % 【E11】S1 分区数固定（config N=4），静态 child spec
-│   └── broker_queue_partition (per partition)             [permanent]  % 持分区所有权，崩溃必须重启
-├── broker_subscription_sup                                [permanent, one_for_one]
-│   └── broker_subscription_worker
-├── broker_proto_mqtt_sup                                  [permanent]
-│   ├── ranch_listener_sup                                  [transient]
-│   └── mqtt_conn_sup                                       [transient, simple_one_for_one]  % 连接进程动态
-│         └── mqtt_conn_fsm                                 [transient]
-├── broker_security_sup                                    [permanent]
-│   └── broker_security_stub
-└── broker_event_sup
-    └── broker_event_pass_through
+broker_storage_app      → broker_storage_sup                          [one_for_all]
+│                         └── broker_storage_wal_sup（T5）             [one_for_one]
+│                               └── wal_writer (per partition，静态)
+broker_router_app       → broker_router_sup                           [one_for_all]
+│                         └── broker_router_hash（T3）
+broker_queue_app        → broker_queue_sup                            [one_for_one]  % 【E11】分区数固定（config N=4），静态 child spec
+│                         └── broker_queue_partition (per partition)  [permanent]
+broker_subscription_app → broker_subscription_sup                     [one_for_one]
+│                         └── broker_subscription_worker（T7）
+broker_event_app        → broker_event_sup                            [one_for_all]
+broker_security_app     → broker_security_sup                         [one_for_all]
+broker_proto_mqtt_app   → broker_proto_mqtt_sup                       [one_for_all]
+                          ├── ranch_listener_sup（T12）                [transient]
+                          └── mqtt_conn_sup                            [transient, simple_one_for_one]  % 连接进程动态
+                                └── mqtt_conn_fsm                      [transient]
+broker_core：无模块、无 supervisor（纯 `.hrl` 与公共类型，见 §2）
 ```
+
+实测启动序列（`application:ensure_all_started(broker_proto_mqtt)` 返回的顺序，OTP 28.3.1）：
+`sasl → broker_core → broker_storage → broker_router → broker_queue → broker_subscription → broker_event → broker_security → broker_proto_mqtt`。
 
 **重启策略原则（README §7.3 / roadmap §4.2）**：
 - 持连接的 → transient（simple_one_for_one 动态起，崩溃不重启，由客户端重连驱动）；
 - 持分区/存储/订阅状态的 → **permanent + one_for_one**（E11：这类 Worker 崩溃**必须**重启，`simple_one_for_one` 的 transient 语义会静默丢分区，是错误配置）；
 - session 不再是独立子树——session 状态是 `broker_subscription` 持久化数据 + conn_fsm 内存视图，跨连接存活由 `.subs` 文件保证，无需独立 `mqtt_session` 进程（进程级存活本就随 conn 断开而终结）。
 
-**启动顺序（T0.5 冻结连带要求，ADR-010 §10.6 / ADR-011 §11.2）**：Router 的 `Filter → SubRef` 索引**不持久化**，因此监督树不能"起完就接单"。`broker_app` 的启动序列固定为：
+**启动顺序（T0.5 冻结连带要求，ADR-010 §10.6 / ADR-011 §11.2）**：Router 的 `Filter → SubRef` 索引**不持久化**，因此不能"起完就接单"。四个 boot step 分别落在依赖链上的 supervisor `init/1` 里（`broker_storage_sup` → `broker_subscription_sup` → `broker_proto_mqtt_sup`），顺序由上面的 `applications` 拓扑保证：
 
 1. `broker_storage_wal` 对各分区 `recover/2`（缺分区即 `{not_found, _}` 报错，**不自动 create**），得到 `CommittedOffset`/`HighOffset`；
 2. `broker_subscription` 读 `sessions/*.subs` 重建订阅实体并铸造 SubRef；
@@ -482,7 +487,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | ID | 任务 | 依赖 | 预估 | 冻结产物 |
 |---|---|---|---|---|
 | T0.5 | 起草 ADR-009/010/011 骨架（先出评审文本再实现）——**已完成，三份 ADR 经 F1~F6 整改后冻结** | — | 1 | ADR-009/010/011（已采纳） |
-| T1 | rebar3 umbrella apps 骨架 + sys.config + vm.args + application master | T0.5 | 1 | 目录结构 |
+| T1 | rebar3 umbrella apps 骨架 + sys.config + vm.args + application master——**已完成**：8 app、7 顶层 supervisor、`broker_message.hrl` 与两个 behavior 落盘；`rebar3 compile`（warnings_as_errors）与 `rebar3 release` 节点启动均实测通过 | T0.5 | 1 | 目录结构（§2/§6 已按实测修正） |
 | T2 | `broker_core`：`broker_message.hrl` + 公共类型 + 行为定义（仅 header/类型，无函数） | T1 | 0.5 | ADR-009 |
 | T3 | `broker_router` behavior + `broker_router_hash`（含 MQTT 通配符匹配）；**读路径为调用者进程内 ETS 并发查，写路径单一写者**（§3.2 冻结点 2） | T2 | 2 | ADR-010 |
 | T4 | `broker_storage` behavior + `broker_storage_memory`（含 `create/2` 与 `recover/2` 分离） | T2 | 1.5 | ADR-011 |
@@ -607,3 +612,13 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | **F5** | Router `subscribe/3` 自行铸造 SubRef，与"Router 不得调用 subscription API"判据自相矛盾 | SubRef 由 `broker_subscription` 铸造；流程固定「创建实体 → `register/4` → `route/3` 原样返回 → `unregister/2`」，Router 从不解引用 | ADR-010 §10.1/§10.2、§3.2、§5.2、§9-T7 |
 | **F6** | roadmap §3.2 的抽象动词表与冻结 API 无溯源指针；设计文档 §3 与 ADR 存在两份真相 | roadmap §3.2 加覆盖指针（批注式，不改其动词基线）；设计文档 §3.2/§3.3 标注"ADR 摘录，冲突以 ADR 为准"；补 §6 启动顺序（recover → 重建订阅 → register 回填 → 才放开 listener），使 R1b 有实现前提 | roadmap §3.2、本文前言/§3/§6 |
 | **G1** | ADR-010 §10.1 把 `route_ctx` 只定义成 record，却在 `-callback route/3` 中当类型用；**OTP 28.3.1 `erlc` 实测报 `type route_ctx() undefined`，冻结文本无法编译** | 补 `-type route_ctx() :: #route_ctx{}.'` 与 `-export_type([router_env/0, sub_ref/0, route_ctx/0]).'`；三份 ADR 的 record/behavior 定义已全部 `erlc` 通过并核对 `behaviour_info(callbacks)`/`(optional_callbacks)` | ADR-010 §10.1/验证、§3.2 |
+
+### T1 实现期间发现并修正（2026-10-21，均为实测暴露）
+
+| 项 | 问题 | 修正 |
+|---|---|---|
+| **H1** | §6 画的单一 `broker_app_sup`「application master」在 8 个独立 OTP app 的结构下没有承载者：它若把别的 app 的 supervisor 当 child 起，那些 app 就不能再作为 application 启动 | 取消该层，改为每 app 一个顶层 supervisor，跨 app 顺序由 `.app.src` 的 `applications` 拓扑保证；实测 `ensure_all_started` 顺序与四个 boot step 一致 |
+| **H2** | relx 用 `{sys_config_src, ...}` / `{vm_args_src, ...}` 时，rebar3 3.27 只把文件原名拷进 `releases/Vsn/`（仍带 `.src`），启动脚本找不到配置 → `bin/unified_mq daemon` 挂死、`ping` 无响应 | 改用 `{sys_config, ...}` / `{vm_args, ...}`；实测 `releases/0.1.0/{sys.config,vm.args}` 生成、`daemon`+`ping=pong`+`rpc application:get_env` 全部正确 |
+| **H3** | `{extended_effects, true}` 不被该 relx 版本识别，报 `Unknown term found in relx configuration` | 移除 |
+| **H4** | `vm.args` 里写的 `+C multi_scheduling` 被 erts 拒绝（`Invalid time warp mode`），节点起不来；`+h`/`+W` 亦非 OTP 28 合法开关 | 改为 `-C multi_time_warp`，删掉未经确认的开关；此后所有 vm.args 选项一律以"能否真启动"为准 |
+| **H5** | `sys.config` 里预置的 sasl 文件日志指向不存在的 `log/sasl` 目录 | S1 用默认 logger，文件日志归 T12 dev 环境；`.gitignore` 补 `/data/`、`/log/` |
