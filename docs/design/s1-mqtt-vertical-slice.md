@@ -1,11 +1,11 @@
 # S1 方案设计 — MQTT 垂直切片原型
 
-- **文档版本**：v0.4（ADR 冻结同步版）
+- **文档版本**：v0.5（T3/T4 实现同步版）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §3
 - **前置**：S0 已完成，ADR-001~008 已定稿；ADR-009/010/011（三抽象）**已冻结**（[`docs/adr/`](../adr/)）
 - **目标 Gate**：roadmap §3.4「Gate S1」
-- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 工程骨架已落地并实测通过**（§2 配置接线、§6 监督树按实测修正）→ 下一步 T2/T3/T4
-- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 6 项（F1~F6），关键变更见 §13 变更摘要
+- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端已实现并实测通过**（27 个 CT 用例，`rebar3 ct`/`xref`/`dialyzer` 干净）→ 下一步 T5
+- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13。ADR 侧只加**冻结后批注**，不动已冻结文本
 
 ---
 
@@ -339,7 +339,7 @@ mqtt_conn_fsm:handle_publish
 |---|---|---|---|---|
 | `sessions/{clientid}.subs` | 订阅集合（filter list） | 仅 SUB/UNSUB | **每次变化即 fsync** | 0（强一致）|
 | `sessions/{clientid}.inflight` | packet_id 分配器 + in-flight 集合 | 每条 QoS1 投递/ack | 批量缓冲，随 group commit 节拍刷盘 | ≤64 条 / 100 ms |
-| `subscriptions/cursors/{subref}.cursor` | per-sub cursor offset | 每条消费 ack | 每 `cursor_flush_interval_ms`（默认 100）或每 `cursor_max_regress`（默认 64）先到触发 | ≤64 条 / 100 ms |
+| `subscriptions/cursors/{subref}.cursor` | per-sub cursor offset **【v0.5 修正：需按 (subref, partition) 存，见 §13 H11】** | 每条消费 ack | 每 `cursor_flush_interval_ms`（默认 100）或每 `cursor_max_regress`（默认 64）先到触发 | ≤64 条 / 100 ms |
 
 **为什么分层刷盘**：in-flight 集合每条 QoS1 消息都变化；若"每次变化即 fsync"，等于每条消息额外一次独立 fsync（S0.3 §2.1 实测 ~871 µs），group commit 的 17× 收益直接归零。而 MQTT 3.1.1 §4.1 本就允许 session 恢复时 broker **重发未确认消息**（DUP=1），in-flight 精确性不是规范契约——允许回退只多不少。**订阅集合的强一致（Gate 核心）不受影响。**
 
@@ -401,6 +401,13 @@ broker_core：无模块、无 supervisor（纯 `.hrl` 与公共类型，见 §2�
 ### 7.1 内存后端（`broker_storage_memory`）
 
 ETS 表 `messages` = `{PartitionId, Offset, Msg}`；`append/3` 只支持 `os_buffer`，caller 传其他 sync_mode 返回 `{error, {unsupported_sync_mode, _}}`；offset 单调递增。`capability/1` → `[os_buffer]`。部署此后端时 listener 必须配 `mqtt_max_qos = 0`（§3.3、§4.4）。
+
+**T4 实测补充**（`apps/broker_storage/src/broker_storage_memory*.erl`，2026-10-21）：
+
+- 分区注册表由 `broker_storage_memory_store` 持有，但**数据面进程内直跑**：meta 表用 `ets:update_counter/3` 做**块状 offset 原子分配**（一次 append N 条拿连续 N 个），messages 表直接 `ets:insert`，因此 `append/3` 与 `read_from/3` 都不经过任何 gen_server（README §7.2）。只有 create/recover/close/advance_committed/truncate 走写者进程。
+- 代价：两张表必须是 `public`，于是并发读可能看见"offset 已分配、消息尚未插入"的瞬时空洞并把该页提前截断。S1 真实链路里 §5.1(d) 已按分区串行化 append，不会触发；**多写者并发下的这个观察窗口是 T5 并发测试必须对 WAL 明确结论的场景之一**。
+- offset 基数在 ADR-011 中未冻结，本实现定为 **1 起步**：空分区 `recover` 返回 `CommittedOffset = 0`（什么都没有确认过）、`HighOffset = 1`（下一条写入位置）。
+- 在冻结签名内加了两道守卫（error 项是 `term()`，不构成 API 变更）：`advance_committed/2` 拒绝越过 `HighOffset` 与向后退；`truncate/2` 拒绝把边界推到 `Committed + 1` 之后。§11.3 的"偏高绝对禁止"由此从文字变成可机械检查。
 
 ### 7.2 WAL 后端（`broker_storage_wal`）
 
@@ -489,8 +496,8 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | T0.5 | 起草 ADR-009/010/011 骨架（先出评审文本再实现）——**已完成，三份 ADR 经 F1~F6 整改后冻结** | — | 1 | ADR-009/010/011（已采纳） |
 | T1 | rebar3 umbrella apps 骨架 + sys.config + vm.args + application master——**已完成**：8 app、7 顶层 supervisor、`broker_message.hrl` 与两个 behavior 落盘；`rebar3 compile`（warnings_as_errors）与 `rebar3 release` 节点启动均实测通过 | T0.5 | 1 | 目录结构（§2/§6 已按实测修正） |
 | T2 | `broker_core`：`broker_message.hrl` + 公共类型 + 行为定义（仅 header/类型，无函数） | T1 | 0.5 | ADR-009 |
-| T3 | `broker_router` behavior + `broker_router_hash`（含 MQTT 通配符匹配）；**读路径为调用者进程内 ETS 并发查，写路径单一写者**（§3.2 冻结点 2） | T2 | 2 | ADR-010 |
-| T4 | `broker_storage` behavior + `broker_storage_memory`（含 `create/2` 与 `recover/2` 分离） | T2 | 1.5 | ADR-011 |
+| T3 | `broker_router` behavior + `broker_router_hash`（含 MQTT 通配符匹配）；**读路径为调用者进程内 ETS 并发查，写路径单一写者**（§3.2 冻结点 2）——**已完成**：14 个 CT 用例通过（§4.7 通配符黄金用例 + 挂起写者后 `route/3` 仍返回正确结果，实测证明读路径不经进程） | T2 | 2 | ADR-010 |
+| T4 | `broker_storage` behavior + `broker_storage_memory`（含 `create/2` 与 `recover/2` 分离）——**已完成**：13 个 CT 用例通过（`recover` 绝不建分区、超能力 sync_mode 报错且不消耗 offset、水位不可偏高、truncate 只设逻辑边界） | T2 | 1.5 | ADR-011 |
 | **T5** | `broker_storage_wal` 重写（segment / writer / reader / recovery / group_committer / **index** / codec 兼容层）；**交付项含（E5）：多 conn_fsm 并发 append 正确性测试——批次内每个 caller 回复严格在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿** | T4 | **6.5** | — |
 | T6 | `broker_queue` 分区 Worker（append 串行化 + storage 生命周期 + `capability/1` 查询 API + 通知订阅） | T3, T4 | 2 | — |
 | T7 | `broker_subscription`：per-sub cursor + `.subs`/`.inflight`/`.cursor` 三层持久化（§5.3）+ **SubRef 铸造**与 `register/4` 回填（§3.2 冻结点 3）+ 分发 + advance_committed 聚合 | T6 | 3 | — |
@@ -612,6 +619,19 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | **F5** | Router `subscribe/3` 自行铸造 SubRef，与"Router 不得调用 subscription API"判据自相矛盾 | SubRef 由 `broker_subscription` 铸造；流程固定「创建实体 → `register/4` → `route/3` 原样返回 → `unregister/2`」，Router 从不解引用 | ADR-010 §10.1/§10.2、§3.2、§5.2、§9-T7 |
 | **F6** | roadmap §3.2 的抽象动词表与冻结 API 无溯源指针；设计文档 §3 与 ADR 存在两份真相 | roadmap §3.2 加覆盖指针（批注式，不改其动词基线）；设计文档 §3.2/§3.3 标注"ADR 摘录，冲突以 ADR 为准"；补 §6 启动顺序（recover → 重建订阅 → register 回填 → 才放开 listener），使 R1b 有实现前提 | roadmap §3.2、本文前言/§3/§6 |
 | **G1** | ADR-010 §10.1 把 `route_ctx` 只定义成 record，却在 `-callback route/3` 中当类型用；**OTP 28.3.1 `erlc` 实测报 `type route_ctx() undefined`，冻结文本无法编译** | 补 `-type route_ctx() :: #route_ctx{}.'` 与 `-export_type([router_env/0, sub_ref/0, route_ctx/0]).'`；三份 ADR 的 record/behavior 定义已全部 `erlc` 通过并核对 `behaviour_info(callbacks)`/`(optional_callbacks)` | ADR-010 §10.1/验证、§3.2 |
+
+### T3/T4 实现期间发现并修正（2026-10-21，均为实测暴露）
+
+冻结文本本身没有 API 错误，但下列 6 项在"第一次被真实实现踩过"时暴露。H6/H7 需要 ADR 批注，H8/H11 是 T5/T7 的必答项。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **H6** | `route_ctx` 冻结在 `broker_router.erl` **模块内**——Erlang 的 record 不跨模块可见，于是除该模块外**没有任何调用者能构造 Ctx**，§5.1(c) 的 `route(T, Ctx, Env)` 一行无法写出 | record 原样搬进 `apps/broker_router/include/broker_router.hrl`（字段与类型标注不变），behavior 模块改为 include 该头文件；ADR-010 §10.1 加批注。**API 未变**，仅定义位置变 | ADR-010 §10.1、§3.2 |
+| **H7** | ADR-010 验证段把"一条消息命中多订阅时 Router 返回列表完整且**去重**"记在 Router 名下。但一个 SubRef 只登记一个 filter（`register/4` 对同一 SubRef 的第二次登记返回 `{already_registered, _}`，否则索引与 `.subs` 会不一致），跨 filter 的重复在结构上不可能发生；而同一 **client** 的多个重叠 filter（`sport/#` 与 `sport/tennis/+`）会产生多个 SubRef，合并它们必须解引用 SubRef——§10.2 明令禁止 | Router 侧改为可保证的两条：结果**完整**且**同一 SubRef 不重复**（已测）；MQTT §4.8 的"同 client 重叠订阅按 max QoS 投递一次"归 `broker_subscription`（T7）。验证段加勘误批注 | ADR-010 验证、§9-T7、T13 |
+| **H8** | §6 boot step 1 要求逐分区 `recover/2` 且"缺分区即报错、不自动 create"（§11.2），但 S1 **没有任何角色负责首次部署时 `create/2`**：干净数据目录起 broker 必然 `{not_found, _}` 而启动失败。内存后端实测同样无法通过 step 1 | 不是代码缺陷，是规格缺口。T5 必须先定"分区 bootstrap 由谁做"（管理命令 / `partition_bootstrap` 配置 / 以数据目录标记区分首启与恢复），**不得**用"recover 顺手创建"绕过 §11.2 | §6、§11.2、T5 |
+| **H9** | ADR-011 未冻结 offset 基数，`CommittedOffset`/`HighOffset` 在空分区上的取值含糊（这直接决定 §8.2 R3 的 `max(0, last_flushed - K)` 怎么写） | 定为 offset 从 **1** 开始、`Committed = 0` 表示"从未确认过任何一条"、空分区 `recover` 返回 `0 / 1`；已在 §7.1 落文并由测试锁定 | §7.1、§8.2、T5 |
+| **H10** | §11.3 的"水位偏高绝对禁止"只是文字约束，签名层面 `advance_committed/2`、`truncate/2` 都能传任意 offset | 实现加守卫并在 T4 用例锁定（见 §7.1）；T5 WAL 后端必须通过同一组用例，否则视为缺陷 | §7.1、§11.3、T5 |
+| **H11** | **hash 分区 + 通配符订阅 ⇒ 一个订阅跨多个分区**。实测 `sport/#` 一个 SubRef 同时命中分区 `[0,1,3]`（N=4）。而 §5.3 规定 per-sub cursor 是 `subscriptions/cursors/{subref}.cursor` 里的**一个标量 offset**——单个标量无法描述"跨 3 个分区各读到哪"，追赶/重投会漏或重复 | 冻结 API 无需改动（per-sub cursor 归 subscription，storage 不感知，正是 §11.3 的切分）。T7 必须把 cursor 落成 **per (SubRef, PartitionId)**（如 `{subref}.{partition}.cursor`）。已列为 T7 前置决策 | §5.2、§5.3、§9-T7 |
 
 ### T1 实现期间发现并修正（2026-10-21，均为实测暴露）
 
