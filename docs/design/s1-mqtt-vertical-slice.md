@@ -1,11 +1,11 @@
 # S1 方案设计 — MQTT 垂直切片原型
 
-- **文档版本**：v0.6（T3/T4 实现同步版）
+- **文档版本**：v0.9（T7 实现同步版）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §3
 - **前置**：S0 已完成，ADR-001~008 已定稿；ADR-009/010/011（三抽象）**已冻结**（[`docs/adr/`](../adr/)）
 - **目标 Gate**：roadmap §3.4「Gate S1」
-- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端已实现并实测通过**（27 个 CT 用例，`rebar3 ct`/`xref`/`dialyzer` 干净）→ 下一步 T5
-- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）。ADR 侧只加**冻结后批注**，不动已冻结文本
+- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端、T5 WAL 后端、T6 分区 Worker、T7 订阅层已实现并实测通过**（181 个 CT 用例：既有 157 + T7 订阅 21 + Router 监督树 3，`rebar3 ct` 无一条 FAILED、`xref`/`dialyzer` 干净）；**装配后的 release 节点实测**：T6 的两半（干净目录响亮失败 / 带外建分区后 11 app 全起）复验通过，T7 的 R1b 节点级预演通过——带外建 4 分区 → `bin/unified_mq start` → `subscribe(<<"c1">>, <<"sport/#">>, 1)` → `data/sessions/YzE.subs` 落盘 → `application:stop+ensure_all_started(broker_subscription)` → route 索引仍含该 SubRef（boot step 2+3 回填走 `already_registered` 路径）、`cursor/2` 从 `.subs` 内嵌原点恢复 → 下一步 T9
+- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）；**v0.6 → v0.7 同步 T5 实测发现（I1~I15，见 §13）：WAL 模块划分、组提交策略模块形态、tmpfs 防护位置、E5 并发结论、以及 H8「分区 bootstrap 由谁做」的归属答复**；**v0.7 → v0.8 同步 T6 实测发现（J1~J11，见 §13）：§5.1(d) 的"分区 Worker 串行化"改为"单一 storage writer 串行化"（否则 group commit 退化成每批 1 条）、H8 的 `create_partition/1` 与 boot step 1 已落地并在 release 上实测两半、OTP 28 `get_env/2` 返回 `{ok,Val}`、relx 脚本 `cd $ROOTDIR` 使相对 `data_dir` 落进 release 树**；**v0.8 → v0.9 同步 T7 实测发现（K0~K10，见 §13）：修掉 T3 遗留的 Router 装配缺口（`broker_router_sup` 从不启动索引 store，I12 同类），§5.3 的 cursor 文件按 H11 落成 per-client 聚合的 `.cursors` 并把订阅原点内嵌进 `.subs`（恢复规则"绝不回退到 Committed/0/High 兜底"），committed 聚合公式定死为 `min(活 cursor) − 1` 且刷盘严格先于 `advance_committed`，OQ-2 答复为"不抽 behavior"**。ADR 侧只加**冻结后批注**，不动已冻结文本
 
 ---
 
@@ -69,6 +69,8 @@ test/
 **配置读取**：S1 无 `broker_config` app，全部通过 `application:get_env/2` 直读 `sys.config`；监督树无 `broker_config_sup`。roadmap §3.1「Mnesia 只放最小配置」在 S1 进一步降级为「无 Mnesia，纯静态配置」。
 
 **T1 实测的 relx 接线**：`config/sys.config.src` 与 `config/vm.args.src` 必须用 relx 的 `{sys_config, ...}` / `{vm_args, ...}` 键接入。用 `{sys_config_src, ...}` / `{vm_args_src, ...}`（rebar3 3.27）会把文件原名拷进 `releases/Vsn/`（仍是 `*.src`），启动脚本找不到而不拉起节点。两文件均不含 `{{...}}` 占位，因此 `rebar3 shell` 的 `{config, "config/sys.config.src"}` 可直接复用同一份；`vm.args` 则只有 release 节点读，shell 不读（实测为 `nonode@nohost`）。
+
+**T6 实测补两条 relx/配置事实（2026-10-22，详见 §13 J3/J8）**：(1) 生成的 `bin/unified_mq` 在 exec 前做 `cd "$ROOTDIR"`（脚本第 770 行），所以相对 `data_dir` 落在 **release 根目录**而非调用者 CWD，`rebar3 release` 会连带清掉它——T12 的 dev 环境必须用 release 树外的绝对路径。(2) **OTP 28 的 `application:get_env/2` 返回 `{ok, Val}` 而非裸值**（`kernel-10.5/src/application.erl:918`），全项目统一用返回裸值的 `get_env/3`。
 
 `spikes/` 只读，S1 阶段不得被 `apps/*` 引用（roadmap §2 硬约束）。S0.3 的 WAL 代码作为参考，需在 `broker_storage` 中重写为生产版本，原因见 §7.2。
 
@@ -315,6 +317,12 @@ mqtt_conn_fsm:handle_publish
          （in-flight 集合更新写入 session .inflight 缓冲，不逐条 fsync，见 §5.3）
 ```
 
+**T6 实测批注（2026-10-22）——(d) 的"分区 Worker 串行化"读法已修正**：上面流程图第 (d) 行的「分区 Worker 串行化（多 conn_fsm 并发投递由 mailbox 吸收）」**不成立**，实现里 `broker_queue:append/3` **不经过分区 Worker**：
+
+- **真正的串行化点是单一的 `wal_writer` 进程**（每分区一个），并发投递由**它的** mailbox 吸收，group committer 在那里攒批。分区 Worker 若插在中间做 `gen_server:call`，每个 caller 都会独占 writer 一次往返 ⇒ **每批恒为 1 条**，吞吐退化成 S0.3 §2.1 实测的逐条 fsync ~1148 msg/s——那正是 ADR-008 决定自写 WAL 要超越的数字。
+- 实现形态与 §3.2 冻结点 2（Router 不串行化）**同构**：句柄放在 `protected` ETS 注册表里，caller 在自己进程内查表后直接 `Backend:append(Hd, [Msg], Mode)`；分区 Worker 只持有**生命周期与元数据**（storage 句柄刷新、`capability` 缓存来源、订阅者集合与 `{new_messages,_,_,_}` 广播），**不在数据路径上**。
+- **实测两例**（`broker_queue_SUITE`）：`the_data_path_does_not_pass_through_the_partition_worker` 把 Worker `sys:suspend` 后两次 append 仍返回 `{ok,1}`/`{ok,2}`（若走 Worker 会挂到 CT 超时）；`eight_concurrent_callers_pay_for_one_fsync` 先把 8 个 caller 停在 writer 的 mailbox 里再放行，读 writer 自己的计数器得 `#{records := 8, batches := 1, syncs := 1}`——**8 条消息付 1 次 fsync**，且因为请求已确证在 mailbox 中，该断言不依赖机器快慢。
+
 **顺序约束**：
 
 - **(e) PUBACK 只依赖 (d) storage append 返回**——**先于** (f) dispatch，不等待 dispatch 完成。
@@ -327,6 +335,12 @@ mqtt_conn_fsm:handle_publish
 - 分区 Worker 收到 `append` 成功后，向本分区上所有 SubRef 的 dispatcher 广播 `{new_messages, PartitionId, FromOffset, ToOffset}`。
 - Dispatcher **内嵌在 `mqtt_conn_fsm` 内**（S1 选择：减少进程数；S2 引入独立 dispatcher 时通过 optional callback 扩展，不破坏 §3.2/§3.3）。调用 `broker_storage:read_from/3` 拉取 → 转 MQTT PUBLISH → 等客户端 PUBACK → 调 `broker_subscription:ack` → 后者聚合"全部订阅都 ack 的连续前缀" → 定期 `broker_storage:advance_committed/2`。
 
+**T6 实测批注（2026-10-22）——"Worker 收到 append 成功"的措辞**：Worker 不是**处理** append 的一方（见 §5.1 批注），而是被 append 的调用者 `gen_server:cast` **告知**。由此广播的性质必须按下面三条读，T7 的 dispatcher 依赖它们：
+
+1. **`{new_messages, PartitionId, From, To}` 是唤醒信号，不是投递契约**。dispatcher 收到后仍要自己 `read_from(Cursor, Limit)`，不能把通知里的区间当作待投消息集合。
+2. **区间可乱序、可重叠、可丢失**：多个 caller 并发 append 时 cast 的到达顺序与 offset 顺序无关；Worker 崩溃期间发出的 cast 直接丢失。恢复路径是 dispatcher 下一次按 cursor 读——cursor 才是唯一真相源，通知只是让它早点醒。
+3. **订阅者集合由 Worker 持有并 `monitor`**，进程死亡自动摘除，无需 dispatcher 显式退订（`unsubscribe/2` 仍保留且幂等，因为 MQTT UNSUBSCRIBE 与断连竞争会同时到达）。实测：`a_dead_subscriber_is_dropped_without_disturbing_appends`。
+
 **离线积压机制（E7 整改）**：clean_session=false 订阅者离线期间**不存在 broker 侧内存离线队列**——消息持久化在 WAL 中，积压仅表现为该订阅 cursor 滞后；重连时 conn_fsm 从 cursor 起 `read_from` 追赶。两条 S1 限制写入 protocol-compatibility.md：
 1. 追赶深度受 WAL 段保留约束——S2 retention 策略前，段文件不删、理论全量可追；但追赶本身是单连接顺序读，积压极深时首条消息延迟线性增长（已知行为，非丢消息）。
 2. 追赶期间到达的新消息与积压消息按 offset 顺序统一投递，无优先级反转。
@@ -337,9 +351,16 @@ mqtt_conn_fsm:handle_publish
 
 | 文件 | 内容 | 变化频率 | fsync 策略 | 回退窗口 |
 |---|---|---|---|---|
-| `sessions/{clientid}.subs` | 订阅集合（filter list） | 仅 SUB/UNSUB | **每次变化即 fsync** | 0（强一致）|
+| `sessions/{clientid}.subs` | 订阅集合（filter list）**+ 每条订阅各分区的初始 cursor 原点【K5】** | 仅 SUB/UNSUB | **每次变化即 fsync** | 0（强一致）|
 | `sessions/{clientid}.inflight` | packet_id 分配器 + in-flight 集合 | 每条 QoS1 投递/ack | 批量缓冲，随 group commit 节拍刷盘 | ≤64 条 / 100 ms |
-| `subscriptions/cursors/{subref}.cursor` | per-sub cursor offset **【v0.5 修正：需按 (subref, partition) 存，见 §13 H11】** | 每条消费 ack | 每 `cursor_flush_interval_ms`（默认 100）或每 `cursor_max_regress`（默认 64）先到触发 | ≤64 条 / 100 ms |
+| `sessions/{clientid}.cursors`【K4：per-client 聚合，取代原 `{subref}.cursor`】 | per-`(SubRef, PartitionId)` cursor（H11）| 每条消费 ack | 每 `cursor_flush_interval_ms`（默认 100）或每 `cursor_max_regress`（默认 64）先到触发 | ≤64 条 / 100 ms |
+
+**T7 实测批注（2026-10-23）**：
+
+- **文件名**：MQTT clientid 是任意二进制（含 `/` 合法），落盘名为 **url-safe base64 编码**后的 id；真实 id 存在文件内容里——`list_sessions/0` 以内容为准，名字只是地址。
+- **K4**：cursor 文件按 **per-client 聚合**（一个文件含该 client 全部 `(SubRef, PartitionId)` 行），原子性 = 整文件 temp+fsync+rename。比 per-`(subref,partition)` 多文件少 N×M 倍写放大，回退窗口语义不变——偏离原表格的 `{subref}.cursor` 文本，登记于 §13。
+- **K5**：订阅时查各分区 `HighOffset` 并把原点随 `.subs` **即时 fsync**——订阅原点是强一致的。启动恢复规则：有 `.cursors` 用其值，否则用 `.subs` 内嵌原点；**绝不用 Committed/0/High 当场兜底**（回退到订阅起点之前=违 §4.2；跳过未 ack 积压=丢消息）。
+- **K6**：`broker_storage:advance_committed` 的聚合公式与次序是刚性的——cursor 语义"下一条要读"、committed 语义"最后已确认"（存储守卫 `Offset =< High-1 andalso >= Committed`）⇒ **committed = min(活 cursor) − 1**，无活 cursor 的分区跳过；且必须**先 `.cursors` 落盘、后 `advance_committed`**——反过来则崩溃后 cursor 回退到 committed 之下，S2 truncate 会丢数（§11.3"偏高绝对禁止"的镜像）。
 
 **为什么分层刷盘**：in-flight 集合每条 QoS1 消息都变化；若"每次变化即 fsync"，等于每条消息额外一次独立 fsync（S0.3 §2.1 实测 ~871 µs），group commit 的 17× 收益直接归零。而 MQTT 3.1.1 §4.1 本就允许 session 恢复时 broker **重发未确认消息**（DUP=1），in-flight 精确性不是规范契约——允许回退只多不少。**订阅集合的强一致（Gate 核心）不受影响。**
 
@@ -348,7 +369,7 @@ mqtt_conn_fsm:handle_publish
 - cursor 与 in-flight 允许有界回退 → **至少一次投递**（R3、R7），重复是契约内行为。
 - `broker_storage:advance_committed` 是**独立**的存储水位（S2 retention 与 S4 复制用），不替代 per-sub cursor 文件。
 
-**S2 迁移路径（OQ-2）**：Mnesia 上线后三个文件全部退役迁入表（`subscription_meta`、`cursor_meta`、`session_meta`），`broker_subscription` 对外 API 不变。
+**S2 迁移路径（OQ-2）**：Mnesia 上线后三个文件全部退役迁入表（`subscription_meta`、`cursor_meta`、`session_meta`），`broker_subscription` 对外 API 不变。**→ 已答复（K3，2026-10-23）**：文件层**不抽 behavior**——三个文件是 subscription 的内部实现细节，S2 是整体替换而非并列后端，没有第二个实现者需要插拔；持久化模块命名 `broker_subscription_files`（刻意不用 `_store` 后缀，避免暗示抽象层）。
 
 **回退窗口可配置到零**：`cursor_max_regress = 1` + `cursor_flush_interval_ms = 0` 时 cursor 逐条 fsync，逼近零回退（代价：每条消费 ack 一次独立 fsync，与 §7.2 group commit 收益对冲）。**默认档为有界回退**，零回退档仅供对重复敏感的调用方显式开启；R3 测试两档都要跑（§8.2），证明该参数语义真实而非纸面。`.inflight` 不提供零回退档——MQTT 3.1.1 §4.1 本就允许 session 恢复时重发未确认消息，精确性非规范契约。
 
@@ -377,6 +398,13 @@ broker_proto_mqtt_app   → broker_proto_mqtt_sup                       [one_for
 broker_core：无模块、无 supervisor（纯 `.hrl` 与公共类型，见 §2）
 ```
 
+**T5 实测批注（2026-10-21，不改上图基线，只记两处偏差）**：
+
+- **`wal_writer (per partition，静态)` 里的"静态"不成立**：ADR-011 §11.2 把 `create/2` 定为带外动作、`recover/2` 对缺失分区必须报错，于是 boot 时**没有任何可枚举的分区清单**能让 `init/1` 返回。writer 子进程由 `broker_storage_wal_sup:start_partition/3` 用 `supervisor:start_child/2` 动态加入（`id => {wal_writer, PartitionId}`、`restart => permanent`，符合上图的 `one_for_one`）。supervisor 的 `init/1` 返回空 child 列表——这不是遗漏，是"分区清单不在存储层"的结构后果（清单归属见下方 boot step 1 批注）。
+- **`broker_storage_sup` 按配置只起自己需要的那一个子进程**（`one_for_all` 不变）：`backend = broker_storage_wal` → 起 `broker_storage_wal_sup`；`backend = broker_storage_memory` → 起 `broker_storage_memory_store`。**这修掉了 T4 的一个真实缺陷**：内存后端此前从未有任何角色启动 `broker_storage_memory_store`，于是 release 里每一次 `broker_storage_memory:create/2` 都是 `noproc`——T4 的 CT 套件因为在自己进程里手工起表而全绿，缺陷只在装配后的 release 中出现。现由 `apps/broker_storage/test/broker_storage_sup_SUITE.erl` 锁住："每个后端启动它的 `create/2` 所需的那个进程"。
+
+**T6 实测批注（2026-10-22，上图 `broker_queue` 那两行成立，补一个未画出的子进程）**：`broker_queue_sup` 的 `init/1` 实际返回 **5 个** child（N=4 时）：`broker_queue_store`（注册表的单写者，**必须排在分区 worker 之前**，否则 worker 的 `init/1` 写句柄时表还不存在）+ 4 个 `broker_queue_partition`（`id => {partition, PartitionId}`、`restart => permanent`）。清单是静态的，因此 I14 实测到的"supervisor `init` 期间子进程失败即整体失败、不进 intensity 重试"正好把 boot step 1 变成全有或全无——任一分区 `recover/2` 得 `{not_found,_}`，整个 application 起不来（release 实测见下方 H8 批注）。
+
 实测启动序列（`application:ensure_all_started(broker_proto_mqtt)` 返回的顺序，OTP 28.3.1）：
 `sasl → broker_core → broker_storage → broker_router → broker_queue → broker_subscription → broker_event → broker_security → broker_proto_mqtt`。
 
@@ -393,6 +421,29 @@ broker_core：无模块、无 supervisor（纯 `.hrl` 与公共类型，见 §2�
 4. **以上全部成功后**才启动 `ranch_listener_sup` 接单。
 
 第 4 步的顺序性是 Gate S1「订阅集合不丢」（§8.2 R1b）的实现前提：若 listener 先起，新连接 SUBSCRIBE 会与回填竞争，回填的旧订阅可能覆盖或被旧 SubRef 污染，R1b 变成概率性通过。任何 step 失败 → 整个 application 启动失败并告警，**不得**降级为"部分恢复后继续服务"。
+
+**T5 批注 — H8（分区 bootstrap 由谁做）已答复，2026-10-21**：
+
+- **step 1 的执行者不是 `broker_storage_sup`**（上面括号里那串 supervisor 名要按此读）：分区清单 `{partitions, N}` 配在 `broker_queue` 的 application env（见 `config/sys.config.src`），存储层看不到它，所以"对各分区 `recover/2`"这个循环只能落在 **`broker_queue`（T6 交付）**。`broker_storage_sup` 只负责把进程结构立起来（见本节上一批注），不执行 recover。
+- **`create/2` 的唯一调用者是带外管理动作**：S1 = 显式调用 `broker_queue:create_partition/1`（T6 交付），**不出现在任何 boot 路径里**。于是"干净数据目录起 broker"会拿到 `{not_found, _}` → application 启动失败并告警。这是 §11.2 要求的**响亮失败**，不是待修的启动 bug，也不得用"recover 顺手创建"或"首启标记"绕开——后者正是 §11.2 要防的"恢复出空分区并报告健康"。
+- 推论：**首启与恢复不需要靠数据目录内容来区分**，区别只在于有没有人显式 `create` 过。dev/CI 的起法是先建分区再 boot；S1 不提供 `partition_bootstrap` 之类的启动期自动建分区开关。
+
+**T6 批注 — 上面两条已落地，并在装配后的 release 上实测两半，2026-10-22**：
+
+- **step 1 的实现形态**：`broker_queue_sup:init/1` 返回 `[store_spec() | [partition_spec(Id) || Id <- broker_queue:partition_ids()]]`——**静态子进程清单**，每个分区一个 `broker_queue_partition`，其 `init/1` 只做 `Backend:recover(PartitionId, Config)` 并把句柄写进注册表；`{error,{not_found,Id}}` → `{stop, {partition_not_found, Id}}`。清单是静态的（不是 `start_child`），因此 I14 实测到的"supervisor `init` 期间子进程失败会立刻整体失败、不进入 intensity 重试"正好把 boot step 1 变成**全有或全无**：任一分区缺失，整个 application 起不来。
+- **release 实测（前半）**：`rebar3 release` 后在干净目录 `bin/unified_mq console` → 退出码 1，crash report 里是 `{{shutdown,{failed_to_start_child,{partition,0},{partition_not_found,0}}},{broker_queue_app,start,[normal,[]]}}`，且 **`data/` 一个字节都没被创建**（CT 侧同名断言 `boot_fails_loudly_when_a_partition_was_never_created` 锁死"失败且不留痕"）。
+- **release 实测（后半）**：带外建好 4 个分区后 `bin/unified_mq start` → `ping = pong`，rpc 查到 11 个 application 全部运行、`broker_queue_sup` 有 4 个 `{partition,N}` + 1 个 `broker_queue_store`、`broker_storage_wal_sup` 有 4 个 `{wal_writer,N}`、`broker_queue:capability(0) = [os_buffer,fsync]`。
+- **带外建分区的两个实测前提**（写进 §13 J8/J9，运维脚本必须照做）：
+  1. `create_partition/1` 需要 `broker_queue` **已 load**（不必 start）——分区清单在它的 env 里，未 load 时 `partition_ids/0` 抛 `{invalid_partition_count, undefined}`。实测可用的起法：`erl -noshell -pa <rel>/lib/*/ebin -config <rel>/releases/Vsn/sys.config -eval 'application:load(broker_queue), application:ensure_all_started(broker_storage), ...'`。
+  2. 该 `erl` 的 **CWD 必须与节点启动后的 CWD 一致**：relx 生成的 `bin/unified_mq` 在 exec 前做 `cd "$ROOTDIR"`，所以 `data_dir = "data"` 实际落在 **release 根目录**，不是调用者所在目录。实测在别处建好的分区，节点起来后一律 `{not_found,_}`。T12 的 dev 环境必须改用 release 树之外的绝对路径。
+- **`create_partition/1` 的边界**：只接受 `partition_ids/0` 里的 id（`9` → `{error,{unknown_partition,9}}`），因此不会在"永远没有 worker 去看"的位置留下孤儿目录；对已存在分区返回 `{error,{already_exists,Id}}`（ADR-011 §11.2）。
+
+**T7 实测批注（2026-10-23，boot step 2+3 落地，并修掉一个 T3 遗留的装配缺口）**：
+
+- **K0 — Router 索引 store 在装配后的节点里没人启动（I12 同类缺陷）**：上图 `broker_router_sup └── broker_router_hash（T3）` 那行**不成立**——T3 的 `broker_router_hash:init/1` 会自起一个 `broker_router_hash_store`，但 `broker_router_sup:init/1` 返回空 children，于是带外起的 release 节点里 `register/4` 无处可写；T3 的 CT 全绿是因为套件在自己进程里手工 `?HASH:init/1`。现 `broker_router_sup` 按 `backend` env 起 `broker_router_hash_store`（permanent），由新增的 `broker_router_sup_SUITE`（3 例）钉住"sup 之下有 store、`broker_router:env/0` 可达"。
+- **装配期访问器在 behavior 之外**：消费者的 boot 需要的是 sup 已拥有的那个 store 的 env，而 `init/1` 会另起进程（撞注册名或泄漏孤儿）——故 `broker_router_hash` 加 **`current_env/0`**（从注册名拼装 env，不启动任何东西，store 不在则 `{error, router_store_not_started}`），`broker_router` 加 **`env/0` / `register/3` / `unregister/1`** facade。**ADR-010 冻结签名一字未动**：这是对"冻结签名没给装配期访问留位置"这类 I12 型缺口的实现期补足。
+- **step 2+3 的实现形态**：落在 `broker_subscription_worker:init/1`（`broker_subscription_sup` 的唯一 child，permanent）——读 `sessions/*.subs`（权威）合并 `.cursors`/`.inflight`，重建实体与 cursor 行进 ETS，再逐条 `broker_router:register(Filter, SubRef, #{})` 回填；`{error,{already_registered,SubRef}}` 视为 ok（K8：崩溃窗口里 router 可能残留同一 SubRef）。任何一步失败 → `{stop, {subscription_boot_failed, Reason}}` → application 启动失败，不留半状态可服务（仿 T6 的全有或全无，release 实测见页首状态行）。
+- **K7 — 单写者 + 无锁读**：worker 持 `entities/cursors/attachments/inflight` 四张 `protected` ETS（`read_concurrency`），写（subscribe/ack/attach/…）经 `gen_server:call`，读（`cursor/2`、`subscriptions/1`、`session/1`、`dispatch/2`）在调用者进程内直查——与 J1/J4 给 queue 层定的形态同构；实测挂起 worker 后读路径照常返回。
 
 ---
 
@@ -424,6 +475,13 @@ S0.3 spike 已验证正确性与性能，spike 代码存在下列**不可直接�
 | 恢复逻辑只覆盖撕裂尾部截断 | 增加：段文件列表校验、offset 索引重建、session/cursor 文件独立恢复 | S0.3 §4 torn_tail_recovery_test |
 | 记录编码直接序列化 `#broker_message{}` | 独立于消息模型的紧凑元组编码（见下方） | — |
 
+**T5 实测批注（2026-10-21，逐行对照上表的"S1 修正"列）**：
+
+- **模块划分与表格第一行不同**（表为计划，以下为落地）：`wal_codec` / `wal_segment` / `wal_index` / `wal_meta` / `wal_recovery` / `wal_writer` / `wal_group_committer` 七个模块 + `broker_storage_wal`（behavior 适配层）+ `broker_storage_wal_sup`。**没有 `wal_reader`**：读路径是 `broker_storage_wal:read_from/3` 在**调用者进程内**直接 `wal_index:locate/2` 定位锚点、再 `wal_segment:fold/5` 流式扫描，独立成模块反而会迫使它跨进程传句柄（README §7.2 数据面不经进程）。**新增 `wal_meta`** 是 §11.3 的要求：`recover/2` 必须返回 `CommittedOffset`，而水位若只能从段文件重放推出，恢复代价就与日志长度成正比——`meta.log` 让"读水位"成为一次定长读。
+- **`wal_group_committer` 不是 gen_server**（表格第二行的"gen_server：mailbox 收集 append 请求"未落地成独立进程）：它是一个**纯策略模块**（`new/1`、`deadline/3`、`due/4`、`timeout/2`、`needs_sync/1`、`take/2`、`earliest/1`，无状态、无进程），mailbox 收集与批次触发都在 `wal_writer` 的 `handle_call` 里用"延迟回复"完成（`{noreply, ...}` 攒批 → fsync 后逐个 `gen_server:reply`）。理由：批次的所有权必须与 offset 分配、段轮转、水位推进在同一个进程里，否则 fsync 与 offset 分配之间又多一处竞态；而策略独立成模块才能被 `wal_group_committer_SUITE`（11 例）单测，不必起进程。
+- **E5（多写者并发）已实测通过**，见 §9 T5 行与 §11.1 首行风险：16 个并发 caller 交叉 `fsync`/`os_buffer` 各 2 条 → 32 个 offset 恰为 `1..32` 无洞无重、`NextOffset = 33`，且**每个 caller 只在自己的 offset 上读到自己那条 payload**（无 cross-reply），每个回复都在该批 fsync 完成之后。
+- **tmpfs 防护的落点与判据都改了**（表格第五行）：落在 `wal_writer:start_link/3` 而**不是** `init/1`——因为 `create/2` 不能先起一个注定要立刻崩的子进程再去把它拆掉（那会烧掉 supervisor 的 `intensity` 预算并留下 `already_present` 的 spec）。判据是读 `/proc/mounts` **按 fstype 匹配** `tmpfs`/`ramfs`，而非 S0.3 §4 的"100 µs fsync 计时"启发式：计时法在快的 SSD 上会误判正常盘为易失，而误判的代价是节点起不来。可通过 `require_durable_fs => false` 关闭（CI/测试用），关闭时返回警告而不是错误。
+
 **Group commit 默认值**：`batch_size = 32`（S0.3 §2.2 拐点）；`batch_delay_ms` 按 sync_mode 区分：`os_buffer = 0`、`fsync = 1 ms`。
 
 **读路径索引（E8 整改）**：每分区维护内存索引 `wal_index`：
@@ -437,6 +495,14 @@ S0.3 spike 已验证正确性与性能，spike 代码存在下列**不可直接�
 - `read_from(Offset, Limit)`：索引定位 ≤Offset 的最近锚点 → 从锚点顺序扫到目标 → 流式读取（消息体不驻留索引）；
 - `wal_recovery` 重放段头重建索引。
 - 无索引则每次 dispatch 全段扫描，group commit 省的 fsync 被读放大吃回去。
+
+**T5 实测批注（索引的实际形态）**：`wal_index` 是一张 **`public` 的 `ordered_set` ETS 表**，由 writer 进程持有、读者在**自己进程内**查（这正是 §3.2 冻结点 2 在存储层的同一手法）；键只有两种：`{meta}`（open/closed 标志 + `truncate_before` 逻辑边界）与 `{anchor, Offset}`（值为 `{SegPath, FilePos}`，锚点自带段路径，所以跨段续读是一次 `locate/2` 而不是一次分区级重扫）。上面伪代码里的 `[{StartOffset, SegPath, [{AnchorOffset, FilePos}]}]` 三段嵌套结构未采用——ETS 的有序键已经提供了"≤Offset 的最近锚点"这个能力，再套一层段分组只会让 `locate/2` 变成两次查找。
+
+**`HighOffset` 刻意不进索引**：§7.1 第 2 条记的内存后端缺陷（并发读看见"offset 已分配、消息尚未插入"的瞬时空洞）根源就是把"下一个 offset"暴露给了读路径。WAL 侧 `high` 只由 writer 进程的状态持有，`read_from/3` 从段文件实际扫到什么就是什么，**读到 torn tail 与读到日志末尾不可区分，也不需要区分**（前者是"writer 正跑在前面"，正常现象）。这一条是 T5 对 §7.1 遗留观察窗口的明确结论：**WAL 后端不存在该窗口**。
+
+**句柄会因 writer 崩溃而失效**：索引表随 writer 进程消亡，此后 `read_from/3` 抛 `badarg` 而非返回 `{error, _}`——与内存后端同性质（§7.1）。调用方（T6 `broker_queue`）在 writer 重启后必须重新 `recover/2` 取新句柄，不得缓存 pid/句柄跨重启使用。
+
+**T6 批注 — 上面这条已按要求落地，2026-10-22**：`broker_queue` 的三个数据面 API 都把 `Backend:*(Hd, ...)` 包在 `try ... catch Class:Reason ->` 里，捕获到就向分区 Worker 发一次 `reattach`（Worker 重新 `recover/2` 并覆盖注册表里的句柄），然后把 `{error, {stale_handle, PartitionId, Class, Reason, Repair}}` 交给调用者。**不做自动重试**：一个已经抵达 writer 的 append 可能已经消耗了 offset，静默重试会在发布者毫不知情的情况下制造重复消息——重试与否是发布语义的决定，归 caller（QoS1 的重发有 packet_id 去重兜底，S1 的 `broker_queue` 不代劳）。实测 `a_crashed_storage_writer_is_reattached_and_the_log_continues`：`kill -9` writer 后第一次 append 报 `{error,{stale_handle,...}}`，第二次直接 `{ok,4}`，整页 `[1,2,3,4]` 完好、末条 payload 正确。Worker 侧的 `reattach` 失败时**保留旧 state 不停机**——否则一次磁盘抖动会变成 worker 重启风暴。
 
 **记录编码**：
 
@@ -456,9 +522,19 @@ WAL 记录头 = `<<Magic:8, Vsn:8, CRC32:32, Len:32>>`，Body = 紧凑元组 `er
 
 **旧段兼容**：`wal_recovery` 遇到 `Vsn > 当前支持最大 Vsn` → 拒绝启动并报警；`Vsn < 当前` → 走兼容分支读入，新段用最新 Vsn 写出。
 
+**T5 实测批注（写路径的三条落地规则）**：
+
+- **段轮转发生在 writer 内部，且可以在一个批次的中途**：`segment_max_records` 是每段的记录数上限，一个 32 条的批完全可能跨两段写。因此**没有 `wal_segment:rotate/N`**——轮转是 writer 的状态迁移（关旧段 → 以新的 `StartOffset` 命名开新段 → 把新段首记录钉成锚点），`wal_segment` 只提供无状态的文件操作（`path/2`、`list/1`、`open_append/1`、`append/2`、`sync/1`、`close/1`、`truncate_at/2`、`fold/5,6`）。
+- **编码在调用者进程执行**：`wal_writer:append/3` 先把 `[#broker_message{}]` 逐条 `wal_codec:encode/1` 成二进制，**再**进 writer。反过来的话，CPU 密集的 `term_to_binary` 全落在单一 writer 进程里，group commit 攒的批越大、该进程越成为吞吐瓶颈——批处理要省的是 fsync 次数，不是把 CPU 串行化。
+- **写失败或 fsync 失败是致命错误，不重试**：offset 是"先分配后落盘"发出去的，一次失败后继续服务就等于把已承诺的 offset 变成永久空洞（§11.4 禁止静默降级）。writer 于是 `{stop, Reason, ...}` 自杀，批内所有 caller 收到 `{error, {writer_stopped, Reason}}`，supervisor 重启后从磁盘重建状态。`broker_storage_wal_SUITE` 里的 `a_crashed_writer_is_restarted_and_the_log_survives` 用 `kill -9` 实测了这条路径（重启后 `recover` 得 `{0, 4}`，三条 payload 完好）。
+
+**实测规模**：`wal_codec` 15 / `wal_segment` 13 / `wal_index` 8 / `wal_meta` 9 / `wal_recovery` 19 / `wal_writer` 19 / `wal_group_committer` 11 例（WAL 内部共 94 例），加 `broker_storage_wal_SUITE` 19 例（13 契约 + 6 后端专有）。
+
 ### 7.3 段文件命名与保留
 
 `data/wal/{partition_id}/segment-{StartOffset:020d}.log`。S1 **不实现物理段清理**：`truncate/2` 只设逻辑不可读边界（§3.3 冻结点 5），段文件永不删；retention 策略在 S2 补齐。
+
+**T5 实测批注**：每个分区目录内除段文件外还有 **`meta.log`**（`wal_meta`，定长水位记录，见 §7.2）。20 位零填充不是排版偏好而是正确性要求：`wal_segment:list/1` 按**文件名字典序**排序，只有等宽填充才能让字典序等于 offset 数值序，否则 `segment-10.log` 会排在 `segment-2.log` 之前，恢复时"最后一段"就选错了。路径布局由 `broker_storage_wal_SUITE` 的 `the_partition_layout_is_the_frozen_path_from_design_7_3` **独立重算**并断言（用例里重新拼 `data_dir/wal/{id}`，不调用生产代码的拼路径函数），所以将来改布局会红。
 
 ---
 
@@ -499,8 +575,8 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | T2 | `broker_core`：`broker_message.hrl` + 公共类型 + 行为定义（仅 header/类型，无函数） | T1 | 0.5 | ADR-009 |
 | T3 | `broker_router` behavior + `broker_router_hash`（含 MQTT 通配符匹配）；**读路径为调用者进程内 ETS 并发查，写路径单一写者**（§3.2 冻结点 2）——**已完成**：14 个 CT 用例通过（§4.7 通配符黄金用例 + 挂起写者后 `route/3` 仍返回正确结果，实测证明读路径不经进程） | T2 | 2 | ADR-010 |
 | T4 | `broker_storage` behavior + `broker_storage_memory`（含 `create/2` 与 `recover/2` 分离）——**已完成**：13 个 CT 用例通过（`recover` 绝不建分区、超能力 sync_mode 报错且不消耗 offset、水位不可偏高、truncate 只设逻辑边界）；用例已抽为可复用契约头 `broker_storage_contract.hrl`，T5 的 WAL 套件按同一 hook 接口消费 | T2 | 1.5 | ADR-011 |
-| **T5** | `broker_storage_wal` 重写（segment / writer / reader / recovery / group_committer / **index** / codec 兼容层）；**交付项含（E5）：多 conn_fsm 并发 append 正确性测试——批次内每个 caller 回复严格在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿**；**WAL 套件必须先通过 `broker_storage_contract.hrl` 的 13 个契约用例（`?CAPABILITY = [os_buffer, fsync]`）** | T4 | **6.5** | — |
-| T6 | `broker_queue` 分区 Worker（append 串行化 + storage 生命周期 + `capability/1` 查询 API + 通知订阅） | T3, T4 | 2 | — |
+| **T5** | `broker_storage_wal` 重写（segment / writer / reader / recovery / group_committer / **index** / codec 兼容层）；**交付项含（E5）：多 conn_fsm 并发 append 正确性测试——批次内每个 caller 回复严格在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿**；**WAL 套件必须先通过 `broker_storage_contract.hrl` 的 13 个契约用例（`?CAPABILITY = [os_buffer, fsync]`）**——**已完成**：113 个 CT 用例通过（WAL 后端 19 = 13 契约 + 6 后端专有；内部 94 = codec 15 / segment 13 / index 8 / meta 9 / recovery 19 / writer 19 / group_committer 11）。13 个契约断言**一条未改、一条未跳**地在 WAL 后端跑通，Gate「WAL 与内存实现可互换」由机械检查证明；E5 三项断言全部实测（16 caller 混合 `fsync`/`os_buffer` 并发 → offset 恰为 `1..32`、无 cross-reply、回复严格在 fsync 后）；`kill -9` writer 后重启 recover 日志完好；跨段 `read_from` 已覆盖。**H8 已答复**（§6 批注）：`create/2` 只归带外管理动作，boot step 1 的 recover 循环归 T6 `broker_queue`。**模块划分与本行计划名有偏差**（无 `wal_reader`，新增 `wal_codec`/`wal_meta`，group_committer 为纯策略模块）——详见 §7.2 批注 | T4 | **6.5** | — |
+| T6 | `broker_queue` 分区 Worker（append 串行化 + storage 生命周期 + `capability/1` 查询 API + 通知订阅）——**T5 追加两项交付（H8/§6 批注）**：(a) `broker_queue:create_partition/1` 作为 `create/2` 的**唯一**带外入口；(b) boot step 1 的"逐分区 `recover/2`、缺分区即启动失败"循环落在 `broker_queue_sup`（分区清单 `{partitions, N}` 在它的 env 里，存储层看不到）。另需消化 §7.2 批注的"句柄随 writer 崩溃失效"：worker 必须在 writer 重启后重新 `recover/2`<br>**→ 已完成（2026-10-22）**：4 个模块（`broker_queue` 公共 API / `broker_queue_store` protected 注册表单写者 / `broker_queue_partition` 每分区 worker / `broker_queue_sup` 静态子进程清单）+ 16 个 CT 用例，`rebar3 ct` 全套 **157/157** 无一条 FAILED、`dialyzer` 干净、`xref` 仅剩预期的 unused-export。(a)(b) 均落地并在**装配后的 release 上实测两半**（§6 T6 批注）；I15 的句柄失效按"不自动重试 + `reattach`"消化（§7.2 T6 批注）。**与本行计划名有偏差**：`append` **不经** Worker 串行化，串行化点是单一 `wal_writer`——否则 group commit 退化为每批 1 条（§5.1 T6 批注 J1，含 8 caller → `batches=1, syncs=1` 的实测）| T3, T4, **T5** | 2 | — |
 | T7 | `broker_subscription`：per-sub cursor + `.subs`/`.inflight`/`.cursor` 三层持久化（§5.3）+ **SubRef 铸造**与 `register/4` 回填（§3.2 冻结点 3）+ 分发 + advance_committed 聚合 | T6 | 3 | — |
 | T8 | `broker_proto_mqtt` 帧编解码（含黄金样本单测 + proper 模糊测试） | T1 | 3 | — |
 | T9 | `broker_proto_mqtt` 连接 FSM + capability 缓存 + keepalive + packet_id + `mqtt_max_qos` 执行 | T8, T6, T7 | 3 | — |
@@ -536,17 +612,17 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 
 | 风险 | 缓解 |
 |---|---|
-| **多写者并发 group commit 未经 S0 实测**（S0.3 §6 待办原文） | T5 并发正确性测试前置于一切性能断言；若发现延迟退化，batch_delay_ms 上调而非改架构 |
+| **多写者并发 group commit 未经 S0 实测**（S0.3 §6 待办原文）<br>**→ T5 已消除（2026-10-21 实测）**：16 caller 混合 sync_mode 并发下 offset 恰为 `1..32`、无 cross-reply、每个回复严格在本批 fsync 之后；未发现需要上调 `batch_delay_ms` 的延迟退化。证据：`broker_storage_wal_SUITE:mixed_sync_modes_concurrently_yield_dense_offsets_and_readable_records`<br>**→ T6 在 queue 边界复测（2026-10-22）**：32 个 caller 全部经 `broker_queue:append/3`（而非直调后端）并发写入，offset 恰为 `1..32`、`read_from` 整页完整、`NextOffset = 33`。证据：`broker_queue_SUITE:concurrent_appends_through_the_queue_yield_dense_offsets` | T5 并发正确性测试前置于一切性能断言；若发现延迟退化，batch_delay_ms 上调而非改架构 |
 | MQTT 帧自研编解码边界情况出错 | 黄金样本用 mosquitto 抓包；`proper` 随机帧测试 |
 | `.inflight` 批量回退窗口内客户端断连时序复杂 | R7 只断言"不丢、可多"；测试用 fault injection 固定断连时序 |
-| Group commit 与逐条 fsync 语义冲突 | Group committer 保证批次内所有请求 fsync 完成后回复；测试覆盖并发 append（同 E5） |
+| Group commit 与逐条 fsync 语义冲突<br>**→ T5 已消除**：批次内所有请求在同一 fsync 完成后才回复，混合 `os_buffer`/`fsync` 并发互不饥饿（同上用例） | Group committer 保证批次内所有请求 fsync 完成后回复；测试覆盖并发 append（同 E5） |
 | WAL 版本兼容 | §7.2 决策：Vsn 位 + 独立磁盘元组；S6 评估 CBOR 迁移成本 |
 | Cursor/in-flight 100 ms 回退 → 客户端看到重复 | QoS1 at-least-once 允许；R3/R7 措辞明确 |
 | 单节点分区数固定，无法在线扩缩容 | S1 非目标，S4 处理 |
 
 ### 11.2 开放问题（S1 期间需答复）
 
-- **OQ-2**：`broker_subscription` 三个持久化文件与 S2 Mnesia 迁移的接口边界——文件层是否需要抽象成 `broker_subscription_store` behavior？S1 评审期答复。
+- ~~**OQ-2**：`broker_subscription` 三个持久化文件与 S2 Mnesia 迁移的接口边界——文件层是否需要抽象成 `broker_subscription_store` behavior？~~ → **已答复（K3，T7 实现期 2026-10-23）**：不抽 behavior；见 §5.3 迁移路径批注。
 - **OQ-4**：MQTT 通配符匹配放 Router 还是 Subscription？S1 暂定 Router；S2 引入 Shared subscription 时复议。
 - **OQ-5**：`broker_event` pass_through 桩的实际契约——客户端发送 `content-type = application/cloudevents+json` 时 S1 应 (a) 完全不检查直接透传，还是 (b) 检查但仅记录不校验？S1 评审期定案。
 - ~~OQ-6（session fsync 性能）~~ → **已解决（E3）**：拆 `.subs` 强一致 / `.inflight` 批量两层，不再逐条 fsync。
@@ -621,6 +697,70 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | **F6** | roadmap §3.2 的抽象动词表与冻结 API 无溯源指针；设计文档 §3 与 ADR 存在两份真相 | roadmap §3.2 加覆盖指针（批注式，不改其动词基线）；设计文档 §3.2/§3.3 标注"ADR 摘录，冲突以 ADR 为准"；补 §6 启动顺序（recover → 重建订阅 → register 回填 → 才放开 listener），使 R1b 有实现前提 | roadmap §3.2、本文前言/§3/§6 |
 | **G1** | ADR-010 §10.1 把 `route_ctx` 只定义成 record，却在 `-callback route/3` 中当类型用；**OTP 28.3.1 `erlc` 实测报 `type route_ctx() undefined`，冻结文本无法编译** | 补 `-type route_ctx() :: #route_ctx{}.'` 与 `-export_type([router_env/0, sub_ref/0, route_ctx/0]).'`；三份 ADR 的 record/behavior 定义已全部 `erlc` 通过并核对 `behaviour_info(callbacks)`/`(optional_callbacks)` | ADR-010 §10.1/验证、§3.2 |
 
+### T7 实现期间发现并修正（2026-10-23，均为实测暴露）
+
+冻结 API（ADR-009/010/011）全程未改。K0 是 **T3 遗留的真实装配缺陷**（I12 同类，只在装配后的节点里暴露），K1 是冻结 behavior 没给水位查询留位置的非 behavior 补足，K2~K10 是 §5.2/§5.3 计划文本第一次被真实实现时的偏差——其中 K4/K5 偏离 §5.3 表格文本（已在该表就地批注），K6 把"committed 只允许偏低"（§11.3）从口号落成公式与次序。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **K0** | `broker_router_sup:init/1` 返回空 children：T3 的索引 store 只在 CT 套件自己进程里由 `?HASH:init/1` 手工带起，**装配后的节点里根本没有路由索引进程**——boot step 3 的 `register/4` 无处可写，与 I12（内存 store 无人启动）同构 | `broker_router_sup` 按 `backend` env 起 `broker_router_hash_store`（permanent）；新增装配期访问器 `broker_router_hash:current_env/0`（不启动进程，store 不在则 `{error, router_store_not_started}`）与 facade `broker_router:env/0`/`register/3`/`unregister/1`；`broker_router_sup_SUITE` 3 例 + 订阅套件第 19 例钉住。**测试钩子须成对导出**（J10 教训沿用） | §6、`broker_router`、§9-T7 |
+| **K1** | 订阅层需要每分区 `(Committed, High)`：新订阅锚定原点（K5）、聚合守卫自检。冻结的 `broker_storage` behavior **没有水位查询**，而 `recover/2` 名义上能拿到但有 reopen 副作用（关掉再重开 writer） | 两后端加**非 behavior 扩展** `watermarks(Hd) -> {ok, Committed, High}`：WAL 读 `wal_writer` 进程状态，内存读 meta 表（`High = Last+1`）；经注册表由 `broker_queue:watermarks/1` 暴露（`stale` 捕获与 append 同路径）。分区清单一律取 `broker_queue:partition_ids()`，不读 router 里重复的 `{partitions}` env | §3.3（文本未动）、§7.1、§7.2 |
+| **K2** | ADR-010【F5】只说"SubRef 由订阅层铸造、Router 不解引用"，形状未定 | **`{ClientId, Filter}`**：铸造确定性 ⇒ boot step 2 读 `.subs` 可精确重建；元组自带反向索引 ⇒ H7 合并无需额外查表；**重订阅不碰 router**（同值条目本就在），只更新实体 QoS + 重写 `.subs`（MQTT §4.8 覆盖语义） | §3.2、§5.2 |
+| **K3** | **OQ-2 答复**：三个持久化文件要不要抽象成 `broker_subscription_store` behavior | **不抽**。文件层是 subscription 的内部实现细节，S2 换 Mnesia 是整体替换而非并列后端，没有第二个实现者需要插拔；模块命名 `broker_subscription_files`（刻意避开 `_store` 后缀，不暗示抽象层） | §5.3、§11.2 |
+| **K4** | §5.3 表格写 `subscriptions/cursors/{subref}.cursor`，H11 之后变成 per-`(SubRef, PartitionId)` 一族文件——一个 client 十几个订阅 × 4 分区就是几十个文件，各自 temp+fsync+rename | **per-client 聚合**成单文件 `sessions/{clientid}.cursors`（一次 rename 原子覆盖全部行），文件名用 url-safe base64(clientid)、真实 id 在文件内容里（clientid 是任意二进制，`/` 合法）；写放大降 N×M 倍，回退窗口语义不变 | §5.3 |
+| **K5** | cursor 恢复时的兜底值含糊：`.cursors` 缺失（首启/被清）时用什么填？用 `Committed` 会把已 ack 的窗口重放成"未读"、用 `0` 会回放整个分区（违 §4.2 的"订阅后才有消息"）、用 `High` 会跳过未 ack 积压 | **订阅原点内嵌进 `.subs` 并即时 fsync**（订阅那一刻查全分区 High，强一致）；恢复规则唯一：有 `.cursors` 用其值，否则用 `.subs` 内嵌原点，**不做任何形式的当场兜底** | §5.3 |
+| **K6** | "聚合出的 committed 只允许偏低"没有公式与次序；且聚合与刷盘的先后从未写明——乱序时崩溃后 cursor 可能落在 committed 之下，S2 truncate 恰好丢掉那段"用户还没 ack"的数据（§11.3 禁的"偏高"换了个入口进来） | 公式钉死 **committed = min(活 cursor) − 1**（无活 cursor 的分区跳过；守卫 `Offset =< High-1 andalso >= Committed` 反推所得），且**先 `.cursors` 落盘、后 `advance_committed`**——`cursor_tick` 与阈值触发两条路径同序；`advance_committed` 失败不回滚 `last_committed`，下个 tick 重试（幂等：存储守卫拒绝后退）。套件用"水位与文件内容同刻观察"锁死次序 | §5.3、§8.2 R3 |
+| **K7** | 订阅层的进程形态未定：独立 dispatcher？每 client 一进程？ | **单 `broker_subscription_worker` 单写者** + 四张 `protected` ETS（entities/cursors/attachments/inflight，`read_concurrency`），仿 J1/J4：写经 `gen_server:call`，读（`cursor/2`、`subscriptions/1`、`session/1`、`dispatch/2`）在调用者进程无锁直查。实测挂起 worker 后读照常（同 T3 的证法） | §5.2、§6 |
+| **K8** | 崩溃窗口：`.subs` 已写而 `unregister` 未达 ⇒ router 索引多一条死 SubRef；boot 回填会撞残留条目 | 写序统一成"**宁可索引多、不可索引缺**"（subscribe 先 register 后写盘，失败回滚 unregister；unsubscribe 先写盘后 unregister，残留无害）；`dispatch` 解引用**自己的实体表**跳过未知 SubRef（publisher 不为别层的记账缺口买单）；boot 对 `{already_registered, SubRef}` 视为 ok | §5.1、§5.2 |
+| **K9** | §5.1(f) 写"dispatch 推送给订阅者"，但 QoS1 的真实消费是 T9 的 pull 路径（按 cursor `read_from`），推什么？ | **重释为**：QoS0 = 真推送（不进存储，无 offset 可拉）；QoS1 = **冗余唤醒**（按 J6 合法——信号可丢可重，cursor 是唯一真相）；H7 合并（同 client 重叠 filter 恰好一次、取 max QoS）在此做，投递形状 `{broker_deliver, ClientId, MaxQoS, [SubRef], {PartitionId, Offset, Msg}}`；in-flight 记账归 pull 路径（T9） | §5.1、§9-T9 |
+| **K10** | attach 与断连竞态：旧连接的迟到 `detach` 会不会摘掉新连接（MQTT 同 Session 接管） | `detach(ClientId, Pid)` **带 pid 守卫**；attach 时 `monitor`，DOWN 自动摘除；`Persist=false`（clean session）断连即拆实体 + router + 文件，**拆序 disk-first**（先删文件后动内存，崩溃后不复活出"内存没有、盘上有"的幽灵会话） | §4.2、§5.2 |
+
+**补充实现期观察（不构成设计偏差，但会重复用到）**：
+
+- `binary_to_term/2` 的第二参数是**选项列表**——裸 `safe` 抛 `badarg`；files 模块的 catch-all 把它变成假的 `{corrupt_session, Path}`，"编程错误伪装成数据损坏"，在 release 级重启冒烟里才现形（字节本身一直是完好的）。跨节点/跨版本解码统一写 `binary_to_term(Bin, [safe])`。
+- `application:start/1` 成功返回**裸 `ok`**（不是 `{ok, _}`）；一次失败的 start 之后，ac 短暂处于 settle 窗口、对下一次 start 回 `{error, {already_started, _}}`——测试里"失败后重启"需要按 worker 是否存活做 settle 重试（`start_after_settle` 助手）。
+- **release 节点探针的两条实操**：relx CLI `rpc` 的 `Args` 参数按 `erlang:apply/3` 列表文本解析（单个原子也要写成 `[atom]`，裸写会得到 badarg）；且 OTP 28 的运行中节点经 `rpc:call` 远程 apply `code`/`erlang` 系函数会得到 `undef`（`code:add_pa/1`、`erlang:system/1` 实测如此，应用模块不受影响）——验证脚本因此写成"对已加载 app 模块的多次 rpc + 数据往返"（例：`broker_router:env/0` 的 Env map 传回 `route/3`，pid/tid 天然可跨节点）。
+
+### T6 实现期间发现并修正（2026-10-22，均为实测暴露）
+
+冻结 API（ADR-009/010/011）全程未改。下列 11 项里 **J1 是设计文本的读法修正**（§5.1(d) 的串行化点写错了进程），**J2/J3 是真实缺陷**（一个是配置形状没人能读，一个是 OTP 28 的返回值形状），**J10 是 T5 遗留的真实缺陷**（被 CT 的汇总数字掩盖），J8/J9/J11 是 release 级运维路径的实测前提。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **J1** | §5.1(d) 写"分区 Worker 串行化（多 conn_fsm 并发投递由 mailbox 吸收）"。若照字面把 append 做成对 Worker 的 `gen_server:call`，每个 caller 都独占 writer 一次往返 ⇒ **每批恒为 1 条**，吞吐退回 S0.3 §2.1 的逐条 fsync ~1148 msg/s，即 ADR-008 自写 WAL 要超越的那个数字 | 串行化点改为**单一的 `wal_writer` 进程**（每分区一个），并发由**它的** mailbox 吸收；`broker_queue:append/3` 在**调用者进程内**查 `protected` ETS 注册表拿句柄后直调 `Backend:append/3`，Worker 只管生命周期/元数据/广播，**不在数据路径上**——与 §3.2 冻结点 2（Router 不串行化）同构。实测两例：`sys:suspend(Worker)` 后 append 仍返回 `{ok,1}`/`{ok,2}`；8 个 caller 先停进 writer mailbox 再放行 ⇒ `#{records := 8, batches := 1, syncs := 1}` | §5.1、§9-T6 |
+| **J2** | `config/sys.config.src` 里 `{wal, [...]}` 是 **proplist**，而 `wal_writer`/`wal_group_committer` 全部用 `maps:get`/`is_map` 读它 ⇒ 第一条 append 就 `badarg`。T5 没暴露是因为 CT 自己构造 Config，**T6 是第一个把 application env 直接当 Config 交给后端的消费者** | 把 env 改成 map（`batch_delay_ms` 本身也是 map，因为 `deadline/3` 做 `maps:get(Mode, Delays, 0)`）。**不加"proplist→map 翻译层"**：翻译层会让"配置里写的 key"与"代码里读的 key"再次分叉，正是这个缺陷的成因 | `config/sys.config.src`、§7.2 |
+| **J3** | **OTP 28 的 `application:get_env/2` 返回 `'undefined' \| {'ok', Val}`，不是裸值**（`kernel-10.5/src/application.erl:918` 的 spec，:923 直接转发 `application_controller:get_env/2`；探针实测 `{ok,4}`）。按老习惯写 `case application:get_env(App, Key) of N when is_integer(N) ->` 永远落到 else 分支 | 全项目统一用 **`get_env/3`**（返回裸值）。仓库级 grep 确认 2 元形式只有 T6 新写的那一处，既有代码本来就全用 3 元；`config/sys.config.src` 顶部"read with application:get_env/2"的注释同步改为 /3 并写明原因 | §2、`config/sys.config.src` |
+| **J4** | 注册表若是 `public` ETS，任何进程都能把某分区的句柄换成指向**别人的日志**——数据面直读 ETS 的代价 | 用 `protected` + 单写者 `broker_queue_store`（`put/2` 走 gen_server），读仍在调用者进程内。与 ADR-010【F3】给 router 索引定的形态一致 | §5.1、§9-T6 |
+| **J5** | Worker `terminate/2` 时注册表条目怎么办：擦掉看起来"干净" | **保留**。擦掉后 `lookup/1` 会报 `{unknown_partition, Id}`——那是"这个分区不存在"的谎，比"句柄过期但能自愈"严重得多。附带删除了无调用者的 `broker_queue_store:erase/1`（xref 报出） | §7.2、§9-T6 |
+| **J6** | `{new_messages, PartitionId, From, To}` 的语义强度未定，T7 的 dispatcher 会依赖它 | 明确为 **cast = 唤醒信号，不是投递契约**：可乱序、可重叠、Worker 崩溃期间会丢。dispatcher 必须自己按 cursor `read_from`，cursor 才是唯一真相源。订阅者集合由 Worker `monitor` 并自动摘除死亡进程 | §5.2、§9-T7 |
+| **J7** | 句柄失效（I15）后是否自动重试 | **不自动重试**。已抵达 writer 的 append 可能已消耗 offset，静默重试会在发布者毫不知情下制造重复消息；重试是发布语义的决定，归 caller。返回 `{error, {stale_handle, PartitionId, Class, Reason, Repair}}`，其中 `Repair` 是本次 `reattach` 的结果。`reattach` 失败时 Worker **保留 state 不停机**，否则一次磁盘抖动变成重启风暴 | §7.2、§9-T6 |
+| **J8** | relx 生成的 `bin/unified_mq` 在 exec 前做 **`cd "$ROOTDIR"`**（脚本第 770 行），所以 `data_dir = "data"` 落在 **release 根目录**（`_build/default/rel/unified_mq/data`），不是调用者的 CWD。后果两条：`rebar3 release` 会清掉数据；带外建的分区若不在同一 CWD，节点起来一律 `{not_found,_}` | 实测确认并在 `config/sys.config.src` 的 `data_dir` 旁写明。**T12 的 dev 环境必须改用 release 树之外的绝对路径**；S1 的验证脚本按"与节点同 CWD"执行 | §2、§6、§9-T12 |
+| **J9** | `create_partition/1` 号称"app 停着也能用"，但分区清单在 `broker_queue` 的 env 里 ⇒ app **未 load** 时 `partition_ids/0` 抛 `{invalid_partition_count, undefined}`；而 release 又**没有维护命令**（节点根本起不来，`rpc` 无从下手） | 精确化为"需要 **load**，不需要 **start**"。实测可用的带外路径：`erl -noshell -pa <rel>/lib/*/ebin -config <rel>/releases/Vsn/sys.config -eval 'application:load(broker_queue), application:ensure_all_started(broker_storage), broker_queue:create_partition(Id), halt().'`（CWD 见 J8）。**不在 `partition_ids/0` 里隐式 `application:load`**——隐式加载是意外副作用，且会掩盖"配置没读到"这个真问题 | §6、§9-T6 |
+| **J10** | **T5 遗留的真实缺陷**：`broker_storage_wal_SUITE` 定义了 `init_per_suite/1` 却没有 `end_per_suite/1`。CT 只要二者**之一**被导出就会调 `end_per_suite`（`test_server_ctrl:do_add_init_and_end_per_suite/4` 对两者都做 `function_exported` 检查），于是每次全套跑都打一条 `%%% undefined ==> end_per_suite: FAILED {undef,...}`——**但 CT 不把它计入总数**，"All 141 tests passed" 字面为真，失败只出现在 `%%%` 明细行里 | 补 `end_per_suite/1`（顺带 `application:stop(broker_storage)`，避免把运行中的 storage app 泄漏给同节点的后续套件）。**验收规则修正：看 `FAILED` 明细行，不能只看汇总数字**；本轮全套 157/157 已确认零 FAILED 行 | §9-T5、验收流程 |
+| **J11** | 本机 `/tmp` 是 **tmpfs**，持久化守卫（I4/I5）在 `/tmp` 下拒绝建分区（`{error,{volatile_filesystem,"data/wal/0"}}`） | 守卫**按设计工作**，不是缺陷；但 release 级验证必须在 ext4 上跑（`/`、`/home` 均为 ext4）。记在此处是因为这个坑会重复踩 | §7.2、验收流程 |
+
+### T5 实现期间发现并修正（2026-10-21，均为实测暴露）
+
+冻结 API（ADR-011）全程未改，13 个契约用例在 WAL 后端**一条未改未跳**地跑通。下列 15 项是"计划文本 ↔ 第一次真实实现"的偏差，I11 是 §9-T5 留下的必答项答复，I12/I13 是**真实缺陷**（I12 只在装配后的 release 中出现）。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **I1** | §7.2 计划的模块清单含 `wal_reader`，但读路径若独立成进程/模块，就必须跨进程传段句柄 | **不设 `wal_reader`**：读路径 = `broker_storage_wal:read_from/3` 在**调用者进程内** `wal_index:locate/2` 定锚点 + `wal_segment:fold/5` 流式扫描（README §7.2 数据面不经进程） | §7.2、§9-T5 |
+| **I2** | §7.2 把 `wal_group_committer` 写成"gen_server：mailbox 收集 append 请求"。批次所有权若与 offset 分配/段轮转/水位推进**不在同一进程**，fsync 与 offset 分配之间就多一处竞态 | 改为**纯策略模块**（`new/1`、`deadline/3`、`due/4`、`timeout/2`、`needs_sync/1`、`take/2`、`earliest/1`，无状态无进程）；mailbox 攒批 + 延迟回复留在 `wal_writer:handle_call`。附带收益：策略可脱离进程单测（11 例） | §7.2、§9-T5 |
+| **I3** | §7.2 模块清单缺 `wal_meta`，而 §11.3 要求 `recover/2` 返回 `CommittedOffset`——水位若只能从段重放推出，恢复代价与日志长度成正比 | 新增 `meta.log`（定长水位记录，`wal_meta`）；尾部状态三分类 `clean \| {torn, truncated} \| {corrupt, term()}`，`recover` 读水位成为一次定长读 | §7.2、§7.3 |
+| **I4** | §7.2 说 tmpfs 防护"移到 `wal_writer:init/1`"。放 `init/1` 会让 `create/2` 先起一个注定自杀的子进程再拆掉，白烧 supervisor `intensity` 预算并留下 `already_present` 的 spec | 守卫提到 `start_link/3`（`wal_writer:check_filesystem/2`），不通过则**根本不创建进程**，`create/2` 直接返回 `{error, {volatile_filesystem, Dir}}` 且目录不存在 | §7.2 |
+| **I5** | S0.3 §4 的 tmpfs 判据是"fsync 计时 < 100 µs"。快 SSD 上会把正常盘误判为易失，而误判的代价是**节点起不来** | 改读 `/proc/mounts` **按 fstype** 匹配 `tmpfs`/`ramfs`；ext4/xfs/btrfs/zfs/overlay 一律采信；`require_durable_fs => false` 可关（CI），关闭时返回**警告**而非错误。`classify_fs/2` 把挂载表文本作参数，因此可在测试里注入而不必伪造宿主机挂载 | §7.2、§8.1 |
+| **I6** | §7.2 的索引伪代码是 `[{StartOffset, SegPath, [{AnchorOffset, FilePos}]}]` 三层嵌套。ETS 的有序键本身已提供"≤Offset 的最近锚点"，再套一层段分组只会让 `locate/2` 变两次查找 | 改为 `public` 的 `ordered_set` ETS，键只有 `{meta}`（open/closed + `truncate_before`）与 `{anchor, Offset}`（值含 `SegPath`，故跨段续读是一次 `locate/2` 而非分区级重扫） | §7.2（E8） |
+| **I7** | §7.1 第 2 条留的悬案："多写者并发下的观察窗口是 T5 必须对 WAL 明确结论的场景之一" | **结论：WAL 后端不存在该窗口**。`HighOffset` 刻意**不进索引**，只由 writer 进程状态持有；`read_from/3` 扫到 torn tail 与扫到日志末尾不可区分，也不需要区分（前者是"writer 正跑在前面"）。内存后端的空洞源于把"下一个 offset"暴露给读路径，WAL 侧结构性避开 | §7.1、§7.2 |
+| **I8** | 计划隐含"轮转是段模块的一个函数" | **没有 `wal_segment:rotate/N`**：`segment_max_records` 是每段记录数上限，一个批可以在中途跨段，所以轮转是 writer 的**状态迁移**（关旧段 → 按新 `StartOffset` 命名开段 → 钉住新段首记录锚点）；`wal_segment` 只暴露无状态文件操作 | §7.2 |
+| **I9** | 编码在哪个进程执行未定 | **调用者进程**：`wal_writer:append/3` 先逐条 `wal_codec:encode/1` 成二进制再进 writer。否则 `term_to_binary` 的 CPU 全压在单一 writer 上，group commit 攒的批越大、该进程越成吞吐瓶颈——批处理要省的是 fsync 次数，不是把 CPU 串行化 | §7.2 |
+| **I10** | 写/fsync 失败的重试语义未定 | **致命不重试**：offset 是"先分配后落盘"发出去的，失败后继续服务等于把已承诺 offset 变成永久空洞（§11.4 禁止静默降级）。writer `{stop, Reason, ...}` 自杀，批内 caller 收 `{error, {writer_stopped, Reason}}`，supervisor 重启后从磁盘重建 | §7.2、§11.1 |
+| **I11** | **H8 未答**：§6 boot step 1 要求逐分区 `recover/2`，但分区清单 `{partitions, N}` 配在 `broker_queue` 的 env 里，**存储层看不到它**；且 §11.2 禁止 recover 顺手 create，于是 S1 没有任何角色负责首次 `create/2` | **归属答复**：(a) boot step 1 的 recover 循环落在 **`broker_queue_sup`**，不是 `broker_storage_sup`（后者只立进程结构）；(b) `create/2` 的**唯一**入口是带外管理动作 `broker_queue:create_partition/1`（**T6 交付**），不出现在任何 boot 路径；(c) 干净数据目录 boot 必失败是 §11.2 要求的**响亮失败**，不引入 `partition_bootstrap`/首启标记之类开关——那等于从后门绕掉守卫。首启与恢复因此无需靠数据目录内容区分 | §6、§9-T6、§11.2 |
+| **I12** | **T4 真实缺陷，且只在 release 中暴露**：没有任何角色启动 `broker_storage_memory_store`，于是装配后的节点里每次 `broker_storage_memory:create/2` 都是 `noproc`。T4 的 CT 全绿，是因为套件在自己进程里手工建了表 | `broker_storage_sup:init/1` 按 `backend` **只起自己需要的那一个子进程**（wal → `broker_storage_wal_sup`；memory → `broker_storage_memory_store`）；新增 `broker_storage_sup_SUITE`（1 例）把"每个后端启动它的 `create/2` 所需进程"钉成断言 | §6、§7.1 |
+| **I13** | **v0.6 契约头的真实缺陷**：tripwire 写成 `[os_buffer \| unsupported_modes()]`，隐含"后端只声明 os_buffer"。诚实声明 `fsync` 的 WAL 后端**被自己的 tripwire 判失败**（`{badmatch, false}`），而这条断言本意只是防止 `sync_mode()` 集合扩张后漏改 | 引入 `all_sync_modes/0` 作为唯一真相源，`unsupported_modes/0` 从中派生；tripwire 改为"声明的模式必须属于 `all_sync_modes/0`"。WAL 后端 13/13 通过 | §7.1、§7.2 |
+| **I14** | OTP 28.3.1 supervisor 的两个行为未在文档里：`start_child` 失败**不留 spec**（所以契约里 `recover(7)` → `create(7)` 的顺序是安全的）；子进程启动函数返回 `{error, Reason}` 会被包成 **`{error, {Reason, #child{}}}`**（9 元组 tag `child`） | `broker_storage_wal:unwrap/1` 剥掉这层包装，保住 ADR-011 §11.2 承诺的 `{error, {not_found, Id}}` 原样出到调用方——否则冻结签名里的错误元组会被 supervisor 悄悄改写 | §3.3、§6 |
+| **I15** | 句柄生命周期未定：索引 ETS 随 writer 进程消亡 | **writer 崩溃后旧句柄失效**，`read_from/3` 抛 `badarg` 而非返回 `{error, _}`（与内存后端同性质）。T6 的分区 worker **不得**跨 writer 重启缓存 pid/句柄，重启后必须重新 `recover/2`；`a_crashed_writer_is_restarted_and_the_log_survives` 用 `kill -9` 实测了这条路径（重启后 `recover` 得 `{0, 4}`，三条 payload 完好）<br>**→ 已由 T6 消化（J7）**：`broker_queue` 捕获 `badarg` 后向 Worker 发 `reattach`（重新 `recover/2` 覆盖注册表句柄），返回 `{error,{stale_handle,...}}` 交 caller 决定，**不自动重试**；`broker_queue_SUITE:a_crashed_storage_writer_is_reattached_and_the_log_continues` 实测 `kill -9` 后第二次 append 得 `{ok,4}`、整页 `[1,2,3,4]` 完好 | §7.2、§9-T6 |
+
 ### T3/T4 实现期间发现并修正（2026-10-21，均为实测暴露）
 
 冻结文本本身没有 API 错误，但下列 6 项在"第一次被真实实现踩过"时暴露。H6/H7 需要 ADR 批注，H8/H11 是 T5/T7 的必答项。
@@ -629,9 +769,9 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 |---|---|---|---|
 | **H6** | `route_ctx` 冻结在 `broker_router.erl` **模块内**——Erlang 的 record 不跨模块可见，于是除该模块外**没有任何调用者能构造 Ctx**，§5.1(c) 的 `route(T, Ctx, Env)` 一行无法写出 | record 原样搬进 `apps/broker_router/include/broker_router.hrl`（字段与类型标注不变），behavior 模块改为 include 该头文件；ADR-010 §10.1 加批注。**API 未变**，仅定义位置变 | ADR-010 §10.1、§3.2 |
 | **H7** | ADR-010 验证段把"一条消息命中多订阅时 Router 返回列表完整且**去重**"记在 Router 名下。但一个 SubRef 只登记一个 filter（`register/4` 对同一 SubRef 的第二次登记返回 `{already_registered, _}`，否则索引与 `.subs` 会不一致），跨 filter 的重复在结构上不可能发生；而同一 **client** 的多个重叠 filter（`sport/#` 与 `sport/tennis/+`）会产生多个 SubRef，合并它们必须解引用 SubRef——§10.2 明令禁止 | Router 侧改为可保证的两条：结果**完整**且**同一 SubRef 不重复**（已测）；MQTT §4.8 的"同 client 重叠订阅按 max QoS 投递一次"归 `broker_subscription`（T7）。验证段加勘误批注 | ADR-010 验证、§9-T7、T13 |
-| **H8** | §6 boot step 1 要求逐分区 `recover/2` 且"缺分区即报错、不自动 create"（§11.2），但 S1 **没有任何角色负责首次部署时 `create/2`**：干净数据目录起 broker 必然 `{not_found, _}` 而启动失败。内存后端实测同样无法通过 step 1 | 不是代码缺陷，是规格缺口。T5 必须先定"分区 bootstrap 由谁做"（管理命令 / `partition_bootstrap` 配置 / 以数据目录标记区分首启与恢复），**不得**用"recover 顺手创建"绕过 §11.2 | §6、§11.2、T5 |
-| **H9** | ADR-011 未冻结 offset 基数，`CommittedOffset`/`HighOffset` 在空分区上的取值含糊（这直接决定 §8.2 R3 的 `max(0, last_flushed - K)` 怎么写） | 定为 offset 从 **1** 开始、`Committed = 0` 表示"从未确认过任何一条"、空分区 `recover` 返回 `0 / 1`；已在 §7.1 落文并由测试锁定 | §7.1、§8.2、T5 |
-| **H10** | §11.3 的"水位偏高绝对禁止"只是文字约束，签名层面 `advance_committed/2`、`truncate/2` 都能传任意 offset | 实现加守卫并在 T4 用例锁定（见 §7.1）；T5 WAL 后端必须通过同一组用例，否则视为缺陷 | §7.1、§11.3、T5 |
+| **H8** | §6 boot step 1 要求逐分区 `recover/2` 且"缺分区即报错、不自动 create"（§11.2），但 S1 **没有任何角色负责首次部署时 `create/2`**：干净数据目录起 broker 必然 `{not_found, _}` 而启动失败。内存后端实测同样无法通过 step 1 | 不是代码缺陷，是规格缺口。T5 必须先定"分区 bootstrap 由谁做"（管理命令 / `partition_bootstrap` 配置 / 以数据目录标记区分首启与恢复），**不得**用"recover 顺手创建"绕过 §11.2<br>**→ 已由 I11 答复（2026-10-21）**：`create/2` 只归带外管理动作 `broker_queue:create_partition/1`（T6 交付）；boot step 1 的 recover 循环归 `broker_queue_sup`；三个候选方案里的后两个（`partition_bootstrap` 配置、首启标记）**均被否决**，因为它们等价于从后门绕掉 §11.2 的守卫 | §6、§11.2、T5 |
+| **H9** | ADR-011 未冻结 offset 基数，`CommittedOffset`/`HighOffset` 在空分区上的取值含糊（这直接决定 §8.2 R3 的 `max(0, last_flushed - K)` 怎么写） | 定为 offset 从 **1** 开始、`Committed = 0` 表示"从未确认过任何一条"、空分区 `recover` 返回 `0 / 1`；已在 §7.1 落文并由测试锁定。**T5 已在 WAL 后端复验通过**（同一契约用例，13/13） | §7.1、§8.2、T5 |
+| **H10** | §11.3 的"水位偏高绝对禁止"只是文字约束，签名层面 `advance_committed/2`、`truncate/2` 都能传任意 offset | 实现加守卫并在 T4 用例锁定（见 §7.1）；T5 WAL 后端必须通过同一组用例，否则视为缺陷。**已实测通过**：13 个契约用例在 WAL 后端一条未改未跳地跑通，水位守卫（偏高拒绝、后退拒绝）与 truncate 边界均由机械检查覆盖 | §7.1、§11.3、T5 |
 | **H11** | **hash 分区 + 通配符订阅 ⇒ 一个订阅跨多个分区**。实测 `sport/#` 一个 SubRef 同时命中分区 `[0,1,3]`（N=4）。而 §5.3 规定 per-sub cursor 是 `subscriptions/cursors/{subref}.cursor` 里的**一个标量 offset**——单个标量无法描述"跨 3 个分区各读到哪"，追赶/重投会漏或重复 | 冻结 API 无需改动（per-sub cursor 归 subscription，storage 不感知，正是 §11.3 的切分）。T7 必须把 cursor 落成 **per (SubRef, PartitionId)**（如 `{subref}.{partition}.cursor`）。已列为 T7 前置决策 | §5.2、§5.3、§9-T7 |
 
 ### T1 实现期间发现并修正（2026-10-21，均为实测暴露）

@@ -56,6 +56,22 @@ roadmap §3.2 的 `ack` **改名为 `advance_committed`**（语义收紧见 11.2
 
 **【冻结后缺口批注 T4，2026-10-21｜H8——T5 必答】** 分离本身成立，但本 ADR 与 §6 都没规定**首次部署时谁调 `create/2`**。按 §6 boot step 1"逐分区 `recover/2`，缺分区即失败"，干净数据目录启动的 broker **必然**启动失败；内存后端同样无法通过 step 1（它从来没有人 create 过分区）。T5 必须显式选定一种 bootstrap 路径——管理命令 / `partition_bootstrap` 配置 / 用数据目录里的标记文件区分"首次启动"与"恢复"——并保证选择结果**不是**"recover 顺手创建"，否则本节整改作废。在此之前，`broker_storage_sup` 不接任何后端的启动接线。
 
+**【冻结后批注 T5，2026-10-21｜H8 已答复】** 三个候选里的**管理动作**被选定，另两个被否决：
+
+- **选定**：`create/2` 的唯一入口是带外管理动作 `broker_queue:create_partition/1`（**T6 交付**），不出现在任何 boot 路径。
+- **否决 `partition_bootstrap` 配置**与**数据目录首启标记**：两者都让启动路径在"目录不存在"时自己建分区，等价于"recover 顺手创建"的带开关版本，本节整改作废。
+- **首启与恢复无需靠数据目录内容区分**——差别只在于有没有人显式 `create` 过。干净数据目录 boot 得到 `{error, {not_found, _}}` → application 启动失败并告警，这是本节要求的**响亮失败**，不是待修 bug。
+- **boot step 1 的执行者不是 `broker_storage_sup`**：分区清单 `{partitions, N}` 配在 `broker_queue` 的 application env，存储层看不到它，故"逐分区 `recover/2`"的循环归 `broker_queue_sup`（设计文档 §6 批注）。`broker_storage_sup` 只按 `backend` 起自己需要的那一个子进程。
+- **顺带修掉 T4 的真实缺陷**：内存后端此前从未有任何角色启动 `broker_storage_memory_store`，装配后的 release 里每次 `broker_storage_memory:create/2` 都是 `noproc`（CT 全绿，因为套件在自己进程里手工建表）。现由 `broker_storage_sup_SUITE` 钉住"每个后端启动它的 `create/2` 所需进程"。
+- **OTP 28.3.1 实测的两个 supervisor 事实**（影响 §11.2 的错误元组能否原样出到调用方）：`start_child` 失败**不留 spec**（所以"先 `recover` 再 `create`"的顺序安全）；子进程启动函数返回 `{error, Reason}` 会被包成 `{error, {Reason, #child{}}}`，适配层必须剥包装才能保住本节承诺的 `{error, {not_found, PartitionId}}`。
+
+**【冻结后批注 T6，2026-10-22｜本节的分离已在装配后的 release 上实测两半】** H8 的答复不再是纸面结论：
+
+- **前半（缺分区必须响亮失败）**：`rebar3 release` 后在干净目录启动 → 退出码 1，crash report 为 `{{shutdown,{failed_to_start_child,{partition,0},{partition_not_found,0}}},{broker_queue_app,start,[normal,[]]}}`，且 **`data/` 未被创建任何内容**。本节要的"启动失败而不是恢复出空分区并报告健康"在真实 release 上成立。CT 侧由 `broker_queue_SUITE:boot_fails_loudly_when_a_partition_was_never_created` 钉住（同时断言"失败**且**不留痕"）。
+- **后半（`create/2` 是唯一入口）**：带外 `create_partition(0..3)` 后再启动 → 11 个 application 全部运行，`broker_queue_sup` 有 4 个分区 worker + 1 个注册表，`broker_storage_wal_sup` 有 4 个 writer。`create_partition(9)` → `{error,{unknown_partition,9}}`（不在配置清单里的 id 一律拒绝，因此不会留下"永远没有 worker 去看"的孤儿目录）；对已存在分区 → `{error,{already_exists,0}}`。
+- **本节承诺的两个错误元组都原样出到了调用方**：`{not_found, Id}` 未被 supervisor 的 `{Reason, #child{}}` 包装吞掉（上一条批注要求的剥包装已实现），`{already_exists, Id}` 同样原样返回。
+- **带外路径的两个实测前提**（设计文档 §13 J8/J9）：`create_partition/1` 需要 `broker_queue` 已 **load**（不必 start）；执行时的 CWD 必须与节点启动后的 CWD 一致，因为 relx 生成的启动脚本会 `cd "$ROOTDIR"`，相对 `data_dir` 因此落在 release 根目录。
+
 ### 11.3 storage 只管全局 committed watermark
 
 **决策**：storage 不感知订阅模型，只维护一个**全局 committed watermark** = 所有订阅都已确认的连续前缀。
@@ -82,6 +98,8 @@ roadmap §3.2 的 `ack` **改名为 `advance_committed`**（语义收紧见 11.2
 
 `broker_storage_memory` 的 T4 用例已锁这三条；**T5 的 WAL 后端必须通过同一组用例**，否则按缺陷处理。同一组用例已抽为可复用契约头 `apps/broker_storage/test/broker_storage_contract.hrl`（后端套件只提供 `?BACKEND`/`?CAPABILITY` 与 `backend_setup/1`、`backend_cleanup/1`、`backend_config/1`；头文件内不出现任何后端名/表名/目录名），所以"必须通过同一组用例"是字面可执行的：T5 交付判据 = 该头文件在 `broker_storage_wal` 上 13/13 通过。另：offset 基数本 ADR 未冻结，S1 实现定为**从 1 开始**，`Committed = 0` 表示"从未确认过任何一条"，空分区 `recover` 返回 `CommittedOffset = 0, HighOffset = 1`——§8.2 R3 的 `max(0, last_flushed_offset - K)` 按此解释。
 
+**【冻结后批注 T5，2026-10-21｜13/13 已实测】** 上述交付判据已满足：`broker_storage_contract.hrl` 的 13 个用例在 `broker_storage_wal`（`?CAPABILITY = [os_buffer, fsync]`）上**一条未改、一条未跳**地通过，水位两向守卫与 `truncate/2` 边界由机械检查覆盖。WAL 侧另有一条本节未预见的实现约束：**committed watermark 不能只靠重放段文件推出**，否则恢复代价与日志长度成正比；故新增 `wal_meta`（分区目录内 `meta.log`，定长水位记录），`recover/2` 读水位成为一次定长读。尾部状态三分类 `clean | {torn, truncated} | {corrupt, term()}`，torn 按 §11.5 截断、corrupt 拒绝启动。
+
 **不设 AckRanges（F1 整改）**：storage 只有单一连续前缀，因此 `recover/2` 返回两个标量水位即可。原 `AckRanges`（非连续已 ack 区间集合）在本 ADR 的模型下**没有归属者**——全局水位是标量、per-sub cursor 是标量、逐 offset ack 状态 storage 不持有。故从 API 移除，v0.2 引入它所要解决的"百万级 offset 列表内存爆炸"问题（D10）在此被**结构性消除**而非缓解。`recover/2` 同时补上 `HighOffset`，否则恢复后无法确定追加位置（原 API 缺口）。
 
 ### 11.4 sync_mode 是 per-call 参数 + 能力双层校验
@@ -101,6 +119,12 @@ roadmap §3.2 的 `ack` **改名为 `advance_committed`**（语义收紧见 11.2
 | `broker_storage_memory` | `[os_buffer]` | 部署此后端时 listener 必须配 `mqtt_max_qos = 0` |
 | `broker_storage_wal` | `[os_buffer, fsync]` | fsync 走 group commit |
 | （S4 新增）`broker_storage_replicated` | 追加 `replicated_commit` | **不改 behavior**，S1 该模式返回 `unsupported_sync_mode` |
+
+**【冻结后批注 T5，2026-10-21｜"禁止静默降级"的三条落地规则】** WAL 后端 `capability/1` 实测返回 `[os_buffer, fsync]`；能力检查发生在 writer **分配 offset 之前**，所以被拒的模式不消耗 offset（下一个 caller 仍拿到它被承诺的号）。本节那句硬约束在 T5 变成了读/写路径上三条可测的规则：
+
+1. **完整但不可解码的记录 → 报错，不返回短页**：`read_from/3` 返回 `{error, {corrupt_record, Path, Reason}}`。把它当日志末尾返回是静默降级——订阅者会永远等一个**确实存在**的 offset。
+2. **torn tail（writer 正跑在前面）→ 与日志末尾不可区分，正常返回**：这是并发写的常态而非损坏。`HighOffset` 刻意**不进读路径索引**，因此内存后端那个"offset 已分配、消息尚未插入"的观察窗口（设计文档 §7.1）在 WAL 后端**结构性不存在**。
+3. **写或 fsync 失败 → 致命不重试**：offset 是先分配后落盘发出去的，失败后继续服务等于把已承诺的 offset 变成永久空洞。writer 于是 `{stop, Reason, ...}` 自杀，批内所有 caller 收 `{error, {writer_stopped, Reason}}`，由 supervisor 重启后从磁盘重建状态。
 
 ### 11.5 磁盘协议独立于内存模型
 
@@ -153,9 +177,9 @@ roadmap §3.4 第 2 条「已 ACK 消息不丢、订阅位置不丢、未 ACK �
 - **语法已实测**（冻结前，OTP 28.3.1 `erlc`）：§11.1 的 8 个 callback 全部编译通过，`behaviour_info(callbacks)` 返回 `[{create,2},{recover,2},{close,1},{append,3},{read_from,3},{advance_committed,2},{truncate,2},{capability,1}]`；`#broker_message{}` 在 callback 类型位中使用亦通过。
 
 - **S0.3 已支持**：fsync 871 µs/msg、group commit batch=32~64 拐点 ~19944 msg/s（17×）、20k 记录恢复 143 ms、撕裂尾部干净截断。
-- **S1 T5**：多写者并发 append 正确性——批次内每个 caller 的回复严格发生在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿。**这是 S0.3 §6 明确遗留的待办**（spike 为单写者模型），必须在前置给任何性能断言之前完成。
-- **S1 T5（F2）**：`recover/2` 指向不存在/空目录时必须返回 `{error, {not_found, _}}` 且**不创建**任何文件；`create/2` 对已存在分区必须拒绝。测试用错误 partition id 与缺失挂载点两个用例锁死该行为。
-- **S1 T5（F1）**：`recover/2` 返回的 `HighOffset` 必须等于最后一条已落盘记录的 offset+1，重启后追加不产生 offset 重用或空洞。
+- **S1 T5**：多写者并发 append 正确性——批次内每个 caller 的回复严格发生在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿。**这是 S0.3 §6 明确遗留的待办**（spike 为单写者模型），必须在前置给任何性能断言之前完成。<br>**→ 已满足（2026-10-21 实测）**：`broker_storage_wal_SUITE:mixed_sync_modes_concurrently_yield_dense_offsets_and_readable_records`——16 个并发 caller 交替 `fsync`/`os_buffer` 各 2 条，32 个 offset 恰为 `1..32`（无洞无重）、`NextOffset = 33`、每个 caller 只在自己的 offset 上读到自己那条 payload。未发现需上调 `batch_delay_ms` 的延迟退化，故 §7.2 的默认值不动。
+- **S1 T5（F2）**：`recover/2` 指向不存在/空目录时必须返回 `{error, {not_found, _}}` 且**不创建**任何文件；`create/2` 对已存在分区必须拒绝。测试用错误 partition id 与缺失挂载点两个用例锁死该行为。<br>**→ 已满足（13 个契约用例在 WAL 后端原样通过）**：错误 partition id 得 `{error, {not_found, 7}}` 且目录未被创建；已存在分区 `create/2` 得 `{error, {already_exists, 7}}`。**诚实边界**：原文所说的"缺失挂载点"未用真实卸载挂载点的方式实测——它在实现上等价于"目录不存在/为空"，由同一 `not_found` 断言覆盖；另有一条本节未要求的守卫已实测：数据目录落在 `tmpfs`/`ramfs` 上时 `create/2` 返回 `{error, {volatile_filesystem, Dir}}` 且不建目录（S0.3 §5 陷阱）。
+- **S1 T5（F1）**：`recover/2` 返回的 `HighOffset` 必须等于最后一条已落盘记录的 offset+1，重启后追加不产生 offset 重用或空洞。<br>**→ 已满足**：除契约用例外，`records_written_through_the_backend_survive_an_independent_recovery` 绕过 behavior 直接调 `wal_recovery:recover/3`，在 3 条 fsync append + `advance_committed(1)` 后得 `#{high => 4, committed => 1, truncate_before => 1}`；`a_crashed_writer_is_restarted_and_the_log_survives` 用 `kill -9` 杀 writer，重启后 `recover` 得 `{0, 4}` 且三条 payload 完好。
 - **S1 T14**：崩溃后 committed watermark **只允许偏低**；构造"ack 已发生但 meta 段未刷盘"的注入用例，断言重启后表现为重复投递而非消息缺失。
 - **S1 T13**：同一测试套件在 memory 与 WAL 两后端互换通过；`capability` 不匹配时返回错误而非降级。
 - **S1 T14（R1a/R1b/R2~R7）**：崩溃恢复契约逐档证明；R3 用默认档与零回退档各跑一轮。
