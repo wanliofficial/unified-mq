@@ -12,7 +12,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include("broker_router.hrl").
 
--export([init/1, route/3, register/4, unregister/2]).
+-export([init/1, route/3, register/4, unregister/2, current_env/0]).
 
 -type env() :: #{store := pid(),
                  tab := ets:tid(),
@@ -80,6 +80,43 @@ register(#{store := Store}, Filter, SubRef, _SubOpts) ->
 -spec unregister(env(), broker_router:sub_ref()) -> ok | {error, term()}.
 unregister(#{store := Store}, SubRef) ->
     broker_router_hash_store:unregister(Store, SubRef).
+
+%% @doc Assemble the env from the *running* store without starting anything.
+%% `init/1' starts a store itself, which is right for a test process but wrong
+%% for a consumer: boot step 3 (and every publisher) needs the env of the store
+%% `broker_router_sup' owns, and calling init/1 there would either collide with
+%% the supervisor's registered child or leak an untracked process. Not a
+%% behavior callback -- ADR-010 is frozen; this is the assembly-time accessor
+%% the frozen signatures never had a story for (design §13 I12-class gap).
+-spec current_env() -> {ok, env()} | {error, term()}.
+current_env() ->
+    Partitions = application:get_env(broker_router, partitions, undefined),
+    case {whereis(store_name()), partitions_ok(Partitions)} of
+        {undefined, _} ->
+            {error, router_store_not_started};
+        {_, false} ->
+            {error, {invalid_partitions, Partitions}};
+        %% Same guard as init/1: an out-of-range count would make modulo
+        %% arithmetic on the first publish crash, and here it is caught at boot
+        %% instead. The hash stays phash2 -- S1 offers no other, and the app env
+        %% has no `hash' key (init/1 took it from a Config map nobody builds at
+        %% boot; see design §6 'two partition keys').
+        {Pid, true} ->
+            {ok, #{store => Pid,
+                   tab => broker_router_hash_store:table(Pid),
+                   partitions => Partitions,
+                   hash => phash2}}
+    end.
+
+partitions_ok(N) ->
+    is_integer(N) andalso N > 0.
+
+%% The registered name `broker_router_sup' gives the child, and the name init/1
+%% defaults to. One source so the supervisor's child and current_env/0 cannot
+%% disagree.
+-spec store_name() -> atom().
+store_name() ->
+    broker_router_hash_store.
 
 %%%_* Internal ----------------------------------------------------------
 
