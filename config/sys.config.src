@@ -1,7 +1,9 @@
-%% Application environment, read with application:get_env/2 (design §2: S1 has
-%% no broker_config app). Copied into the release as releases/Vsn/sys.config by
-%% relx, and read directly by `rebar3 shell'. Contains no {{...}} placeholders,
-%% so the same file serves both paths.
+%% Application environment, read with application:get_env/3 (design §2: S1 has
+%% no broker_config app). Under OTP 28 get_env/2 returns {ok, Val} rather than
+%% Val -- see design §13 J3 -- so every read site in this project uses the
+%% 3-arity form. Copied into the release as releases/Vsn/sys.config by relx, and
+%% read directly by `rebar3 shell'. Contains no {{...}} placeholders, so the
+%% same file serves both paths.
 [
   %% SASL progress/error reports go to the default logger in S1. File-based
   %% error logging (and the log/ directory that would back it) belongs to T12's
@@ -9,16 +11,22 @@
 
   {broker_storage, [
     {backend, broker_storage_wal},
+    %% Relative, so it resolves against the node's CWD. The relx-generated
+    %% bin/unified_mq does `cd "$ROOTDIR"` before exec, which makes that CWD the
+    %% release root -- a relative data_dir therefore lives inside _build and is
+    %% wiped by the next `rebar3 release` (design §13 J8). T12's dev environment
+    %% must set an absolute path outside the release tree.
     {data_dir, "data"},
     %% S0.3 §2.2: batch=32 is the throughput inflection point (17x over
     %% single-message fsync); 256 caps the latency cost of waiting for a batch.
-    {wal, [
-      {batch_size, 32},
-      {max_batch_size, 256},
-      {batch_delay_ms, #{os_buffer => 0, fsync => 1}},
-      {index_anchor_interval, 256},
-      {segment_max_records, 100000}
-    ]}
+    %% A map, not a proplist: broker_queue:storage_config/0 hands this value
+    %% straight to the backend, and wal_writer/wal_group_committer read it with
+    %% maps:get -- a proplist here would raise badarg on the first append.
+    {wal, #{batch_size => 32,
+            max_batch_size => 256,
+            batch_delay_ms => #{os_buffer => 0, fsync => 1},
+            index_anchor_interval => 256,
+            segment_max_records => 100000}}
   ]},
 
   {broker_router, [
@@ -32,6 +40,10 @@
   ]},
 
   {broker_subscription, [
+    %% Its own key, not broker_storage's: layers read their own config even
+    %% when the values coincide (design §13 K4; J8's relative-path note
+    %% applies here too -- resolves against the node's CWD).
+    {data_dir, "data"},
     %% Bounded cursor regress window (Gate S1 R3). Setting both to 1/0 selects
     %% the near-zero-regress tier, which pays a per-ack fsync.
     {cursor_max_regress, 64},
