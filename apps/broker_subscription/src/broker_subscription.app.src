@@ -1,8 +1,11 @@
 {application, broker_subscription, [
     {description, "Subscriptions, per-subscription cursors, delivery and session persistence"},
     {vsn, "0.1.0"},
-    {registered, []},
+    {registered, [broker_subscription_sup, broker_subscription_worker]},
     {mod, {broker_subscription_app, []}},
     {applications, [kernel, stdlib, sasl, broker_core, broker_storage, broker_router, broker_queue]},
-    {env, []}
+    {env, [{data_dir, "data"},
+           {cursor_max_regress, 64},
+           {cursor_flush_interval_ms, 100},
+           {inflight_flush_interval_ms, 100}]}
 ]}.

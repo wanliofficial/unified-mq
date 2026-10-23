@@ -12,7 +12,8 @@
 
 -export([create/2, recover/2, close/1,
          append/3, read_from/3,
-         advance_committed/2, truncate/2, capability/1]).
+         advance_committed/2, truncate/2, capability/1,
+         watermarks/1]).
 
 -record(hd, {id       :: partition_id(),
              store    :: pid(),
@@ -86,6 +87,17 @@ read_from(#hd{id = Id, log_tab = LogTab} = Hd, From, Limit) ->
 
 advance_committed(#hd{id = Id, store = Store}, Offset) ->
     broker_storage_memory_store:advance_committed(Store, Id, Offset).
+
+%% @doc The non-behavior tail query of design §13 K1, answered in the caller's
+%% process from the same public `meta_tab' the data path reads. `Last' is the
+%% highest allocated offset, so `High = Last + 1' -- the identical conversion
+%% `recover/2' makes in the store (`broker_storage_memory_store:81').
+-spec watermarks(broker_storage:handle()) -> {ok, offset(), offset()} | {error, term()}.
+watermarks(#hd{} = Hd) ->
+    case partition_state(Hd) of
+        {ok, Last, Committed, _Trunc} -> {ok, Committed, Last + 1};
+        {error, Reason} -> {error, Reason}
+    end.
 
 truncate(#hd{id = Id, store = Store}, BeforeOffset) ->
     broker_storage_memory_store:truncate(Store, Id, BeforeOffset).
