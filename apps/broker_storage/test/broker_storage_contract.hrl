@@ -10,12 +10,18 @@
 %% includes this file:
 %%   -define(BACKEND, Module).        the backend module atom
 %%   -define(CAPABILITY, [sync_mode()])  its ADR-011 §11.4 capability value
-%%   backend_setup(Config)            per-testcase cold start, returns Config
+%%   backend_setup(Case, Config)      per-testcase cold start, returns Config
 %%   backend_cleanup(Config)          per-testcase teardown
 %%   backend_config(Config)           the map handed to create/2 and recover/2
+%%   backend_cases()                  extra cases this backend owes beyond the
+%%                                    contract ([] for most)
 %% A missing hook is an undefined-function warning, and the umbrella
 %% `warnings_as_errors' turns that into a build failure, so a suite cannot
 %% forget one.
+%%
+%% `backend_setup' takes the case name because CT hands every testcase in one
+%% suite run the SAME priv_dir: a disk backend has to build a per-case
+%% subdirectory or each case appends to the previous one's partition.
 %%
 %% Nothing below may name a backend, a table or a directory. If a case needs one
 %% of those, the hook layer is too thin and has to be widened instead.
@@ -34,6 +40,12 @@
 -endif.
 
 all() ->
+    contract_cases() ++ backend_cases().
+
+%% The contract proper. A backend suite cannot add to this list, only to
+%% backend_cases/0, so "13/13, nothing skipped" stays a property of the header
+%% rather than of each suite's all/0.
+contract_cases() ->
     [create_returns_handle_with_os_buffer_capability,
      recover_missing_partition_does_not_create,
      create_twice_reports_already_exists,
@@ -51,8 +63,8 @@ all() ->
 %% Setup must leave the partition set empty -- the cases never delete anything,
 %% so a disk backend uses a fresh tmp dir per testcase and a process-backed
 %% backend uses a freshly started store.
-init_per_testcase(_Case, Config) ->
-    backend_setup(Config).
+init_per_testcase(Case, Config) ->
+    backend_setup(Case, Config).
 
 end_per_testcase(_Case, Config) ->
     backend_cleanup(Config),
@@ -68,11 +80,11 @@ create_returns_handle_with_os_buffer_capability(Config) ->
     Declared = lists:usort(?CAPABILITY),
     Declared = lists:usort(?BACKEND:capability(Hd)),
     true = lists:member(os_buffer, Declared),
-    %% Tripwire: a suite that declares a mode outside the frozen sync_mode()
-    %% set fails here, which is the signal to widen unsupported_modes/0 --
-    %% otherwise a new mode would silently escape the rejection case.
+    %% Tripwire: a backend that declares a mode outside the frozen sync_mode()
+    %% set fails here, which is the signal to widen all_sync_modes/0 -- otherwise
+    %% the new mode would escape the rejection case below unnoticed.
     lists:foreach(fun(Mode) ->
-                     true = lists:member(Mode, [os_buffer | unsupported_modes()])
+                     true = lists:member(Mode, all_sync_modes())
                   end,
                   Declared),
     ok.
@@ -212,10 +224,16 @@ concurrent_append_yields_unique_offsets(Config) ->
 
 %%%_* Contract helpers ---------------------------------------------------
 
+%% The frozen `sync_mode()' set of ADR-009, spelled out rather than read from the
+%% type: a new mode then has to be added here deliberately, and both the tripwire
+%% above and the rejection case below keep covering the whole set.
+all_sync_modes() ->
+    [os_buffer, fsync, replicated_commit].
+
 %% Every sync_mode() in the frozen ADR-009 type, minus what this backend
 %% declares it can honour.
 unsupported_modes() ->
-    [Mode || Mode <- [fsync, replicated_commit], not lists:member(Mode, ?CAPABILITY)].
+    [Mode || Mode <- all_sync_modes(), not lists:member(Mode, ?CAPABILITY)].
 
 collect([], Acc) ->
     lists:reverse(Acc);

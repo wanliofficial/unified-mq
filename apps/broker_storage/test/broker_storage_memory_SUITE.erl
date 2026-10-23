@@ -17,7 +17,7 @@
 
 %% The store process owns the two ETS tables; one fresh store per testcase is
 %% this backend's equivalent of an empty data directory.
-backend_setup(Config) ->
+backend_setup(_Case, Config) ->
     {ok, _StorePid} = broker_storage_memory_store:start_link(),
     Config.
 
@@ -27,3 +27,6 @@ backend_cleanup(_Config) ->
 %% Memory partitions are ETS keys: no path, no per-partition options.
 backend_config(_Config) ->
     #{}.
+
+backend_cases() ->
+    [].

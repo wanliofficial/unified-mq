@@ -3,6 +3,7 @@
 *.beam
 *.plt
 erl_crash.dump
+rebar3.crashdump
 .concrete/DEV_MODE
 
 # rebar 2.x
@@ -33,3 +34,6 @@ spikes/*/.data/
 # runtime data of the umbrella node (WAL segments, session files)
 /data/
 /log/
+
+# CLI tool state (not project content)
+/.qoder/
