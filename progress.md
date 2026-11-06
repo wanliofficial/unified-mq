@@ -1,7 +1,7 @@
 # Progress — UnifiedMQ
 
 > 多阶段路线（技术验证 → 原型 → 生产可用）参见 `docs/roadmap.md`。
-> 当前进度：**S0 已完成并推送 `origin/main`；S1 进行中——ADR-009/010/011 已冻结，T1 骨架 + T3 `broker_router_hash` + T4 `broker_storage_memory` + T5 `broker_storage_wal` + T6 `broker_queue` 分区 Worker + T7 `broker_subscription` 订阅层 + T8 帧编解码 + T9 `broker_proto_mqtt` 连接 FSM + T10 `broker_security` 桩 + T12 监督树整合 / ranch listener / dev 环境 + T13 集成套件 + T14 崩溃恢复套件 + T15 真实客户端兼容性已实现并实测通过（256 个 CT 用例，`rebar3 ct` 零 FAILED 行、零 Skipped，`dialyzer` 干净；T14 默认档 / 零回退档各 8/8 PASS；T15 8/8 用例、46/46 帧字节一致）。MQTT 3.1.1 的端到端闭环（publish → 路由 → WAL fsync → PUBACK → subscribe → 投递 → ack → 离线追赶 / 重连接管 / blob 恢复）已在真实 TCP + 真实 `mqtt_conn_fsm` 子进程上跑通，并经 **ranch listener + paho-mqtt 真实客户端在 release 节点上复验**（`RELEASE-PAHO-OK`），以及在“WAL 有 QoS1 记录、磁盘有非 clean 持久会话”的状态下连续重启复验（M10/M11）。T13 用 **`wal`/`memory` 两个 CT group 跑同一组 6 个端到端用例（12/12）**；T14 用 **真实容器 + 宿主 ext4 数据卷 + `docker kill -s KILL`** 跑完 R1a/R1b/R2~R7，默认档与零回退档各 8/8，R3 cursor 33 vs 51、R6 208.8/204.7 ms、R4 撕裂尾 3196→3198→3196；T15 用 **透明 TCP tee + paho 2.x + mosquitto 2.1.2** 跑 8 个用例，46/46 帧 decode→encode 字节一致，并修掉 v5 拒绝帧的帧型（M16）。**T16 两份文档已交付（`docs/architecture.md` + `docs/storage-and-recovery.md` v0.1，只写 S1 已实现事实、S2+ 单列演进）**，下一步 T17 Gate 签认（T11 `broker_event` 桩可并行）。**
+> 当前进度：**S0 已完成并推送 `origin/main`；S1 已完成（Gate S1 于 2026-11-06 通过）**——ADR-009/010/011 已冻结并经 T17 复核，T1 骨架 + T3 `broker_router_hash` + T4 `broker_storage_memory` + T5 `broker_storage_wal` + T6 `broker_queue` 分区 Worker + T7 `broker_subscription` 订阅层 + T8 帧编解码 + T9 `broker_proto_mqtt` 连接 FSM + T10 `broker_security` 桩 + T12 监督树整合 / ranch listener / dev 环境 + T13 集成套件 + T14 崩溃恢复套件 + T15 真实客户端兼容性已实现并实测通过（256 个 CT 用例，`rebar3 ct` 零 FAILED 行、零 Skipped，`dialyzer` 干净；T14 默认档 / 零回退档各 8/8 PASS；T15 8/8 用例、46/46 帧字节一致）。MQTT 3.1.1 的端到端闭环（publish → 路由 → WAL fsync → PUBACK → subscribe → 投递 → ack → 离线追赶 / 重连接管 / blob 恢复）已在真实 TCP + 真实 `mqtt_conn_fsm` 子进程上跑通，并经 **ranch listener + paho-mqtt 真实客户端在 release 节点上复验**（`RELEASE-PAHO-OK`），以及在“WAL 有 QoS1 记录、磁盘有非 clean 持久会话”的状态下连续重启复验（M10/M11）。T13 用 **`wal`/`memory` 两个 CT group 跑同一组 6 个端到端用例（12/12）**；T14 用 **真实容器 + 宿主 ext4 数据卷 + `docker kill -s KILL`** 跑完 R1a/R1b/R2~R7，默认档与零回退档各 8/8，R3 cursor 33 vs 51、R6 208.8/204.7 ms、R4 撕裂尾 3196→3198→3196；T15 用 **透明 TCP tee + paho 2.x + mosquitto 2.1.2** 跑 8 个用例，46/46 帧 decode→encode 字节一致，并修掉 v5 拒绝帧的帧型（M16）。**T16 两份文档已交付（`docs/architecture.md` + `docs/storage-and-recovery.md` v0.1，只写 S1 已实现事实、S2+ 单列演进）；T17 已完成冻结契约复核（无偏离、未触发 ADR 修订）并在 ADR-011 §11.7 正式签认 E1 措辞——Gate S1 四项验收全部通过（2026-11-06），S1 垂直切片完成。**
 
 ## 环境基线
 
@@ -14,7 +14,7 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | S0 技术验证 | ✅ 完成 | 5 个 spike + Gate ADR-001~008 全部落盘并推送 |
-| S1 MQTT 垂直切片 | 🟡 进行中 | 方案设计 v0.13（四轮评审 46 项整改 + T1/T3/T4/T5/T6/T7/T8/T9/T10/T12/T13/T14/T15 实现同步 84 项：H1~H11 / I1~I15 / J1~J11 / K0~K10 / L1~L20 / **M1~M16**）；ADR 已冻结；**T1/T3/T4/T5/T6/T7/T8/T9/T10/T12/T13/T14/T15 完成**（256 个 CT 用例，零 FAILED 行、零 Skipped、`dialyzer` 干净；release 实测含 T7 的 R1b 节点级预演、T12 的 ranch listener + paho-mqtt 真实客户端端到端，以及 T12/M10/M11 的“有 QoS1 记录 + 有持久会话时连续重启”恢复；T13 用 `wal`/`memory` 双组同用例跑通 12/12；T14 崩溃矩阵默认档 / 零回退档各 8/8；T15 真实客户端 8/8、46/46 帧字节一致），**T16 已交付两份文档 v0.1**，下一步 T17（Gate S1 签认）；T11 `broker_event` 桩可并行 |
+| S1 MQTT 垂直切片 | ✅ **完成（2026-11-06，Gate S1 通过）** | 方案设计 v0.15（四轮评审 46 项整改 + 实现期同步 90 项：H1~H11 / I1~I15 / J1~J11 / K0~K10 / L1~L20 / M1~M16）；ADR 已冻结并经 T17 复核；**T1/T3/T4/T5/T6/T7/T8/T9/T10/T12/T13/T14/T15/T16/T17 全部完成**（256 个 CT 用例，零 FAILED 行、零 Skipped、`dialyzer` 干净；release 实测含 T7 的 R1b 节点级预演、T12 的 ranch listener + paho-mqtt 真实客户端端到端，以及 T12/M10/M11 的“有 QoS1 记录 + 有持久会话时连续重启”恢复；T13 用 `wal`/`memory` 双组同用例跑通 12/12；T14 崩溃矩阵默认档 / 零回退档各 8/8；T15 真实客户端 8/8、46/46 帧字节一致；T16 两份架构/存储文档 v0.1；T17 冻结契约复核 + E1 签认）。T11 `broker_event` pass_through 桩仍为 ⬜（0.5 人日，不在 Gate 路径） |
 | S2/S3 | ⬜ 未开始 | roadmap 标注 S2/S3 可并行，S3 必须早于 S4 |
 | S4+ | ⬜ 未开始 | — |
 
@@ -36,6 +36,22 @@
 - ADR-004 CloudEvents 可选 / ADR-005 事件 id vs broker id / ADR-006 Pulsar 与存储解耦
 - ADR-007 显式三级可靠性（os_buffer / fsync / replicated_commit）及丢失边界
 - ADR-008 分组策略（默认 16 分区/组、故障域=组大小）+ 存储方案 A（自研分段 WAL + group commit）
+
+## Gate S1 验收结论
+
+**结论：✅ 通过（2026-11-06）。** 四行验收均有可复跑的实测证据，签认记录见 ADR-011 §11.7 与 `docs/protocol-compatibility.md` §5。
+
+| Gate 项 | 证据 | 复跑入口 |
+|---|---|---|
+| 真实 MQTT 客户端完成 publish → subscribe → ack 全链路 | paho-mqtt 2.x + mosquitto 2.1.2 对真实 release 跑 **8/8 用例**，**46/46 帧** `decode→encode` 字节一致（含双向 PUBACK、PINGREQ/PINGRESP、SUBACK、v5 拒绝帧） | `python3 test/protocol-compatibility/mqtt/t15_compat.py --case all` |
+| `kill -9` 后重启，丢失/重复行为有断言且符合契约 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`，R1a/R1b/R2~R7 × 默认/零回退两档 = **16/16 PASS**（R3 cursor 33 vs 51、R6 208.8/204.7 ms、R4 撕裂尾截断） | `python3 tools/docker/s1_recovery.py --tier all` |
+| 三个核心抽象完成评审并冻结 | ADR-009/010/011 状态=已采纳；T17 机械复核：记录 13 字段同名同序、Storage 8 回调、Router 5 回调 + optional、Router 无跨层调用——**无偏离** | ADR-011 §验证「S1 T17」条 |
+| WAL 与内存实现可互换 | 同一 `broker_storage_contract.hrl` 的 13 个契约用例在两个后端各跑一遍（机械检查）；T13 的 `wal`/`memory` 双组端到端 12/12 | `rebar3 ct`（`broker_storage_*` 与 `test/integration/s1_e2e_SUITE`） |
+| Gate 前不实现第二协议 | `apps/` 下只有 `broker_proto_mqtt`（T17 复核；T15 之前一直保持） | `ls -d apps/broker_proto_*` |
+
+**「订阅位置不丢」（E1）的签认口径**：订阅集合零容忍（R1b）+ cursor 有界回退 ≤`cursor_max_regress`（默认 64 / 100 ms；零回退档 1 / 0，R3 双档实测）+ in-flight 只保证不丢、允许重复（R7）。默认档的重复窗口是契约的一部分，不是缺陷；Producer 侧「已 ACK 不丢」仍零容忍，两者不可互借措辞。
+
+**未纳入 Gate 的剩余项**：T11（`broker_event` pass_through 桩，0.5 人日）未做，S1 数据路径不经过它；不阻塞 Gate，S2 前补即可。
 
 ## 过程中修正
 
@@ -63,11 +79,12 @@
 | T14 docker 崩溃恢复套件 | ✅ **完成（2026-11-06）** | `tools/docker/{s1_recovery.py,entrypoint.sh,docker-compose.s1.yml,README.md}` + `rebar3 as t14 release` profile（`dev_mode=false`、`include_erts=false`）。真实容器（`erlang:28.3.1.0`，与宿主 OTP 28.3.1/ERTS 16.2 同版本）+ 宿主 ext4 数据卷 bind mount + `docker kill -s KILL`。**默认档 / 零回退档各 8/8 PASS、0 FAIL**：R1a WAL high=2 且 payload 回放；R1b `session_present=1`、`.subs` 90 B、免重发 SUBSCRIBE 仍投递；R2 200 条中 acked 前 10 条、恢复 31（默认）/ 29（零档）为无空洞前缀；R3 默认 `flushed_cursor=33`（两次 33/34，重放 18/17、丢失 0、重复 0）vs 零档 `51=N+1`（重放 0、重复 0）；R4 segment 3196→3198（人工撕裂）→3196（截断，零档 3198→3200→3198；断言是回到撕裂前大小）且 20 条全回；R5 存储 0、投递 0；R6 20k 恢复 **208.836 ms**（默认）/ **204.706 ms**（零档）< 500 ms；R7 未 ack 消息重连后重发且不丢。偏差三条：M13 宿主驱动、M14 R6 只计 `recover/2`、M15 docker-compose 不可用改 CLI。产品代码与冻结 API 未改 |
 | T15 真实客户端兼容性 | ✅ **完成（2026-11-06）** | `test/protocol-compatibility/mqtt/{t15_compat.py,t15_capture.erl,README.md}`。T14 release 跑在 `erlang:28.3.1.0` 容器（`18831`），宿主 `18832` 的透明 TCP tee 抓双向字节；paho-mqtt 2.x（宿主）+ mosquitto 2.1.2（`eclipse-mosquitto:2`）驱动 8 个用例，**8/8 PASS**。分析器用生产 `mqtt_frame` 逐帧 `decode→encode`，**46/46 帧字节完全一致**：CONNECT/SUBSCRIBE/QoS1 PUBLISH/双向 PUBACK/PINGREQ/PINGRESP/DISCONNECT、CONNACK `20020000`、SUBACK `9003000101`；v5 CONNECT 被 paho 与 mosquitto 共同读为 135（`0x87`）；QoS2 PUBLISH 与含 NUL 的 filter 均为 parse 期拒绝且无 SUBACK；retain 入站 `33` → 投递 `32`；Will 异常断连零投递。**M16**：v5 拒绝帧由 `20020087` 改为 `2003008700`（v5 帧型），否则两个真实客户端都在属性解码阶段报错、拿不到原因码。偏差：mosquitto 默认空 ClientID 被 §4.2 拒绝，驱动显式 `-i`。`rebar3 ct` 仍 256/256、`dialyzer` 干净 |
 | T16 架构 / 存储恢复文档 | ✅ **完成（2026-11-06）** | `docs/architecture.md` v0.1：8 app 表（依赖 / 进程 / 对外入口 / 状态归属）、7 个顶层 supervisor + 嵌套 `broker_storage_wal_sup` + ranch 子树、重启策略与理由、三条进程边界规则、连接生命周期、OTP 拓扑序 + 4 个 boot step、publish / subscribe / session 数据流、配置面、证据索引、S2+ 演进位。`docs/storage-and-recovery.md` v0.1：5 条不变量、目录布局、WAL 段记录（`55 01 CRC Len Body`，`compressed,1`，body 元组带 Vsn）与水位记录（`4D 01 ...`）字节布局、段命名 / 轮转 / 稀疏索引 / `read_from` 语义、group commit 决策规则与一次 append 时序、水位守卫与「先刷 `.cursors` 再 `advance_committed`」次序、恢复算法与尾部判定表、内存后端、三层会话持久化与 boot 合并规则（K5）、R1a~R7 双档实测表、保证与不保证、文件系统守卫与运维、ADR-011 条款对照。两份文档只写 S1 已实现事实，S2+ 单列。核稿时按代码逐项复查并修正 3 处措辞（`broker_proto_mqtt` 依赖 7 个兄弟 app、`session_present` 判据、内存后端 `recover/2` 的 `{error,{not_found,_}}`） | `docs/architecture.md`、`docs/storage-and-recovery.md` |
-| T17 / T11 | ⬜ 未开始 | 关键路径剩 **T17（0.5 人日）**：复核「T2~T15 实现 ↔ 冻结 API」一致性，正式签认 E1 的 Gate 措辞并写入 ADR-011 附录与 `docs/protocol-compatibility.md`。T11 `broker_event` pass_through 桩（0.5 人日）不在关键路径，可随时插入 | — |
+| T17 Gate S1 签认 | ✅ **完成（2026-11-06）** | 冻结契约复核（T2~T15 最终代码 ↔ ADR-009/010/011）：`record_info(fields, broker_message)` 13 字段同名同序；`broker_storage:behaviour_info(callbacks)` 恰 8 项，WAL/memory 都声明 behavior 且 `capability/1` 为 `[os_buffer,fsync]` / `[os_buffer]`；`broker_router` 5 回调 + optional `on_partition_change/2`，`#route_ctx{}` 三字段一致，源码对 storage/subscription 的引用只在注释；`apps/` 仍只有 `broker_proto_mqtt`。**无偏离、未触发 ADR 修订**。E1 措辞在 ADR-011 §11.7 正式签认（R1a/R1b/R3/R7 × 实测 × 参数），并写入 `docs/protocol-compatibility.md` v0.5 §5（新增「冻结契约一致性」章） | `docs/adr/011-broker-storage-behavior.md` §11.7、`docs/protocol-compatibility.md` §5 |
+| T11 `broker_event` 桩 | ⬜ 未开始 | pass_through 桩 0.5 人日，不在 Gate S1 路径；S1 数据路径不经过它（`event` 恒 `undefined`），可在 S2 前随时插入 | — |
 
 ### 第二协议门禁（roadmap §3.4 硬约束）
 
-**Gate S1 未通过前，禁止实现第二个协议适配器。** 执行方式：本文件阶段状态表为唯一门禁状态源——S1 未标记 ✅ 时，任何新增 `apps/broker_proto_*`（`broker_proto_mqtt` 除外）的 PR 一律拒绝合入。
+**Gate S1 已于 2026-11-06 通过，门禁解除。** 第二协议须按 roadmap §5 的 S5 顺序（MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar）实施；S1 收尾时 `apps/` 仍只有 `broker_proto_mqtt` 一个适配器（T17 已机械核对）。
 
 ### S1 已定的关键决策（摘自冻结 ADR + 设计文档 v0.11）
 
@@ -76,7 +93,7 @@
 - **ADR-011**：`create/2` 与 `recover/2` **分离**，recover 对缺失分区返回 `{not_found,_}` 且绝不自动创建（防"恢复出空分区并报告健康"的静默数据丢失）；`recover/2` 返回 `CommittedOffset` + `HighOffset`，**不设 `AckRanges`**；水位**只允许偏低**（偏低=重复，允许；偏高=提前 truncate 丢数据，绝对禁止）。
 - WAL 磁盘协议独立于 `#broker_message{}`，带 `Vsn` 版本位（取代原 OQ-1）。
 - Session 持久化分三层：`.subs` 强一致即改即 fsync；`.inflight` 与 `.cursor` 批量刷盘（避免逐条 fsync 归零 group commit 收益）。
-- Gate「订阅位置不丢」措辞解释已复审确认，写入 ADR-011 附录 11.7。
+- Gate「订阅位置不丢」措辞解释已复审确认，写入 ADR-011 附录 11.7，并已于 **T17 正式签认（2026-11-06）**；同一口径写入 `docs/protocol-compatibility.md` §5。
 - 多写者并发 group commit 为 S0.3 §6 遗留待办，列为 T5 前置交付项——**T5 已实测消除**：16 caller 混合 `fsync`/`os_buffer` 并发下 offset 恰为 `1..32`、无 cross-reply、每个回复严格在本批 fsync 之后；未发现需要上调 `batch_delay_ms` 的延迟退化，故 §7.2 默认值不动。
 - **T3/T4 实测暴露 6 项（H6~H11，详见设计文档 §13）**：`route_ctx` 原本冻结在 behavior 模块内，record 不跨模块可见 ⇒ 任何调用者都无法构造 Ctx，已搬进 `include/broker_router.hrl`（字段未变，H6）；"Router 返回列表去重"里同 client 重叠订阅的合并做不到（必须解引用 SubRef，§10.2 禁止），归 T7 订阅层（H7）；**§6 boot step 1 没有 `create/2` 的调用者，干净数据目录必然启动失败**——T5 必须先定分区 bootstrap（H8）；offset 基数定为从 1 开始、空分区 `recover` 返回 `0/1`（H9）；`advance_committed`/`truncate` 的方向守卫在冻结签名内落成可机械检查（H10）；**hash 分区 + 通配符订阅 ⇒ 一个订阅跨多分区**（实测 `sport/#` 命中分区 `[0,1,3]`），故 §5.3 的 per-sub 单标量 `.cursor` 不成立，T7 须改为 per `(SubRef, PartitionId)`（H11）。
 - **T3/T4 的 S1 已知限制（非缺陷）**：`route/3` 不使用 `Ctx`、`register/4` 不入库 `SubOpts`（security 为单用户桩，多租户 filter 隔离留 S2）；内存后端数据面走 `public` ETS，并发读可能看见"offset 已分配、消息未插入"的瞬时空洞而提前截断一页——真实链路 §5.1(d) 按分区串行化 append 不会触发，但**同一场景是 T5 并发测试必须给 WAL 明确结论的项**。**→ T5 已给结论：WAL 后端不存在该窗口**——`HighOffset` 刻意不进读路径索引，只由 writer 进程状态持有，`read_from/3` 从段文件实际扫到什么就是什么（读到 torn tail 与读到日志末尾不可区分，也不需要区分）。内存后端的空洞源于把"下一个 offset"暴露给了读路径，WAL 侧结构性避开。

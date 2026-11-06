@@ -1,6 +1,6 @@
 # ADR-011：`broker_storage` behavior、能力模型与磁盘协议
 
-- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F1/F2 评审整改已并入；附录 11.7 的 Gate 措辞解释随设计文档 v0.3 复审确认，正式签认仍在 T17 评审会
+- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F1/F2 评审整改已并入；附录 11.7 的 Gate 措辞解释随设计文档 v0.3 复审确认，并已于 **T17 评审会正式签认（2026-11-06）**，见 §11.7 末尾
 - **日期**：2026-10-21
 - **关联**：README §5.3（存储方案）/§6.3（ACK 与持久化承诺）；roadmap §3.2 抽象 3、§3.4 Gate；ADR-007（三档可靠性）、ADR-008（方案 A 自研 WAL）、ADR-009（内存模型）；S0.3 spike；设计文档 `docs/design/s1-mqtt-vertical-slice.md` §3.3、§5.3、§7
 
@@ -161,6 +161,24 @@ roadmap §3.4 第 2 条「已 ACK 消息不丢、订阅位置不丢、未 ACK �
 
 参数可逼近零回退：`cursor_max_regress=1` + `cursor_flush_interval_ms=0` → cursor 逐条 fsync，代价与 group commit 收益对冲。`.inflight` 不提供零回退档（MQTT 3.1.1 §4.1 本就允许 session 恢复时重发未确认消息）。
 
+#### T17 正式签认（2026-11-06，Gate S1）
+
+本附录的措辞经 T2~T15 的实现与实测复核后**正式签认**，作为 Gate S1「订阅位置不丢」的唯一解释。签认的四条断言、实测证据与结论：
+
+| # | 断言（本附录口径） | 实测证据 | 结论 |
+|---|---|---|---|
+| 1 | 已 ACK 消息不丢（Producer 侧 PUBACK 过），零容忍 | T14 **R1a**：收 PUBACK 后 `docker kill -s KILL`，重启 `high=2`、原 payload 回放 | 通过 |
+| 2 | 订阅**集合**不丢，零容忍（`.subs` 即改即 fsync） | T14 **R1b**：重启 `session_present=1`、免重发 SUBSCRIBE 仍可投递；T13 协议级重连用例 | 通过 |
+| 3 | 消费 **cursor** 允许有界回退 ≤`cursor_max_regress`（默认 64 / 100 ms） | T14 **R3** 双档：默认档 `flushed_cursor=33/34`（两次运行，均在窗口内，重放 18/17 条、丢失 0），零回退档（1 / 0）`51=N+1`（重放 0、重复 0） | 通过 |
+| 4 | 未 ACK 消息重投是契约行为，只保证不丢 | T14 **R7**：已投递未 ack 的消息重连后重发、不丢；T9 的 DUP=1 同 packet_id 用例 | 通过 |
+
+签认同时确认参数与实现一致，而非纸面承诺：
+
+- `cursor_max_regress` 的判定在 `broker_subscription_worker:absorb_advance/3`（`interval =:= 0` 时每次推进即刷，否则累计到阈值；tick 兜底），默认 `64` / `100 ms`，零回退档 `1` / `0` —— 与 R3 的双档差异一一对应。
+- 聚合次序 `min(活 cursor) - 1` 且**先刷 `.cursors` 再 `advance_committed`**，由 worker 的 `cursor_tick` 固定；这条次序保证崩溃后 cursor 不会落在 committed 之下。
+- 本签认**不放宽** Producer 侧 durability（第 1 条仍零容忍），也不把 cursor 的"不丢"解释成"恰好一次"；重复窗口的边界以本条参数为准。
+- `.inflight` 只在"至少一次"意义上受约束（R7），没有零回退档——与 MQTT 3.1.1 §4.1 的会话重发语义一致。
+
 ## 后果（Consequences）
 
 - **+** storage 与订阅模型解耦，S2 四种订阅语义与 S4 复制都无需改 behavior。
@@ -175,6 +193,13 @@ roadmap §3.4 第 2 条「已 ACK 消息不丢、订阅位置不丢、未 ACK �
 ## 验证（Validation）
 
 - **语法已实测**（冻结前，OTP 28.3.1 `erlc`）：§11.1 的 8 个 callback 全部编译通过，`behaviour_info(callbacks)` 返回 `[{create,2},{recover,2},{close,1},{append,3},{read_from,3},{advance_committed,2},{truncate,2},{capability,1}]`；`#broker_message{}` 在 callback 类型位中使用亦通过。
+
+- **S1 T17 冻结契约复核（2026-11-06）**：对 T2~T15 的最终代码做机械核对，**未触发修订**：
+  - `broker_storage:behaviour_info(callbacks)` 恰为上列 8 项（已排序比对），既无缺席也无新增；
+  - `broker_storage_wal` 与 `broker_storage_memory` 均声明 `-behaviour(broker_storage)` 并导出全部 8 个回调；`capability/1` 分别为 `[os_buffer, fsync]` / `[os_buffer]`（§11.4 的实例级答案）；
+  - `broker_router:behaviour_info(callbacks)` 与 ADR-010 §10.1 的 5 项一致，`optional_callbacks = [{on_partition_change,2}]`；
+  - `#broker_message{}` 的 13 个字段与 ADR-009 §9.1 同名同序；
+  - `apps/` 下仍只有 `broker_proto_mqtt` 一个协议适配器（Gate S1 第四条）。
 
 - **S0.3 已支持**：fsync 871 µs/msg、group commit batch=32~64 拐点 ~19944 msg/s（17×）、20k 记录恢复 143 ms、撕裂尾部干净截断。
 - **S1 T5**：多写者并发 append 正确性——批次内每个 caller 的回复严格发生在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿。**这是 S0.3 §6 明确遗留的待办**（spike 为单写者模型），必须在前置给任何性能断言之前完成。<br>**→ 已满足（2026-10-21 实测）**：`broker_storage_wal_SUITE:mixed_sync_modes_concurrently_yield_dense_offsets_and_readable_records`——16 个并发 caller 交替 `fsync`/`os_buffer` 各 2 条，32 个 offset 恰为 `1..32`（无洞无重）、`NextOffset = 33`、每个 caller 只在自己的 offset 上读到自己那条 payload。未发现需上调 `batch_delay_ms` 的延迟退化，故 §7.2 的默认值不动。

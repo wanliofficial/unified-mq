@@ -1,6 +1,6 @@
 # ADR-009：统一消息模型 `broker_message` 记录定稿
 
-- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F1~F6 评审整改已并入；后续修改须走 ADR 修订流程
+- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F1~F6 评审整改已并入；后续修改须走 ADR 修订流程；**T17 复核（2026-11-06）**：`record_info(fields, broker_message)` 与 §9.1 同名同序，未触发修订
 - **日期**：2026-10-21
 - **关联**：README §3.1（两种模型分离）/§6.3（可靠性等级）/§9.1（发布生命周期）；roadmap §3.2 抽象 1；ADR-005（事件 ID 分离）、ADR-007（三档可靠性）；设计文档 `docs/design/s1-mqtt-vertical-slice.md` §3.1
 
@@ -80,6 +80,7 @@ README §3.1 给了草案但留有三处歧义，必须在 S1 定死而非推迟
 ## 验证（Validation）
 
 - **语法已实测**（冻结前，OTP 28.3.1 `erlc`）：§9.1 记录含字段级类型标注可编译，且被 ADR-011 的 `-callback append/3` 直接引用通过。
+- **S1 T17 冻结契约复核（2026-11-06）**：对 T2~T15 的最终代码做机械核对——包含 `broker_message.hrl` 编译后 `record_info(fields, broker_message)` 返回 `[message_id, tenant_id, destination, partition_id, payload, payload_encoding, headers, proto_meta, persistence, reliability, created_at, expires_at, event]`（`record_info(size, ...) = 14`，即 13 字段 + tag），与 §9.1 **同名同序**；`partition_id()` 仍为 `non_neg_integer()`、`sync_mode()` 仍为三值枚举。**未触发修订**。
 
 - S1 集成测试（T13）：同一测试套件在 memory 与 WAL 两后端下，`#broker_message{}` 往返字段级相等（含空槽位）。
 - S1 崩溃恢复测试（T14 R1a/R4）：WAL 记录编解码无损，`Vsn` 往返正确。

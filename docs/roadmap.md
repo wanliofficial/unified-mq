@@ -142,11 +142,13 @@ unified-mq/
 
 ### Gate S1
 
-- [ ] 真实 MQTT 客户端（Eclipse Paho / mosquitto_pub）完成 publish → subscribe → ack 全链路
-- [ ] `kill -9` 后重启，消息丢失/重复行为有测试断言且符合契约
-- [ ] 三个核心抽象完成评审并冻结
-- [ ] `apps/broker_storage` 的 WAL 与内存实现可互换（同一 behaviour 两种后端）
-- [ ] **在此 Gate 之前不允许实现第二个协议**
+- [x] 真实 MQTT 客户端（Eclipse Paho / mosquitto_pub）完成 publish → subscribe → ack 全链路 —— **T15（2026-11-06）：8/8 用例、46/46 帧字节一致**
+- [x] `kill -9` 后重启，消息丢失/重复行为有测试断言且符合契约 —— **T14：R1a~R7 × 默认/零回退双档 16/16 PASS**
+- [x] 三个核心抽象完成评审并冻结 —— **T0.5 冻结；T17 复核无偏离**
+- [x] `apps/broker_storage` 的 WAL 与内存实现可互换（同一 behaviour 两种后端） —— **T4/T5 契约 13 例 × 2；T13 端到端双组 12/12**
+- [x] **在此 Gate 之前不允许实现第二个协议** —— 通过时 `apps/` 仍只有 `broker_proto_mqtt`
+
+> **Gate S1 于 2026-11-06 通过。** 签认记录：ADR-011 §11.7（E1 措辞）、`docs/protocol-compatibility.md` §5（冻结契约一致性）、`progress.md`「Gate S1 验收结论」。
 
 ---
 
@@ -311,7 +313,7 @@ unified-mq/
 |---|---|---|
 | `docs/adr/00N-*.md` | S0 | 13 |
 | `docs/architecture.md` | S1 | 2 |
-| `docs/storage-and-recovery.md` | S2 / S4 | 5.3、6 |
+| `docs/storage-and-recovery.md` | S1（v0.1，T16）；S2 / S4 扩写 | 5.3、6 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

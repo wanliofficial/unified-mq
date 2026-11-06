@@ -1,6 +1,6 @@
 # ADR-010：`broker_router` behavior 与路由/订阅索引职责边界
 
-- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F3/F5 评审整改已并入；后续修改须走 ADR 修订流程
+- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F3/F5 评审整改已并入；后续修改须走 ADR 修订流程；**T17 复核（2026-11-06）**：5 个回调与 `route_ctx` 字段一致，未触发修订
 - **日期**：2026-10-21
 - **关联**：README §2.1（分层职责）/§9.1（发布生命周期第 6 步）；roadmap §3.2 抽象 2；ADR-001（Adapter 与内核分离）、ADR-008（分组模型）；设计文档 `docs/design/s1-mqtt-vertical-slice.md` §3.2
 
@@ -126,6 +126,7 @@ Router 的索引状态在内存（ETS），**不落盘**。冷启动顺序固定
   - **做不到**：同一 client 持有 `sport/#` 与 `sport/tennis/+` 两个重叠订阅时，MQTT §4.8 要求"按 max QoS 投递一次"。这两个订阅是两个 SubRef，合并它们**必须解引用 SubRef**，正被 §10.2 禁止。该职责归 `broker_subscription`（T7 铸造 SubRef 时即知所属 client），Router 只提供完整列表。T13 的断言因此要分两层写。
 
 - **【冻结后实测补充 T3】** `behaviour_info(callbacks)` 返回**含 optional 的全部 5 项**，`optional_callbacks` 返回其子集 `[{on_partition_change,2}]`——核对 optional 语义时以后者为准。`broker_router_hash` 在 S1 不导出 `on_partition_change/2`，由 T3 用例锁定（§10.5）。
+- **【S1 T17 冻结契约复核，2026-11-06】** 对最终代码机械核对：`broker_router:behaviour_info(callbacks)` 恰为 `[{init,1},{route,3},{register,4},{unregister,2},{on_partition_change,2}]`，`optional_callbacks = [{on_partition_change,2}]`；`#route_ctx{tenant_id, publisher, reliability}` 字段与类型标注与 §10.1 一致（定义位置按 H6 批注在 `include/broker_router.hrl`，仅位置变）；`apps/broker_router/src/` 对 `broker_storage`/`broker_subscription` 的引用只出现在注释里，§10.2 的边界可机械检查成立。**未触发修订**。
 - **【冻结后实测补充 T3｜H9】** `partition_id` 基数冻结文本未定，S1 实现定为 **0-based**（`erlang:phash2(Destination, N)` 天然产出 `0..N-1`，不做 +1 偏移）。`route/3` 只按 destination 决定分区，`Ctx#route_ctx.tenant_id` 在 S1 **不参与路由**（security 是单用户桩），`SubOpts` 亦不入库——多租户的 filter 隔离是 S2 待办，届时 tenant 需进入索引 key。
 - S1 集成测试（T13，F5）：SubRef 由 subscription 生成、Router 原样返回；断言 Router 模块中不存在生成 SubRef 的代码路径。
 - S1 崩溃恢复（T14 R1b，§10.6）：kill -9 重启后索引由 `.subs` 完整重建，且**在索引就绪前 listener 不接受任何连接**（用启动期立即连接的客户端验证被拒或等待）。

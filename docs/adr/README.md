@@ -25,12 +25,14 @@
 
 ## Gate S1 验收清单（roadmap §3.4）
 
-- [x] ADR-009 / 010 / 011 三份核心抽象决策定稿并冻结（**2026-10-21 冻结**；API 定义已在 OTP 28.3.1 `erlc` 实测通过，见各 ADR「验证」节）
-- [ ] 真实 MQTT 客户端完成 publish → subscribe → ack 全链路
-- [ ] `kill -9` 崩溃恢复断言 R1a/R1b/R2~R7 通过且符合契约
-- [ ] `broker_storage` 的 WAL 与内存实现可互换
-- [ ] ADR-011 附录 11.7「订阅位置不丢」措辞解释正式签认
-- [ ] **Gate S1 之前不允许实现第二个协议**（progress.md 状态机 + CI 双门禁）
+- [x] ADR-009 / 010 / 011 三份核心抽象决策定稿并冻结（**2026-10-21 冻结**；API 定义已在 OTP 28.3.1 `erlc` 实测通过，见各 ADR「验证」节；**T17 复核无偏离**）
+- [x] 真实 MQTT 客户端完成 publish → subscribe → ack 全链路（**T15**：8/8 用例、46/46 帧字节一致）
+- [x] `kill -9` 崩溃恢复断言 R1a/R1b/R2~R7 通过且符合契约（**T14**：双档 16/16 PASS）
+- [x] `broker_storage` 的 WAL 与内存实现可互换（**T4/T5**：契约 13 例 × 2；**T13**：端到端双组 12/12）
+- [x] ADR-011 附录 11.7「订阅位置不丢」措辞解释正式签认（**2026-11-06，T17**）
+- [x] **Gate S1 之前不允许实现第二个协议**（`apps/` 始终只有 `broker_proto_mqtt`，T17 复核）
+
+> **Gate S1 于 2026-11-06 通过**，签认记录见 ADR-011 §11.7、`docs/protocol-compatibility.md` §5 与 `progress.md`「Gate S1 验收结论」。
 
 ### 冻结后的真相源顺序
 
