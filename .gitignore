@@ -35,5 +35,10 @@ spikes/*/.data/
 /data/
 /log/
 
+# T14 harness scratch: rendered sys.config/vm.args, crash-test data, reports
+/tools/docker/data/
+/tools/docker/run/
+/tools/docker/__pycache__/
+
 # CLI tool state (not project content)
 /.qoder/

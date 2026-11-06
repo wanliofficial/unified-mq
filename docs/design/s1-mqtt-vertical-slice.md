@@ -1,11 +1,11 @@
 # S1 方案设计 — MQTT 垂直切片原型
 
-- **文档版本**：v0.11（T13 集成套件同步版）
+- **文档版本**：v0.12（T14 崩溃恢复实测同步版）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §3
 - **前置**：S0 已完成，ADR-001~008 已定稿；ADR-009/010/011（三抽象）**已冻结**（[`docs/adr/`](../adr/)）
 - **目标 Gate**：roadmap §3.4「Gate S1」
-- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端、T5 WAL 后端、T6 分区 Worker、T7 订阅层、T8 帧编解码、T9 连接 FSM、T10 security 桩、T12 监督树整合 + ranch listener + dev 环境、T13 集成套件已实现并实测通过**（256 个 CT 用例：T7 后 181 + T8 帧 23 + T9 连接 27 + T10 认证 7 + T12 listener 4 + 解码回归 2（WAL / 会话 blob）+ T13 集成 12（`wal`/`memory` 双组），`rebar3 ct` 零 `FAILED` 明细行且零 Skipped、`dialyzer` 干净、`xref` 仅剩预期 unused-export）；**装配后的 release 节点实测**：T6 的两半（干净目录响亮失败 / 带外建分区后 11 app 全起）复验通过，T7 的 R1b 节点级预演通过——带外建 4 分区 → `bin/unified_mq start` → `subscribe(<<"c1">>, <<"sport/#">>, 1)` → `data/sessions/YzE.subs` 落盘 → `application:stop+ensure_all_started(broker_subscription)` → route 索引仍含该 SubRef（boot step 2+3 回填走 `already_registered` 路径）、`cursor/2` 从 `.subs` 内嵌原点恢复 → `rebar3 shell` 冒烟确认 `mqtt_conn_sup` 在真实 app 树里注册（`broker_proto_mqtt_sup` 的唯一子项）。**T9 的 27 个连接用例是真实 TCP + 真实 `mqtt_conn_fsm` 子进程**（非 mock）：CONNACK 六种码、`mqtt_max_qos` 三种姿态、PUBACK 不被 dispatch 阻塞（挂起 worker 反证）、重叠 filter 恰一次、E7 离线追赶按 offset 序、DUP=1 同 packet_id、takeover 关旧留新 + 迟到 detach 被 K10 弹回、clean session 拆除、memory 后端整条 E12 姿态。**T12 已把 §6 的 boot step 4 落成真实监听端口**：`broker_proto_mqtt_sup` 在 `mqtt_conn_sup` 之后用 `ranch:child_spec/5` 起 listener（`transient`），`mqtt_listener:start_link/3` 仍只经 T9 的 `mqtt_conn_sup:start_conn/2`（无新接缝）；装配后的 release 用 **paho-mqtt 真实客户端**跑通 CONNECT/CONNACK、SUBSCRIBE/SUBACK、QoS1 PUBLISH→PUBACK、QoS0 与投递（`RELEASE-PAHO-OK`），并顺带暴露并修掉两类**真实缺陷**：CONNECT flags 位移一位（§13 M3，真实客户端首次暴露），以及把 `[safe]` 当通用规则导致的"重启即失败"——WAL 记录体（§13 M10，写过一条 QoS1 后 `partition_recover_failed`）与 `.inflight` 会话 blob（§13 M11，持久会话直接让 `broker_subscription` 起不来），两者都由 `rebar3 shell` 的非 primLoad 启动顺序首次暴露。**T13 已把 §9 的端到端集成套件落成 `test/integration/s1_e2e_SUITE`**：6 个用例 × `wal`/`memory` 两个 CT group（同一套件跑两个后端），全程真实 TCP + T12 的 ranch listener，覆盖 QoS0 往返、QoS1 的 WAL 全链路与 memory 的 E12 姿态、§4.8 不升 QoS、非 clean 重连恢复订阅集合、clean=true 拆除、E7 离线追赶按 offset 序；`All 256 tests passed` 且零 FAILED/Skipped。**尚未实测**：`kill -9` 级 PUBACK-before-fsync 证明（T14）、真实客户端字节级对比（T15，T12 的 paho 连接已覆盖 CONNECT 一个包）→ 下一步 T14。
-- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）；**v0.6 → v0.7 同步 T5 实测发现（I1~I15，见 §13）：WAL 模块划分、组提交策略模块形态、tmpfs 防护位置、E5 并发结论、以及 H8「分区 bootstrap 由谁做」的归属答复**；**v0.7 → v0.8 同步 T6 实测发现（J1~J11，见 §13）：§5.1(d) 的"分区 Worker 串行化"改为"单一 storage writer 串行化"（否则 group commit 退化成每批 1 条）、H8 的 `create_partition/1` 与 boot step 1 已落地并在 release 上实测两半、OTP 28 `get_env/2` 返回 `{ok,Val}`、relx 脚本 `cd $ROOTDIR` 使相对 `data_dir` 落进 release 树**；**v0.8 → v0.9 同步 T7 实测发现（K0~K10，见 §13）：修掉 T3 遗留的 Router 装配缺口（`broker_router_sup` 从不启动索引 store，I12 同类），§5.3 的 cursor 文件按 H11 落成 per-client 聚合的 `.cursors` 并把订阅原点内嵌进 `.subs`（恢复规则"绝不回退到 Committed/0/High 兜底"），committed 聚合公式定死为 `min(活 cursor) − 1` 且刷盘严格先于 `advance_committed`，OQ-2 答复为"不抽 behavior"**；**v0.9 → v0.10 同步 T8/T9/T10 实测发现（L1~L20，见 §13）：§4.1 的"mosquitto 抓包黄金样本"按规范示例手推 + 6 条 proper 属性等价替代（L1）；§4.2 连接图三处过期（`awaiting_owner` 状态、子进程 `temporary` 而非 `transient`、无 `mqtt_session` 模块，L5/L15）；keepalive 不能用 `state_timeout`（任何事件都会取消它 ⇒ conn 自己的定时器替死对端续命）且 `keep_alive=0` 取服务端上限而非禁用（L3）；capability 从"启动时查一次"改为 CONNECT 时按全分区算 `EffectiveMaxQos`（L11）；§4.5 要求发的 CONNACK `0x87` 是 3.1.1 的保留字节 ⇒ 解码侧守卫放宽、有意不对称（L12）；非法 filter 在 codec parse 期即拒绝，姿态是断连无 SUBACK 而非逐 topic 0x80（L13）；takeover 落成 `attach/3 → {ok, PrevPid}` + 新 conn 自旧 conn 发内部消息，旧 conn 跳过 blob 快照、迟到 detach 由 K10 pid 守卫弹回（L17）；DUP 重发收敛为"每条连接恰好一次"（L8）；ADR-010 的 opaque env 在第一个真实消费者处显形，`route/3` 的 `#route_ctx{}` 与"永不返回 `[]`"按冻结契约落实（L16）**；**v0.10 → v0.11 同步 T13 集成套件：`test/integration/s1_e2e_SUITE` 以 `wal`/`memory` 两个 CT group 跑同一组端到端用例（Gate「WAL 与内存实现可互换」的套件级证据），并记录验收工具的 stale-beam 计数问题（M12）**。ADR 侧只加**冻结后批注**，不动已冻结文本
+- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端、T5 WAL 后端、T6 分区 Worker、T7 订阅层、T8 帧编解码、T9 连接 FSM、T10 security 桩、T12 监督树整合 + ranch listener + dev 环境、T13 集成套件、T14 崩溃恢复矩阵已实现并实测通过**（256 个 CT 用例：T7 后 181 + T8 帧 23 + T9 连接 27 + T10 认证 7 + T12 listener 4 + 解码回归 2（WAL / 会话 blob）+ T13 集成 12（`wal`/`memory` 双组），`rebar3 ct` 零 `FAILED` 明细行且零 Skipped、`dialyzer` 干净、`xref` 仅剩预期 unused-export；T14 的 R1a~R7 在默认档 / 零回退档各 8/8 PASS）；**装配后的 release 节点实测**：T6 的两半（干净目录响亮失败 / 带外建分区后 11 app 全起）复验通过，T7 的 R1b 节点级预演通过——带外建 4 分区 → `bin/unified_mq start` → `subscribe(<<"c1">>, <<"sport/#">>, 1)` → `data/sessions/YzE.subs` 落盘 → `application:stop+ensure_all_started(broker_subscription)` → route 索引仍含该 SubRef（boot step 2+3 回填走 `already_registered` 路径）、`cursor/2` 从 `.subs` 内嵌原点恢复 → `rebar3 shell` 冒烟确认 `mqtt_conn_sup` 在真实 app 树里注册（`broker_proto_mqtt_sup` 的唯一子项）。**T9 的 27 个连接用例是真实 TCP + 真实 `mqtt_conn_fsm` 子进程**（非 mock）：CONNACK 六种码、`mqtt_max_qos` 三种姿态、PUBACK 不被 dispatch 阻塞（挂起 worker 反证）、重叠 filter 恰一次、E7 离线追赶按 offset 序、DUP=1 同 packet_id、takeover 关旧留新 + 迟到 detach 被 K10 弹回、clean session 拆除、memory 后端整条 E12 姿态。**T12 已把 §6 的 boot step 4 落成真实监听端口**：`broker_proto_mqtt_sup` 在 `mqtt_conn_sup` 之后用 `ranch:child_spec/5` 起 listener（`transient`），`mqtt_listener:start_link/3` 仍只经 T9 的 `mqtt_conn_sup:start_conn/2`（无新接缝）；装配后的 release 用 **paho-mqtt 真实客户端**跑通 CONNECT/CONNACK、SUBSCRIBE/SUBACK、QoS1 PUBLISH→PUBACK、QoS0 与投递（`RELEASE-PAHO-OK`），并顺带暴露并修掉两类**真实缺陷**：CONNECT flags 位移一位（§13 M3，真实客户端首次暴露），以及把 `[safe]` 当通用规则导致的"重启即失败"——WAL 记录体（§13 M10，写过一条 QoS1 后 `partition_recover_failed`）与 `.inflight` 会话 blob（§13 M11，持久会话直接让 `broker_subscription` 起不来），两者都由 `rebar3 shell` 的非 primLoad 启动顺序首次暴露。**T13 已把 §9 的端到端集成套件落成 `test/integration/s1_e2e_SUITE`**：6 个用例 × `wal`/`memory` 两个 CT group（同一套件跑两个后端），全程真实 TCP + T12 的 ranch listener，覆盖 QoS0 往返、QoS1 的 WAL 全链路与 memory 的 E12 姿态、§4.8 不升 QoS、非 clean 重连恢复订阅集合、clean=true 拆除、E7 离线追赶按 offset 序；`All 256 tests passed` 且零 FAILED/Skipped。**T14 已把 §8.2 的崩溃矩阵落成真实容器故障注入**：`tools/docker/s1_recovery.py` 驱动 paho-mqtt 客户端，对 `erlang:28.3.1.0` 容器里的 release 节点（数据目录 bind-mount 到宿主 ext4）执行 `docker kill -s KILL`；**默认档与零回退档各 8/8 PASS、零 FAIL**。关键数字：R1a 恢复后 WAL high=2 且原 payload 回放；R1b `session_present=1`、`.subs` 90 B 且免重发 SUBSCRIBE 仍可投递；R2 200 条里 acked 前 10 条、恢复 31 条为无空洞前缀；R3 默认档 cursor 退到 33（50 条中；两次运行 33/34，均在 K=64 窗口内，重放 18/17 条、零丢失），零回退档 cursor=51=N+1（重放 0、重复 0）；R4 segment 3196→3198（人工撕裂）→3196（恢复截断）且 20 条全回；R5 存储 0 条、投递 0 条；R6 20k 条恢复 **208.836 ms**（默认）/ **204.706 ms**（零档）< 500 ms；R7 未 ack 消息重连后重发且无丢失。**尚未实测**：真实客户端字节级对比（T15，T12 的 paho 连接已覆盖 CONNECT 一个包）→ 下一步 T15。
+- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）；**v0.6 → v0.7 同步 T5 实测发现（I1~I15，见 §13）：WAL 模块划分、组提交策略模块形态、tmpfs 防护位置、E5 并发结论、以及 H8「分区 bootstrap 由谁做」的归属答复**；**v0.7 → v0.8 同步 T6 实测发现（J1~J11，见 §13）：§5.1(d) 的"分区 Worker 串行化"改为"单一 storage writer 串行化"（否则 group commit 退化成每批 1 条）、H8 的 `create_partition/1` 与 boot step 1 已落地并在 release 上实测两半、OTP 28 `get_env/2` 返回 `{ok,Val}`、relx 脚本 `cd $ROOTDIR` 使相对 `data_dir` 落进 release 树**；**v0.8 → v0.9 同步 T7 实测发现（K0~K10，见 §13）：修掉 T3 遗留的 Router 装配缺口（`broker_router_sup` 从不启动索引 store，I12 同类），§5.3 的 cursor 文件按 H11 落成 per-client 聚合的 `.cursors` 并把订阅原点内嵌进 `.subs`（恢复规则"绝不回退到 Committed/0/High 兜底"），committed 聚合公式定死为 `min(活 cursor) − 1` 且刷盘严格先于 `advance_committed`，OQ-2 答复为"不抽 behavior"**；**v0.9 → v0.10 同步 T8/T9/T10 实测发现（L1~L20，见 §13）：§4.1 的"mosquitto 抓包黄金样本"按规范示例手推 + 6 条 proper 属性等价替代（L1）；§4.2 连接图三处过期（`awaiting_owner` 状态、子进程 `temporary` 而非 `transient`、无 `mqtt_session` 模块，L5/L15）；keepalive 不能用 `state_timeout`（任何事件都会取消它 ⇒ conn 自己的定时器替死对端续命）且 `keep_alive=0` 取服务端上限而非禁用（L3）；capability 从"启动时查一次"改为 CONNECT 时按全分区算 `EffectiveMaxQos`（L11）；§4.5 要求发的 CONNACK `0x87` 是 3.1.1 的保留字节 ⇒ 解码侧守卫放宽、有意不对称（L12）；非法 filter 在 codec parse 期即拒绝，姿态是断连无 SUBACK 而非逐 topic 0x80（L13）；takeover 落成 `attach/3 → {ok, PrevPid}` + 新 conn 自旧 conn 发内部消息，旧 conn 跳过 blob 快照、迟到 detach 由 K10 pid 守卫弹回（L17）；DUP 重发收敛为"每条连接恰好一次"（L8）；ADR-010 的 opaque env 在第一个真实消费者处显形，`route/3` 的 `#route_ctx{}` 与"永不返回 `[]`"按冻结契约落实（L16）**；**v0.10 → v0.11 同步 T13 集成套件：`test/integration/s1_e2e_SUITE` 以 `wal`/`memory` 两个 CT group 跑同一组端到端用例（Gate「WAL 与内存实现可互换」的套件级证据），并记录验收工具的 stale-beam 计数问题（M12）**；**v0.11 → v0.12 同步 T14 崩溃恢复：§8.1 改为实际编排（`rebar3 as t14 release` + `erlang:28.3.1.0` 容器 + 宿主 paho 驱动 + `docker kill -s KILL`），新增 §8.4 双档证据表，并记录宿主驱动 / R6 测量口径 / docker-compose 不可用三条偏差（M13~M15）**。ADR 侧只加**冻结后批注**，不动已冻结文本
 
 ---
 
@@ -573,10 +573,19 @@ WAL 记录头 = `<<Magic:8, Vsn:8, CRC32:32, Len:32>>`，Body = 紧凑元组 `er
 
 ### 8.1 编排
 
-`tools/docker/docker-compose.s1.yml`：
-- `broker`：单节点，挂载 `./data:/var/lib/unified-mq`（真实卷，非 tmpfs；由 `wal_writer:init` 校验）
-- `mqtt-client`：paho-mqtt Python 客户端 + mosquitto 命令行，脚本驱动
-- 测试从宿主机 `docker compose kill -9 broker` 注入崩溃
+实际编排由 `tools/docker/` 三个文件组成（`docker-compose.s1.yml` 保留为声明式参考，见 M15）：
+
+| 文件 | 作用 |
+|---|---|
+| `tools/docker/entrypoint.sh` | 启动容器内 epmd → 带外 `broker_queue:create_partition/1` 建 4 分区（H8：boot 只 recover）→ `bin/unified_mq foreground` |
+| `tools/docker/s1_recovery.py` | 从 `config/sys.config.src` 渲染 `run/sys.config`（逐项断言替换次数），在**宿主**跑 paho-mqtt 客户端，注入 kill -9，执行 R1a~R7，输出 `run/report-*.json` |
+| `tools/docker/docker-compose.s1.yml` | 同一 broker 服务的声明式等价物：数据卷、端口、OTP 镜像 |
+
+- **release**：`rebar3 as t14 release`（`{dev_mode,false}` 使 app 复制而非符号链接到 checkout；`{include_erts,false}`）。release 以宿主 OTP **28.3.1 / ERTS 16.2** 构建，只读挂载进容器。
+- **镜像**：`erlang:28.3.1.0`（OTP 28.3.1 / ERTS 16.2），与宿主完全同版本；不需要把宿主 ERTS 或 glibc 相关 beam 文件带进镜像。
+- **数据目录**：`tools/docker/data` bind-mount 到容器 `/var/lib/unified-mq`，宿主侧是 ext4（`wal_writer:check_filesystem` 的真实生产条件，不是 tmpfs）。broker 以宿主 uid/gid 运行，release 与 `run/` 只读挂载。
+- **端口**：宿主 `127.0.0.1:18830` → 容器 1883。宿主 1883 被无关容器占用，T14 保持自包含；链路仍是真实 TCP + ranch listener。
+- **崩溃注入**：`docker kill -s KILL unified-mq-s1-broker`，随后 `docker start` 复用同一容器与挂载（entrypoint 的 bootstrap 在已恢复目录上幂等，走 `{already_exists, P}` 分支）。
 
 ### 8.2 断言清单
 
@@ -594,6 +603,27 @@ WAL 记录头 = `<<Magic:8, Vsn:8, CRC32:32, Len:32>>`，Body = 紧凑元组 `er
 ### 8.3 掉电模拟（不阻塞 Gate S1）
 
 S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢失窗口。S1 沿用 kill -9；掉电模拟（dm-flakey / VM 硬复位）留待 S2 补齐；protocol-compatibility.md 与 ADR-007 已注明。
+
+### 8.4 T14 实测证据（2026-11-06）
+
+驱动：`python3 tools/docker/s1_recovery.py --tier all`。每个场景都从**全新数据目录 + 全新容器**开始；两档各跑一遍 R1a~R7，共 **16 次 PASS、0 FAIL**。报告落在 `tools/docker/run/report-*.json`（gitignored）。
+
+| # | 默认档（K=64 / 100 ms） | 零回退档（K=1 / 0 ms） |
+|---|---|---|
+| R1a | PASS：`session_present=1`，`.subs` 90 B，WAL `high=2`（恰一条记录），payload 原样回放 | PASS：`.subs` 87 B，`high=2`，payload 原样回放 |
+| R1b | PASS：`session_present=1`，`.subs` 90 B；未重发 SUBSCRIBE 仍收到 crash 后消息 | PASS：`.subs` 87 B；同上 |
+| R2 | PASS：200 条中 recovered 31 条，为 `msg-0000..msg-0030` 无空洞前缀；acked 前 10 条在列 | PASS：recovered 29，同样无空洞、无撕裂 |
+| R3 | PASS：`flushed_cursor=33`（50 条中；两次独立运行 33/34，均在 K=64 窗口内），重放 18 条 = 退回到 33 之后的全部；丢失 0，重复 0 | PASS：`flushed_cursor=51=N+1`，重放 0 条、重复 0（逐 ack 已刷盘；确定性） |
+| R4 | PASS：`segment` 3196 → 人工写 `55 01` 后 3198 → 恢复截断回 **3196**；20 条全回、无虚构记录 | PASS：3198 → 3200 → 3198；20 条全回（段字节数随记录编码略变，断言是"回到撕裂前大小"） |
+| R5 | PASS：QoS0 10 条 → WAL stored 0，重启后 delivered 0 | PASS：stored 0，delivered 0 |
+| R6 | PASS：20 000 条、恢复 **208.836 ms** < 500 ms（4 分区 high 4892/5055/4966/5091） | PASS：**204.706 ms** < 500 ms |
+| R7 | PASS：已投递未 ack 的消息重连后重发（`dup=false`，按 cursor 追赶等价），不丢失 | PASS：同上 |
+
+**两档语义差异的证据**：R3 的 `flushed_cursor` 在默认档退到 33/34（K=64 窗口内、随 100 ms tick 落点变化），零回退档**确定地**停在 51（=N+1），且零回退档重放集为空——证明 `cursor_max_regress` / `cursor_flush_interval_ms` 不是纸面参数（E1）。默认档允许 offset ≤ last_flushed 的子集重复，R3 仍断言"offset > flushed 的一条不丢"。
+
+**恢复耗时口径（M14）**：R6 只计 `broker_storage_wal:recover/2`（一次性 VM 内对 4 分区计时），不含容器/VM 启动，避免把 Docker daemon 抖动算进存储属性；预算 500 ms 与 §8.2 一致。
+
+**取证方式**：MQTT 侧断言全部走真实 socket；协议看不到的量（WAL high、刷盘 cursor、重放耗时）由一次性 Erlang VM 以 release 同一份 `sys.config` 只读打开同一数据卷读出（`probe_recover` / `probe_cursors`），不修改任何状态。
 
 ---
 
@@ -615,7 +645,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | T11 | `broker_event` 桩（pass_through，接口位保留） | T2 | 0.5 | — |
 | T12 | 监督树整合 + application 启动流程（§6 启动顺序 4 步：`recover` → `.subs` 重建 → `register` 回填 → 才放开 listener）+ dev 环境<br>**→ 已完成（2026-11-06）**：`mqtt_listener`（ranch 2.3.0 `ranch_protocol`，`start_conn(undefined, Opts)` + 显式 `link/1`）+ `broker_proto_mqtt_sup` 用 `ranch:child_spec/5` 在 `mqtt_conn_sup` 之后起 listener（embedded、`transient`）+ FSM 的 `{handshake,...}`/`arm_socket/2` + L20 的 per-listener `ProtoOpts` 经 `opt/3` 消费；`listeners` 默认 `[]`（库/CT 节点不绑端口），release/`rebar3 shell` 由 `config/sys.config.src` 给 1883；J8 修复（`data_dir` 改 release 树外绝对路径）+ `broker_security:users` 与六项连接级 env 落配置。**4 个新 listener CT 用例**（CONNACK、端到端 pub/sub/PUBACK、`.subs` 回填先于 accept、stop 收口连接）+ **2 个解码回归用例**（M10 WAL 记录体、M11 `.inflight` 会话 blob），全套 **244/244** 零 FAILED 零 Skipped；release 用 paho 实连 `RELEASE-PAHO-OK`，并在连续两次重启（分区里已有 QoS1 记录）后重复通过。偏差见 §13 **M1~M11**（M3 是真实 CONNECT flags 缺陷；M10/M11 是同一类「`[safe]` 解码外来原子 ⇒ 重启即失败」缺陷，分别落在 WAL 记录体与会话 blob） | T5-T11 | 1 | — |
 | T13 | common_test 集成测试套件（端到端 pub/sub/ack、QoS0/1、clean_session、离线追赶）<br>**→ 已完成（2026-11-06）**：`test/integration/s1_e2e_SUITE.erl`，`all() -> [{group, wal}, {group, memory}]`，6 个用例在两组各跑一遍（**12/12**）——整套用例跑在真实 TCP + T12 的 ranch listener 上，不用固定 sleep，断言按 `broker_queue:watermarks/1` 与 `broker_subscription:cursor/2` 轮询。覆盖：`qos0_publish_subscribe_roundtrip`（QoS0 直接推送、无 PUBACK、水位不动）、`qos1_posture_follows_backend_capability`（WAL：PUBACK→append→cursor/committed 前进；memory：SUBACK `0x80` + 超限 PUBLISH 断连且零 append）、`subscription_qos_is_not_escalated`（§4.8 `min` 语义 + read-and-skip）、`clean_session_false_restores_the_subscription_set`（R1b 协议级半边：`session_present=1`、免重发 SUBSCRIBE、恢复后可投递）、`clean_session_true_discards_the_session`（§4.2：CONNACK 前实体已清、断连后 `.subs` 被删、`session/1` 回 `not_found`）、`offline_catch_up_is_offset_ordered`（E7：三条 QoS1 按 offset 序投递并 ack；memory 的 QoS0 无积压）。偏差仅验收工具一条（§13 **M12**：`rebar3 ct` 的 stale beam 让首轮报 258） | T12 | 2 | — |
-| T14 | docker compose 崩溃恢复测试套件（R1a/R1b/R2~R7） | T13 | 2 | — |
+| T14 | docker compose 崩溃恢复测试套件（R1a/R1b/R2~R7）<br>**→ 已完成（2026-11-06）**：`tools/docker/{s1_recovery.py,entrypoint.sh,docker-compose.s1.yml,README.md}` + `rebar3 as t14 release` profile。真实容器（`erlang:28.3.1.0`）+ 宿主 ext4 bind mount + `docker kill -s KILL`；**默认档与零回退档各 8/8 PASS、0 FAIL**。R3 双档给出 `flushed_cursor=33`（两次 33/34）vs `51=N+1`、重放 18 vs 0；R6 208.836/204.706 ms；R4 撕裂尾 3196→3198→3196。偏差三条（§13 **M13** 宿主驱动、**M14** R6 只计 recover、**M15** docker-compose 不可用改 CLI） | T13 | 2 | — |
 | T15 | 真实客户端兼容性测试（paho Python、mosquitto_pub/sub） | T13 | 1.5 | protocol-compatibility.md MQTT 行 |
 | T16 | `docs/architecture.md` + `docs/storage-and-recovery.md` skeleton | T2-T5 | 1.5 | 两份文档 v0.1 |
 | T17 | ADR-009/010/011 定稿 + 评审会（E1 Gate 措辞已确认，会上正式签认并入 ADR-011 附录） | T16 | 0.5 | Gate S1 |
@@ -629,7 +659,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | Gate 项 | 由哪个任务证明 |
 |---|---|
 | 真实 MQTT 客户端完成 publish → subscribe → ack 全链路 | T15（paho + mosquitto） |
-| `kill -9` 后重启，消息丢失/重复行为有测试断言且符合契约 | T14（R1a/R1b/R2~R7） |
+| `kill -9` 后重启，消息丢失/重复行为有测试断言且符合契约 | T14（R1a/R1b/R2~R7）。**T14 已交付**：真实容器 + 宿主 ext4 数据卷 + `docker kill -s KILL`，默认档 / 零回退档各 8/8 PASS（§8.4）；R3 双档 cursor 33 vs 51、R6 208.8/196.0 ms、R4 撕裂尾截断 |
 | 三个核心抽象完成评审并冻结 | **T0.5 已冻结**（ADR-009/010/011 状态=已采纳）；T17 评审会复核冻结内容与 T2~T7 实际实现是否一致，不一致则按 ADR 修订流程处置 |
 | `broker_storage` 的 WAL 与内存实现可互换 | T4 + T5 + T13（同一测试套件跑两个后端；memory 后端下 QoS1 用例按 `mqtt_max_qos=0` 契约执行）。**T13 已交付**：`test/integration/s1_e2e_SUITE` 的 `wal`/`memory` 两组共享同一份 6 用例清单（12/12），memory 分支逐条断言 E12 的 SUBACK `0x80` 与超限 PUBLISH 断连，不用 `skip` |
 | **「订阅位置不丢」的解释（E1，v0.3 复审已确认）**：= 订阅集合零容忍（R1b）+ cursor 有界回退 ≤`cursor_max_regress`（R3，默认档与零回退档双档实测）+ in-flight 允许回退仅保证不丢（R7）。依据 roadmap §3.4 第 3 条「明确可容忍的重复窗口」——该条本身即授权有界重复，否则为空文 | **T17 评审会正式签认（措辞已确认，此处仅走流程）→ 写入 ADR-011 附录与 protocol-compatibility.md** |
@@ -667,7 +697,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 
 ## 12. 交付物清单
 
-**代码**：`apps/*` 8 个应用；`test/integration/s1_e2e_SUITE.erl`（T13：同一组端到端用例跑 `wal`/`memory` 两个后端）；`test/protocol-compatibility/mqtt/*`；`tools/docker/docker-compose.s1.yml`。
+**代码**：`apps/*` 8 个应用；`test/integration/s1_e2e_SUITE.erl`（T13：同一组端到端用例跑 `wal`/`memory` 两个后端）；`test/protocol-compatibility/mqtt/*`；`tools/docker/s1_recovery.py`（T14 驱动，R1a~R7 双档）、`tools/docker/entrypoint.sh`（epmd + 带外建分区）、`tools/docker/docker-compose.s1.yml`（声明式编排参考）、`tools/docker/README.md`（用法与断言映射）、`rebar.config` 的 `t14` release profile。
 
 **文档**：
 - `docs/design/s1-mqtt-vertical-slice.md`（本文，评审通过后升级 v1.0）
@@ -679,7 +709,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 - `docs/protocol-compatibility.md` 追加 MQTT 行（含 §4.5 拒绝策略、§5.2 离线追赶、session 回退限制）
 - `progress.md` 更新 S1 状态 + 第二协议门禁标记
 
-**测试证据**：崩溃恢复 R1a/R1b/R2~R7 CI 输出；T5 并发 append 正确性测试报告；真实客户端兼容性测试报告。
+**测试证据**：崩溃恢复 R1a/R1b/R2~R7 双档报告（T14：`tools/docker/run/report-*.json`，`tools/docker/README.md` 为断言映射）；T5 并发 append 正确性测试报告；真实客户端兼容性测试报告。
 
 ---
 
@@ -757,6 +787,18 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | **M12** | `rebar3 ct` 会把 `test/` 与 `test/integration/` 都编译/复制进 `_build/test/extras/`；删除源 suite 后旧 `.beam` 仍在，CT 仍会运行它。T13 首轮全套因此报 `All 258 tests passed`（真实 256 + 已删除的 `probe_SUITE` 2 例）——**汇总数字虚高且没有任何 FAILED/Skipped 明细** | 删除 `_build/test/extras` 后重跑，得到真实 **256/256**；验收时除 `FAILED`/`Skipped` 明细外，还核对 `%%% *_SUITE` 行与各 suite 的 `TEST COMPLETE` 计数，确认没有已删除套件的残留 | 验收流程（J10/L19 的同一家族） |
 
 **T13 实测证据摘要**：`test/integration/s1_e2e_SUITE` 的 `all() -> [{group, wal}, {group, memory}]`，6 个用例在两组各跑一遍，共 **12/12**；`rebar3 ct` 全套 **256/256**（18 个 suite），零 `FAILED` 明细行、零 Skipped；`dialyzer` 0 warning；`xref` 仍为 32 条预期 unused-export。用例与契约的对应：`qos0_publish_subscribe_roundtrip`（QoS0 直接推送、无 PUBACK、水位不动）、`qos1_posture_follows_backend_capability`（WAL 的 PUBACK→append→cursor/committed 前进；memory 的 SUBACK `0x80` + 超限 PUBLISH 断连且零 append）、`subscription_qos_is_not_escalated`（§4.8 `min` 语义 + read-and-skip，delivery QoS0 不欠 ack）、`clean_session_false_restores_the_subscription_set`（R1b 的协议级半边：`session_present=1`、免重发 SUBSCRIBE、恢复后仍可投递）、`clean_session_true_discards_the_session`（§4.2：CONNACK 前实体已清、断连后 `.subs` 被删、`session/1` 回 `not_found`）、`offline_catch_up_is_offset_ordered`（E7：三条 QoS1 按 offset 序、同连接无重发；memory 的 QoS0 无积压）。**R3/R7 的 `kill -9` 与默认档/零回退档双档仍归 T14**，T13 只覆盖进程级断连与协议级恢复。
+
+### T14 实现期间发现并修正（2026-11-06，均为实测暴露）
+
+冻结 API（ADR-009/010/011）与产品代码全程未改。T14 是 S1 第一个**跨进程、跨容器运行时**的验收：它把 §8.2 的断言搬到真实 release + 真实容器 + 真实 ext4 上，因此暴露的都是"实验室外"的口径问题，而不是产品逻辑缺陷。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **M13** | §8.1 写的是 compose 里再有 `mqtt-client` 服务。但 kill -9 的注入者必须与 MQTT socket 在**同一控制流**里：`PUBACK` 收到的那一刻就要落刀，跨容器做需要额外控制通道，且会引入"客户端没来得及 ack 就被杀"的假象 | 客户端驱动跑在**宿主**（paho-mqtt 2.x，`manual_ack` 控制 ack 时刻），broker 仍在容器里，数据目录仍是真实宿主 mount；compose 文件保留 broker 服务的声明式等价物 | §8.1、§9-T14、§12 |
+| **M14** | R6 的 500 ms 预算在 §8.2 指"20k 条重放"，但若按 boot-to-port 计时，容器冷启动与 Docker daemon 抖动会主导数字，测不到存储属性 | R6 用一次性 Erlang VM 只对 `broker_storage_wal:recover/2`（4 分区）计时；VM 启动在计时之外。默认 208.836 ms、零档 204.706 ms，均远低于预算 | §8.2、§8.4 |
+| **M15** | 参考机 `docker compose` 不存在；`docker-compose` 1.29.2 因 `requests 2.32.4` / `urllib3 2.5.0` 拒绝 docker-py 6.1.3 的 `http+docker` scheme 而无法连接 daemon（`URLSchemeUnknown`） | 驱动改用等价的 `docker run` / `docker kill` / `docker start` / `docker inspect`；容器参数（user、mounts、env、port、stop timeout）与 compose 文件逐项一致，compose 文件保留给 compose 健康的机器 | §8.1、§12、`tools/docker/README.md` |
+
+**T14 实测证据摘要**：`python3 tools/docker/s1_recovery.py --tier all` 后 **16/16 PASS**（8 场景 × 2 档）。产品侧不改一行代码即通过；唯一改动的产品外文件是 `rebar.config` 的 `t14` profile 与 `.gitignore`。镜像 `erlang:28.3.1.0` 与宿主 ERTS 完全同版本（16.2），驱动在开跑前断言 `28/16.2`，版本不符即拒绝运行而不是"带警告继续"。默认档 R3 `flushed_cursor=33`、重放 18 条；零回退档 `51=N+1`、重放 0、重复 0——两档共同证明 E1 的参数语义。R4 的人工撕裂 `3196→3198→3196` 与 R6 的 208.8/204.7 ms 见 §8.4。
 
 ### T8/T9/T10 实现期间发现并修正（2026-10-23，均为实测暴露）
 

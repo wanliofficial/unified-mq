@@ -1,0 +1,40 @@
+# T14 crash-recovery harness (design §8.1).
+#
+# The broker is a single release node with the *real* data directory bind-mounted
+# from the host (ext4, not tmpfs), so `kill -9` loses exactly what an OS crash
+# loses.  The release tree itself is read-only: `../../_build/t14/rel/unified_mq`
+# is built with `rebar3 as t14 release` (dev_mode=false, include_erts=false) and
+# mounted in, and the OTP 28.3.1 image supplies the matching ERTS (16.2) -- the
+# same version the project pins on the host.
+#
+# `sys.config` and `vm.args` are rendered into ./run/ by s1_recovery.py before
+# every run: one source of truth (config/sys.config.src) with the data dir and
+# the cursor-regress knobs substituted for the default/zero tiers.
+#
+# The client driver runs on the host (see README.md, deviation M13): it has to
+# own both the MQTT socket and the instant of `docker-compose kill`.
+version: "3.8"
+
+services:
+  broker:
+    image: erlang:28.3.1.0
+    container_name: unified-mq-s1-broker
+    user: "${S1_UID:-1000}:${S1_GID:-1000}"
+    working_dir: /var/lib/unified-mq
+    environment:
+      HOME: /var/lib/unified-mq
+      ERL_CRASH_DUMP: /var/lib/unified-mq/erl_crash.dump
+      ERL_LIBS: /opt/unified_mq/lib
+      S1_TIER: "${S1_TIER:-default}"
+    entrypoint: ["/bin/sh", "/opt/s1/entrypoint.sh"]
+    volumes:
+      - ../../_build/t14/rel/unified_mq:/opt/unified_mq:ro
+      - ./entrypoint.sh:/opt/s1/entrypoint.sh:ro
+      - ./run/sys.config:/opt/unified_mq/releases/0.1.0/sys.config:ro
+      - ./run/vm.args:/opt/unified_mq/releases/0.1.0/vm.args:ro
+      - ./data:/var/lib/unified-mq
+    ports:
+      # The host's 1883 belongs to an unrelated container; 18830 keeps T14
+      # self-contained and still exercises a real TCP listener.
+      - "127.0.0.1:${S1_BROKER_PORT:-18830}:1883"
+    stop_grace_period: 10s
