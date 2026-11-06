@@ -219,7 +219,12 @@ connect_mqtt5_is_refused(_Config) ->
     {Client, Pid} = mqtt_pair(),
     Monitor = erlang:monitor(process, Pid),
     ok = gen_tcp:send(Client, mqtt_raw_connect(5, <<"c1">>)),
-    #connack{return_code = 16#87} = mqtt_recv(Client),
+    %% T15 M16: a v5 client parses CONNACK as flags|reason|properties, so the
+    %% refusal is v5-framed (5 bytes, zero properties). A 3.1.1-shaped 4-byte
+    %% CONNACK makes paho-mqtt raise in its properties decoder instead of
+    %% surfacing 0x87, so the wire bytes are asserted verbatim here and the
+    %% 3.1.1 decoder (rightly) cannot read this frame.
+    {ok, <<16#20, 3, 0, 16#87, 0>>} = gen_tcp:recv(Client, 5, 3000),
     ok = expect_closed(Client),
     {ok, normal} = expect_down(Monitor, Pid),
     ok.

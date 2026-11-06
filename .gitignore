@@ -40,5 +40,10 @@ spikes/*/.data/
 /tools/docker/run/
 /tools/docker/__pycache__/
 
+# T15 harness scratch: broker data volume, captures, reports, analyzer beam
+/test/protocol-compatibility/mqtt/data/
+/test/protocol-compatibility/mqtt/run/
+/test/protocol-compatibility/mqtt/__pycache__/
+
 # CLI tool state (not project content)
 /.qoder/

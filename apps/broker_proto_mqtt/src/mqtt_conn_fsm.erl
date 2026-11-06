@@ -239,9 +239,16 @@ tcp_frames(#st{buf = Buf} = D, StateName) ->
 %% §4.5's version posture is fed by the codec's distinct reasons: an MQTT 5
 %% CONNECT has no 3.1.1 body shape, so it is refused at parse time and the
 %% CONNACK code is derived here rather than from a #connect{} record.
+%%
+%% The refusal MUST be framed for the version the client asked for. A v5 client
+%% parses CONNACK as `flags|reason|properties-length', so the 4-byte 3.1.1 shape
+%% (`20 02 00 87') makes paho-mqtt 2.x raise inside its properties decoder
+%% instead of surfacing the refusal -- the client never learns why (T15 M16).
+%% Five bytes, zero properties: `20 03 00 87 00'. 3.1.1 stays byte-for-byte as
+%% before for every other version (mqtt_frame:connack/2).
 decode_error({unacceptable_protocol_version, 5}, awaiting_connect, D) ->
     log(warning, "mqtt 5.0 connect refused", []),
-    refuse(16#87, D);
+    {stop, normal, send_frame(<<16#20, 3, 0, 16#87, 0>>, D)};
 decode_error({unsupported_protocol_version, Other}, awaiting_connect, D) ->
     log(warning, "unsupported protocol level ~p", [Other]),
     refuse(1, D);

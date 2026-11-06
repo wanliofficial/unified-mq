@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v0.3（S0.4 基线 + S1 预填 MQTT 行）
-- **最近一次追加**：2026-11-06，§4「S1 预填：MQTT 行」——T12 的 ranch listener + paho 实连证据、CONNECT flags 缺陷（M3）与重启解码缺陷（M10/M11）、T13 的 `wal`/`memory` 双组端到端套件（12/12），以及 T14 的真实容器 `kill -9` 崩溃矩阵（默认档 / 零回退档各 8/8）；S5 的兼容性结论仍待 T15 的真实客户端套件
+- **文档版本**：v0.4（S0.4 基线 + S1 预填 MQTT 行）
+- **最近一次追加**：2026-11-06，§4「S1 预填：MQTT 行」——T12 的 ranch listener + paho 实连证据、CONNECT flags 缺陷（M3）与重启解码缺陷（M10/M11）、T13 的 `wal`/`memory` 双组端到端套件（12/12）、T14 的真实容器 `kill -9` 崩溃矩阵（默认档 / 零回退档各 8/8），以及 **T15 的真实客户端套件（paho 2.x + mosquitto 2.1.2，8/8 用例、46/46 帧字节一致）**
 - **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -14,7 +14,7 @@
 
 | 协议 | S5 顺序 | 推荐客户端 | 语言 | 基线版本 | 验证 | 备注 |
 |---|---|---|---|---|---|---|
-| MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x | ✅（S0.4 基线可获取；本机无 `mosquitto`/`tcpdump`，真实客户端跑通归 T15） | QoS0/1 已在 S1 实现；QoS2、Retain、Will、5.0 语义在 S2 补；逐条限制见本文 §4 |
+| MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x / mosquitto 2.1.2 | ✅（**T15**：8/8 用例；46/46 帧字节一致） | QoS0/1 已在 S1 实现；QoS2、Retain、Will、5.0 语义在 S2 补；逐条限制见本文 §4 |
 | WebSocket | 2 | `ws`（Broker 自有 JSON/二进制帧） | Node | ws 8.x | ✅ | 传输层用 ws，应用层帧由 S5 设计 |
 | NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.37.0 | ✅ | Pub/Sub、Queue Group、Request/Reply |
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java | proton (qpid) | ✅ | Proton=AMQP 1.0；需 0.9.1 时换 amqp091/pika |
@@ -61,24 +61,35 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 4. S1 预填：MQTT 行（T8~T10 + T12 交付，非 S5 终态）
+## 4. S1 预填：MQTT 行（T8~T10 + T12~T15 交付，非 S5 终态）
 
-> 这一行是 **S1 期间的实现事实记录**，不是 S5 的兼容性结论。真正的客户端兼容性验证（paho Python + `mosquitto_pub/sub`）归 **T15**，测试目录 `test/protocol-compatibility/mqtt/` 也在那时才存在；此处先落的证据来自 `apps/broker_proto_mqtt/test/{mqtt_frame,mqtt_conn,mqtt_listener}_SUITE.erl`（真实 TCP + 真实 `mqtt_conn_fsm`，共 54 例）、`apps/broker_security/test/broker_security_SUITE.erl`（7 例）与 `test/integration/s1_e2e_SUITE.erl`（T13：同一组端到端用例跑 `wal`/`memory`，12 例）。设计条款溯源见 [`design/s1-mqtt-vertical-slice.md`](design/s1-mqtt-vertical-slice.md) §4.1/§4.5 批注与 §13 L1~L20、M1~M12。
+> 这一行是 **S1 期间的实现事实记录**，不是 S5 的兼容性结论。T15 已把真实客户端兼容性落成 `test/protocol-compatibility/mqtt/`（paho-mqtt 2.x 宿主 + mosquitto 2.1.2 容器 + 透明 TCP tee + 生产 codec 的逐帧字节对比），本节末尾的 T15 块是其证据。其余证据来自 `apps/broker_proto_mqtt/test/{mqtt_frame,mqtt_conn,mqtt_listener}_SUITE.erl`（真实 TCP + 真实 `mqtt_conn_fsm`，共 54 例）、`apps/broker_security/test/broker_security_SUITE.erl`（7 例）与 `test/integration/s1_e2e_SUITE.erl`（T13：同一组端到端用例跑 `wal`/`memory`，12 例）。设计条款溯源见 [`design/s1-mqtt-vertical-slice.md`](design/s1-mqtt-vertical-slice.md) §4.1/§4.5 批注与 §13 L1~L20、M1~M16。
 
 > **T13 追加（2026-11-06）**：`test/integration/s1_e2e_SUITE` 把 T12 的 listener 与 §8 的端到端断言接起来：`wal` 组验证 QoS1 的 PUBACK→append→cursor/committed 全链路、非 clean 重连恢复订阅集合、三条离线消息按 offset 序追赶；`memory` 组在同一份用例清单下断言 E12（SUBACK `0x80`、超限 PUBLISH 断连且零 append）与 QoS0 无积压，**不用 skip**。这是 Gate「`broker_storage` 的 WAL 与内存实现可互换」的套件级证据；`kill -9` 级 R1a/R1b/R2~R7 归 T14（已交付，见下条）。
 
 > **T14 追加（2026-11-06）**：崩溃矩阵已在**真实容器**里交付——release（`rebar3 as t14 release`）跑在 `erlang:28.3.1.0`（宿主同版本 OTP 28.3.1 / ERTS 16.2），数据目录 bind-mount 到宿主 ext4（`wal_writer:check_filesystem` 的真实条件），`docker kill -s KILL` 注入崩溃，paho-mqtt 2.x 客户端跑在宿主。**默认档（K=64 / 100 ms）与零回退档（K=1 / 0 ms）各 8/8 PASS、零 FAIL**。与协议对端直接相关的结论：R1a 收过 PUBACK 的消息在 kill 后从 WAL 完整回放；R1b 订阅**集合**在崩溃后免重发 SUBSCRIBE 仍生效（`session_present=1`）；R2 未 ack 的并发发布只可能"全丢或成无空洞前缀"，默认档恢复 31/200、零档 29/200，全部为 `msg-0000..` 前缀；R3 默认档 cursor 退到 33（两次 33/34，重放 18/17 条、零丢失），零回退档**确定地**停在 51=N+1（重放 0、重复 0）——**重复窗口与 `cursor_max_regress` 参数语义一致**；R4 撕裂尾 3196→3198→3196、20 条全回（零档 3198→3200→3198，断言是回到撕裂前大小）；R5 QoS0 零存储零投递；R6 20k 条恢复 208.836/204.706 ms < 500 ms；R7 已投递未 ack 的消息重连后重发、无丢失。偏差 M13（宿主驱动）/M14（R6 只计 `recover/2`）/M15（compose 不可用改 CLI）不影响上述协议行为。
 
+> **T15 追加（2026-11-06）**：真实客户端兼容性套件在 `test/protocol-compatibility/mqtt/` 交付（用法与用例映射见该目录 `README.md`）。拓扑是 T14 的 release（`erlang:28.3.1.0` 容器，端口 `18831`）+ 宿主 `127.0.0.1:18832` 的透明 TCP tee；tee 把双向字节落盘，`t15_capture.erl` 用**生产 `mqtt_frame`** 逐帧 `decode→encode` 并与真实字节比较。**8/8 用例 PASS、46/46 帧 `roundtrip=ok`**（c2s + s2c）。逐项证据：
+> - `paho311-full`：CONNECT（clean、keepalive=1、guest/guest）、SUBSCRIBE `t15/paho/#` qos1、QoS1 PUBLISH、**双向 PUBACK**（客户端 ack 投递的 `40020001`，broker ack 发布的 `40020002`）、PINGREQ `c000`/PINGRESP `d000`、DISCONNECT `e000`；CONNACK `20020000`、SUBACK `9003000101`，全部字节一致。
+> - `mosq-pubsub`：mosquitto 2.1.2 QoS1 往返，SUBSCRIBE/PUBLISH/PUBACK 字节与 paho 同类帧同构；`mosquitto_sub`/`pub` 必须显式 `-i`（空 ClientID 按 §4.2 拒绝）。
+> - `paho-v5-refused` / `mosq-v5-refused`：v5 CONNECT ⇒ CONNACK **`2003008700`**（v5 帧型、零属性、reason `0x87`），paho 与 mosquitto 都读出 **135 = 0x87**（"Not authorized"）后关闭。**M16**：原先的 3.1.1 帧型 `20020087` 会让 paho 在属性解码器抛 `IndexError`、mosquitto 报 network protocol error，拒绝原因根本到不了用户；现已修正（3.1.1 其它响应字节不变）。
+> - `paho-qos2-refused`：QoS2 PUBLISH（固定头 `34`）在 parse 期被拒（`bad_publish_qos`），无 PUBREC/PUBCOMP、零存储零投递、连接关闭。
+> - `paho-retain`：入站 retain=1（`33`）被接受并投递为 retain=0（`32`），payload 原样。
+> - `paho-will-ignored`：Will CONNECT 的 flags=`ce`，异常断连后订阅端**零投递**。
+> - `paho-bad-filter`：含 NUL 的 filter（`t15/bad/\x00`）通过 paho 本地校验，broker 在 codec 拒绝（`embedded_null`），**无 SUBACK**、直接断连。
+>
+> 预期之外没有发现新的协议偏差；M16 是唯一的产品代码改动（仅拒绝帧的帧型）。
+
 > **T12 追加（2026-11-06）**：ranch listener 已上线，装配后的 release 节点用 **paho-mqtt 2.x 真实客户端**跑通 CONNECT/CONNACK、SUBSCRIBE/SUBACK、QoS1 PUBLISH→PUBACK、QoS0 与投递（`RELEASE-PAHO-OK`）。这一步立即暴露出一个**真实 CONNECT flags 位移缺陷**（§13 M3：clean session 位被解成 Will，paho 一连接即被拒），说明"手推黄金向量 + round-trip"只能证明自洽、不能证明合规；T15 的价值因此从"首个真实客户端证据"变成"补齐 mosquitto 与更多包型（含 `0x87` 与非法 filter）的字节级对比"。
 
 | 协议 | 状态 | 已支持 | 已知限制 / 转换损失 | 证据 |
 |---|---|---|---|---|
-| MQTT 3.1.1 | **部分支持**（S1 垂直切片） | CONNECT/CONNACK、PUBLISH QoS0+QoS1、PUBACK、SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK、PINGREQ/PINGRESP、DISCONNECT；topic filter 通配符 `+`/`#`（Annex A 校验）；`clean_session` 两半；`keep_alive`（服务端 clamp）；per-session 订阅集合 + cursor + in-flight 跨连接持久化（R1b/R3/R7）；`mqtt_max_qos` 按后端 capability 派生（E2/E12）；`kill -9` 后恢复行为符合 R1a/R1b/R2~R7（T14，默认档/零回退档双档） | 见下方 6 条 | `apps/broker_proto_mqtt/test/`、`apps/broker_security/test/`、`test/integration/s1_e2e_SUITE.erl`、`tools/docker/s1_recovery.py` |
+| MQTT 3.1.1 | **部分支持**（S1 垂直切片） | CONNECT/CONNACK、PUBLISH QoS0+QoS1、PUBACK、SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK、PINGREQ/PINGRESP、DISCONNECT；topic filter 通配符 `+`/`#`（Annex A 校验）；`clean_session` 两半；`keep_alive`（服务端 clamp）；per-session 订阅集合 + cursor + in-flight 跨连接持久化（R1b/R3/R7）；`mqtt_max_qos` 按后端 capability 派生（E2/E12）；`kill -9` 后恢复行为符合 R1a/R1b/R2~R7（T14，默认档/零回退档双档）；真实 paho 2.x + mosquitto 2.1.2 全链路与逐帧字节一致（T15，8/8、46/46） | 见下方 6 条 | `apps/broker_proto_mqtt/test/`、`apps/broker_security/test/`、`test/integration/s1_e2e_SUITE.erl`、`test/protocol-compatibility/mqtt/`、`tools/docker/s1_recovery.py` |
 
 **逐条限制（协议对端可观察的行为，不是内部 TODO）**：
 
 1. **QoS2 / Retain / Will 一律不实现，且非静默**（设计 §4.5）：QoS2 PUBLISH 或超过 `mqtt_max_qos` 的 PUBLISH ⇒ **直接断连、不发任何 ack**；QoS2 SUBSCRIBE（或 `0x80` 任一超限 topic）⇒ SUBACK 对应返回 `0x80` 且不建订阅；PUBLISH 的 retain 位 ⇒ 丢弃该位、消息正常流转、日志 `mqtt_retain_ignored`；CONNECT 的 Will ⇒ 解析后忽略、不存储、异常断连时**不会**有遗嘱消息投出，日志 `mqtt_will_ignored`。
-2. **CONNACK 返回码 `0x87` 是有意的不对称**（设计 §4.5 + §13 L12）：MQTT 5.0 的 CONNECT（`Protocol Level = 5`）被拒绝时，本 broker 回 `0x87`（Not supported），而 3.1.1 把 1~5 之外的字节列为 "reserved for future versions"。**后果**：严格按 3.1.1 实现的对端可能把这一个字节当作畸形包处理，而不是当作"拒绝连接"的语义应答。T15 需要用 paho 与 mosquitto 各验一次这条路径。
+2. **MQTT 5.0 的拒绝是可读的 v5 帧型，但原因码仍取设计冻结值 `0x87`**（设计 §4.5 + §13 M16/L12）：`Protocol Level = 5` 的 CONNECT 被拒绝时，broker 回 **`20 03 00 87 00`**（v5 CONNACK：flags=0、reason=0x87、零属性）后关闭。paho 2.x 与 mosquitto 2.1.2 都把它读成 **135 = 0x87（"Not authorized"）**——原先的 3.1.1 帧型 `20 02 00 87` 会让两个客户端在属性解码阶段报错（M16，已修）。注意 v5 规范里"不支持的协议版本"是 `0x84`，`0x87` 是"未授权"；S1 按冻结设计保留 `0x87`，MQTT 5 的完整语义属 S2。对 3.1.1 客户端，`0x87` 仍是 3.1.1 的保留返回码，严格实现可能视为畸形字节（L12）。
 3. **非法 topic filter 的 SUBSCRIBE 是断连，不是 `0x80`**（§13 L13）：filter 在帧解码阶段就校验（Annex A / §4.7 形状），因此整个 SUBSCRIBE 包属于畸形包 ⇒ 关连接、**无 SUBACK**。`0x80` 只覆盖"请求 QoS 超过有效上限"。客户端若指望逐 topic 部分成功，需要自己保证 filter 合法。
 4. **离线追赶没有优先级、没有独立队列**（设计 §5.2 E7）：重连后从 cursor 顺序读，追赶期间新到的消息与积压消息**按 offset 混在同一序列**投递；积压极深时首条消息延迟随深度线性增长（单连接顺序读）。段文件在 S1 不删，所以"理论全量可追"，但追赶深度上限要等 S2 的 retention 策略才有明确契约。
 5. **at-least-once 的两个 S1 形状**（§13 L8 + §5.3）：(a) 一条连接对同一个未 PUBACK 的消息**只投一次**，S1 没有重试定时器——重发只发生在**重连**（blob 恢复项按 **同一 packet_id + DUP=1** 投一次）；(b) `.inflight` 默认攒批刷盘（`inflight_flush_interval_ms`，默认 100 ms），崩溃后 blob 回退可能让**不同消息复用同一 packet_id**（按 id 去重的客户端会误判）。`inflight_flush_interval_ms = 0` 是已实现的零回退档；T14 已按默认档 / 零回退档各跑一轮，两档都不丢消息（R7），默认档允许重发、零回退档把回退窗口压到最小。
