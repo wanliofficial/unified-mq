@@ -92,8 +92,10 @@ inflight(ClientId, Term) ->
 %% @doc Bind the live connection process to the client's session. `Persist'
 %% mirrors clean_session (§4.2): on detach, false tears the whole session down
 %% (entities, Router index, files), true keeps everything for the reconnect
-%% that will find the cursors waiting.
--spec attach(binary(), pid(), boolean()) -> ok.
+%% that will find the cursors waiting. Answers the previously attached pid
+%% (MQTT §4.3 takeover — the new conn tells it to close; `undefined' when the
+%% same pid re-attaches, so nobody is ever asked to kill themselves).
+-spec attach(binary(), pid(), boolean()) -> {ok, pid() | undefined}.
 attach(ClientId, Pid, Persist) ->
     broker_subscription_worker:attach(ClientId, Pid, Persist).
 

@@ -25,7 +25,8 @@ all() ->
      corrupt_length_never_decodes_as_ok,
      unknown_vsn_is_refused,
      body_vsn_disagreeing_with_the_header_is_refused,
-     bad_magic_is_refused].
+     bad_magic_is_refused,
+     body_decodes_without_the_writing_apps_modules].
 
 %%%_* Tests --------------------------------------------------------------
 
@@ -185,7 +186,45 @@ bad_magic_is_refused(_Config) ->
     {error, {bad_magic, 0}} = wal_codec:decode(<<0:8, Vsn:8, Crc:32, Len:32, Body/binary>>, 1),
     ok.
 
+%% 【M10】: `proto_meta' is protocol-private, so the body carries atoms only the
+%% writer's app knows (`qos'/`retain'/`packet_id' come from broker_proto_mqtt).
+%% Decoding with `[safe]' therefore worked only when those modules happened to
+%% be loaded first: relx's start.script primLoads every module, so releases hid
+%% the bug, while a `rebar3 shell' restart over the first QoS 1 record failed
+%% with partition_recover_failed + {bad_body, badarg}.
+%%
+%% A peer node with only broker_core/broker_storage on its code path reproduces
+%% the boot order that used to break, without depending on which modules this
+%% CT node has already loaded.
+body_decodes_without_the_writing_apps_modules(_Config) ->
+    ProtoMeta = #{qos => 1, dup => 0, retain => 0, packet_id => 7},
+    Bin = wal_codec:encode((msg())#broker_message{proto_meta = ProtoMeta}),
+    BodyAtoms = ["qos", "retain", "packet_id"],
+    {ok, Peer, _Node} =
+        peer:start_link(#{name => wal_codec_suite_peer,
+                          args => ["-pa", filename:dirname(code:which(wal_codec))],
+                          connection => standard_io}),
+    try
+        %% Guard the guard: if the peer already knew these atoms the case would
+        %% pass even with `[safe]' and prove nothing.
+        false = lists:any(fun(Name) -> peer_has_atom(Peer, Name) end, BodyAtoms),
+        {ok, Decoded, _Size} = peer:call(Peer, wal_codec, decode, [Bin, 2]),
+        [{<<"dup">>, 0}, {<<"packet_id">>, 7}, {<<"qos">>, 1}, {<<"retain">>, 0}] =
+            lists:sort([{atom_to_binary(Key, utf8), Value}
+                        || {Key, Value} <- maps:to_list(Decoded#broker_message.proto_meta)]),
+        %% ... and decoding is what brought them into existence.
+        true = lists:all(fun(Name) -> peer_has_atom(Peer, Name) end, BodyAtoms)
+    after
+        peer:stop(Peer)
+    end.
+
 %%%_* Helpers ------------------------------------------------------------
+
+peer_has_atom(Peer, Name) ->
+    case catch peer:call(Peer, erlang, list_to_existing_atom, [Name]) of
+        Atom when is_atom(Atom) -> true;
+        _ -> false
+    end.
 
 msg() ->
     msg(3, <<"payload">>).

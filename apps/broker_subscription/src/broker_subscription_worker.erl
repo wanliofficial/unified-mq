@@ -144,11 +144,25 @@ handle_call({inflight, ClientId, Term}, _From, State) ->
     {reply, ok, maybe_flush_inflight(ClientId, State1)};
 
 handle_call({attach, ClientId, Pid, Persist}, _From, State) ->
+    %% `{ok, PrevPid | undefined}': the takeover signal the new conn sends to
+    %% Prev itself — this process must not touch the old socket (K10's pid
+    %% guard stays the authority on eviction). The same-pid case answers
+    %% `undefined' so a re-attach never tells a conn to kill itself, and the
+    %% replaced row's monitor is released here (ref leak otherwise).
+    Prev = case ets:lookup(?ATTACHMENTS, ClientId) of
+               [{_, #{pid := Pid, ref := _StillValid}}] ->
+                   undefined;
+               [{_, #{pid := OldPid, ref := OldRef}}] ->
+                   _ = erlang:demonitor(OldRef, [flush]),
+                   OldPid;
+               [] ->
+                   undefined
+           end,
     true = ets:insert(?ATTACHMENTS,
                       {ClientId, #{pid => Pid,
                                    ref => erlang:monitor(process, Pid),
                                    persist => Persist}}),
-    {reply, ok, State};
+    {reply, {ok, Prev}, State};
 
 handle_call({detach, ClientId, Pid}, _From, State) ->
     {ok, State1} = do_detach(ClientId, Pid, State),

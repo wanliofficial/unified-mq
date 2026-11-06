@@ -94,8 +94,19 @@ body_tuple(Vsn, #broker_message{message_id = MsgId,
     {Vsn, MsgId, Tenant, Destination, Payload, PayloadEncoding, Persistence,
      ProtoMeta, Headers, Reliability, CreatedAt, ExpiresAt, Event}.
 
+%% NOT `[safe]' (design §13 M10). `proto_meta' is a protocol-private map, so the
+%% body legitimately carries atoms that only the *writer's* app knows:
+%% `qos'/`retain'/`packet_id' come from broker_proto_mqtt. `[safe]' makes
+%% decoding depend on those modules happening to be loaded before recovery --
+%% true for a relx release (start.script primLoads every module) and false for
+%% `rebar3 shell', where a restart after the first QoS 1 record failed with
+%% `partition_recover_failed' + `{bad_body, badarg}'. Integrity and version are
+%% already pinned by the CRC-32 check above and the Vsn branch below, and the
+%% WAL directory is local trusted state, so atom creation here is not the
+%% untrusted-input hazard `[safe]' guards against. wal_meta keeps `[safe]': its
+%% body is a fixed `{Vsn, Committed, TruncateBefore}' of integers.
 decode_body(Vsn, Body, PartitionId, Size) when Vsn =:= ?VSN ->
-    try binary_to_term(Body, [safe]) of
+    try binary_to_term(Body) of
         {?VSN, MsgId, Tenant, Destination, Payload, PayloadEncoding, Persistence,
          ProtoMeta, Headers, Reliability, CreatedAt, ExpiresAt, EventBlob} ->
             {ok, #broker_message{message_id = MsgId,

@@ -53,7 +53,9 @@ all() ->
 init_per_suite(Config) ->
     %% Read the env rather than inheriting it: CT loads no sys.config, and
     %% broker_queue's defaults would otherwise decide the partition count.
-    ok = application:load(broker_queue),
+    %% `_ =' on purpose: CT runs every suite in one node, and an earlier suite
+    %% may have loaded the app already.
+    _ = application:load(broker_queue),
     ok = application:set_env(broker_queue, partitions, ?N),
     Config.
 

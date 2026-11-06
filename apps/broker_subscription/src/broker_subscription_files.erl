@@ -101,15 +101,22 @@ write_inflight(ClientId, Term) ->
 
 -spec read_subs(binary()) -> {ok, subs_body() | none} | {error, term()}.
 read_subs(ClientId) ->
-    read(subs_path(ClientId)).
+    read(subs_path(ClientId), [safe]).
 
 -spec read_cursors(binary()) -> {ok, cursors_body() | none} | {error, term()}.
 read_cursors(ClientId) ->
-    read(cursors_path(ClientId)).
+    read(cursors_path(ClientId), [safe]).
 
 -spec read_inflight(binary()) -> {ok, term() | none} | {error, term()}.
 read_inflight(ClientId) ->
-    read(inflight_path(ClientId)).
+    %% NOT `[safe]' (design §13 M11): the blob is opaque and written by the
+    %% conn FSM, so it carries that app's atoms (`next_pid'/`pending'). Boot
+    %% step 2 reads it before broker_proto_mqtt starts, and a `[safe]' decode
+    %% then failed with `{corrupt_session, Path}' -- a persisted session became
+    %% a boot blocker. `.subs'/`.cursors' bodies are binaries and integers
+    %% only, so they keep `[safe]'. Integrity comes from the atomic rename, and
+    %% the file lives in the local trusted data dir (same reasoning as M10).
+    read(inflight_path(ClientId), []).
 
 %% @doc Boot step 2's input (design §6): every persisted subscription set.
 %% Only `.subs' files are listed -- the set is authoritative (§10.6), cursor
@@ -163,10 +170,10 @@ read_file_subs(Path) ->
             {error, {read_failed, Path, Reason}}
     end.
 
-read(Path) ->
+read(Path, TermOpts) ->
     case file:read_file(Path) of
         {ok, Bin} ->
-            case decode(Bin, Path) of
+            case decode(Bin, Path, TermOpts) of
                 {ok, _ClientId, Body} -> {ok, Body};
                 {error, Reason} -> {error, Reason}
             end;
@@ -182,7 +189,10 @@ encode(ClientId, Body) ->
     term_to_binary({vsn, 1, ClientId, Body}).
 
 decode(Bin, Path) ->
-    try binary_to_term(Bin, [safe]) of
+    decode(Bin, Path, [safe]).
+
+decode(Bin, Path, TermOpts) ->
+    try binary_to_term(Bin, TermOpts) of
         {vsn, 1, ClientId, Body} -> {ok, ClientId, Body};
         {vsn, V, _, _} -> {error, {unsupported_vsn, V, Path}};
         Other -> {error, {corrupt_session, Path, Other}}

@@ -5,18 +5,28 @@
 %% read directly by `rebar3 shell'. Contains no {{...}} placeholders, so the
 %% same file serves both paths.
 [
-  %% SASL progress/error reports go to the default logger in S1. File-based
-  %% error logging (and the log/ directory that would back it) belongs to T12's
-  %% dev environment, not to this skeleton.
+  %% T12's dev environment: progress/error reports go to both the console and a
+  %% file under log/ (design §13 H5 deferred file logging to T12). The path is
+  %% relative to the node's CWD — the repo root for `rebar3 shell', the release
+  %% root for bin/unified_mq — and logger_std_h creates the directory. This is a
+  %% dev convenience only; S1's tests and Gate evidence still come from stdout.
+  {kernel, [
+    {logger, [
+      {handler, s1_file, logger_std_h,
+       #{config => #{file => "log/s1.log"},
+         formatter => {logger_formatter, #{single_line => true,
+                                           legacy_header => false}}}}
+    ]}
+  ]},
 
   {broker_storage, [
     {backend, broker_storage_wal},
-    %% Relative, so it resolves against the node's CWD. The relx-generated
-    %% bin/unified_mq does `cd "$ROOTDIR"` before exec, which makes that CWD the
-    %% release root -- a relative data_dir therefore lives inside _build and is
-    %% wiped by the next `rebar3 release` (design §13 J8). T12's dev environment
-    %% must set an absolute path outside the release tree.
-    {data_dir, "data"},
+    %% Absolute and OUTSIDE the release tree (J8): relx's launcher `cd`s to the
+    %% release root, so a relative `data_dir` would live in `_build/.../rel`
+    %% and be wiped by the next `rebar3 release`; the out-of-band
+    %% `create_partition/1` run would then create partitions somewhere the node
+    %% never looks. `/home` is ext4 on this dev host (J11).
+    {data_dir, "/home/wanli/workspace/unified-mq/data"},
     %% S0.3 §2.2: batch=32 is the throughput inflection point (17x over
     %% single-message fsync); 256 caps the latency cost of waiting for a batch.
     %% A map, not a proplist: broker_queue:storage_config/0 hands this value
@@ -41,9 +51,10 @@
 
   {broker_subscription, [
     %% Its own key, not broker_storage's: layers read their own config even
-    %% when the values coincide (design §13 K4; J8's relative-path note
-    %% applies here too -- resolves against the node's CWD).
-    {data_dir, "data"},
+    %% when the values coincide (design §13 K4). Must be the same absolute path
+    %% as broker_storage's `data_dir' (J8), or `.subs'/`.cursors' land somewhere
+    %% the node's storage side never sees.
+    {data_dir, "/home/wanli/workspace/unified-mq/data"},
     %% Bounded cursor regress window (Gate S1 R3). Setting both to 1/0 selects
     %% the near-zero-regress tier, which pays a per-ack fsync.
     {cursor_max_regress, 64},
@@ -63,14 +74,26 @@
   ]},
 
   {broker_proto_mqtt, [
+    %% One listener per map (T12, design §6 boot step 4). The listener is what
+    %% makes the MQTT port exist at all; `rebar3 shell` and the release both read
+    %% this file, and CT supplies its own ephemeral listener instead.
     {listeners, [
       #{port => 1883,
+        num_acceptors => 10,
+        max_connections => 1024,
         %% Must be 0 whenever broker_storage:backend is broker_storage_memory
         %% (design §3.3 E12), so QoS 1 is refused at SUBACK instead of failing
-        %% at append time.
+        %% at append time. Everything in this map travels to the connection as
+        %% `ProtoOpts' (the L20 seam); the app-level keys below are the defaults
+        %% for connections started outside a listener (tests, embedded use).
         mqtt_max_qos => 1,
-        num_acceptors => 10,
         max_keepalive_ms => 60000}
-    ]}
+    ]},
+    {pull_page_limit, 32},
+    {max_inflight, 64},
+    {pull_poll_interval_ms, 1000},
+    {inflight_snapshot_ms, 20},
+    {mqtt_max_qos, 1},
+    {max_keepalive_ms, 60000}
   ]}
 ].

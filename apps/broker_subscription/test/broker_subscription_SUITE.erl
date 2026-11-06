@@ -48,6 +48,7 @@ all() ->
      a_lost_cursors_file_falls_back_to_the_subs_origin_not_committed,
      an_offline_persistent_subscriber_pins_and_releases_the_watermark,
      inflight_is_an_opaque_blob_that_may_only_staleness_lag,
+     persisted_inflight_blob_decodes_without_the_mqtt_apps_atoms,
      overlapping_filters_of_one_client_merge_into_one_delivery,
      a_dead_attached_process_detaches_and_clean_session_tears_down,
      detach_is_pid_guarded_against_takeover,
@@ -255,7 +256,7 @@ acking_a_dead_subscription_is_idempotent_ok(_Config) ->
 reads_survive_a_suspended_worker(_Config) ->
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
-    ok = broker_subscription:attach(<<"c1">>, self(), true),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, self(), true),
     Worker = whereis(broker_subscription_worker),
     ok = sys:suspend(Worker),
     {ok, 1} = broker_subscription:cursor(SubRef, 0),
@@ -373,7 +374,7 @@ an_offline_persistent_subscriber_pins_and_releases_the_watermark(_Config) ->
     {ok, Offline} = broker_subscription:subscribe(<<"slow">>, <<"slow/#">>, 1),
     {ok, _} = append(0, <<"slow/x">>),
     Pid = spawn(fun() -> timer:sleep(60000) end),
-    ok = broker_subscription:attach(<<"slow">>, Pid, true),
+    {ok, undefined} = broker_subscription:attach(<<"slow">>, Pid, true),
     ok = broker_subscription:detach(<<"slow">>, Pid),
     %% The subscriber is gone but its session (and cursor 1) is kept: it pins.
     ok = broker_subscription:ack(Online, 0, 1),
@@ -406,13 +407,47 @@ inflight_is_an_opaque_blob_that_may_only_staleness_lag(_Config) ->
     true = (V =:= 1) orelse (V =:= 2),
     ok.
 
+%% 【M11】The blob is opaque and belongs to the conn FSM, so it carries that
+%% app's atoms (`next_pid'/`pending'). Boot step 2 reads it *before*
+%% broker_proto_mqtt starts, so decoding with `[safe]' turned a persisted
+%% session into a boot blocker: `broker_subscription_worker:init/1' exited with
+%% `{inflight_file,{corrupt_session,Path}}'. A peer node with only this app on
+%% its code path reproduces that boot order (this CT node has every module
+%% loaded, which is why the bug hid here).
+persisted_inflight_blob_decodes_without_the_mqtt_apps_atoms(Config) ->
+    DataDir = ?config(data_dir, Config),
+    ok = broker_subscription_files:write_inflight(<<"peer-blob">>,
+                                                  #{next_pid => 2, pending => []}),
+    Ebin = filename:dirname(code:which(broker_subscription_files)),
+    {ok, Peer, _Node} =
+        peer:start_link(#{name => subscription_blob_peer,
+                          args => ["-pa", Ebin],
+                          connection => standard_io}),
+    try
+        %% Guard the guard: `[safe]' can only fail on an atom the peer does not
+        %% know, so a peer that already had it would prove nothing.
+        false = peer_has_atom(Peer, "next_pid"),
+        ok = peer:call(Peer, application, set_env,
+                       [broker_subscription, data_dir, DataDir]),
+        {ok, #{next_pid := 2, pending := []}} =
+            peer:call(Peer, broker_subscription_files, read_inflight, [<<"peer-blob">>])
+    after
+        peer:stop(Peer)
+    end.
+
+peer_has_atom(Peer, Name) ->
+    case catch peer:call(Peer, erlang, list_to_existing_atom, [Name]) of
+        Atom when is_atom(Atom) -> true;
+        _ -> false
+    end.
+
 %%%_* dispatch (H7, §5.1(f)/K9) ------------------------------------------------
 
 overlapping_filters_of_one_client_merge_into_one_delivery(_Config) ->
     ok = boot(),
     {ok, Wide} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 0),
     {ok, Narrow} = broker_subscription:subscribe(<<"c1">>, <<"sport/tennis/+">>, 1),
-    ok = broker_subscription:attach(<<"c1">>, self(), true),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, self(), true),
     Refs = route_refs(<<"sport/tennis/a">>),
     true = lists:member(Wide, Refs) andalso lists:member(Narrow, Refs),
     ok = broker_subscription:dispatch(Refs, {0, 5, msg(<<"x">>)}),
@@ -428,7 +463,7 @@ overlapping_filters_of_one_client_merge_into_one_delivery(_Config) ->
 a_dead_attached_process_detaches_and_clean_session_tears_down(_Config) ->
     ok = boot(),
     {ok, _SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
-    ok = broker_subscription:attach(<<"c1">>, self(), false),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, self(), false),
     %% Persist=false (§4.2 clean session): the detach itself must remove the
     %% entities, the Router entries and the files.
     ok = broker_subscription:detach(<<"c1">>, self()),
@@ -443,8 +478,11 @@ detach_is_pid_guarded_against_takeover(_Config) ->
     {ok, _} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
     Old = spawn(fun() -> timer:sleep(60000) end),
     New = self(),
-    ok = broker_subscription:attach(<<"c1">>, Old, true),
-    ok = broker_subscription:attach(<<"c1">>, New, true),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, Old, true),
+    %% T9's takeover input: attach answers the *previous* pid, the new conn
+    %% decides what to do with it (close its socket).
+    {ok, Old} = broker_subscription:attach(<<"c1">>, New, true),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, New, true),
     %% K10: the old socket's late DOWN/detach after a takeover must not evict
     %% the survivor.
     ok = broker_subscription:detach(<<"c1">>, Old),
