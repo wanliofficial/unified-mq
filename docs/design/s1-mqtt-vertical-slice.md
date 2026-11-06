@@ -1,11 +1,11 @@
 # S1 方案设计 — MQTT 垂直切片原型
 
-- **文档版本**：v0.9（T7 实现同步版）
+- **文档版本**：v0.11（T13 集成套件同步版）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §3
 - **前置**：S0 已完成，ADR-001~008 已定稿；ADR-009/010/011（三抽象）**已冻结**（[`docs/adr/`](../adr/)）
 - **目标 Gate**：roadmap §3.4「Gate S1」
-- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端、T5 WAL 后端、T6 分区 Worker、T7 订阅层已实现并实测通过**（181 个 CT 用例：既有 157 + T7 订阅 21 + Router 监督树 3，`rebar3 ct` 无一条 FAILED、`xref`/`dialyzer` 干净）；**装配后的 release 节点实测**：T6 的两半（干净目录响亮失败 / 带外建分区后 11 app 全起）复验通过，T7 的 R1b 节点级预演通过——带外建 4 分区 → `bin/unified_mq start` → `subscribe(<<"c1">>, <<"sport/#">>, 1)` → `data/sessions/YzE.subs` 落盘 → `application:stop+ensure_all_started(broker_subscription)` → route 索引仍含该 SubRef（boot step 2+3 回填走 `already_registered` 路径）、`cursor/2` 从 `.subs` 内嵌原点恢复 → 下一步 T9
-- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）；**v0.6 → v0.7 同步 T5 实测发现（I1~I15，见 §13）：WAL 模块划分、组提交策略模块形态、tmpfs 防护位置、E5 并发结论、以及 H8「分区 bootstrap 由谁做」的归属答复**；**v0.7 → v0.8 同步 T6 实测发现（J1~J11，见 §13）：§5.1(d) 的"分区 Worker 串行化"改为"单一 storage writer 串行化"（否则 group commit 退化成每批 1 条）、H8 的 `create_partition/1` 与 boot step 1 已落地并在 release 上实测两半、OTP 28 `get_env/2` 返回 `{ok,Val}`、relx 脚本 `cd $ROOTDIR` 使相对 `data_dir` 落进 release 树**；**v0.8 → v0.9 同步 T7 实测发现（K0~K10，见 §13）：修掉 T3 遗留的 Router 装配缺口（`broker_router_sup` 从不启动索引 store，I12 同类），§5.3 的 cursor 文件按 H11 落成 per-client 聚合的 `.cursors` 并把订阅原点内嵌进 `.subs`（恢复规则"绝不回退到 Committed/0/High 兜底"），committed 聚合公式定死为 `min(活 cursor) − 1` 且刷盘严格先于 `advance_committed`，OQ-2 答复为"不抽 behavior"**。ADR 侧只加**冻结后批注**，不动已冻结文本
+- **状态**：设计评审收敛 + T0.5 三份 ADR 已冻结 + **T1 骨架、T3 Router、T4 内存后端、T5 WAL 后端、T6 分区 Worker、T7 订阅层、T8 帧编解码、T9 连接 FSM、T10 security 桩、T12 监督树整合 + ranch listener + dev 环境、T13 集成套件已实现并实测通过**（256 个 CT 用例：T7 后 181 + T8 帧 23 + T9 连接 27 + T10 认证 7 + T12 listener 4 + 解码回归 2（WAL / 会话 blob）+ T13 集成 12（`wal`/`memory` 双组），`rebar3 ct` 零 `FAILED` 明细行且零 Skipped、`dialyzer` 干净、`xref` 仅剩预期 unused-export）；**装配后的 release 节点实测**：T6 的两半（干净目录响亮失败 / 带外建分区后 11 app 全起）复验通过，T7 的 R1b 节点级预演通过——带外建 4 分区 → `bin/unified_mq start` → `subscribe(<<"c1">>, <<"sport/#">>, 1)` → `data/sessions/YzE.subs` 落盘 → `application:stop+ensure_all_started(broker_subscription)` → route 索引仍含该 SubRef（boot step 2+3 回填走 `already_registered` 路径）、`cursor/2` 从 `.subs` 内嵌原点恢复 → `rebar3 shell` 冒烟确认 `mqtt_conn_sup` 在真实 app 树里注册（`broker_proto_mqtt_sup` 的唯一子项）。**T9 的 27 个连接用例是真实 TCP + 真实 `mqtt_conn_fsm` 子进程**（非 mock）：CONNACK 六种码、`mqtt_max_qos` 三种姿态、PUBACK 不被 dispatch 阻塞（挂起 worker 反证）、重叠 filter 恰一次、E7 离线追赶按 offset 序、DUP=1 同 packet_id、takeover 关旧留新 + 迟到 detach 被 K10 弹回、clean session 拆除、memory 后端整条 E12 姿态。**T12 已把 §6 的 boot step 4 落成真实监听端口**：`broker_proto_mqtt_sup` 在 `mqtt_conn_sup` 之后用 `ranch:child_spec/5` 起 listener（`transient`），`mqtt_listener:start_link/3` 仍只经 T9 的 `mqtt_conn_sup:start_conn/2`（无新接缝）；装配后的 release 用 **paho-mqtt 真实客户端**跑通 CONNECT/CONNACK、SUBSCRIBE/SUBACK、QoS1 PUBLISH→PUBACK、QoS0 与投递（`RELEASE-PAHO-OK`），并顺带暴露并修掉两类**真实缺陷**：CONNECT flags 位移一位（§13 M3，真实客户端首次暴露），以及把 `[safe]` 当通用规则导致的"重启即失败"——WAL 记录体（§13 M10，写过一条 QoS1 后 `partition_recover_failed`）与 `.inflight` 会话 blob（§13 M11，持久会话直接让 `broker_subscription` 起不来），两者都由 `rebar3 shell` 的非 primLoad 启动顺序首次暴露。**T13 已把 §9 的端到端集成套件落成 `test/integration/s1_e2e_SUITE`**：6 个用例 × `wal`/`memory` 两个 CT group（同一套件跑两个后端），全程真实 TCP + T12 的 ranch listener，覆盖 QoS0 往返、QoS1 的 WAL 全链路与 memory 的 E12 姿态、§4.8 不升 QoS、非 clean 重连恢复订阅集合、clean=true 拆除、E7 离线追赶按 offset 序；`All 256 tests passed` 且零 FAILED/Skipped。**尚未实测**：`kill -9` 级 PUBACK-before-fsync 证明（T14）、真实客户端字节级对比（T15，T12 的 paho 连接已覆盖 CONNECT 一个包）→ 下一步 T14。
+- **修订记录**：v0.1 → v0.2 应用 27 项整改（B1~B4、C1~C6、S1~S6、D1~D13）；v0.2 → v0.3 应用复审整改 12 项（E1~E12）；v0.3 → v0.4 应用冻结评审 7 项（F1~F6、G1）；v0.4 → v0.5 同步 T1/T3/T4 实测发现（H1~H11），变更摘要见 §13；v0.5 → v0.6 把 T4 的 13 个契约用例参数化为 `apps/broker_storage/test/broker_storage_contract.hrl`，使 Gate「WAL 与内存实现可互换」成为机械检查（§7.1、§9 T5 行）；**v0.6 → v0.7 同步 T5 实测发现（I1~I15，见 §13）：WAL 模块划分、组提交策略模块形态、tmpfs 防护位置、E5 并发结论、以及 H8「分区 bootstrap 由谁做」的归属答复**；**v0.7 → v0.8 同步 T6 实测发现（J1~J11，见 §13）：§5.1(d) 的"分区 Worker 串行化"改为"单一 storage writer 串行化"（否则 group commit 退化成每批 1 条）、H8 的 `create_partition/1` 与 boot step 1 已落地并在 release 上实测两半、OTP 28 `get_env/2` 返回 `{ok,Val}`、relx 脚本 `cd $ROOTDIR` 使相对 `data_dir` 落进 release 树**；**v0.8 → v0.9 同步 T7 实测发现（K0~K10，见 §13）：修掉 T3 遗留的 Router 装配缺口（`broker_router_sup` 从不启动索引 store，I12 同类），§5.3 的 cursor 文件按 H11 落成 per-client 聚合的 `.cursors` 并把订阅原点内嵌进 `.subs`（恢复规则"绝不回退到 Committed/0/High 兜底"），committed 聚合公式定死为 `min(活 cursor) − 1` 且刷盘严格先于 `advance_committed`，OQ-2 答复为"不抽 behavior"**；**v0.9 → v0.10 同步 T8/T9/T10 实测发现（L1~L20，见 §13）：§4.1 的"mosquitto 抓包黄金样本"按规范示例手推 + 6 条 proper 属性等价替代（L1）；§4.2 连接图三处过期（`awaiting_owner` 状态、子进程 `temporary` 而非 `transient`、无 `mqtt_session` 模块，L5/L15）；keepalive 不能用 `state_timeout`（任何事件都会取消它 ⇒ conn 自己的定时器替死对端续命）且 `keep_alive=0` 取服务端上限而非禁用（L3）；capability 从"启动时查一次"改为 CONNECT 时按全分区算 `EffectiveMaxQos`（L11）；§4.5 要求发的 CONNACK `0x87` 是 3.1.1 的保留字节 ⇒ 解码侧守卫放宽、有意不对称（L12）；非法 filter 在 codec parse 期即拒绝，姿态是断连无 SUBACK 而非逐 topic 0x80（L13）；takeover 落成 `attach/3 → {ok, PrevPid}` + 新 conn 自旧 conn 发内部消息，旧 conn 跳过 blob 快照、迟到 detach 由 K10 pid 守卫弹回（L17）；DUP 重发收敛为"每条连接恰好一次"（L8）；ADR-010 的 opaque env 在第一个真实消费者处显形，`route/3` 的 `#route_ctx{}` 与"永不返回 `[]`"按冻结契约落实（L16）**；**v0.10 → v0.11 同步 T13 集成套件：`test/integration/s1_e2e_SUITE` 以 `wal`/`memory` 两个 CT group 跑同一组端到端用例（Gate「WAL 与内存实现可互换」的套件级证据），并记录验收工具的 stale-beam 计数问题（M12）**。ADR 侧只加**冻结后批注**，不动已冻结文本
 
 ---
 
@@ -66,7 +66,7 @@ test/
 
 **应用职责边界**：`broker_core` 只提供 header/类型/behavior 定义，**不含业务函数**；消息构造、时间戳生成、ID 分配下沉到各 app 内部（`broker_proto_mqtt` 构造 `#broker_message{}`，`broker_storage` 分配 offset，`broker_subscription` 维护 cursor）。避免 `.hrl` include 依赖导致 app 循环，防止 `broker_core` 变成"上帝 app"。
 
-**配置读取**：S1 无 `broker_config` app，全部通过 `application:get_env/2` 直读 `sys.config`；监督树无 `broker_config_sup`。roadmap §3.1「Mnesia 只放最小配置」在 S1 进一步降级为「无 Mnesia，纯静态配置」。
+**配置读取**：S1 无 `broker_config` app，全部通过 `application:get_env/3`（带代码默认，OTP 28 的 2 元形式返回 `{ok, V}`，见 §13 J3）直读 `sys.config`；监督树无 `broker_config_sup`。roadmap §3.1「Mnesia 只放最小配置」在 S1 进一步降级为「无 Mnesia，纯静态配置」。
 
 **T1 实测的 relx 接线**：`config/sys.config.src` 与 `config/vm.args.src` 必须用 relx 的 `{sys_config, ...}` / `{vm_args, ...}` 键接入。用 `{sys_config_src, ...}` / `{vm_args_src, ...}`（rebar3 3.27）会把文件原名拷进 `releases/Vsn/`（仍是 `*.src`），启动脚本找不到而不拉起节点。两文件均不含 `{{...}}` 占位，因此 `rebar3 shell` 的 `{config, "config/sys.config.src"}` 可直接复用同一份；`vm.args` 则只有 release 节点读，shell 不读（实测为 `nonode@nohost`）。
 
@@ -234,6 +234,8 @@ MQTT 3.1.1 帧结构简单，S1 **不引入外部依赖**，在 `apps/broker_pro
 
 变长 Remaining Length、UTF-8 字符串、topic filter 通配符校验严格按 OASIS MQTT 3.1.1 规范；单元测试用 mosquitto 抓包字节做黄金样本，配合 `proper` 模糊测试。
 
+**T8 实测批注（2026-10-23）**：本机无 `mosquitto`/`tcpdump`，"抓包字节"改为**按规范示例逐字节手推**，再由 6 条 `proper` 属性（round-trip / 流切分不变 / `decode/1` 对任意二进制不崩 / varint 双向 / `encode/1` 拒非法 / 单 bit 翻转不产生"另一种合法帧"）覆盖抓包原本要担保的那一半；真实客户端的字节级对比仍是 T15 的交付，未在 T8 内偷换（§13 L1）。另外两条形状在此确定：`decode/1` **永不 crash**（入站不可信），`encode/1` 对非法构造**抛编程错误**而非返回 `{error,_}`（出站由构造点保证，L2）；SUBSCRIBE 的 topic filter 在 **parse 期**校验，非法 filter 因而不是"逐 topic 回 `0x80`"而是整个包畸形 ⇒ 断连无 SUBACK（L13，见 §4.5）。
+
 ### 4.2 连接 FSM 与会话
 
 ```
@@ -245,6 +247,8 @@ mqtt_listener (ranch acceptor)
         ├── capability 缓存（启动时查一次，E2）
         └── 关联 mqtt_session（per-ClientId，clean_session=false 时跨连接存活 + 持久化）
 ```
+
+**T9 实测批注（2026-10-23）——上图三处已过期，实现以此为准**：(1) 状态多一个前置的 **`awaiting_owner`**——`controlling_process` 完成前碰 socket 就是 `not_owner`，且交接用的普通 `Pid ! connect` 在 `handle_event_function` 下到达为 `info` 事件（不是 `$gen_cast`），子句不能守卫事件类型（L5）；(2) 子进程实际是 **`temporary` + `brutal_kill`** 而非 `transient`——对端造成的死亡本来就按 `normal` 停手（见模块前言），`transient` 在这种情况下与 `temporary` 等价；差别在**我们自己的故障**（`{setopts_failed,_}`、`{append_failed,_}`、`{publish_failed,_}`）：`transient` 会重启，而重启拿到的是同一个多半已死的 socket，只会原地打转，`temporary` 让任何停止都是终结。`simple_one_for_one` 的 `intensity = 0`（连带实测：`temporary` 不被 `application:stop/1` 收口，测试须显式清场，L15）；(3) **没有 `mqtt_session` 模块**——会话状态就是 `broker_subscription` 的四张表（实体/cursor/attachment/inflight）加上 conn 自己的 state，与 §5.2"S1 把 dispatcher 内嵌进 conn_fsm"是同一个选择（L15）。keepalive 一项也非平凡：`state_timeout` 会被**任何**收到的事件取消，于是 conn 自己的 poll/round/snapshot 定时器会替死掉的对端续命，测不到"对端静默"；改为显式 `send_after(1.5×KA)` + ref 判别迟到 tick，只由 `{tcp,...}` 与 `enter connected` 复位，且 **`keep_alive=0` 取 `max_keepalive_ms` 上限而非禁用**（L3）。
 
 - **`clean_session=true`**：连接建立时新建临时 session，断开即销毁；订阅与 in-flight 不持久化。
 - **`clean_session=false`**：session 状态由 `broker_subscription` 持久化（文件布局见 §5.3），跨连接保留：
@@ -270,6 +274,8 @@ mqtt_listener (ranch acceptor)
 
 `broker_security` 桩：`authenticate(Username, Password) -> {ok, Principal :: principal()} | {error, Reason}`。S1 默认实现从 `sys.config` 读明文用户表，Principal = binary username；ACL 桩一律返回 `allow`。真实 ACL / TLS 在 S6。
 
+**T10 实测批注（2026-10-23）**：桩比这句话多两处（均登记 §13 L10，都不动本节冻结措辞）——(a) `tenant_id(Principal) -> binary()`：ADR-009 的 `#broker_message.tenant_id` **必填**，而上面这句话没给来源，用户表 shape 因此是 `{Username, #{password, tenant_id}}`；(b) **匿名 CONNECT**（username 与 password 皆无）文本无依据，实现取 `principal = client_id`，不引入"匿名 principal"这个新概念，会话归属仍由 client_id 决定。失败原因保持 §4.3 原话 `bad_username_or_password`，不区分"用户不存在"与"密码错"（套件里有一条专门钉这点）。
+
 ### 4.4 QoS 与可靠性映射
 
 | MQTT QoS | S1 broker 行为 | ADR-007 等级 | 校验方式 |
@@ -279,6 +285,8 @@ mqtt_listener (ranch acceptor)
 | QoS 2 | 拒绝，见 §4.5 | — | — |
 
 **关键契约（ADR-007）**：QoS1 的 PUBACK **必须**在 `broker_storage:append(..., fsync)` 返回 `{ok, [Offset]}` 之后发出——不得提前。§5.1 流程图与 §8.2 R1a 断言以此为准。
+
+**T9 实测批注（2026-10-23）——"`mqtt_max_qos` 由 listener config 结合后端 capability 推导"的两处落地偏差**：(1) S1 没有 listener 级配置载体，`mqtt_max_qos` 是 **app env**（`get_env/3` 带默认），conn 在 **CONNECT 时**快照进自己的 state，会话中途改配置不影响已建立的连接（§13 L20，per-listener 上限要等 T12 新增 seam）；(2) 推导公式定死为 **`EffectiveMaxQos = min(ConfigMax, fsync ∈ capability ? 1 : 0)`**，capability 取 `broker_queue:partition_ids()` 的**全部分区**，任一分区缺 `fsync`（或分区清单为空）即降到 0——所以"memory 后端必须配 0"这句运维要求**由实现自动保证**，配成 1 也不会静默放行（§13 L11；用例 `the_memory_backend_serves_the_full_e12_posture`）。执行点两处：SUBACK 对超限 topic 回 `0x80` 不建订阅、PUBLISH 超限或 QoS2 直接断连且不发 ack（E12）。R1a 的"PUBACK 不等 dispatch"已由挂起 `broker_subscription_worker` 的反证用例实测（`puback_is_not_blocked_by_the_subscription_worker`）。
 
 ### 4.5 QoS2 / Retain / Will 拒绝策略
 
@@ -291,6 +299,8 @@ S1 不实现这些语义，但**不得静默**：
 - **MQTT 5.0 版本号**：`CONNECT` 里 `Protocol Level = 5` 一律拒绝（CONNACK 返回原因码 `0x87` Not supported，附 log）；强制走 3.1.1。
 
 上述策略在 protocol-compatibility.md 能力矩阵的 MQTT 行明确标注"部分支持"，避免测试断言与实现漂移。
+
+**T8/T9 实测批注（2026-10-23）**：`0x87` 这一条要求本 broker **发出**一个 3.1.1 列为"reserved for future versions"的字节，于是自研解码器若严格按 3.1.1 守卫 CONNACK 返回码，就会解不出自己发出的帧（黄金向量 round-trip 首先失败）。处置是**有意的不对称**：出站照本节发 `0x87`，入站 `p_connack` 的返回码守卫放宽为任意单字节（`session_present` 仍严格 0/1），`#connack.return_code` 类型随之拓到 `0..255`——严格 3.1.1 的对端**可能**把这个字节当畸形包处理，已写入 protocol-compatibility.md 的 MQTT 行（§13 L12）。另外"QoS2 SUBSCRIBE → `0x80`"覆盖的是**请求 QoS 超限**，非法 topic filter 不属于它：filter 在 parse 期即被拒绝，整包畸形 ⇒ 断连无 SUBACK（§13 L13）。
 
 ---
 
@@ -341,6 +351,15 @@ mqtt_conn_fsm:handle_publish
 2. **区间可乱序、可重叠、可丢失**：多个 caller 并发 append 时 cast 的到达顺序与 offset 顺序无关；Worker 崩溃期间发出的 cast 直接丢失。恢复路径是 dispatcher 下一次按 cursor 读——cursor 才是唯一真相源，通知只是让它早点醒。
 3. **订阅者集合由 Worker 持有并 `monitor`**，进程死亡自动摘除，无需 dispatcher 显式退订（`unsubscribe/2` 仍保留且幂等，因为 MQTT UNSUBSCRIBE 与断连竞争会同时到达）。实测：`a_dead_subscriber_is_dropped_without_disturbing_appends`。
 
+**T9 实测批注（2026-10-23）——pull 循环的实际形状**（逐条对应 §13 L6/L7/L8/L14，K9 的投递形状在这里落地）：
+
+- **读位置只有一个**：起点取该分区本 client 各订阅 cursor 的 **`min`**，单条消息是否相关由**各行自己的 cursor** 决定；计划里的"本地高水位 frontier"被删除（两个真相源，违 J6）。每轮先 `subscriptions(ClientId)` 重读（protected ETS 读），这也是 UNSUBSCRIBE 与我们竞争的消化方式。
+- **投递级别不升高（§4.8）**：命中集合的 QoS = `min(1, max(hits QoS))`，而"1"来自存储事实——**只有 QoS1 发布才在日志里**，所以纯 QoS0 命中集合就是 QoS0 直投、**不欠 ack**；`position = undefined` 的推送（QoS0 publish 的实时路径）同样一律按 QoS0 投。
+- **read-and-skip 是必需的，不是优化**：不命中任何 filter 的流量也要把该分区每条 cursor 推过去，否则 K6 的 `committed = min(活 cursor) − 1` 会永远钉在第一条约不相关的消息上。**S1 已知限制（同一机制的另一半）**：一条 **QoS0 订阅离线**时没有 conn 替它 skip，它的 cursor 就停在原点 ⇒ 该分区 committed 偏低（**方向是"偏低"，即多留数据，不 truncate、不丢**）；恢复要等 S2 的离线 cursor 回收/truncate 策略。
+- **轮判决分三档** `progress > stalled > idle`：窗满（`max_inflight`）是 `stalled`，不烧下一轮，等 PUBACK 或哨兵 tick；纯 DUP 重发是 `idle`——这条排序就是防重发风暴的机制。
+- **状态必须一路串回来**：`pull_sweep/3` 一度把线程化的 `#st{}` 丢掉，结果是"帧上了线、记账没了"，异常还被轮内 `try` 吞成一条日志（L7，真缺陷）。
+- **`{new_messages}` 与带位置的 `{broker_deliver}` 都只是唤醒**：元组里的 `Msg` 不读，读只发生在 `broker_queue:read_from/3`（J6/K9）。丢唤醒的恢复路径唯一，就是 `pull_poll_interval_ms` 哨兵轮（每个被处理的事件后重排）。
+
 **离线积压机制（E7 整改）**：clean_session=false 订阅者离线期间**不存在 broker 侧内存离线队列**——消息持久化在 WAL 中，积压仅表现为该订阅 cursor 滞后；重连时 conn_fsm 从 cursor 起 `read_from` 追赶。两条 S1 限制写入 protocol-compatibility.md：
 1. 追赶深度受 WAL 段保留约束——S2 retention 策略前，段文件不删、理论全量可追；但追赶本身是单连接顺序读，积压极深时首条消息延迟线性增长（已知行为，非丢消息）。
 2. 追赶期间到达的新消息与积压消息按 offset 顺序统一投递，无优先级反转。
@@ -371,7 +390,9 @@ mqtt_conn_fsm:handle_publish
 
 **S2 迁移路径（OQ-2）**：Mnesia 上线后三个文件全部退役迁入表（`subscription_meta`、`cursor_meta`、`session_meta`），`broker_subscription` 对外 API 不变。**→ 已答复（K3，2026-10-23）**：文件层**不抽 behavior**——三个文件是 subscription 的内部实现细节，S2 是整体替换而非并列后端，没有第二个实现者需要插拔；持久化模块命名 `broker_subscription_files`（刻意不用 `_store` 后缀，避免暗示抽象层）。
 
-**回退窗口可配置到零**：`cursor_max_regress = 1` + `cursor_flush_interval_ms = 0` 时 cursor 逐条 fsync，逼近零回退（代价：每条消费 ack 一次独立 fsync，与 §7.2 group commit 收益对冲）。**默认档为有界回退**，零回退档仅供对重复敏感的调用方显式开启；R3 测试两档都要跑（§8.2），证明该参数语义真实而非纸面。`.inflight` 不提供零回退档——MQTT 3.1.1 §4.1 本就允许 session 恢复时重发未确认消息，精确性非规范契约。
+**回退窗口可配置到零**：`cursor_max_regress = 1` + `cursor_flush_interval_ms = 0` 时 cursor 逐条 fsync，逼近零回退（代价：每条消费 ack 一次独立 fsync，与 §7.2 group commit 收益对冲）。**默认档为有界回退**，零回退档仅供对重复敏感的调用方显式开启；R3 测试两档都要跑（§8.2），证明该参数语义真实而非纸面。`.inflight` 不提供零回退档——MQTT 3.1.1 §4.1 本就允许 session 恢复时重发未确认消息，精确性非规范契约。**（T9 修正：这半句与 T7 的代码不符）** `inflight_flush_interval_ms = 0` 是**已经实现**的零回退档：worker 的 `maybe_flush_inflight/2` 有 `inflight_interval := 0` 分支（每次 `inflight/2` 写入即刻 temp+fsync+rename），且 `rearm(inflight_tick, ...)` 在 `Ms =< 0` 时不排 tick。**保留的是结论而非机制**：S1 默认档仍是批量（精确性非规范契约，R7 只断言"不丢、可多"），但 §13 L8 的 packet_id 复用风险确实有零回退档可开——**T13/T14 的 R7 断言因此可以按默认档 / 零回退档各跑一轮**，与 R3 的双档手法对齐。
+
+**T12 补（M11）**：`.inflight` 是**不透明 blob**（内容由 conn FSM 定义：`#{next_pid, pending}`），所以它的解码**不能用 `[safe]`**——那两个键原子只在 `broker_proto_mqtt` 里，而 boot step 2 在它启动之前就要读这个文件。`.subs`/`.cursors` 的 body 只有 binary/integer，继续 `[safe]`。详见 §13 M11。
 
 ---
 
@@ -444,6 +465,14 @@ broker_core：无模块、无 supervisor（纯 `.hrl` 与公共类型，见 §2�
 - **装配期访问器在 behavior 之外**：消费者的 boot 需要的是 sup 已拥有的那个 store 的 env，而 `init/1` 会另起进程（撞注册名或泄漏孤儿）——故 `broker_router_hash` 加 **`current_env/0`**（从注册名拼装 env，不启动任何东西，store 不在则 `{error, router_store_not_started}`），`broker_router` 加 **`env/0` / `register/3` / `unregister/1`** facade。**ADR-010 冻结签名一字未动**：这是对"冻结签名没给装配期访问留位置"这类 I12 型缺口的实现期补足。
 - **step 2+3 的实现形态**：落在 `broker_subscription_worker:init/1`（`broker_subscription_sup` 的唯一 child，permanent）——读 `sessions/*.subs`（权威）合并 `.cursors`/`.inflight`，重建实体与 cursor 行进 ETS，再逐条 `broker_router:register(Filter, SubRef, #{})` 回填；`{error,{already_registered,SubRef}}` 视为 ok（K8：崩溃窗口里 router 可能残留同一 SubRef）。任何一步失败 → `{stop, {subscription_boot_failed, Reason}}` → application 启动失败，不留半状态可服务（仿 T6 的全有或全无，release 实测见页首状态行）。
 - **K7 — 单写者 + 无锁读**：worker 持 `entities/cursors/attachments/inflight` 四张 `protected` ETS（`read_concurrency`），写（subscribe/ack/attach/…）经 `gen_server:call`，读（`cursor/2`、`subscriptions/1`、`session/1`、`dispatch/2`）在调用者进程内直查——与 J1/J4 给 queue 层定的形态同构；实测挂起 worker 后读路径照常返回。
+
+**T12 实测批注（2026-11-06，boot step 4 落地，上图 `ranch_listener_sup` 那一行按此读）**：
+
+- **实际子树**：`broker_proto_mqtt_sup` 的 children 是 `[mqtt_conn_sup, ranch_embedded_sup]`，后者由 `ranch:child_spec/5` 生成，内含 `ranch_server_proxy` + `ranch_listener_sup` → `ranch_acceptors_sup`/`ranch_conns_sup`。**listener 嵌在我们的 supervisor 下**（不是 ranch 的全局 `ranch_sup`），所以 `application:stop(broker_proto_mqtt)` 同时停止接单与会话进程；child spec 的 `restart => transient` 与图一致，"我们自己的故障"会重启、正常 stop 不复活。
+- **step 4 的顺序成立**：listener 是 `broker_proto_mqtt_sup:init/1` 返回列表的**最后一项**，而 `broker_proto_mqtt` 的 `applications` 依赖链保证 `broker_subscription`（step 2+3）已经启动完成；`restored_subscription_is_indexed_before_the_listener_accepts` 用例用"先离线写 `.subs`、冷启动后再 CONNECT"证明第一个 CONNECT 到达时索引已回填。
+- **绑定失败 = application 启动失败**（不降级）：实测 1883 被本机 EMQX 占用时，release 以 `{{shutdown,{failed_to_start_child,{ranch_embedded_sup,{mqtt,1883}},...{listen_error,{mqtt,1883},eaddrinuse}}},{broker_proto_mqtt_app,start,...}}` 整体失败，日志同时落在 `log/erlang.log.1` 与 T12 新增的 `log/s1.log`（H5 的文件日志）。
+- **dev 开法**：`rebar3 shell` 直接读 `config/sys.config.src`，`listeners` 存在即绑 1883；`.app.src` 的默认是 `[]`，因此库节点与 CT 节点不绑任何端口（T12 的 listener 套件用 `port => 0` 让内核分配，再用 `ranch:get_port/1` 读回）。
+- **数据目录**：`data_dir` 已是 release 树外的绝对路径（J8 关闭），带外 `create_partition/1` 与节点启动看到同一批分区；release 树里不再产生 `data/`。
 
 ---
 
@@ -528,7 +557,9 @@ WAL 记录头 = `<<Magic:8, Vsn:8, CRC32:32, Len:32>>`，Body = 紧凑元组 `er
 - **编码在调用者进程执行**：`wal_writer:append/3` 先把 `[#broker_message{}]` 逐条 `wal_codec:encode/1` 成二进制，**再**进 writer。反过来的话，CPU 密集的 `term_to_binary` 全落在单一 writer 进程里，group commit 攒的批越大、该进程越成为吞吐瓶颈——批处理要省的是 fsync 次数，不是把 CPU 串行化。
 - **写失败或 fsync 失败是致命错误，不重试**：offset 是"先分配后落盘"发出去的，一次失败后继续服务就等于把已承诺的 offset 变成永久空洞（§11.4 禁止静默降级）。writer 于是 `{stop, Reason, ...}` 自杀，批内所有 caller 收到 `{error, {writer_stopped, Reason}}`，supervisor 重启后从磁盘重建状态。`broker_storage_wal_SUITE` 里的 `a_crashed_writer_is_restarted_and_the_log_survives` 用 `kill -9` 实测了这条路径（重启后 `recover` 得 `{0, 4}`，三条 payload 完好）。
 
-**实测规模**：`wal_codec` 15 / `wal_segment` 13 / `wal_index` 8 / `wal_meta` 9 / `wal_recovery` 19 / `wal_writer` 19 / `wal_group_committer` 11 例（WAL 内部共 94 例），加 `broker_storage_wal_SUITE` 19 例（13 契约 + 6 后端专有）。
+**实测规模**：`wal_codec` 16 / `wal_segment` 13 / `wal_index` 8 / `wal_meta` 9 / `wal_recovery` 19 / `wal_writer` 19 / `wal_group_committer` 11 例（WAL 内部共 95 例），加 `broker_storage_wal_SUITE` 19 例（13 契约 + 6 后端专有）。
+
+**T12 补一条解码规则（M10）**：记录体用 `binary_to_term/1` 解码，**不加 `[safe]`**。`proto_meta` 是协议私有 map，QoS1 消息带 `qos`/`retain`/`packet_id` 等原子，而这些原子由 writer app（`broker_proto_mqtt`）引入；`[safe]` 会把恢复的成功与否系在"哪些模块先被加载"上——release 的 `start.script` 恰好事先 `primLoad` 了全部模块，`rebar3 shell` 则没有。完整性与版本已由 CRC-32 与 Vsn 分支守住，且 WAL 目录是本地可信状态；`wal_meta`（纯整数固定形状）继续用 `[safe]`。同类问题在会话层也有一个实例（§13 M11：`.inflight` 是不透明 blob，带 `mqtt_conn_fsm` 的 `next_pid`/`pending`），处置相同。`wal_codec_SUITE:body_decodes_without_the_writing_apps_modules` 用一个只挂 `broker_core`/`broker_storage` ebin 的 `peer` 节点钉住这条。
 
 ### 7.3 段文件命名与保留
 
@@ -578,12 +609,12 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | **T5** | `broker_storage_wal` 重写（segment / writer / reader / recovery / group_committer / **index** / codec 兼容层）；**交付项含（E5）：多 conn_fsm 并发 append 正确性测试——批次内每个 caller 回复严格在 fsync 之后、offset 无 cross-reply、混合 sync_mode 并发不互相饥饿**；**WAL 套件必须先通过 `broker_storage_contract.hrl` 的 13 个契约用例（`?CAPABILITY = [os_buffer, fsync]`）**——**已完成**：113 个 CT 用例通过（WAL 后端 19 = 13 契约 + 6 后端专有；内部 94 = codec 15 / segment 13 / index 8 / meta 9 / recovery 19 / writer 19 / group_committer 11）。13 个契约断言**一条未改、一条未跳**地在 WAL 后端跑通，Gate「WAL 与内存实现可互换」由机械检查证明；E5 三项断言全部实测（16 caller 混合 `fsync`/`os_buffer` 并发 → offset 恰为 `1..32`、无 cross-reply、回复严格在 fsync 后）；`kill -9` writer 后重启 recover 日志完好；跨段 `read_from` 已覆盖。**H8 已答复**（§6 批注）：`create/2` 只归带外管理动作，boot step 1 的 recover 循环归 T6 `broker_queue`。**模块划分与本行计划名有偏差**（无 `wal_reader`，新增 `wal_codec`/`wal_meta`，group_committer 为纯策略模块）——详见 §7.2 批注 | T4 | **6.5** | — |
 | T6 | `broker_queue` 分区 Worker（append 串行化 + storage 生命周期 + `capability/1` 查询 API + 通知订阅）——**T5 追加两项交付（H8/§6 批注）**：(a) `broker_queue:create_partition/1` 作为 `create/2` 的**唯一**带外入口；(b) boot step 1 的"逐分区 `recover/2`、缺分区即启动失败"循环落在 `broker_queue_sup`（分区清单 `{partitions, N}` 在它的 env 里，存储层看不到）。另需消化 §7.2 批注的"句柄随 writer 崩溃失效"：worker 必须在 writer 重启后重新 `recover/2`<br>**→ 已完成（2026-10-22）**：4 个模块（`broker_queue` 公共 API / `broker_queue_store` protected 注册表单写者 / `broker_queue_partition` 每分区 worker / `broker_queue_sup` 静态子进程清单）+ 16 个 CT 用例，`rebar3 ct` 全套 **157/157** 无一条 FAILED、`dialyzer` 干净、`xref` 仅剩预期的 unused-export。(a)(b) 均落地并在**装配后的 release 上实测两半**（§6 T6 批注）；I15 的句柄失效按"不自动重试 + `reattach`"消化（§7.2 T6 批注）。**与本行计划名有偏差**：`append` **不经** Worker 串行化，串行化点是单一 `wal_writer`——否则 group commit 退化为每批 1 条（§5.1 T6 批注 J1，含 8 caller → `batches=1, syncs=1` 的实测）| T3, T4, **T5** | 2 | — |
 | T7 | `broker_subscription`：per-sub cursor + `.subs`/`.inflight`/`.cursor` 三层持久化（§5.3）+ **SubRef 铸造**与 `register/4` 回填（§3.2 冻结点 3）+ 分发 + advance_committed 聚合 | T6 | 3 | — |
-| T8 | `broker_proto_mqtt` 帧编解码（含黄金样本单测 + proper 模糊测试） | T1 | 3 | — |
-| T9 | `broker_proto_mqtt` 连接 FSM + capability 缓存 + keepalive + packet_id + `mqtt_max_qos` 执行 | T8, T6, T7 | 3 | — |
-| T10 | `broker_security` 桩 + 配置驱动用户表 | T1 | 0.5 | — |
+| T8 | `broker_proto_mqtt` 帧编解码（含黄金样本单测 + proper 模糊测试）<br>**→ 已完成（2026-10-23）**：`mqtt_frame`（`decode/1` 永不 crash、`encode/1` 对非法构造抛编程错误）+ `mqtt_filter`（L9：协议侧自建匹配）+ `include/mqtt_frame.hrl`（记录是公布的构造界面，L18）；23 个 CT 用例 = 逐字节黄金向量 + 6 条 proper 属性（round-trip / 流切分 / 任意二进制不崩 / varint 双向 / encode 拒非法 / 单 bit 翻转不产生另一种合法帧，各 200 例）。**§4.1 计划的"mosquitto 抓包样本"本机不可得，按规范示例手推等价替代**（L1）； Annex A UTF-8、保留 QoS2 位型、pid=0、非法 filter 均在 parse 期拒绝（L13） | T1 | 3 | — |
+| T9 | `broker_proto_mqtt` 连接 FSM + capability 缓存 + keepalive + packet_id + `mqtt_max_qos` 执行<br>**→ 已完成（2026-10-23）**：`mqtt_conn_fsm`（gen_statem，`awaiting_owner → awaiting_connect → connected`）+ `mqtt_conn_sup`（`simple_one_for_one`/`temporary`，T12 的 `start_conn/2` 入口已预留）+ `mqtt_client.hrl`（真实 TCP 的 mini client，零固定端口）；27 个 CT 用例覆盖 §4.5 全部拒绝码、E2/E12 三种 `mqtt_max_qos` 姿态、R1a（挂起订阅 worker 反证 PUBACK 只等 fsync 不等 dispatch）、J6/K9（`cursor/2` 为唯一读位置、推送只是信号）、§4.8 投递级别不升高、E7 离线追赶、R7 DUP=1 同 packet_id、§4.3 takeover 与 §4.2 clean 拆除、memory 后端整条姿态。**偏差集中于 keepalive 定时器形态、capability 查询时机、连接图三处过期——见 §13 L3/L5/L11/L15**；listener 归 T12 | T8, T6, T7 | 3 | — |
+| T10 | `broker_security` 桩 + 配置驱动用户表<br>**→ 已完成（2026-10-23）**：`authenticate/2`（失败措辞按 §4.3，不区分"用户不存在/密码错"）+ `authorize/2`（恒 `allow`）+ **`tenant_id/1`（§4.3 之外新增，ADR-009 的 `tenant_id` 必填，L10）**；用户表 `{Username, #{password, tenant_id}}` 读 `get_env(broker_security, users, [])`（J3）；7 个 CT 用例（含匿名 principal 映射与"不泄露用户是否存在"两条）。配置项在 `config/sys.config.src` 待 T12 装配时补 | T1 | 0.5 | — |
 | T11 | `broker_event` 桩（pass_through，接口位保留） | T2 | 0.5 | — |
-| T12 | 监督树整合 + application 启动流程（§6 启动顺序 4 步：`recover` → `.subs` 重建 → `register` 回填 → 才放开 listener）+ dev 环境 | T5-T11 | 1 | — |
-| T13 | common_test 集成测试套件（端到端 pub/sub/ack、QoS0/1、clean_session、离线追赶） | T12 | 2 | — |
+| T12 | 监督树整合 + application 启动流程（§6 启动顺序 4 步：`recover` → `.subs` 重建 → `register` 回填 → 才放开 listener）+ dev 环境<br>**→ 已完成（2026-11-06）**：`mqtt_listener`（ranch 2.3.0 `ranch_protocol`，`start_conn(undefined, Opts)` + 显式 `link/1`）+ `broker_proto_mqtt_sup` 用 `ranch:child_spec/5` 在 `mqtt_conn_sup` 之后起 listener（embedded、`transient`）+ FSM 的 `{handshake,...}`/`arm_socket/2` + L20 的 per-listener `ProtoOpts` 经 `opt/3` 消费；`listeners` 默认 `[]`（库/CT 节点不绑端口），release/`rebar3 shell` 由 `config/sys.config.src` 给 1883；J8 修复（`data_dir` 改 release 树外绝对路径）+ `broker_security:users` 与六项连接级 env 落配置。**4 个新 listener CT 用例**（CONNACK、端到端 pub/sub/PUBACK、`.subs` 回填先于 accept、stop 收口连接）+ **2 个解码回归用例**（M10 WAL 记录体、M11 `.inflight` 会话 blob），全套 **244/244** 零 FAILED 零 Skipped；release 用 paho 实连 `RELEASE-PAHO-OK`，并在连续两次重启（分区里已有 QoS1 记录）后重复通过。偏差见 §13 **M1~M11**（M3 是真实 CONNECT flags 缺陷；M10/M11 是同一类「`[safe]` 解码外来原子 ⇒ 重启即失败」缺陷，分别落在 WAL 记录体与会话 blob） | T5-T11 | 1 | — |
+| T13 | common_test 集成测试套件（端到端 pub/sub/ack、QoS0/1、clean_session、离线追赶）<br>**→ 已完成（2026-11-06）**：`test/integration/s1_e2e_SUITE.erl`，`all() -> [{group, wal}, {group, memory}]`，6 个用例在两组各跑一遍（**12/12**）——整套用例跑在真实 TCP + T12 的 ranch listener 上，不用固定 sleep，断言按 `broker_queue:watermarks/1` 与 `broker_subscription:cursor/2` 轮询。覆盖：`qos0_publish_subscribe_roundtrip`（QoS0 直接推送、无 PUBACK、水位不动）、`qos1_posture_follows_backend_capability`（WAL：PUBACK→append→cursor/committed 前进；memory：SUBACK `0x80` + 超限 PUBLISH 断连且零 append）、`subscription_qos_is_not_escalated`（§4.8 `min` 语义 + read-and-skip）、`clean_session_false_restores_the_subscription_set`（R1b 协议级半边：`session_present=1`、免重发 SUBSCRIBE、恢复后可投递）、`clean_session_true_discards_the_session`（§4.2：CONNACK 前实体已清、断连后 `.subs` 被删、`session/1` 回 `not_found`）、`offline_catch_up_is_offset_ordered`（E7：三条 QoS1 按 offset 序投递并 ack；memory 的 QoS0 无积压）。偏差仅验收工具一条（§13 **M12**：`rebar3 ct` 的 stale beam 让首轮报 258） | T12 | 2 | — |
 | T14 | docker compose 崩溃恢复测试套件（R1a/R1b/R2~R7） | T13 | 2 | — |
 | T15 | 真实客户端兼容性测试（paho Python、mosquitto_pub/sub） | T13 | 1.5 | protocol-compatibility.md MQTT 行 |
 | T16 | `docs/architecture.md` + `docs/storage-and-recovery.md` skeleton | T2-T5 | 1.5 | 两份文档 v0.1 |
@@ -600,7 +631,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | 真实 MQTT 客户端完成 publish → subscribe → ack 全链路 | T15（paho + mosquitto） |
 | `kill -9` 后重启，消息丢失/重复行为有测试断言且符合契约 | T14（R1a/R1b/R2~R7） |
 | 三个核心抽象完成评审并冻结 | **T0.5 已冻结**（ADR-009/010/011 状态=已采纳）；T17 评审会复核冻结内容与 T2~T7 实际实现是否一致，不一致则按 ADR 修订流程处置 |
-| `broker_storage` 的 WAL 与内存实现可互换 | T4 + T5 + T13（同一测试套件跑两个后端；memory 后端下 QoS1 用例按 `mqtt_max_qos=0` 契约执行） |
+| `broker_storage` 的 WAL 与内存实现可互换 | T4 + T5 + T13（同一测试套件跑两个后端；memory 后端下 QoS1 用例按 `mqtt_max_qos=0` 契约执行）。**T13 已交付**：`test/integration/s1_e2e_SUITE` 的 `wal`/`memory` 两组共享同一份 6 用例清单（12/12），memory 分支逐条断言 E12 的 SUBACK `0x80` 与超限 PUBLISH 断连，不用 `skip` |
 | **「订阅位置不丢」的解释（E1，v0.3 复审已确认）**：= 订阅集合零容忍（R1b）+ cursor 有界回退 ≤`cursor_max_regress`（R3，默认档与零回退档双档实测）+ in-flight 允许回退仅保证不丢（R7）。依据 roadmap §3.4 第 3 条「明确可容忍的重复窗口」——该条本身即授权有界重复，否则为空文 | **T17 评审会正式签认（措辞已确认，此处仅走流程）→ 写入 ADR-011 附录与 protocol-compatibility.md** |
 | 在此 Gate 之前不允许实现第二个协议 | 流程 Gate：progress.md 状态机标记"S1 未通过 → 拒绝合入第二协议 PR"；CI workflow 检查 `apps/broker_proto_*` 中除 `broker_proto_mqtt` 外无新增 app |
 
@@ -636,7 +667,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 
 ## 12. 交付物清单
 
-**代码**：`apps/*` 8 个应用；`test/integration/*`（含 T5 并发 append 测试）；`test/protocol-compatibility/mqtt/*`；`tools/docker/docker-compose.s1.yml`。
+**代码**：`apps/*` 8 个应用；`test/integration/s1_e2e_SUITE.erl`（T13：同一组端到端用例跑 `wal`/`memory` 两个后端）；`test/protocol-compatibility/mqtt/*`；`tools/docker/docker-compose.s1.yml`。
 
 **文档**：
 - `docs/design/s1-mqtt-vertical-slice.md`（本文，评审通过后升级 v1.0）
@@ -697,6 +728,78 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 | **F6** | roadmap §3.2 的抽象动词表与冻结 API 无溯源指针；设计文档 §3 与 ADR 存在两份真相 | roadmap §3.2 加覆盖指针（批注式，不改其动词基线）；设计文档 §3.2/§3.3 标注"ADR 摘录，冲突以 ADR 为准"；补 §6 启动顺序（recover → 重建订阅 → register 回填 → 才放开 listener），使 R1b 有实现前提 | roadmap §3.2、本文前言/§3/§6 |
 | **G1** | ADR-010 §10.1 把 `route_ctx` 只定义成 record，却在 `-callback route/3` 中当类型用；**OTP 28.3.1 `erlc` 实测报 `type route_ctx() undefined`，冻结文本无法编译** | 补 `-type route_ctx() :: #route_ctx{}.'` 与 `-export_type([router_env/0, sub_ref/0, route_ctx/0]).'`；三份 ADR 的 record/behavior 定义已全部 `erlc` 通过并核对 `behaviour_info(callbacks)`/`(optional_callbacks)` | ADR-010 §10.1/验证、§3.2 |
 
+### T12 实现期间发现并修正（2026-11-06，均为实测暴露）
+
+冻结 API（ADR-009/010/011）全程未改。这一批的主角是 **ranch 2.x 的连接契约**（与 1.x 的 `start_link` 返回值/消息形状不同，M1/M2）、**L20 承诺的 per-listener 配置 seam 第一次有真实承载点**（M4）、以及一个**被"自洽的黄金向量"掩盖的真实协议缺陷**（M3：CONNECT flags 整体位移一位，自研编解码 round-trip 全绿，真实客户端一连接即被解成 Will）。M3 的教训直接改写 T8/T15 的分工：手推向量只能证明"我们前后一致"，不能证明"我们与规范一致"。**M10 则是相反方向的教训**：T7 从一次 `badarg` 里总结出的"解码一律 `[safe]`"在消息体上不成立——`proto_meta` 的原子归 writer app 所有，把安全选项当成通用规则会让恢复依赖模块加载顺序，而 release 的 `primLoad` 恰好掩盖了它；**M11 是同一个根因的第二个实例**，而且后果更重：它不是"恢复失败"，而是 `broker_subscription` 根本起不来。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **M1** | ranch 2.x 的 `ranch_protocol:start_link/3` 在**套接字仍归 acceptor 所有**时被调用，之后 ranch 才做 `controlling_process` 并发 `{handshake, Ref, Transport, Socket, Timeout}`；T9 的 FSM 只认"启动时带 socket + `connect` 事件"这一种交接口，直接照搬会在 `awaiting_owner` 里没有 socket 可用 | `mqtt_conn_sup:start_conn(undefined, Opts)` 起 FSM（socket 后置），新增 `{handshake,...}` 事件子句，与测试 helper 的 `connect` 一起收敛到唯一的 `arm_socket/2`（`inet:setopts(active, once)`）后进入 `awaiting_connect`。**没有新增连接接缝**：两条路径的入口仍是 `start_conn/2` | §4.2、§6、§9-T12 |
+| **M2** | 用 `ranch:start_listener/5` 会把 listener 挂到 ranch 的全局 `ranch_sup`：`application:stop(broker_proto_mqtt)` 之后端口仍在、连接进程也仍归 ranch 管；且 `ranch_tcp:listen/1` **从 `socket_opts` 里的 `{port, P}` 取端口**（首参固定 0），把 `port` 放在 transport opts 顶层会随机端口或 `badarg` | 改用 **`ranch:child_spec/5`**（embedded：`ranch_embedded_sup` + `ranch_server_proxy`），listener 成为 `broker_proto_mqtt_sup` 的最后一项，`restart => transient`；端口写成 `socket_opts => [{port, Port}]`；`ranch` 进 `applications` 与 release 列表 | §6、§9-T12 |
+| **M3** | **真实缺陷**：CONNECT flags 解码整体错位一位——把 bit0 当 clean、bit1 当 will、bit2-3 当 will QoS、bit4 当 will retain、bit5/6 当 password/username、bit7 当 reserved。规范是 **bit0 reserved=0、bit1 clean、bit2 will、bit3-4 will QoS、bit5 will retain、bit6 password、bit7 username**。paho 发 `0x02`（clean session）时被解成 `will=1` 且后续没有 Will 字段 ⇒ `{malformed_packet, will_topic_truncated}`，连接直接断开。**T8 的黄金向量与 `encode/1` 用的是同一张错表，round-trip 属性因此全绿**——缺陷只在真实客户端下暴露 | 按 §3.1.2.3 重写 decode/encode 两张位表（`read_creds/2` 的两个错误分支同步改成 `2#10000000`=username-without-password / `2#01000000`=password-without-username），并把 T8/T9 的所有 CONNECT 向量改成真值（clean=0x02、will=0x04、will QoS1=0x08、will retain=0x20、user+pass=0xC0）；`mqtt_client.hrl` 的 `mqtt_raw_connect` 同步。**教训：T15 的真实客户端字节级对比不是锦上添花，而是唯一能证伪"自洽错表"的手段**（本轮用 paho 先行覆盖了 CONNECT 一个包） | §4.1、§9-T8、§9-T15 |
+| **M4** | L20 说"per-listener 上限要等 T12 新增 seam"，但没说配置怎么进 conn：`start_conn/2` 的 `Opts` 在 T9 里被原样塞进 `#st.opts` 后无人读取 | listener spec 里 `ProtoOpts = maps:with([mqtt_max_qos, max_keepalive_ms, pull_page_limit, max_inflight, pull_poll_interval_ms, inflight_snapshot_ms], Spec)`；FSM 全部读取点收敛到 **`opt(Key, Default, #st{opts})`**（listener map 优先，回落 app env）。CONNECT 时仍把 `max_qos`/`keepalive_ms` 快照进 state（E2 语义不变） | §4.2、§9-T12、L20 |
+| **M5** | **J8 关闭**：`data_dir` 是相对路径时落在 release 根（`bin/unified_mq` 先 `cd "$ROOTDIR"`），`rebar3 release` 会连同数据一起清掉；带外建的分区与节点看到的不是同一目录 | `broker_storage` 与 `broker_subscription` 的 `data_dir` 都改为 **release 树外绝对路径**（本机 ext4 上的仓库 `data/`），并在配置旁写明"两处必须一致"。实测：仓库根带外建 4 分区 → `rebar3 release` 重建 → release 启动直接 recover 到同一批分区（不再 `{not_found,_}`），release 树内不产生 `data/` | §2、§6、J8 |
+| **M6** | **H5 关闭**：文件日志一直"归 T12"，但没有实现；`.app.src` 若默认带 listener，库/CT 节点会一起绑 1883，与宿主机既有 broker 或并行 CT 冲突 | `sys.config.src` 增加 `kernel.logger` 的 `s1_file` handler（`log/s1.log`，`logger_std_h` 自动建目录；release 根与 shell 的 CWD 各自落一个 `log/`，已在 `.gitignore`）；`.app.src` 的 `listeners` 默认 **`[]`**，只有 `sys.config.src` 给出 `#{port => 1883, ...}`。**本机 1883 被用户的 EMQX 占用**，所以端到端实测用 18830：同一条配置路径只改端口即通；最终配置再起一次拿到 `eaddrinuse`，反证它确实在读 1883 | §2、§6、H5、§9-T12 |
+| **M7** | **L15 的收口**：conn 子进程是 `temporary`，`application:stop` 不会杀它们；ranch 的 `ranch_conns_sup` 靠 **link**（`{'EXIT', Pid, _}`）计数并在 listener 关闭时向每个协议 pid 发 shutdown。若 `mqtt_listener:start_link/3` 只返回 supervisor 名下的 pid 而不 `link(Pid)`，listener 停止后连接与 socket 全部泄漏 | `start_link/3` 在返回前显式 `link(Pid)`；新增用例 `stopping_the_listener_closes_its_connections`：CONNACK 后 `application:stop(broker_proto_mqtt)`，断言 conn 进程收到 DOWN 且客户端 socket 读到 `{error, closed}` | §4.2、§6、L15 |
+| **M8** | ranch 的 listener ref 是 `get_port/1` 的唯一句柄；CT 里若用动态 ref，用例之间拿不到端口 | listener spec 的 `ref` 默认 **`{mqtt, Port}`**（同一配置内稳定），套件用 `port => 0` + `ranch:get_port(?REF)` 读回实际端口；`wait_cursor_after/4` 等投递断言全部按 cursor 前进等待，不按固定 sleep | §6、§9-T13 |
+| **M9** | `mqtt_conn_SUITE` 与 `mqtt_listener_SUITE` 同节点先后跑，env 会互相污染（`listeners`、`backend`、`data_dir`） | listener 套件 `init_per_testcase` 无条件写全部六项 + `listeners`，`end_per_testcase` 无条件写回 `backend = broker_storage_wal` 并 `kill_conns()`（L15/L19 的同一手法）；`init_per_suite` 的 `application:load` 一律 `_ =`（J10/L19） | 验收流程、§9-T12 |
+| **M10** | **真实缺陷（重启即失败）**：`wal_codec:decode_body/4` 用 `binary_to_term(Body, [safe])` 解记录体，而 QoS1 的 `proto_meta` 含 `qos`/`retain`/`packet_id` 等**只有 writer app（`broker_proto_mqtt`）才引入**的原子；`broker_storage` 的恢复发生在 `broker_proto_mqtt` 启动之前。relx release 因 `start.script` 对所有模块 `primLoad` 而侥幸不暴露；`rebar3 shell` / 手工 `ensure_all_started` 在**写过一条 QoS1 后重启**即 `partition_recover_failed` + `{corrupt_record,...,{bad_body,badarg}}`（T7 的"一律 `[safe]`"教训在这里反向咬人） | `decode_body/4` 去掉 `[safe]`：CRC-32 已先校验完整性、Vsn 分支已管版本、WAL 目录是本地可信状态，并就地写明理由；`wal_meta` 保留 `[safe]`（记录体是纯整数的固定形状）。新增回归用例 `body_decodes_without_the_writing_apps_modules`：`peer` 起一个只挂 `broker_core`/`broker_storage` ebin 的节点，先断言 `qos`/`retain`/`packet_id` 在该节点**不存在**，再解码同一条 QoS1 字节并要求成功。修复前该用例以 `{error,{bad_body,badarg}}` 失败（已实测），修复后 1/1 通过 | §7.2、§9-T12、L 批 `[safe]` 条 |
+| **M11** | **真实缺陷（持久会话 ⇒ 应用起不来）**：同一根因的第二个实例。`broker_subscription_files:decode/2` 对三类会话文件统一用 `[safe]`，但 `.inflight` 是**不透明 blob**，内容是 `mqtt_conn_fsm` 的 `#{next_pid => N, pending => [...]}`——这两个键原子只存在于 conn FSM。boot step 2（`broker_subscription_worker:init/1` → `load_client/4`）在 `broker_proto_mqtt` 启动**之前**读它，于是任何 `clean_session=False` 的客户端只要落过一次 blob，非 relx 启动就会 `{inflight_file,{corrupt_session,Path}}` → worker 起不来 → `broker_subscription` 启动失败。CT 与 release 都没暴露：前者全模块已加载，后者 `primLoad` | `read_inflight/1` 改用 `read(Path, [])`（不安全解码），`read_subs/1`/`read_cursors/1` 继续 `[safe]`（body 只有 binary/integer）；在 `read_inflight/1` 旁写明"blob 的原子归 writer app"与完整性依据（原子 rename + 本地可信目录）。新增回归用例 `persisted_inflight_blob_decodes_without_the_mqtt_apps_atoms`：`peer` 只挂 `broker_subscription` ebin，先断言 `next_pid` 不存在，再用真实 `write_inflight/2` 落盘并 `read_inflight/1` 读回。修复前以 `{error,{corrupt_session,...}}` 失败（已实测），修复后 1/1 通过；另用 paho 非 clean 会话做了两次真实重启复验（见下方证据） | §5.3、§7.2、§9-T12、L 批 `[safe]` 条 |
+
+**T12 实测证据摘要**：`mqtt_frame_SUITE` 23 + `mqtt_conn_SUITE` 27 + `mqtt_listener_SUITE` 4 = **54/54**；`wal_codec_SUITE` 16/16（含 M10 回归 1 例）、`broker_subscription_SUITE` 22/22（含 M11 回归 1 例）；全套 `rebar3 ct` **244/244**，零 `FAILED` 明细行、零 Skipped；`dialyzer` 0 warning；`xref` 仅剩预期 unused-export（32 条，均为对外 API/测试入口）；release 组装含 `ranch-2.3.0`，paho-mqtt 真实客户端经 listener 完成 CONNECT/SUBSCRIBE/QoS1 PUBLISH+PUBACK/QoS0 与投递，输出 `RELEASE-PAHO-OK`。**M10 的复验走真实故障现场**：`rebar3 shell` 在已有 3 条 QoS1 记录的 `data/wal/2` 上冷启动 → `broker_queue:watermarks(2)` 返回 `{ok,2,4}`、CONNACK `<<32,2,0,0>>`、日志零 `partition_recover_failed`/`bad_body`；release 在连续**两次**重启（记录数继续增长到 1020 B）后各跑一遍 paho，均 `RELEASE-PAHO-OK`。**M11 的复验同样走真实故障现场**：paho 以 `clean_session=False` 留下 `persist-m10` 的 `.subs`/`.cursors`/`.inflight`（blob = `#{next_pid => 2, pending => []}`，原子 `next_pid`/`pending` 来自 `mqtt_conn_fsm`）→ 修复前 `rebar3 shell` 重启时 `broker_subscription_worker:init/1` 以 `{inflight_file,{corrupt_session,Path}}` 失败、应用起不来；修复后两次重启都能 `session(<<"persist-m10">>)` 还原订阅与 inflight，且非 clean 重连拿到 `CONNACK 0x20 0x02 0x01 0x00`（session present）。
+
+### T13 实现期间发现并修正（2026-11-06，均为实测暴露）
+
+冻结 API（ADR-009/010/011）与产品代码全程未改。这一批是**验收工具**的一条发现 + 一套新套件：T13 把 T12 的 listener 与 §8 的端到端断言接起来，并让 Gate「WAL 与内存实现可互换」从"两个后端各自的契约套件"升级为"同一组端到端用例跑两个后端"。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **M12** | `rebar3 ct` 会把 `test/` 与 `test/integration/` 都编译/复制进 `_build/test/extras/`；删除源 suite 后旧 `.beam` 仍在，CT 仍会运行它。T13 首轮全套因此报 `All 258 tests passed`（真实 256 + 已删除的 `probe_SUITE` 2 例）——**汇总数字虚高且没有任何 FAILED/Skipped 明细** | 删除 `_build/test/extras` 后重跑，得到真实 **256/256**；验收时除 `FAILED`/`Skipped` 明细外，还核对 `%%% *_SUITE` 行与各 suite 的 `TEST COMPLETE` 计数，确认没有已删除套件的残留 | 验收流程（J10/L19 的同一家族） |
+
+**T13 实测证据摘要**：`test/integration/s1_e2e_SUITE` 的 `all() -> [{group, wal}, {group, memory}]`，6 个用例在两组各跑一遍，共 **12/12**；`rebar3 ct` 全套 **256/256**（18 个 suite），零 `FAILED` 明细行、零 Skipped；`dialyzer` 0 warning；`xref` 仍为 32 条预期 unused-export。用例与契约的对应：`qos0_publish_subscribe_roundtrip`（QoS0 直接推送、无 PUBACK、水位不动）、`qos1_posture_follows_backend_capability`（WAL 的 PUBACK→append→cursor/committed 前进；memory 的 SUBACK `0x80` + 超限 PUBLISH 断连且零 append）、`subscription_qos_is_not_escalated`（§4.8 `min` 语义 + read-and-skip，delivery QoS0 不欠 ack）、`clean_session_false_restores_the_subscription_set`（R1b 的协议级半边：`session_present=1`、免重发 SUBSCRIBE、恢复后仍可投递）、`clean_session_true_discards_the_session`（§4.2：CONNACK 前实体已清、断连后 `.subs` 被删、`session/1` 回 `not_found`）、`offline_catch_up_is_offset_ordered`（E7：三条 QoS1 按 offset 序、同连接无重发；memory 的 QoS0 无积压）。**R3/R7 的 `kill -9` 与默认档/零回退档双档仍归 T14**，T13 只覆盖进程级断连与协议级恢复。
+
+### T8/T9/T10 实现期间发现并修正（2026-10-23，均为实测暴露）
+
+冻结 API（ADR-009/010/011）全程未改。这一批是 S1 第一次把协议侧接上真实进程与真实 socket，所以偏差分成三类：**规范文本在本机不可得**（L1）、**gen_statem / logger / supervisor 的语义与计划假设不符**（L3~L5、L15、L19，全部由 27 个连接用例首跑全灭暴露）、**§4.1/§4.2 计划文本第一次被真实实现时的偏差**（L6~L14、L16~L18、L20）。L7 与 L13 是真缺陷（前者静默丢记账、后者一旦到达即 `case_clause`），都由静态检查或套件而非阅读发现。
+
+| 项 | 问题 | 处置 | 影响 |
+|---|---|---|---|
+| **L1** | §4.1 写"单元测试用 mosquitto 抓包字节做黄金样本"——本机无 `mosquitto`、无 `tcpdump`，抓包这一步不可执行 | 黄金向量改为**按 OASIS MQTT 3.1.1 §2.1~§4.x 的规范示例逐字节手推**（CONNECT/CONNACK/PUBLISH qos0+qos1/PUBACK/SUBSCRIBE/SUBACK/UNSUBSCRIBE/UNSUBACK/PINGREQ/DISCONNECT/多字节 Remaining Length 边界），并以 6 条 `proper` 属性补上抓包本来要覆盖的那一半：round-trip、流切分不变、`decode/1` 对任意二进制不崩、varint 双向、`encode/1` 拒非法、**单 bit 翻转不产生"另一种合法帧"**（各 200 例）。真实客户端字节级对比仍是 T15 的交付，不在 T8 内偷换 | §4.1、§9-T8、§12 |
+| **L2** | 出站帧的非法构造（QoS2、pid=0、topic 含通配符、超长 filter）以什么形状失败 | `encode/1` **抛 `error({malformed_frame_out, Kind})`**——出站帧的合法性由构造点保证，违反它是我们自己的 bug，返回 `{error,_}` 会让调用方把它当成对端的错；`decode/1` 则**永不 crash**（属性 P3 钉住），因为入站数据不可信 | §4.1 |
+| **L3** | §4.2 的"keepalive 定时器（1.5× KeepAlive）"若按 gen_statem 的 `state_timeout` 实现，实测**语义不对**：`state_timeout` 被**任何**收到的事件取消，且只有重新返回该动作才复位——而 conn 自己的 poll 哨兵、排定的 pull 轮、快照 tick 都会替一个已经死掉的对端续命，keepalive 测量的就不再是"对端静默" | keepalive 用**显式 `send_after(1.5×KA) + make_ref()`**，只由 `{tcp,...}` 事件与 `enter connected` 复位，过期 tick 与迟到 tick 按 ref 判别后丢弃；且 **`keep_alive = 0` 取服务端 `max_keepalive_ms` 上限而非 §4.1 的"0=禁用"**（S1 不接受 idle-forever 会话），非零值 clamp 到同一上限并记日志 | §4.2、`config/sys.config.src` |
+| **L4** | `logger:log(warn, ...)` 在 OTP 28.3.1 抛 `function_clause`（`logger_config:less_or_equal_level/2`）——`warn` 是 `error_logger` 的别名，不是 `logger` 的级别名 | `log/3` 助手一律用 `warning｜info｜error`；因为 conn 是全 broker 第一个自己打日志的模块，这个崩溃会被误读成协议缺陷 | §4.2 |
+| **L5** | 手递交接 socket 后测试助手发的是普通 `Pid ! connect`；`callback_mode = [handle_event_function, state_enter]` 下它到达为 **`info` 类型**（只有 `gen_statem:cast/2` 才包成 `$gen_cast`），于是带事件类型守卫的交接子句**丢弃了每一条连接** | 交接子句不守卫事件类型（按内容匹配），并新增 §4.2 图上没有的 **`awaiting_owner`** 状态：`controlling_process` 完成前碰 socket 是 `not_owner`，这个状态就是为此而存在 | §4.2、§9-T9 |
+| **L6** | 计划的 pull 起点是 `max(cursor/2, 本 conn 本地高水位 frontier)`。加 `frontier` 是**多余的**：cursor 已经是"这个 client 读过哪里"的权威，本地再存一份高水位就出现两个真相源（且 J6 明确 cursor 是唯一读位置） | 起点改为**该分区内各订阅 cursor 的 `min`**（`Start = lists:min(...)`），单条消息是否相关由**各行自己的 cursor** 决定；`frontier` 字段从 `#st{}` 删除。丢唤醒的恢复路径唯一：`pull_poll_interval_ms` 哨兵轮，且它在**每个被处理的事件后重排**（tick 自己已消耗 ref） | §5.2、§9-T9 |
+| **L7** | **真缺陷**：`pull_sweep/3` 与 `pull_round/1` 把线程化的 `#st{}` 丢掉了（`{progress, _}` 只取判决不取状态）。表现为帧确实上了线、而 `pending`/`packet_id` 记账被遗忘——异常落在轮内 `try` 里，被吞成一条 `case_clause {idle, #st{...}}` 日志，读代码看不出来 | 判决与状态成对返回并一路串联（`{Verdict, D1}`），投递路径的记账（`pending`/`pending_rev`/`sent`/`next_pid`/`inflight_dirty`）以 `D1` 为准。**教训：任何"信号 + 状态"的循环必须把状态串到底，只有带真实往返的套件能暴露它** | §5.2 |
+| **L8** | 计划的"每轮把 `pending` 全部按同 pid DUP=1 重发"实测变成**无界噪声**：一个安静的连接每 1s 就把整个未 ack 集合重发一遍，客户端只会看到重复 | 新增 `sent` 集合（**本连接已发出过**的 packet_id）：blob 恢复出来的条目（上一个连接的 in-flight）本连接**恰好一次** DUP=1 + 同 packet_id（R7/§4.1 的重发义务），会话内已发过的静默不重复；`handle_puback` 移除对应项，clean session 拆除清空。**没有重试定时器**——R7 只承诺"不丢"，重投节拍归 S2 | §4.1、§5.2、R7 |
+| **L9** | pull 路径要本地判断"这条存储消息命中哪些 filter"，但匹配函数在 `broker_router_hash` 内部（未导出），跨 app 调用等于把协议层接到一个具体 Router 实现的私有函数上；OQ-4 的"Router 暂定"讲的是**索引方向**（哪个分区），不是"谁拥有 filter 语义" | 协议侧自建 **`mqtt_filter:matches/2`**（+ `validate_filter/1`/`validate_topic/1`），MQTT 通配符语义归协议适配器；Router 的匹配表照旧服务 `route/3`，两份实现由 T3 的通配符黄金用例与 T9 的重叠 filter 用例分别钉住 | §3.2、OQ-4、§4.7 |
+| **L10** | §4.3 只冻结了"有凭证"的认证形状，两件事没文本可依据：ADR-009 的 `#broker_message.tenant_id` **必填**而桩接口没给来源；匿名 CONNECT（username 与 password 皆无）没有定义 | `broker_security` 在 §4.3 三函数之外**新增 `tenant_id(Principal) -> binary()`**（用户表 shape `{Username, #{password, tenant_id}}`）；匿名 CONNECT 映射 **`principal = client_id`**（不引入"匿名 principal"这个新概念，会话归属仍由 client_id 决定）。两者都是"消息构造必需"而非认证强度问题；`authenticate/2` 的失败措辞保持 §4.3 原话 `bad_username_or_password`，不泄露"用户是否存在" | §4.3、§9-T10 |
+| **L11** | §4.2 的图写"capability 缓存（启动时查一次，E2）"。app 启动时全 broker 只有一份配置，而**有效 QoS 上限是 per-session 事实**：memory 后端下 `fsync ∉ capability`，`mqtt_max_qos = 1` 的配置就是矛盾的 | 在 **CONNECT 时**按 `broker_queue:partition_ids()` 全量查 capability，算 **`EffectiveMaxQos = min(ConfigMax, fsync∈caps ? 1 : 0)`**，缓存进该 conn 的 state；任一分区缺 `fsync` 或分区清单为空即降到 0（**矛盾不静默**），随后由 SUBACK 0x80 与"PUBLISH 超限即断连无 ack"两处执行（E12）。memory 后端用例把这套姿态整条跑通 | §4.2、E2/E12、§9-T9 |
+| **L12** | §4.5 要求对 MQTT 5.0 的 CONNECT **发** CONNACK 返回码 `0x87`，而 3.1.1 把 1~5 之外的字节列为"reserved for future versions"；本模块的解码器按 3.1.1 严格守卫 RC ⇒ 自己发出的字节自己都解不出来（黄金向量的 round-trip 属性首先失败） | 出站照 §4.5 发 `0x87`；入站侧 `p_connack` 的 RC 守卫**放宽为单字节任意值**（`session_present` 仍严格 0/1），`#connack.return_code` 类型随之拓到 `0..255`。这是一处**有意的不对称**：严格 3.1.1 的对端可能把 `0x87` 当畸形包处理——写入 protocol-compatibility.md 的 MQTT 行 | §4.5、protocol-compatibility.md |
+| **L13** | 计划把"非法 topic filter"放在 SUBSCRIBE 的逐 filter 处置里（回 0x80）。实测：`mqtt_frame` 在 **parse 期**就拒绝非法 filter（`bad_filter_shape`），因此整个包已经是协议错误，不存在"逐 topic 授予"的时机 | 姿态定为**断连、无 SUBACK**（`decode_error/3` 路径），`grant/3` 的非法 filter 分支只作为纵深保留——顺带暴露一个真缺陷：原写法 `{error, Reason}` 模式漏了一层嵌套（实际值是 `{{error,R}, Bool}`），真到达即 `case_clause`，已由 dialyzer 的"永不匹配"报告修正为 `{{error, Reason}, _}`。§4.1 表格的"0x80"覆盖面只包括**请求 QoS 超限** | §4.1、§4.5 |
+| **L14** | in-flight 窗（`max_inflight = 64`）满了以后怎么办，文本没有说；若不封顶，一个不 ack 的消费者会把整段 backlog 变成无界内存 | 窗满即**本轮不再投新 QoS1**（停投，不是背压：不通知 publisher、不丢、不断连），PUBACK 到达时重新排一轮把窗腾出来。单轮预算 + `pull_page_limit` 给阻塞 `gen_tcp:send` 一个上界。**慢消费者隔离仍归 S2**，登记为 S1 已知限制 | §5.2、§11.1、protocol-compatibility.md |
+| **L15** | §4.2 的连接图三处与实现不符：(a) 无 `awaiting_owner`（L5）；(b) 子进程写 `transient` 而实际要 **`temporary`**——对端造成的死亡本就按 `normal` 停手，两种重启类型在那条路径上等价，真正的差别是**我们自己的故障**（`{setopts_failed,_}`/`{append_failed,_}`/`{publish_failed,_}`）：`transient` 会重启，而重启拿到的是同一个多半已死的 socket，只会原地打转；(c) 图里的 **`mqtt_session` 模块不存在** | (a) 见 L5；(b) `simple_one_for_one` + `temporary` + `brutal_kill` + `intensity = 0`（conn 死亡是 per-socket 的事实，不是机群故障信号）。**连带实测：`temporary` 子进程不被 `application:stop/1` 收口**，所以套件 `end_per_testcase` 必须显式 `kill_conns()`，否则 socket 与日志噪声跨过用例；(c) 会话状态 = `broker_subscription` 的四张表（实体/cursor/attachment/inflight）+ conn 自己的 `#st{}`，与 §5.2"S1 把 dispatcher 内嵌进 conn_fsm"的选择一致，不新增一个只为装字段的模块。**T12 补上收口**：`temporary` 子进程仍不被 `application:stop` 直接收口，但 listener 停止时 ranch 的 conns sup 会向每个协议 pid 发 shutdown——前提是 `mqtt_listener:start_link/3` 显式 `link(Pid)`（§13 M7），由 `stopping_the_listener_closes_its_connections` 锁定 | §4.2、§5.2、§6 |
+| **L16** | ADR-010 把 env 冻结成 opaque `router_env() :: term()`（G1 只补了 `route_ctx()` 未定义），类型擦除到**第一个真实消费者**才显形：`broker_router:env()` 的值喂给 `broker_router_hash:route/3` 时，dialyzer 正确报"契约被破坏"；同时计划写的 `route(Topic, #{}, Env)` 传的 `#{}` 根本不是 `#route_ctx{}` | 发布路径按冻结契约构造**真实 `#route_ctx{tenant_id, publisher, reliability}`**（S1 的 hash 路由不读它，但契约要求调用方供）；env 的形状仍归实现私有（`route/3` 的 map 匹配就是运行期检查），**不改 ADR-010 一字**。另外 `route/3` 永不返回 `[]`（ADR-010：哈希就是答案，"没人订阅"是 `{ok,[{P,[]}]}`），删掉计划里 `[] -> {0, []}` 那个**编造 partition 0** 的兜底 | §3.2、§5.1(c)、ADR-010 批注 |
+| **L17** | §4.3 的 takeover 只说"新连接踢掉旧连接"，而踢的动作要碰**旧连接的 socket**——订阅层不能替别人关 socket，旧 conn 的迟到 `detach` 又会摘掉新行（K10） | `attach/3` 从返回 `ok` 改为 **`{ok, PrevPid \| undefined}`**（facade spec 同步；同 pid 重 attach 回 `undefined`，永不自杀），由**新 conn 自己**发 `{mqtt_takeover, NewPid}`；旧 conn 收到后**跳过 inflight 快照**再关 socket——旧 blob 落在新 blob 之后会把上一个连接的 in-flight 复活。worker 顺带修替换行的 **monitor ref 泄漏**（`demonitor(OldRef,[flush])`）。另：`{error,_}` 分支被 dialyzer 证明不可达（worker 无法应答是 raise，不是返回形状），删除 | §4.3、§5.2、K10 |
+| **L18** | `mqtt_frame` 把 `frame()` 声明为 `-opaque`，但同一份记录在 `mqtt_frame.hrl` 里是**公布的构造界面**（conn 要造 `#publish{}` 交给 `encode/1`）——opacity 与自己的设计自相矛盾，dialyzer 在唯一的出站构造点报"非 opaque 值" | 改 `-type frame()`，并把理由写在该类型旁：出站合法性由 `encode/1` 的**字段守卫**保证（L2），不是由类型保证。`-export_type([frame/0]).` 不变 | §4.1 |
+| **L19** | J10 家族的跨套件污染换了两个入口：`broker_queue_SUITE:init_per_suite` 断言 `ok = application:load(broker_queue)`，而 CT 在**同一节点**跑所有套件，`mqtt_conn_SUITE` 字母序在前并已启动它 ⇒ `{already_loaded, _}`，全套出现 16 条 Skipped；另一处是 memory 后端用例把 `backend` 留在 `broker_storage_memory` 交给后面的套件 | load 断言放宽为 `_ = application:load(_)`（本仓既有约定）；**用例内移动的 env 必须成对还原**——本套件在 `end_per_testcase` 无条件写回 `backend = broker_storage_wal`（失败用例也不会泄漏，比在体末尾还原更强）。验收仍看 `FAILED`/`Skipped` 明细行：本轮 **238/238 零 FAILED 零 Skipped** | 验收流程、§9-T9 |
+| **L20** | §4.2 暗示 keepalive/max_qos/页面预算是"连接级"参数，但 S1 只有 **app env** 一个作用域（`get_env/3` 带代码默认），listener/socket 级配置没有承载点 | 全部读 app env，conn 在 CONNECT 时把 `max_qos`/`keepalive_ms` 快照进自己的 state（会话中途改配置不影响已建立的连接，这是 E2 缓存语义的自然结果）。**T12 已落地（M4）**：listener 的 `ProtoOpts` 携带六项连接级配置，经 `start_conn/2` 的 `Opts` 进入 `#st.opts`，FSM 用 `opt/3` 优先读它、回落 app env——per-listener 上限因此有了承载点，且非 listener 连接（测试/嵌入式）行为不变 | §4.2、§9-T12 |
+
+**补充实现期观察（不构成设计偏差，但会重复用到）**：
+
+- `proper` 作为 test-profile 依赖（`{proper, "1.5.0"}`）**一次编译通过**，计划里的三级 fallback（`{overrides, ...}` / `vendor/proper` path dep / 自研伪随机）未启用；test profile 的 `erl_opts` 必须**保留** `[debug_info, nowarn_export_all]`，否则会失去根配置的 `warnings_as_errors`。
+- `gen_statem` 的自发送元组（`{poll_t, Ref}`、`{ka_t, Ref}`…）**按内容匹配而非事件类型**，所以每一类定时器都要自带 ref 判别，否则迟到 tick 会被当成新 tick。
+- 阻塞式 `gen_tcp:recv/3` 的测试客户端要**先试缓冲再问 socket**（`mqtt_recv_or/3` 的 accumulate-and-drain），否则 `decode/1` 的"一次一帧 + 返回余料"契约在测试侧被读成"一次一 socket 读"，粘包会假失败。`mqtt_client.hrl` 的读缓冲放在**包含它的进程的 process dictionary** 里，因此一个节点上每个套件只能有一个模块 include 它。
+- `application:set_env/3` 在 app **未 load** 时写入的值，会被之后的 `ensure_all_started` 记住并**压过 `.app` 默认值**——memory 后端用例正是靠这点成立，不必先 load 再 set。
+
+**T9 留下的 S1 已知限制（写进 protocol-compatibility.md 的 MQTT 行，S2 或后续任务消化）**：
+
+1. **没有背压，只有停投**：`max_inflight`（默认 64）窗满时本轮不再投新 QoS1，等 PUBACK 或哨兵 tick；一个不 ack 的消费者只会停滞**自己**的投递，不会拖垮分区，也不会被隔离（慢消费者隔离归 S2，§13 L14）。
+2. **重投节拍缺失**：同一条连接对同一个未 ack 项只投一次（DUP 只在重连时发生，§13 L8），S1 没有重试定时器。连带的真实风险是 **packet_id 复用**：`.inflight` 按 `inflight_flush_interval_ms`（默认 100）攒批刷盘，崩溃后 blob 回退 ⇒ `next_pid` 退回旧值，不同消息顶同一个 packet_id，按 id 去重的客户端会误判。把该参数调成 **`0`** 即每次写入即刻落盘（worker 的 `maybe_flush_inflight/2` 有专门的 0 分支），逼近零复用（吞吐代价由调用方承担）——与 §5.3 cursor 的"默认档 / 零回退档"双档测试是同一个手法，**T13/T14 需按双档各跑一轮**。
+3. **接管瞬间的迟到动作**：K10 的 pid 守卫只保护 attachment 行；旧 conn 若正好在一轮 pull 中间，它仍可能往旧 socket 投一条并 `ack`（推进 cursor）。判定无害：ack 单调前进，新 conn 从 cursor 续读，不会因此跳号（§13 L17）。
+4. **QoS0 订阅离线时 committed 偏低**：没有 conn 替它 skip，该分区 committed 停在最早那条未读消息（方向是"偏低"＝多留数据，绝不 truncate、不丢），恢复要等 S2 的离线 cursor 回收策略（§5.2 批注）。
+5. **追赶是单连接顺序读**：积压极深时首条消息延迟随深度线性增长，且新消息与积压按 offset 序统一投递、无优先级（E7 原有两条，T9 实测复核成立）。
+
 ### T7 实现期间发现并修正（2026-10-23，均为实测暴露）
 
 冻结 API（ADR-009/010/011）全程未改。K0 是 **T3 遗留的真实装配缺陷**（I12 同类，只在装配后的节点里暴露），K1 是冻结 behavior 没给水位查询留位置的非 behavior 补足，K2~K10 是 §5.2/§5.3 计划文本第一次被真实实现时的偏差——其中 K4/K5 偏离 §5.3 表格文本（已在该表就地批注），K6 把"committed 只允许偏低"（§11.3）从口号落成公式与次序。
@@ -717,7 +820,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 
 **补充实现期观察（不构成设计偏差，但会重复用到）**：
 
-- `binary_to_term/2` 的第二参数是**选项列表**——裸 `safe` 抛 `badarg`；files 模块的 catch-all 把它变成假的 `{corrupt_session, Path}`，"编程错误伪装成数据损坏"，在 release 级重启冒烟里才现形（字节本身一直是完好的）。跨节点/跨版本解码统一写 `binary_to_term(Bin, [safe])`。
+- `binary_to_term/2` 的第二参数是**选项列表**——裸 `safe` 抛 `badarg`；files 模块的 catch-all 把它变成假的 `{corrupt_session, Path}`，"编程错误伪装成数据损坏"，在 release 级重启冒烟里才现形（字节本身一直是完好的）。跨节点/跨版本解码统一写 `binary_to_term(Bin, [safe])`。**M10 把这条收窄**：`[safe]` 只适用于**形状固定**的记录（`wal_meta`、`.subs`/`.cursors` 这类 body 只有 binary/integer 的文件）；WAL 的消息体（`proto_meta`）与 `.inflight` 会话 blob 的原子归 writer app 所有，必须用 `binary_to_term/1`（完整性由 CRC-32 / 原子 rename + 本地可信目录保证，见 §13 M10/M11）。
 - `application:start/1` 成功返回**裸 `ok`**（不是 `{ok, _}`）；一次失败的 start 之后，ac 短暂处于 settle 窗口、对下一次 start 回 `{error, {already_started, _}}`——测试里"失败后重启"需要按 worker 是否存活做 settle 重试（`start_after_settle` 助手）。
 - **release 节点探针的两条实操**：relx CLI `rpc` 的 `Args` 参数按 `erlang:apply/3` 列表文本解析（单个原子也要写成 `[atom]`，裸写会得到 badarg）；且 OTP 28 的运行中节点经 `rpc:call` 远程 apply `code`/`erlang` 系函数会得到 `undef`（`code:add_pa/1`、`erlang:system/1` 实测如此，应用模块不受影响）——验证脚本因此写成"对已加载 app 模块的多次 rpc + 数据往返"（例：`broker_router:env/0` 的 Env map 传回 `route/3`，pid/tid 天然可跨节点）。
 
