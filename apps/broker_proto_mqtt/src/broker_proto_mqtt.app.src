@@ -5,7 +5,7 @@
     {mod, {broker_proto_mqtt_app, []}},
     {applications, [kernel, stdlib, sasl, ranch, broker_core, broker_metrics,
                     broker_storage, broker_router, broker_queue, broker_subscription,
-                    broker_event, broker_security]},
+                    broker_event, broker_security, broker_retain]},
     {env, [{%% Empty on purpose: a library/test node binds no port unless the
             %% release config (config/sys.config.src) supplies a listener. T12's
             %% listener suite supplies its own ephemeral port.
@@ -15,5 +15,9 @@
            {pull_poll_interval_ms, 1000},
            {inflight_snapshot_ms, 20},
            {max_keepalive_ms, 60000},
-           {mqtt_max_qos, 1}]}
+           %% S2-C (ADR-018 §18.4): QoS 2 is allowed by default and bounded by
+           %% the backend capability at CONNECT (E2). `released' + `received'
+           %% per session are capped; over the cap is a deliberate disconnect.
+           {mqtt_max_qos, 2},
+           {max_qos2_state_per_session, 100}]}
 ]}.

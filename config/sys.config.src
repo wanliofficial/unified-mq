@@ -97,18 +97,31 @@
         num_acceptors => 10,
         max_connections => 1024,
         %% Must be 0 whenever broker_storage:backend is broker_storage_memory
-        %% (design §3.3 E12), so QoS 1 is refused at SUBACK instead of failing
-        %% at append time. Everything in this map travels to the connection as
-        %% `ProtoOpts' (the L20 seam); the app-level keys below are the defaults
-        %% for connections started outside a listener (tests, embedded use).
-        mqtt_max_qos => 1,
+        %% (design §3.3 E12), so QoS 1/2 are refused at SUBACK instead of
+        %% failing at append time. Everything in this map travels to the
+        %% connection as `ProtoOpts' (the L20 seam); the app-level keys below
+        %% are the defaults for connections started outside a listener.
+        mqtt_max_qos => 2,
         max_keepalive_ms => 60000}
     ]},
     {pull_page_limit, 32},
     {max_inflight, 64},
     {pull_poll_interval_ms, 1000},
     {inflight_snapshot_ms, 20},
-    {mqtt_max_qos, 1},
-    {max_keepalive_ms, 60000}
+    {mqtt_max_qos, 2},
+    {max_keepalive_ms, 60000},
+    %% ADR-018 §18.4: per-session cap on `released' + `received'. Over the cap
+    %% the connection is closed (a silent drop of QoS 2 state would lie).
+    {max_qos2_state_per_session, 100}
+  ]},
+
+  {broker_retain, [
+    %% J8: same absolute path as broker_storage/broker_subscription -- the
+    %% retained snapshot must live beside the sessions it serves.
+    {data_dir, "/home/wanli/workspace/unified-mq/data"},
+    {retain_flush_interval_ms, 100},
+    {max_retained, 10000},
+    {max_retained_bytes, 67108864},
+    {max_payload_bytes, 262144}
   ]}
 ].
