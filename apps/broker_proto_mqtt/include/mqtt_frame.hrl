@@ -11,7 +11,7 @@
          keep_alive = 0          :: non_neg_integer(),
          clean_session = 0       :: 0 | 1,
          will_flag = 0           :: 0 | 1,
-         will_qos = 0            :: 0 | 1,
+         will_qos = 0            :: 0 | 1 | 2,
          will_retain = 0         :: 0 | 1,
          will_topic              :: binary() | undefined,
          will_payload            :: binary() | undefined,
@@ -26,13 +26,19 @@
                   return_code = 0      :: 0..255}).
 
 -record(publish, {dup = 0    :: 0 | 1,
-                  qos = 0    :: 0 | 1,
+                  qos = 0    :: 0 | 1 | 2,
                   retain = 0 :: 0 | 1,
                   topic          :: binary(),
                   packet_id      :: pos_integer() | undefined,
                   payload = <<>> :: binary()}).
 
 -record(puback, {packet_id :: pos_integer()}).
+
+%% QoS 2 handshake (S2-C, ADR-012/018). The fixed header flags are part of the
+%% wire contract: PUBREC/PUBCOMP carry 0b0000, PUBREL carries 0b0010.
+-record(pubrec, {packet_id :: pos_integer()}).
+-record(pubrel, {packet_id :: pos_integer()}).
+-record(pubcomp, {packet_id :: pos_integer()}).
 
 -record(subscribe, {packet_id :: pos_integer(),
                     topics = [] :: [{binary(), 0..2}]}).

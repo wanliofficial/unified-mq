@@ -32,10 +32,14 @@ all() ->
      non_minimal_varint_accepted,
      publish_qos0_no_pid,
      puback_zero_pid_rejected,
+     qos2_handshake_golden,
+     qos2_handshake_rejections,
+     qos2_publish_roundtrip,
      subscribe_qos_byte_bounds,
      connect_version_rejections,
      connect_will_without_flag_rejected,
-     connect_will_qos_above_one_rejected,
+     connect_will_qos_above_two_rejected,
+     connect_will_qos_two_roundtrip,
      connect_reserved_bit_rejected,
      connect_username_without_password_rejected,
      utf8_rejections,
@@ -64,6 +68,12 @@ golden_vectors_decode(_Config) ->
          {<<"0x3A 0x15 00 05 61 2F 62 2F 63 00 0A 68 65 6C 6C 6F 20 77 6F 72 6C 64 29">>,
           #publish{dup = 1, qos = 1, topic = <<"a/b/c">>, packet_id = 10,
                    payload = <<"hello world)">>}},
+         {<<"0x34 0x0B 00 05 61 2F 62 2F 63 00 0A 68 69">>,
+          #publish{qos = 2, topic = <<"a/b/c">>, packet_id = 10,
+                   payload = <<"hi">>}},
+         {<<"0x50 0x02 00 0A">>, #pubrec{packet_id = 10}},
+         {<<"0x62 0x02 00 0A">>, #pubrel{packet_id = 10}},
+         {<<"0x70 0x02 00 0A">>, #pubcomp{packet_id = 10}},
          {<<"0x82 0x19 00 01 00 03 61 2F 23 01 00 0E 73 70 6F 72 74 2F 74 65 6E 6E 69 73 2F 23 02">>,
           #subscribe{packet_id = 1,
                      topics = [{<<"a/#">>, 1}, {<<"sport/tennis/#">>, 2}]}}],
@@ -80,6 +90,9 @@ golden_vectors_encode(_Config) ->
           #publish{dup = 1, qos = 1, topic = <<"a/b/c">>, packet_id = 10,
                    payload = <<"hello world)">>}},
          {<<"0x40 0x02 00 0A">>, #puback{packet_id = 10}},
+         {<<"0x50 0x02 00 0A">>, #pubrec{packet_id = 10}},
+         {<<"0x62 0x02 00 0A">>, #pubrel{packet_id = 10}},
+         {<<"0x70 0x02 00 0A">>, #pubcomp{packet_id = 10}},
          {<<"0x90 0x03 00 01 00">>, #suback{packet_id = 1, return_codes = [0]}},
          {<<"0xA2 0x0C 00 01 00 03 61 2F 23 00 03 74 2F 31">>,
           #unsubscribe{packet_id = 1, topics = [<<"a/#">>, <<"t/1">>]}},
@@ -153,6 +166,37 @@ puback_zero_pid_rejected(_Config) ->
     {error, _} = mqtt_frame:decode(<<16#40, 2, 0, 0>>),
     ok.
 
+%% S2-C: the four-step handshake's three frames, byte for byte (§3.5/§3.6).
+qos2_handshake_golden(_Config) ->
+    ?assertEqual(<<16#50, 2, 0, 10>>, mqtt_frame:encode(#pubrec{packet_id = 10})),
+    ?assertEqual(<<16#62, 2, 0, 10>>, mqtt_frame:encode(#pubrel{packet_id = 10})),
+    ?assertEqual(<<16#70, 2, 0, 10>>, mqtt_frame:encode(#pubcomp{packet_id = 10})),
+    ok.
+
+qos2_handshake_rejections(_Config) ->
+    %% PUBREL flags are 0b0010; PUBREC/PUBCOMP are 0b0000. Everything else is
+    %% the §4.5 protocol-error posture: decode refuses, the conn disconnects.
+    lists:foreach(
+      fun(Bin) -> {error, _} = mqtt_frame:decode(Bin) end,
+      [<<16#52, 2, 0, 10>>,          % PUBREC with flags 2
+       <<16#60, 2, 0, 10>>,          % PUBREL with flags 0
+       <<16#72, 2, 0, 10>>,          % PUBCOMP with flags 2
+       <<16#50, 2, 0, 0>>,           % packet id 0
+       <<16#62, 2, 0, 0>>,
+       <<16#70, 2, 0, 0>>,
+       <<16#50, 1, 0>>,              % truncated body
+       <<16#62, 3, 0, 10, 0>>]),     % trailing byte
+    ok.
+
+qos2_publish_roundtrip(_Config) ->
+    F = #publish{dup = 1, qos = 2, retain = 1, topic = <<"t/q2">>,
+                 packet_id = 65535, payload = <<1, 2, 3>>},
+    {ok, F, <<>>} = mqtt_frame:decode(mqtt_frame:encode(F)),
+    %% QoS 2 needs a packet id; encoding without one is a programming error.
+    ?assertError({malformed_frame_out, publish},
+                 mqtt_frame:encode(F#publish{packet_id = undefined})),
+    ok.
+
 subscribe_qos_byte_bounds(_Config) ->
     %% Requested-QoS byte: only 0..2 valid, top six bits must be zero.
     Ok = fun(Byte) ->
@@ -186,13 +230,19 @@ connect_will_without_flag_rejected(_Config) ->
         mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
     ok.
 
-connect_will_qos_above_one_rejected(_Config) ->
-    %% S1 stores/delivers QoS 0/1 only; a will asking for 2 is rejected at
-    %% the codec (reserved value for a 3.1.1 implementation that stops here).
-    Body = <<0, 4, "MQTT", 4, 2#00010100, 0, 60, 0, 2, "mo",
+connect_will_qos_above_two_rejected(_Config) ->
+    %% 0b11 is reserved (§3.1.2.4); QoS 2 is legal since S2-C.
+    Body = <<0, 4, "MQTT", 4, 2#00011100, 0, 60, 0, 2, "mo",
              0, 1, "w", 0, 1, "p">>,
-    {error, {unsupported_will_qos, 2}} =
+    {error, {unsupported_will_qos, 3}} =
         mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
+    ok.
+
+connect_will_qos_two_roundtrip(_Config) ->
+    C = #connect{client_id = <<"w2">>, keep_alive = 10, will_flag = 1,
+                 will_qos = 2, will_retain = 1, will_topic = <<"w">>,
+                 will_payload = <<"p">>},
+    {ok, C, <<>>} = mqtt_frame:decode(mqtt_frame:encode(C)),
     ok.
 
 connect_reserved_bit_rejected(_Config) ->
@@ -254,7 +304,7 @@ fixed_header_flag_rejections(_Config) ->
                 <<16#36, 3, 0, 1, "a">>,                        % PUBLISH QoS 0b11
                 <<16#21, 2, 0, 0>>,                             % CONNACK flags /= 0
                 <<16#38, 1, 0>>,                                % PUBLISH flags 0b1000 (dup on qos0 ok shape, bad len)
-                <<16#50, 0>>, <<16#62, 2, 0, 10>>, <<16#70, 2>>, % QoS2 types 5/6/7: no S1 frame set
+                <<16#60, 2, 0, 10>>, <<16#52, 2, 0, 10>>,       % QoS2 handshake flags
                 <<16#80, 6, 0, 7, 0, 2, "t/", 1>>,              % SUBSCRIBE flags /= 0b0010
                 <<16#A0, 6, 0, 7, 0, 2, "t/">>,                 % UNSUBSCRIBE flags /= 0b0010
                 <<16#D0, 1, 0>>, <<16#C0, 1, 0>>],              % bodies where none allowed
@@ -392,7 +442,7 @@ prop_varint() ->
             end).
 
 prop_encode_rejects() ->
-    ?FORALL(T, oneof([pub_qos2, pub_pid_zero, pub_pid_undefined,
+    ?FORALL(T, oneof([pub_pid_zero, pub_pid_undefined,
                       pub_empty_topic, pub_wildcard_topic,
                       sub_empty, suback_empty, unsub_empty,
                       conn_asymmetric_creds, conn_will_split,
@@ -405,9 +455,6 @@ did_raise(F) ->
         _ -> false
     end.
 
-illegal_frame(pub_qos2) ->
-    fun() -> mqtt_frame:encode(#publish{qos = 2, topic = <<"a">>,
-                                         packet_id = 1}) end;
 illegal_frame(pub_pid_zero) ->
     fun() -> mqtt_frame:encode(#publish{qos = 1, topic = <<"a">>,
                                          packet_id = 0}) end;
@@ -518,10 +565,10 @@ gen_payload() ->
 
 gen_publish() ->
     ?LET({QoS, Dup, Ret, Topic, Pid, Payload},
-         {choose(0, 1), choose(0, 1), choose(0, 1), gen_topic_string(),
+         {choose(0, 2), choose(0, 1), choose(0, 1), gen_topic_string(),
           gen_pos_int(), gen_payload()},
          #publish{dup = Dup, qos = QoS, retain = Ret, topic = Topic,
-                  packet_id = case QoS of 0 -> undefined; 1 -> Pid end,
+                  packet_id = case QoS of 0 -> undefined; _ -> Pid end,
                   payload = Payload}).
 
 gen_subscribe() ->
@@ -539,7 +586,7 @@ gen_connect() ->
     ?LET({Id, KA, CS, HasWill, HasCreds, WT, WP, WQ, WR, User, Pass},
          {gen_topic_string(), choose(0, 65535), choose(0, 1),
           choose(0, 1), choose(0, 1), gen_topic_string(), gen_payload(),
-          choose(0, 1), choose(0, 1), gen_binary_string(),
+          choose(0, 2), choose(0, 1), gen_binary_string(),
           gen_binary_string()},
          #connect{client_id = Id, keep_alive = KA, clean_session = CS,
                   %% will_qos/will_retain ride in the will_flag bit pair:
@@ -564,6 +611,10 @@ any_frame() ->
     oneof([{pub, gen_publish()}, {sub, gen_subscribe()},
            {unsub, gen_unsubscribe()}, {conn, gen_connect()},
            {connack, gen_connack()},
+           {puback, ?LET(P, gen_pos_int(), #puback{packet_id = P})},
+           {pubrec, ?LET(P, gen_pos_int(), #pubrec{packet_id = P})},
+           {pubrel, ?LET(P, gen_pos_int(), #pubrel{packet_id = P})},
+           {pubcomp, ?LET(P, gen_pos_int(), #pubcomp{packet_id = P})},
            {ping, oneof([#ping{kind = req}])},
            {pingresp, oneof([#ping{kind = resp}])},
            {disc, oneof([#disconnect{}])}]).

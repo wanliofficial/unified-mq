@@ -2,13 +2,15 @@
 %% crashes) and `encode/1' (outbound frames; an illegal construction is a
 %% programming error and raises — it never reaches the wire).
 %%
-%% Strictness is deliberate for S1 — §4.5's rejection posture leans on it:
+%% Strictness is deliberate — §4.5's rejection posture leans on it:
 %% fixed-header flags, reserved types, PUBLISH QoS 0b11, packet id 0, the
 %% varint bound, and Annex A UTF-8 (NUL, surrogates, overlong, >U+10FFFF) all
 %% come back as `{error, _}' for the conn to disconnect on without acking.
-%% The S1 frame set carries no QoS 2 handshake: PUBREC/PUBREL/PUBCOMP (types
-%% 5-7) have no records and decode to `{error, _}' — which satisfies §4.5's
-%% "QoS 2 PUBLISH -> disconnect" just as the conn's own posture check does.
+%%
+%% Since S2-C the frame set is the complete packet range the broker needs:
+%% PUBREC(5)/PUBREL(6)/PUBCOMP(7) decode with their fixed-header flags checked
+%% (PUBREL is 0b0010, the other two 0b0000), and PUBLISH/will may carry QoS 2
+%% (ADR-012, ADR-018).
 %%
 %% Conventions the conn_fsm relies on:
 %%  * `{more, Buf}' means "wait for bytes", never "this prefix is bad".
@@ -43,6 +45,7 @@
 %% own legal frame a type error at the call site. Illegal frames are refused at
 %% runtime by encode/1's field guards, which is where the guarantee actually is.
 -type frame() :: #connect{} | #connack{} | #publish{} | #puback{}
+               | #pubrec{} | #pubrel{} | #pubcomp{}
                | #subscribe{} | #suback{} | #unsubscribe{} | #unsuback{}
                | #disconnect{} | #ping{}.
 
@@ -57,9 +60,8 @@ decode(<<>>) ->
 decode(<<TypeFlags:8, Rest0/binary>>) ->
     Type = TypeFlags bsr 4,
     Flags = TypeFlags band 16#0F,
-    %% Reserved packet types (§2.1.3) and the QoS 2 handshake (5-7, no S1
-    %% frame set) are rejected on the type byte alone: waiting for a body
-    %% that will never be legal is `{more}' with no upside.
+    %% Reserved packet types (§2.1.3) are rejected on the type byte alone:
+    %% waiting for a body that will never be legal is `{more}' with no upside.
     case reserved_type(Type) of
         true ->
             {error, {malformed_packet, {reserved_type, Type}}};
@@ -68,9 +70,6 @@ decode(<<TypeFlags:8, Rest0/binary>>) ->
     end.
 
 reserved_type(0) -> true;    %% §2.1.3 reserved
-reserved_type(5) -> true;    %% PUBREC
-reserved_type(6) -> true;    %% PUBREL
-reserved_type(7) -> true;    %% PUBCOMP
 reserved_type(15) -> true;   %% §2.1.3 reserved
 reserved_type(_) -> false.
 
@@ -144,13 +143,22 @@ do_parse_body(3, Flags, Body) ->
     QoS = (Flags bsr 1) band 2#11,
     Retain = Flags band 1,
     if
-        %% QoS 0b11 reserved (rejection posture); QoS 2 would need a record
-        %% the S1 frame set does not have.
-        QoS =< 1 -> p_publish(Dup, QoS, Retain, Body);
+        %% QoS 0b11 reserved (rejection posture). S2-C carries QoS 2 as well
+        %% (ADR-012), so only 0b11 stays illegal.
+        QoS =< 2 -> p_publish(Dup, QoS, Retain, Body);
         true -> {error, {malformed_packet, {bad_publish_qos, QoS}}}
     end;
 do_parse_body(4, 0, <<Pid:16>>) when Pid =/= 0 ->
     {ok, #puback{packet_id = Pid}};
+%% QoS 2 handshake: exact (type, flags) pairs, §2.2.2 table. PUBREL's flags
+%% are 0b0010 by definition; a peer sending 0b0000 lands in the fallback and
+%% is disconnected by the conn, which is the §4.5 rejection posture.
+do_parse_body(5, 0, <<Pid:16>>) when Pid =/= 0 ->
+    {ok, #pubrec{packet_id = Pid}};
+do_parse_body(6, 2, <<Pid:16>>) when Pid =/= 0 ->
+    {ok, #pubrel{packet_id = Pid}};
+do_parse_body(7, 0, <<Pid:16>>) when Pid =/= 0 ->
+    {ok, #pubcomp{packet_id = Pid}};
 do_parse_body(8, 2, Body) ->
     p_subscribe(Body);
 do_parse_body(9, 0, <<Pid:16, Codes/binary>>) when Pid =/= 0 ->
@@ -187,8 +195,8 @@ p_connect(Body) ->
                     %% §3.1.2.4: Will QoS/Retain are meaningless (must be 0)
                     %% without the Will Flag.
                     {error, {malformed_packet, will_flags_without_will}};
-                WillQoS > 1 ->
-                    %% §3.1.2.4: QoS 3 is reserved; S1 has no QoS 2 either.
+                WillQoS > 2 ->
+                    %% §3.1.2.4: QoS 3 is reserved; S2-C carries 0/1/2.
                     {error, {unsupported_will_qos, WillQoS}};
                 true ->
                     connect_tail(Rest, CSession, Will, WillQoS,
@@ -546,6 +554,28 @@ encode(#puback{packet_id = Pid}) ->
         true ->
             erlang:error({malformed_frame_out, puback})
     end;
+encode(#pubrec{packet_id = Pid}) ->
+    if
+        is_integer(Pid), Pid >= 1, Pid =< 65535 ->
+            fixed_header(5, 0, <<Pid:16>>);
+        true ->
+            erlang:error({malformed_frame_out, pubrec})
+    end;
+encode(#pubrel{packet_id = Pid}) ->
+    if
+        is_integer(Pid), Pid >= 1, Pid =< 65535 ->
+            %% §3.6.1: PUBREL's fixed header flags are 0b0010, mandatory.
+            fixed_header(6, 2, <<Pid:16>>);
+        true ->
+            erlang:error({malformed_frame_out, pubrel})
+    end;
+encode(#pubcomp{packet_id = Pid}) ->
+    if
+        is_integer(Pid), Pid >= 1, Pid =< 65535 ->
+            fixed_header(7, 0, <<Pid:16>>);
+        true ->
+            erlang:error({malformed_frame_out, pubcomp})
+    end;
 encode(#subscribe{packet_id = Pid, topics = Topics}) ->
     if
         is_integer(Pid), Pid >= 1, Pid =< 65535,
@@ -647,11 +677,12 @@ e_publish(#publish{dup = Dup, qos = 0, retain = Ret, topic = Topic,
     Flags = (Dup bsl 3) bor (Ret bsl 0),
     fixed_header(3, Flags, <<(len16(Topic))/binary, Topic/binary,
                              Payload/binary>>);
-e_publish(#publish{dup = Dup, qos = 1, retain = Ret, topic = Topic,
-                   packet_id = Pid, payload = Payload}) ->
+e_publish(#publish{dup = Dup, qos = QoS, retain = Ret, topic = Topic,
+                   packet_id = Pid, payload = Payload})
+  when QoS =:= 1; QoS =:= 2 ->
     if
         is_integer(Pid), Pid >= 1, Pid =< 65535 ->
-            Flags = (Dup bsl 3) bor 2 bor (Ret bsl 0),
+            Flags = (Dup bsl 3) bor (QoS bsl 1) bor (Ret bsl 0),
             fixed_header(3, Flags, <<(len16(Topic))/binary, Topic/binary,
                                      Pid:16, Payload/binary>>);
         true ->
