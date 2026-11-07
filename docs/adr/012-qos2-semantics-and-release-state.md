@@ -1,6 +1,7 @@
 # ADR-012：MQTT QoS 2 的语义边界与 release 状态持久化
 
 - **状态**：**已采纳（S2 M0 冻结，2026-11-07）**——用户签认；后续修改须走 ADR 修订流程
+- **修订**：§12.2 的 `released` 形状与 §12.4 的未知握手帧姿态由 **ADR-018 §18.3（R1~R4）** 修订；本文其余条款继续有效
 - **日期**：2026-11-07
 - **关联**：README §6.3/§11.1；roadmap §4.1（MQTT 补齐）；ADR-007（显式可靠性）、ADR-009（`#broker_message{}`）、ADR-011（`broker_storage` 冻结行为）；设计文档 `docs/design/s2-single-node-kernel.md` D1 / §4.3
 

@@ -156,14 +156,14 @@ unified-mq/
 
 **目标**：把原型变成能承载真实流量的单机系统，仍无分布式。
 
-**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.3：O1~O4 已拍板、D1~D9 已结案、ADR-012~017 已签认，S2-A~S2-I 子项目与 Gate 映射）。**S2-A 可观测性最小集已完成（2026-11-07）**，执行计划见 [`docs/design/s2-a-metrics-execution-plan.md`](design/s2-a-metrics-execution-plan.md)；其余子项目逐项开执行计划。
+**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.3：O1~O4 已拍板、D1~D9 已结案、ADR-012~017 已签认，S2-A~S2-I 子项目与 Gate 映射）。**S2-A 可观测性最小集（2026-11-07）、S2-B 替身档（2026-11-07）、S2-C QoS2/Retain/Will（2026-11-07）已完成**；执行计划见 [`s2-a-metrics-execution-plan.md`](design/s2-a-metrics-execution-plan.md)、[`s2-b-reliability-execution-plan.md`](design/s2-b-reliability-execution-plan.md)、[`s2-c-protocol-completion-execution-plan.md`](design/s2-c-protocol-completion-execution-plan.md)；其余子项目逐项开执行计划。
 
 ### 4.1 功能范围
 
 - **分区与顺序**：partition 归属、消息有序性边界
 - **订阅抽象**：Exclusive / Shared / Failover 统一到 `broker_subscription` + `broker_cursor`（README 5.2）
 - **消息生命周期**：ACK / 重投递（指数退避）/ 重试上限 / DLQ / TTL / retention
-- **MQTT 补齐**：QoS 2、Retain、Will、MQTT 5.0 Session 与 User Properties
+- **MQTT 补齐**：QoS 2、Retain、Will ✅（S2-C）；MQTT 5.0 Session 与 User Properties（S2.5）
 - **可靠性等级**：`os_buffer` → `fsync` → `replicated_commit` 三档，Producer ACK 返回时机与等级严格对应（README 6.3）
 - **背压**：bounded batch、mailbox 水位观测、生产者限速、consumer flow permit
 - **可观测性最小集**：连接数、认证失败、吞吐、端到端延迟、ACK 延迟、队列深度、订阅积压、cursor lag、DLQ 规模、WAL 写/刷盘延迟
@@ -324,9 +324,11 @@ unified-mq/
 |---|---|---|
 | `docs/adr/00N-*.md` | S0 | 13 |
 | `docs/architecture.md` | S1 | 2 |
-| `docs/storage-and-recovery.md` | S1（v0.1，T16）；S2 / S4 扩写 | 5.3、6 |
+| `docs/storage-and-recovery.md` | S1（v0.1，T16）；S2-C 扩至 v0.2（`retain.v1` + `.inflight` v2）；S4 继续扩写 | 5.3、6 |
 | `docs/design/s2-single-node-kernel.md` | S2（v0.3 决策冻结） | 4、5.2、6.3、7.2、10 |
 | `docs/design/s2-a-metrics-execution-plan.md` | S2-A（已完成 2026-11-07） | 10.2 |
+| `docs/design/s2-b-reliability-execution-plan.md` | S2-B（替身档已完成 2026-11-07） | 6.3、10 |
+| `docs/design/s2-c-protocol-completion-execution-plan.md` | S2-C（已完成 2026-11-07） | 4.1、11.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

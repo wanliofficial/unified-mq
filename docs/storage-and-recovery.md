@@ -1,10 +1,10 @@
 # 存储与恢复（S1）
 
-- **文档版本**：v0.1（T16，2026-11-06）
-- **状态**：S1 已实现并实测的磁盘格式、刷盘策略与恢复语义；S2/S3/S4 的演进单列于 §14
-- **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、设计文档 §5.3/§7/§8
-- **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`
-- **证据**：`rebar3 ct` 264/264；T14 真实容器 `kill -9` 矩阵（R1a~R7 × 双档 = 16/16，见 `tools/docker/`）
+- **文档版本**：v0.2（S2-C，2026-11-07：§2 目录加 `retain/`、§9 的 `.inflight` 升到形状 v2）
+- **状态**：已实现并实测的磁盘格式、刷盘策略与恢复语义；S2/S3/S4 的演进单列于 §14
+- **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、ADR-018（retain 树与 `.inflight` v2）、设计文档 §5.3/§7/§8
+- **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`、`apps/broker_retain/src/broker_retain_files.erl`
+- **证据**：`rebar3 ct` 322/322（`mqtt_conn_SUITE` 50 例中 20 例为 S2-C 新增）；T14 真实容器 `kill -9` 矩阵（R1a~R8 × 双档 = 18/18；R8 为 S2-C 的 QoS2 崩溃场景）；T15 10/10 真实客户端用例
 
 > 本文回答三个问题：**盘上有什么、什么时候真正落盘、崩溃后哪些字节会被信任**。架构分层与进程归属见 [`architecture.md`](architecture.md)。
 
@@ -31,13 +31,16 @@
 │   │   └── segment-00000000000000001235.log
 │   ├── 1/ …
 │   └── 3/ …                         # S1 固定 4 分区
-└── sessions/
-    ├── Z3Vlc3Q.subs                 # url-safe base64(client_id) + 扩展名
-    ├── Z3Vlc3Q.cursors
-    └── Z3Vlc3Q.inflight
+├── sessions/
+│   ├── Z3Vlc3Q.subs                 # url-safe base64(client_id) + 扩展名
+│   ├── Z3Vlc3Q.cursors
+│   └── Z3Vlc3Q.inflight
+└── retain/
+    └── retain.v1                    # 整棵 retained 树，S2-C 新增（ADR-018 §18.2）
 ```
 
-- `broker_storage.data_dir` 与 `broker_subscription.data_dir` 必须指向**同一个**绝对路径；否则 `.subs` 与 WAL 分居两地，节点重启后互不相认。
+- `broker_storage.data_dir`、`broker_subscription.data_dir` 与 `broker_retain.data_dir` 必须指向**同一个**绝对路径；否则 `.subs`/`retain.v1` 与 WAL 分居两地，节点重启后互不相认。
+- retained 树是一棵树、不是一份日志：`retain.v1` 每次变化整文件重写（temp + `file:sync` + `rename`），没有增量记录，也就没有"撕裂的树"。它有 `vsn`，未知版本与解析失败都是**启动失败**并带路径——用空树起来等于告诉每个新订阅者"从来没有过 retained 消息"。
 - 目录名是分区 id（`0..N-1`），不是哈希值；`wal_recovery` 用目录里的段文件重建 offset，不读任何分区清单。
 - `sessions/` 的文件名只是地址：真实 client id 存在文件内容里（client id 可含 `/`，不能直接做文件名）。
 
@@ -264,12 +267,27 @@ recover(P, Dir):
 |---|---|---|---|
 | `<b64>.subs` | 订阅集合 `[{Filter, QoS, [{Partition, InitOffset}]}]` | SUBSCRIBE / UNSUBSCRIBE | **每次变化** |
 | `<b64>.cursors` | 该 client 全部 `(SubRef, Partition)` 的 cursor | 窗口触发或 tick | 每次写 |
-| `<b64>.inflight` | 不透明 blob：`#{next_pid, pending}` | 每条 QoS1 投递/ack（受窗口约束） | 每次写 |
+| `<b64>.inflight` | 不透明 blob，**形状 v2**（见下） | 每条 QoS1/QoS2 投递、ack、握手推进（受窗口约束） | 每次写 |
 
-- 文件名 = `base64url(client_id)`（无填充）+ 扩展名；内容 = `term_to_binary({vsn,1,ClientId,Body})`。
+- 文件名 = `base64url(client_id)`（无填充）+ 扩展名；内容 = `term_to_binary({vsn,1,ClientId,Body})`。外层信封的 `vsn` 仍是 **1**（S2-C 没改它）；变的是 `.inflight` 的 **Body 形状**：
 - 写入序列：**临时文件 → `file:sync` → `rename` 覆盖**。rename 在 ext4/xfs 上原子，读者只会看到完整旧文件或完整新文件；**不做目录级 fsync**（掉电语义见 §11）。
 - 解码：`.subs`/`.cursors` 用 `[safe]`（body 只有 binary/integer）；`.inflight` **不用** `[safe]`（含 `mqtt_conn_fsm` 的原子，M11）。
 - `list_sessions/0` 只枚举 `*.subs`：集合是权威；`.cursors` 里不属于任何现有 filter 的行会被丢弃。
+
+`.inflight` 的 Body（ADR-018 §18.3 R3）：
+
+```
+#{vsn        := 2,
+  next_pid   := pos_integer(),        % 出站 packet id 分配器的下一值
+  pending    := #{Pid => {Refs, {Partition, Offset}}},
+  qos        := #{Pid => 0 | 1 | 2},  % 与 pending 同键的级别
+  released   := #{Pid => true},       % pending 子集：已见 PUBREC，待 PUBCOMP
+  received   := #{Pid => true}}       % 入站：已回 PUBREC，待 PUBREL
+```
+
+- `released` 只描述 `pending` 里的条目（`restore/1` 会 `maps:filter` 掉孤儿），语义是"重连时发 PUBREL，不要再发一遍 PUBLISH"。
+- retained 补发的条目**不写 blob**：它们没有 `{Partition, Offset}`，重连后客户端重新订阅就能再拿到，写进去只会永久占住窗口槽位。
+- 读到 **v1** blob（`#{next_pid, pending}`）时按"全部是 QoS1、无 released/received"解释——S1 写下的文件在 S2 仍能恢复，代价是那次握手从 QoS1 语义重来（允许重复，符合 §4.1）。
 
 ### 9.2 三个刷盘档
 
@@ -296,6 +314,23 @@ recover(P, Dir):
 **绝不**用 `Committed`、`0` 或"新的 High"作为兜底来替代第 1/2 条：回退到订阅起点之前会重放已确认数据（违 §4.2 语义），跳到 High 会跳过未 ack 的积压（丢消息）。
 
 boot step 3 再逐条 `broker_router:register(Filter, SubRef, #{})` 回填索引；`{error,{already_registered,SubRef}}` 视为成功（崩溃窗口内 Router 可能残留同一 SubRef）。
+
+### 9.4 retained 树（`retain/retain.v1`，S2-C）
+
+| 项 | 值 |
+|---|---|
+| 文件 | `<data_dir>/retain/retain.v1` |
+| 内容 | `term_to_binary({vsn, 1, [{Topic, #broker_message{}}]})` |
+| 写入 | 整树重写：临时文件 → `file:sync` → `rename` |
+| 解码 | 不用 `[safe]`（`#broker_message.proto_meta` 带协议私有原子，与 M10/M11 同因） |
+| 损坏 / 未知 `vsn` | **启动失败**，错误里带路径 |
+
+刷盘时机（ADR-018 §18.2，O6）：
+
+- **QoS1 / QoS2 的 `retain=1` PUBLISH**：先落盘，再回 PUBACK / PUBREC。也就是说，客户端拿到的 ack 一定覆盖了"这条 retained 值已经能被重启后的节点读到"。
+- **QoS0 的 `retain=1` PUBLISH**：走窗口批量（`retain_flush_interval_ms`，默认 100 ms，`0` 表示每次写穿）。QoS0 本身不承诺持久化，所以 retained 值也可能丢——这与 QoS0 的语义一致，不是例外。
+- 上限拒绝（`max_retained` / `max_retained_bytes` / `max_payload_bytes`）发生在**写盘之前**：树不变、仍向在线订阅者转发、publisher 仍拿到正常 ack，计数 `retain_overflow` 加一。**拒绝是有界的显式行为，不是丢消息**。
+- retain 树与 `.inflight`/`.cursors` 之间没有跨文件一致性要求：树只在 PUBLISH 时变，会话文件只在投递/ack 时变，两者可以各自回退到上一个完整版本，最坏结果是"重复补发一条 retained 消息"。
 
 ---
 
@@ -418,6 +453,7 @@ Gate「WAL 与内存实现可互换」的机械检查：`apps/broker_storage/tes
 | Mnesia 控制面 | `.subs`/`.cursors`/`.inflight` 迁入 `subscription_meta`/`cursor_meta`/`session_meta` | `broker_subscription` 对外 API |
 | 复制（S3/S4） | 新后端实现 `replicated_commit`；提交点变为共识返回 | 同一 behavior；ACK 与 capability 一一对应 |
 | 慢消费者/背压 | cursor 回收、离线 QoS0 skip、per-consumer 配额 | `committed = min(活 cursor)-1` 的方向性 |
+| retained 树扩容（S2-F/S4） | 增量日志或按 filter 分片，取代整树重写 | `vsn` 字段；损坏即启动失败 |
 
 ---
 

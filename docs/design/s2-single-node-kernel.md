@@ -183,12 +183,14 @@
 - **断言**：丢弃未 sync 尾部后，已 ACK（PUBACK 过）的消息可读；未 ACK 的尾部不可读但不产生"已提交"假象；恢复后 `high` 回到真实末尾。
 - **状态（2026-11-07）**：**替身档已实现并实测通过**（`tail` / `mqtt` / `replicated` 三场景，K=16 / M=64），证据见 [`docs/benchmarks/reliability/s2-b-osbuffer-loss.md`](../benchmarks/reliability/s2-b-osbuffer-loss.md) 与同目录 `report-osbuffer-*.json`。共享 harness 抽取为 `tools/docker/mq_harness.py`，S1 全量矩阵复跑作回归闸（15/16 PASS，唯一失败 `r3/default` 已用未改动的原始脚本复现为既有 flake）。dm-flakey 实机档驱动已交付（`--skip-prereq` 可核对步骤），**实机报告待特权执行**。
 
-### 4.3 S2-C QoS2 / Retain / Will
+### 4.3 S2-C QoS2 / Retain / Will ✅ 已实现（2026-11-07）
 
-- **QoS2（D1 已定案 (b)）**：`mqtt_frame` 新增 PUBREC(5)/PUBREL(6)/PUBCOMP(7) 编解码（含 3.1.1 固定头 flags）；FSM 出站 `pending` 增加 stage（`awaiting_pubrec`/`awaiting_pubcomp`）；`.inflight` v2 增加 `released`（出站待 PUBCOMP）与 `received`（入站已 PUBREC 待 PUBREL）；重连重发按 MQTT §4.3。承诺边界写死：**线协议四步 + 跨重连不重复；跨崩溃允许重复（至少一次 + DUP）**，不做 exactly-once。
-- **Retain**：`broker_retain`（新 app，避免订阅层再长）持有 `Filter -> {Msg, QoS}` 树；订阅时按 filter 匹配补发 retained，retain=1 的 PUBLISH 更新树并**零长度 payload 清除**；持久化用独立文件 + `vsn`。
-- **Will**：CONNECT 保存 will（topic/payload/qos/retain）；异常断连（keepalive/协议错误/网络）时由 session 所有者发布，正常 DISCONNECT 丢弃；retain 与 will 的组合按规范。
-- **测试**：帧字节级（T15 风格）+ FSM 状态机 + 重启后 retain 树/Will 行为；T14 增加 R8（QoS2 重启）。
+> 冻结决策见 [ADR-018](../adr/018-retain-will-and-qos2-amendments.md)；执行计划与用例清单见 [`s2-c-protocol-completion-execution-plan.md`](s2-c-protocol-completion-execution-plan.md)。以下只写**已实现事实**，实现期与计划的偏差在计划文档里逐条记录。
+
+- **QoS2（D1 已定案 (b)）**：`mqtt_frame` 新增 PUBREC(5)/PUBREL(6)/PUBCOMP(7) 双向编解码（固定头 flags：PUBREL `0b0010`，其余 `0b0000`）；PUBLISH 与 Will 的 QoS 放宽到 0..2。FSM 出站用 `pending_qos` 记录级别、`released` 标记"已见 PUBREC 待 PUBCOMP"——**cursor 只在 PUBCOMP 之后推进**；入站用 `received` 去重（Method A：PUBLISH 时即投递）。`.inflight` 形状升至 **v2**：`#{vsn:=2, next_pid, pending, qos, released, received}`，v1 读入按"全 QoS1"解释。重连重发按 MQTT §4.3：未 `PUBREC` ⇒ 同 packet id `DUP=1` 原级别重发；已 `PUBREC` ⇒ 只发 `PUBREL`。三种未知握手帧全部幂等（回 PUBCOMP / 回 PUBREL / 忽略），不断连不推进 cursor。承诺边界写死：**线协议四步 + 跨重连不重复；跨崩溃允许重复（至少一次 + DUP）**，不做 exactly-once。
+- **Retain（O6 已签认）**：`broker_retain`（新 app，避免订阅层再长）持有 `Topic -> #broker_message{}` 树，持久化到 `retain/retain.v1`（整树 + `vsn`，损坏即启动失败）；订阅时按 filter 匹配补发（QoS = `min(订阅, 存储)`，retain=1，字典序），转发给在线订阅者的帧 retain=0，retain=1 的 PUBLISH 更新树并**零长度 payload 清除**。**QoS1/2 的 retain=1 PUBLISH 先 fsync 落盘再回 ack**，QoS0 走延迟批量。三个上限（条数/字节数/单条大小）**拒绝写入但正常转发**，计数 `retain_overflow`。
+- **Will（O5 已签认）**：CONNECT 保存 will（topic/payload/qos/retain），**仅内存不持久化**——broker 重启不补发（与 mosquitto 默认一致）。TCP 异常关闭 / keepalive 超时 / 协议错误 / 内部失败 / takeover 都发布；**正常 DISCONNECT 与 broker shutdown 不发布**。发布走普通 PUBLISH 路径（QoS>0 先 append fsync），retain 与 will 的组合按规范更新树。
+- **测试**：帧级 27 例、连接级 50 例（其中 QoS2/Retain/Will 20 例）、`broker_retain_SUITE` 17 例；T14 新增 **R8**（收 PUBREC 后 `kill -9`，重启幂等回 PUBCOMP，默认档/零回退档都 PASS）；T15 新增 `paho-qos2`/`paho-retain`/`paho-will`/`paho-will-skipped`/`mosq-qos2`，全套 **10/10 PASS**。
 
 ### 4.4 S2-D 订阅语义与 cursor 重构
 
@@ -241,7 +243,7 @@
 |---|---|---|
 | M0 决策冻结 | D1~D9 结案；ADR-012~017 起草并评审 | 每份 ADR 状态=已采纳；本文升 v0.2+（**已完成**：2026-11-07 六份 ADR 全部签认，本文 v0.3） |
 | M1 观测与证明 | S2-A + S2-B | `os_buffer` 双轨报告可复跑（CI 替身 + dm-flakey）；metrics snapshot 稳定 |
-| M2 协议补齐 | S2-C（QoS2 / Retain / Will） | QoS2/Retain/Will 帧级 + 真实客户端通过；T14 R8 通过。**MQTT 5 已移出本里程碑到 S2.5** |
+| M2 协议补齐 | S2-C（QoS2 / Retain / Will） | ✅ **已完成（2026-11-07）**：帧级 27 例 + 连接级 20 例 + retain 17 例；T14 R8 默认档/零回退档双档 PASS；T15 新增 5 例、全套 10/10 PASS。**MQTT 5 已移出本里程碑到 S2.5** |
 | M3 结构改造 | S2-D → S2-E → S2-F | 三种订阅类型（含 Shared 位图 + 连续前缀）、DLQ/TTL、retention 全绿；`.subs` v1→v2 演练通过 |
 | M4 收口 | S2-G + S2-I + Gate S2 报告 | Gate 四项证据齐备，全量回归零 FAILED |
 | （S2.5） | MQTT 5 子集 | 独立跟踪，不阻塞 Gate S2 |
