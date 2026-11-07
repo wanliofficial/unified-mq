@@ -310,6 +310,82 @@ def scenario_r7(tier):
             "redelivered": True}
 
 
+def scenario_r8(tier):
+    """QoS 2 crash between PUBREC and PUBREL.
+
+    The broker must not lose the message and must not wedge the client. The
+    client's PUBLISH was already stored and delivered (R5's Method A), so what
+    the client holds is a message it never finished acknowledging. After the
+    restart the client re-sends PUBREL; the broker must answer PUBCOMP for that
+    idempotently (R1) and the session's cursor must end up advanced.
+
+    Contract measured here, per ADR-012 §12.1: **at least once, possibly
+    duplicated** -- exactly-once is explicitly not promised across a crash.
+    """
+    cid = f"s1t14-r8-{tier}-sub"
+    payload = b"r8-qos2-crash"
+    topic = "t14/r8/0"
+    subs_bytes = offline_subscriber(cid, "t14/r8/#", 2)
+
+    raw = RawClient(f"s1t14-r8-{tier}-pub")
+    raw.connect()
+    raw.publish(topic, payload, qos=2, packet_id=7)
+    kind, body = raw.recv(8.0)
+    assert_true(kind == RawClient.PUBREC, f"R8: expected PUBREC, got 0x{kind:02x}")
+    assert_true(packet_id(body) == 7, f"R8: PUBREC id {packet_id(body)} != 7")
+    # The message was durable before PUBREC went out (ADR-018 §18.2/ADR-007),
+    # so exactly one WAL record must exist at this instant. That is the promise
+    # the crash below is allowed to rely on.
+    wal = probe_recover(tier)
+    stored = sum(h["high"] - 1 for h in wal["highs"].values())
+    assert_true(stored == 1, f"R8: expected one stored record before PUBREC, got {stored}")
+
+    # Crash with the client's handshake half done and no DISCONNECT.
+    kill_broker(tier)
+    raw.close()
+    start_broker(tier)
+
+    # The reconnect replays PUBREL for the id the broker no longer remembers
+    # (the connection's QoS2 state died with it). R1 says: answer PUBCOMP,
+    # never disconnect.
+    raw2 = RawClient(f"s1t14-r8-{tier}-pub")
+    raw2.connect()
+    raw2.pubrel(7)
+    kind, body = raw2.recv(8.0)
+    assert_true(kind == RawClient.PUBCOMP,
+                f"R8: expected PUBCOMP for the replayed PUBREL, got 0x{kind:02x}")
+    assert_true(packet_id(body) == 7, f"R8: PUBCOMP id {packet_id(body)} != 7")
+    raw2.disconnect()
+
+    # The subscriber was offline-session'd, so the stored message must be there
+    # at least once, and acking it must move the cursor.
+    sub, session_present = reconnect(cid, manual_ack=True)
+    assert_true(session_present, "R8: session_present must be 1 after kill")
+    got = sub.collect(quiet=0.8, total=8.0)
+    matched = [m for m in got if m.payload == payload]
+    assert_true(matched or got, f"R8: no delivery after recovery (got {len(got)})")
+    if not matched:
+        raise AssertionError(f"R8: unexpected payloads after recovery: "
+                             f"{[m.payload for m in got]}")
+    dups = len(matched) - 1
+    for m in matched:
+        sub.ack(m)
+    time.sleep(0.4)  # let the cursor tick land (100 ms window, both tiers)
+
+    cursors = probe_cursors(cid, tier)
+    advanced = [c for c in cursors["cursors"] if c["offset"] > 0]
+    assert_true(advanced, f"R8: cursor never advanced: {cursors['cursors']}")
+    sub.close()
+
+    wal2 = probe_recover(tier)
+    total = sum(h["high"] - 1 for h in wal2["highs"].values())
+    assert_true(total >= 1, f"R8: the record disappeared after recovery: {wal2['highs']}")
+    return {"payload": payload.decode(), "session_present": session_present,
+            "subs_bytes": subs_bytes, "deliveries": len(matched),
+            "duplicates": dups, "stored_records": total,
+            "cursor": advanced[0]}
+
+
 SCENARIO_FUNCS = {
     "r1a": scenario_r1a,
     "r1b": scenario_r1b,
@@ -319,6 +395,7 @@ SCENARIO_FUNCS = {
     "r5": scenario_r5,
     "r6": scenario_r6,
     "r7": scenario_r7,
+    "r8": scenario_r8,
 }
 
 

@@ -20,6 +20,8 @@ import os
 import queue
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -40,7 +42,7 @@ PORT = int(os.environ.get("S1_BROKER_PORT", "18830"))
 DATA_IN_CONTAINER = "/var/lib/unified-mq"
 OTP_ROOT = Path("/home/wanli/Development/otp-28.3.1/bin")
 
-SCENARIOS = ["r1a", "r1b", "r2", "r3", "r4", "r5", "r6", "r7"]
+SCENARIOS = ["r1a", "r1b", "r2", "r3", "r4", "r5", "r6", "r7", "r8"]
 TIERS = ["default", "zero"]
 
 # R3's hard limit is "20k records replay in under 500 ms" (design §8.2); leave
@@ -138,7 +140,8 @@ def render_config(tier):
         if n != count:
             raise RuntimeError(f"sys.config render: {pattern!r} matched {n}, expected {count}")
 
-    sub_once(data_pat, '{data_dir, "%s"}' % DATA_IN_CONTAINER, count=2)
+    # storage + subscription + retain each own a `data_dir' key (J8).
+    sub_once(data_pat, '{data_dir, "%s"}' % DATA_IN_CONTAINER, count=3)
     if tier == "default":
         sub_once(r'\{cursor_max_regress,\s*\d+\}', "{cursor_max_regress, 64}")
         sub_once(r'\{cursor_flush_interval_ms,\s*\d+\}', "{cursor_flush_interval_ms, 100}")
@@ -402,10 +405,14 @@ class Client:
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError(f"publish returned {info.rc}")
         mid = info.mid
-        if qos == 1 and wait:
+        # QoS 2 completes on PUBCOMP, which paho reports through the same
+        # on_publish callback as PUBACK (ADR-018 §18.3: the broker only finishes
+        # the exchange there), so the wait is identical.
+        if qos in (1, 2) and wait:
             with self._pubcv:
                 if not self._pubcv.wait_for(lambda: mid in self._pubacked, timeout):
-                    raise RuntimeError(f"no PUBACK for mid {mid}")
+                    raise RuntimeError(f"no {'PUBACK' if qos == 1 else 'PUBCOMP'} "
+                                       f"for mid {mid}")
         return mid
 
     def wait_pubacks(self, mids, timeout=180.0):
@@ -471,6 +478,154 @@ class Client:
         except Exception:
             pass
 
+
+# ---------------------------------------------------------------------------
+# Raw MQTT client (R8: the kill has to land between PUBREC and PUBREL, which
+# paho's loop thread will not let us time)
+# ---------------------------------------------------------------------------
+
+def _mqtt_str(value):
+    raw = value.encode() if isinstance(value, str) else value
+    return struct.pack("!H", len(raw)) + raw
+
+
+def _mqtt_varint(n):
+    out = bytearray()
+    while True:
+        byte = n % 128
+        n //= 128
+        if n:
+            byte |= 0x80
+        out.append(byte)
+        if not n:
+            return bytes(out)
+
+
+def _mqtt_frame(type_flags, body=b""):
+    return bytes([type_flags]) + _mqtt_varint(len(body)) + body
+
+
+class RawClient:
+    """A hand-rolled MQTT 3.1.1 client for the handful of bytes paho hides.
+
+    Only what R8 needs: CONNECT, SUBSCRIBE, PUBLISH at QoS 0/1/2, and the
+    PUBREC/PUBREL/PUBCOMP half-frames.  Framing is decoded strictly enough to
+    read the frames the broker sends back, so a malformed answer fails loudly
+    instead of being mis-parsed as a different packet type.
+    """
+
+    CONNECT, CONNACK = 0x10, 0x20
+    PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP = 0x30, 0x40, 0x50, 0x62, 0x70
+    SUBSCRIBE, SUBACK = 0x82, 0x90
+
+    def __init__(self, client_id, clean=True, will=None, keepalive=60):
+        self.client_id = client_id
+        self.clean = clean
+        self.will = will
+        self.keepalive = keepalive
+        self.sock = None
+        self._buf = b""
+
+    # -- connection ------------------------------------------------------
+    def connect(self, timeout=10.0):
+        self.sock = socket.create_connection((HOST, PORT), timeout=timeout)
+        self.sock.settimeout(timeout)
+        flags = 0x02 if self.clean else 0x00
+        payload = _mqtt_str(self.client_id)
+        if self.will:
+            flags |= 0x04 | ((self.will.get("qos", 0) & 0x03) << 3)
+            if self.will.get("retain"):
+                flags |= 0x20
+            payload += _mqtt_str(self.will["topic"]) + _mqtt_str(self.will["payload"])
+        body = (_mqtt_str("MQTT") + bytes([4, flags])
+                + struct.pack("!H", self.keepalive) + payload)
+        self._send(_mqtt_frame(self.CONNECT, body))
+        kind, body = self.recv()
+        assert_true(kind == self.CONNACK, f"R8: expected CONNACK, got 0x{kind:02x}")
+        return body[1] & 0x01  # session_present
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def disconnect(self):
+        self._send(_mqtt_frame(0xE0))
+        self.close()
+
+    # -- frames ----------------------------------------------------------
+    def _send(self, raw):
+        self.sock.sendall(raw)
+
+    def recv(self, timeout=15.0):
+        """Read one frame; returns `(type_byte, body)`."""
+        self.sock.settimeout(timeout)
+        while True:
+            if len(self._buf) >= 2:
+                mult, value, idx = 1, 0, 1
+                complete = False
+                while idx < len(self._buf):
+                    byte = self._buf[idx]
+                    value += (byte & 0x7F) * mult
+                    mult *= 128
+                    idx += 1
+                    if not byte & 0x80:
+                        complete = True
+                        break
+                    if idx > 4:
+                        raise RuntimeError("R8: malformed remaining length")
+                if complete and len(self._buf) >= idx + value:
+                    kind = self._buf[0] & 0xF0
+                    body = self._buf[idx:idx + value]
+                    self._buf = self._buf[idx + value:]
+                    return kind, body
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("R8: connection closed while waiting for a frame")
+            self._buf += chunk
+
+    def subscribe(self, topic_filter, qos=1, packet_id=1):
+        body = (struct.pack("!H", packet_id) + _mqtt_str(topic_filter)
+                + bytes([qos & 0x03]))
+        self._send(_mqtt_frame(self.SUBSCRIBE, body))
+        kind, body = self.recv()
+        assert_true(kind == self.SUBACK, f"R8: expected SUBACK, got 0x{kind:02x}")
+        return body[2]  # the granted code
+
+    def publish(self, topic, payload, qos=0, packet_id=None, retain=False):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        head = _mqtt_str(topic)
+        flags = (qos & 0x03) << 1
+        if retain:
+            flags |= 0x01
+        if qos:
+            assert_true(packet_id is not None and 0 < packet_id < 65536,
+                        "R8: a QoS>0 PUBLISH needs a packet id")
+            head += struct.pack("!H", packet_id)
+        self._send(_mqtt_frame(self.PUBLISH | flags, head + payload))
+
+    def pubrel(self, packet_id):
+        self._send(_mqtt_frame(self.PUBREL, struct.pack("!H", packet_id)))
+
+    def pubrec(self, packet_id):
+        self._send(_mqtt_frame(self.PUBREC, struct.pack("!H", packet_id)))
+
+    def pubcomp(self, packet_id):
+        self._send(_mqtt_frame(self.PUBCOMP, struct.pack("!H", packet_id)))
+
+def packet_id(body):
+    """The two-byte id that every ack frame in §3.4-3.7 carries."""
+    return struct.unpack("!H", body[:2])[0]
+
+
+def publish_topic(body):
+    """The topic of a PUBLISH body (its payload follows the packet id)."""
+    tlen = struct.unpack("!H", body[:2])[0]
+    return body[2:2 + tlen].decode()
 
 # ---------------------------------------------------------------------------
 # Scenario helpers

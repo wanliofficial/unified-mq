@@ -16,11 +16,13 @@ Cases:
   paho311-full       CONNECT(+creds)/SUBSCRIBE/PUBLISH qos1/PUBACK/PINGREQ/
                      PINGRESP/DISCONNECT, every client frame byte-identical
   paho-v5-refused    MQTT 5 CONNECT -> CONNACK 0x87 (20 02 00 87) then close
-  paho-qos2-refused  QoS2 PUBLISH -> close, no PUBREC/PUBCOMP
-  paho-retain        inbound retain=1 is stored/delivered with retain=0
-  paho-will-ignored  Will parsed, never published on abnormal close
+  paho-qos2          full QoS2 in both directions (S2-C, ADR-018 §18.3)
+  paho-retain        retain stored on subscribe, retain=0 on forward,
+                     empty payload clears it
+  paho-will          Will published on an abnormal close (S2-C, §18.1)
   paho-bad-filter    NUL in filter (client accepts it) -> close, no SUBACK
   mosq-pubsub        mosquitto 2.1.2 QoS1 round trip + byte-level compare
+  mosq-qos2          mosquitto 2.1.2 QoS2 round trip
   mosq-v5-refused    mosquitto MQTT 5 -> CONNACK 0x87
 
 Usage:
@@ -63,8 +65,9 @@ DATA_IN_CONTAINER = "/var/lib/unified-mq"
 OTP_ROOT = Path("/home/wanli/Development/otp-28.3.1/bin")
 ANALYZER_SRC = MQTT_DIR / "t15_capture.erl"
 
-CASES = ["paho311-full", "paho-v5-refused", "paho-qos2-refused", "paho-retain",
-         "paho-will-ignored", "paho-bad-filter", "mosq-pubsub", "mosq-v5-refused"]
+CASES = ["paho311-full", "paho-v5-refused", "paho-qos2", "paho-retain",
+         "paho-will", "paho-will-skipped", "paho-bad-filter", "mosq-pubsub",
+         "mosq-qos2", "mosq-v5-refused"]
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +113,11 @@ def render_config():
     text = (ROOT / "config" / "sys.config.src").read_text()
     text, n = re.subn(r'\{data_dir,\s*"[^"]*"\}',
                       '{data_dir, "%s"}' % DATA_IN_CONTAINER, text)
-    if n != 2:
-        raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 2")
+    # Three layers own a `data_dir' key (storage, subscription, retain); they
+    # must stay the same absolute path, and the count is asserted so a new app
+    # cannot silently keep pointing at the dev host.
+    if n != 3:
+        raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 3")
     text, n = re.subn(r'"log/s1\.log"', '"%s/log/s1.log"' % DATA_IN_CONTAINER, text)
     if n != 1:
         raise RuntimeError(f"sys.config render: log path matched {n}, expected 1")
@@ -389,10 +395,14 @@ class Client:
         info = self._c.publish(topic, payload, qos, retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError(f"publish returned {info.rc}")
-        if qos == 1 and wait:
+        # paho reports QoS2 completion through the same on_publish callback as
+        # QoS1, but only after PUBCOMP (it drives PUBREC/PUBREL itself), so the
+        # wait is identical and covers both.
+        if qos in (1, 2) and wait:
             with self._ack:
                 if not self._ack.wait_for(lambda: info.mid in self._pubacked, timeout):
-                    raise RuntimeError(f"no PUBACK for mid {info.mid}")
+                    raise RuntimeError(
+                        f"no {'PUBACK' if qos == 1 else 'PUBCOMP'} for mid {info.mid}")
         return info.mid
 
     def next_message(self, timeout=5.0):
@@ -544,33 +554,92 @@ def case_paho_v5_refused():
             "reason": str(reason), "session_present": sp, "closed": closed}
 
 
-def case_paho_qos2_refused():
-    c = Client("t15-paho-qos2", clean=True)
-    c.connect()
-    info = c._c.publish("t15/qos2/a", b"must-not-land", qos=2)
-    assert_ok(info.rc == mqtt.MQTT_ERR_SUCCESS, f"publish rc={info.rc}")
-    assert_ok(c.wait_disconnect(5.0),
-              "broker did not close the connection on QoS2 PUBLISH")
-    c.abort()
-    return {"mid": info.mid}
+def case_paho_qos2():
+    """QoS2 in both directions with a real client.
+
+    Inbound: paho drives PUBLISH -> PUBREC -> PUBREL -> PUBCOMP by itself, and
+    `publish(qos=2, wait=True)' only returns once PUBCOMP arrived, so the case
+    fails loudly if any of the four steps is missing. Outbound: the subscriber
+    receives the message at QoS2, which makes paho run the receiver half of the
+    handshake (PUBREC / PUBREL / PUBCOMP) against us.
+    """
+    sub = Client("t15-paho-qos2-sub", clean=True)
+    sub.connect()
+    sub.subscribe("t15/qos2/#", qos=2)
+    pub = Client("t15-paho-qos2-pub", clean=True)
+    pub.connect()
+    # No wait: the subscriber is the one whose side we want to observe, and the
+    # publish completes on its own.
+    pub_mid = pub.publish("t15/qos2/a", b"exactly-once-hopefully", qos=2, wait=False)
+    msg = sub.next_message(15.0)
+    assert_ok(msg is not None, "QoS2 message never delivered")
+    assert_ok(msg.payload == b"exactly-once-hopefully", f"payload {msg.payload!r}")
+    assert_ok(msg.qos == 2, f"delivered at qos={msg.qos}, not 2")
+    # paho auto-acks in the loop thread; give it a moment to finish PUBCOMP.
+    time.sleep(0.3)
+    pub.close()
+    sub.close()
+    return {"pub_mid": pub_mid, "delivered_qos": msg.qos,
+            "payload": msg.payload.decode()}
 
 
 def case_paho_retain():
-    sub = Client("t15-paho-retain-sub", clean=True)
+    """Retain end to end: store on subscribe, forward with retain=0, clear."""
+    topic = "t15/retain/a"
+    seed = Client("t15-paho-retain-seed", clean=True)
+    seed.connect()
+    seed.publish(topic, b"retained-value", qos=1, retain=True)
+    seed.close()
+
+    # A subscriber that arrives AFTER the publish must get the stored value
+    # with retain=1 -- that is the only way a client can tell a replay from
+    # live traffic (§3.3.1.3).
+    replay = Client("t15-paho-retain-replay", clean=True)
+    replay.connect()
+    replay.subscribe("t15/retain/#", qos=1)
+    stored = replay.next_message(10.0)
+    assert_ok(stored is not None, "retained message not replayed on subscribe")
+    assert_ok(stored.payload == b"retained-value", f"stored payload {stored.payload!r}")
+    assert_ok(stored.retain is True,
+              f"replay must carry retain=1, got retain={stored.retain}")
+    replay.close()
+
+    # A live subscriber gets retain=0, even though the publisher set retain=1.
+    sub = Client("t15-paho-retain-live", clean=True)
     sub.connect()
     sub.subscribe("t15/retain/#", qos=1)
+    live_replay = sub.next_message(10.0)
+    assert_ok(live_replay is not None and live_replay.retain is True,
+              "live subscriber did not get the retained replay first")
     pub = Client("t15-paho-retain-pub", clean=True)
     pub.connect()
-    pub_mid = pub.publish("t15/retain/a", b"retained?", qos=1, retain=True)
-    msg = sub.next_message(10.0)
-    assert_ok(msg is not None and msg.payload == b"retained?", f"no delivery: {msg!r}")
-    assert_ok(msg.retain is False,
-              f"retain bit leaked to delivery (retain={msg.retain})")
+    pub.publish(topic, b"live-value", qos=1, retain=True)
+    live = sub.next_message(10.0)
+    assert_ok(live is not None and live.payload == b"live-value",
+              f"no live delivery: {live!r}")
+    assert_ok(live.retain is False,
+              f"retain bit leaked to live delivery (retain={live.retain})")
+    pub.close()
     sub.close()
-    return {"pub_mid": pub_mid, "delivered_retain": msg.retain}
+
+    # An empty payload deletes the entry: a fresh subscriber gets nothing.
+    clear = Client("t15-paho-retain-clear", clean=True)
+    clear.connect()
+    clear.publish(topic, b"", qos=1, retain=True)
+    clear.close()
+    after = Client("t15-paho-retain-after", clean=True)
+    after.connect()
+    after.subscribe("t15/retain/#", qos=1)
+    gone = after.next_message(2.5)
+    assert_ok(gone is None,
+              f"cleared retained message still replayed: {getattr(gone, 'payload', None)!r}")
+    after.close()
+    return {"topic": topic, "replay_retain": stored.retain,
+            "live_retain": live.retain, "cleared": True}
 
 
-def case_paho_will_ignored():
+def case_paho_will():
+    """The Will must be published on an abnormal close (S2-C, §18.1)."""
     watcher = Client("t15-paho-will-watch", clean=True)
     watcher.connect()
     watcher.subscribe("t15/will/#", qos=1)
@@ -578,13 +647,32 @@ def case_paho_will_ignored():
                     will=("t15/will/a", b"i-was-here", 1))
     doomed.connect()
     time.sleep(0.5)
-    doomed.abort()  # abnormal disconnect: a real broker would publish the Will
+    doomed.abort()  # TCP close without DISCONNECT
+    will = watcher.next_message(10.0)
+    assert_ok(will is not None,
+              "Will was NOT published on an abnormal close")
+    assert_ok(will.payload == b"i-was-here", f"Will payload {will.payload!r}")
+    assert_ok(will.qos == 1, f"Will delivered at qos={will.qos}, not 1")
+    watcher.close()
+    return {"will_topic": "t15/will/a", "delivered": True,
+            "payload": will.payload.decode(), "qos": will.qos}
+
+
+def case_paho_will_skipped_on_disconnect():
+    """A clean DISCONNECT suppresses the Will (§3.14)."""
+    watcher = Client("t15-paho-will2-watch", clean=True)
+    watcher.connect()
+    watcher.subscribe("t15/will2/#", qos=1)
+    polite = Client("t15-paho-will2-polite", clean=True,
+                    will=("t15/will2/a", b"should-not-appear", 1))
+    polite.connect()
+    polite.close()  # DISCONNECT
     leaked = watcher.next_message(2.5)
     assert_ok(leaked is None,
-              f"Will was published on abnormal close: "
+              f"Will published despite DISCONNECT: "
               f"{getattr(leaked, 'payload', None)!r}")
     watcher.close()
-    return {"will_topic": "t15/will/a", "delivered": False}
+    return {"will_topic": "t15/will2/a", "delivered": False}
 
 
 def case_paho_bad_filter():
@@ -626,6 +714,26 @@ def case_mosq_pubsub():
     return {"payload": out.strip(), "pub_rc": pub.returncode}
 
 
+def case_mosq_qos2():
+    """mosquitto 2.1.2 QoS2 round trip through the tee."""
+    sub = subprocess.Popen(
+        ["docker", "run", "--rm", "--network", "host", MOSQ_IMAGE,
+         "mosquitto_sub", "-h", HOST, "-p", str(PROXY_PORT), "-V", "mqttv311",
+         "-q", "2", "-i", "t15-mosq-q2-sub", "-t", "t15/mosq2/#", "-C", "1",
+         "-W", "20"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(1.0)  # let SUBSCRIBE land before the publish
+    pub = mosq(["mosquitto_pub", "-h", HOST, "-p", str(PROXY_PORT),
+                "-V", "mqttv311", "-q", "2", "-i", "t15-mosq-q2-pub",
+                "-t", "t15/mosq2/a", "-m", "hello-mosq-qos2"], timeout=40)
+    assert_ok(pub.returncode == 0,
+              f"mosquitto_pub (qos2) failed rc={pub.returncode}: {pub.stderr}")
+    out, err = sub.communicate(timeout=40)
+    assert_ok(out.strip() == "hello-mosq-qos2",
+              f"mosquitto_sub (qos2) got {out!r} (stderr={err!r})")
+    return {"payload": out.strip(), "pub_rc": pub.returncode}
+
+
 def case_mosq_v5_refused():
     pub = mosq(["mosquitto_pub", "-h", HOST, "-p", str(PROXY_PORT),
                 "-V", "mqttv5", "-t", "t15/v5/a", "-m", "x"], timeout=30)
@@ -638,11 +746,13 @@ def case_mosq_v5_refused():
 CASE_FUNCS = {
     "paho311-full": case_paho311_full,
     "paho-v5-refused": case_paho_v5_refused,
-    "paho-qos2-refused": case_paho_qos2_refused,
+    "paho-qos2": case_paho_qos2,
     "paho-retain": case_paho_retain,
-    "paho-will-ignored": case_paho_will_ignored,
+    "paho-will": case_paho_will,
+    "paho-will-skipped": case_paho_will_skipped_on_disconnect,
     "paho-bad-filter": case_paho_bad_filter,
     "mosq-pubsub": case_mosq_pubsub,
+    "mosq-qos2": case_mosq_qos2,
     "mosq-v5-refused": case_mosq_v5_refused,
 }
 
@@ -719,35 +829,64 @@ def check_paho_v5(name, evidence, cap):
               "decoded an s2c frame, so the v5 CONNACK leaked a 3.1.1 shape")
 
 
+def _publishes(cap, direction, topic_prefix):
+    return [e for e in frames(cap, direction) if e["type"] == "publish"
+            and b64text(e["info"]["topic"]).startswith(topic_prefix)]
+
+
 def check_paho_qos2(name, evidence, cap):
+    # The whole point of the case: a real client's four-step handshake must
+    # round-trip byte-for-byte in BOTH directions.
     assert_roundtrip(cap)
     assert_roundtrip(cap, "s2c")
-    errs = events_of(cap, "c2s", "error")
-    assert_ok(errs, "QoS2 PUBLISH was not rejected at parse time")
-    assert_ok("bad_publish_qos" in errs[0]["reason"],
-              f"unexpected parse error {errs[0]['reason']}")
-    raw = bytes.fromhex(errs[0]["hex"])
-    assert_ok(raw[0] == 0x34,
-              f"rejected frame fixed header {raw[0]:#04x} != 0x34 (QoS2 PUBLISH)")
-    assert_ok(b"t15/qos2/a" in raw and b"must-not-land" in raw,
-              f"rejected frame is not the QoS2 payload: {raw!r}")
-    s2c_types = {e["type"] for e in frames(cap, "s2c")}
-    assert_ok("pubrec" not in s2c_types and "pubcomp" not in s2c_types,
-              f"broker acked QoS2: {sorted(s2c_types)}")
-    assert_ok("publish" not in s2c_types, "QoS2 message was stored/delivered")
+    c2s_types = [e["type"] for e in frames(cap, "c2s")]
+    s2c_types = [e["type"] for e in frames(cap, "s2c")]
+    # Inbound half (client -> broker): PUBLISH qos2, then the client's PUBREL.
+    inbound = _publishes(cap, "c2s", b"t15/qos2/")
+    assert_ok(inbound, "no QoS2 PUBLISH captured from paho")
+    assert_ok(inbound[0]["info"]["qos"] == "2",
+              f"inbound PUBLISH qos={inbound[0]['info']['qos']}")
+    assert_ok("pubrel" in c2s_types,
+              f"client never sent PUBREL (c2s={c2s_types})")
+    # Broker side of the inbound half.
+    assert_ok("pubrec" in s2c_types and "pubcomp" in s2c_types,
+              f"broker did not complete the inbound handshake (s2c={s2c_types})")
+    # Outbound half (broker -> client): PUBLISH qos2 with a packet id, then the
+    # broker's PUBREL once paho's PUBREC arrives.
+    outbound = _publishes(cap, "s2c", b"t15/qos2/")
+    assert_ok(outbound, "no QoS2 PUBLISH delivered to the subscriber")
+    assert_ok(outbound[0]["info"]["qos"] == "2",
+              f"delivered qos={outbound[0]['info']['qos']}, not 2")
+    assert_ok(outbound[0]["info"]["packet_id"] != "none",
+              "QoS2 delivery carried no packet id")
+    assert_ok("pubrec" in c2s_types,
+              "subscriber never answered the delivery with PUBREC")
+    assert_ok("pubrel" in s2c_types,
+              f"broker never released the outbound delivery (s2c={s2c_types})")
+    # The delivered payload is byte-identical to the published one.
+    assert_ok(b64text(outbound[0]["info"]["payload"]) ==
+              b64text(inbound[0]["info"]["payload"]),
+              "delivered payload differs from the published bytes")
 
 
 def check_paho_retain(name, evidence, cap):
     assert_roundtrip(cap)
     assert_roundtrip(cap, "s2c")
-    inbound = [e for e in frames(cap, "c2s") if e["type"] == "publish"
-               and b64text(e["info"]["topic"]) == b"t15/retain/a"]
-    assert_ok(inbound and inbound[0]["info"]["retain"] == "1",
-              "inbound retain bit not captured")
-    outbound = [e for e in frames(cap, "s2c") if e["type"] == "publish"
-                and b64text(e["info"]["topic"]) == b"t15/retain/a"]
-    assert_ok(outbound and outbound[0]["info"]["retain"] == "0",
-              "delivered PUBLISH kept retain=1")
+    inbound = _publishes(cap, "c2s", b"t15/retain/")
+    assert_ok(inbound, "no inbound retained PUBLISH captured")
+    assert_ok(all(e["info"]["retain"] == "1" for e in inbound),
+              "a seeding PUBLISH was not sent with retain=1")
+    # Every replayed/forwarded message on the server side must carry retain=0;
+    # the replay's retain=1 comes from the broker's own replay path, but a
+    # LIVE forward (payload `live-value') must have retain=0.
+    forwards = [e for e in _publishes(cap, "s2c", b"t15/retain/")
+                if b64text(e["info"]["payload"]) == b"live-value"]
+    assert_ok(forwards, "live retained publish was never forwarded")
+    assert_ok(forwards[0]["info"]["retain"] == "0",
+              f"live forward kept retain={forwards[0]['info']['retain']}")
+    # The clear: an empty-payload PUBLISH with retain=1.
+    clears = [e for e in inbound if e["info"]["payload_bytes"] == "0"]
+    assert_ok(clears, "the empty-payload clearing PUBLISH was not captured")
 
 
 def check_paho_will(name, evidence, cap):
@@ -756,9 +895,30 @@ def check_paho_will(name, evidence, cap):
     connects = [e for e in frames(cap, "c2s") if e["type"] == "connect"]
     assert_ok(any(e["info"]["will"] == "1" for e in connects),
               "will flags never sent by paho")
-    leaked = [e for e in frames(cap, "s2c") if e["type"] == "publish"
-              and b64text(e["info"]["topic"]).startswith(b"t15/will/")]
-    assert_ok(not leaked, "Will message was published after abnormal close")
+    wills = [e for e in _publishes(cap, "s2c", b"t15/will/")
+             if b64text(e["info"]["payload"]) == b"i-was-here"]
+    assert_ok(wills, "Will message was NOT published after the abnormal close")
+    # The trigger has to be a crash: that client's own connection must show no
+    # DISCONNECT frame, otherwise the case would be asserting the wrong path.
+    doomed = [conn for conn in cap.values()
+              if any(e["type"] == "connect"
+                     and b64text(e["info"].get("client", "")) ==
+                     b"t15-paho-will-doomed"
+                     for e in conn.get("c2s", []) if e["kind"] == "frame")]
+    assert_ok(doomed, "no capture for the doomed client")
+    doomed_frames = [e for e in doomed[0]["c2s"] if e["kind"] == "frame"]
+    assert_ok(all(e["type"] != "disconnect" for e in doomed_frames),
+              "the doomed client sent a DISCONNECT, so this was not a crash")
+
+
+def check_paho_will_skipped(name, evidence, cap):
+    assert_roundtrip(cap)
+    assert_roundtrip(cap, "s2c")
+    assert_ok(any(e["type"] == "disconnect" for e in frames(cap, "c2s")),
+              "no DISCONNECT captured from the polite client")
+    leaked = [e for e in _publishes(cap, "s2c", b"t15/will2/")]
+    assert_ok(not leaked,
+              "Will published despite a clean DISCONNECT")
 
 
 def check_paho_bad_filter(name, evidence, cap):
@@ -789,6 +949,23 @@ def check_mosq_pubsub(name, evidence, cap):
     assert_ok(frames(cap, "s2c", "suback"), "no SUBACK for mosquitto_sub")
 
 
+def check_mosq_qos2(name, evidence, cap):
+    assert_roundtrip(cap)
+    assert_roundtrip(cap, "s2c")
+    c2s_types = [e["type"] for e in frames(cap, "c2s")]
+    s2c_types = [e["type"] for e in frames(cap, "s2c")]
+    inbound = _publishes(cap, "c2s", b"t15/mosq2/")
+    assert_ok(inbound and inbound[0]["info"]["qos"] == "2",
+              f"mosquitto_pub qos={inbound[0]['info']['qos'] if inbound else None}")
+    outbound = _publishes(cap, "s2c", b"t15/mosq2/")
+    assert_ok(outbound and outbound[0]["info"]["qos"] == "2",
+              "no QoS2 delivery captured for mosquitto_sub")
+    assert_ok("pubrec" in s2c_types and "pubcomp" in s2c_types,
+              f"broker did not answer the inbound QoS2 (s2c={s2c_types})")
+    assert_ok("pubrel" in c2s_types and "pubrel" in s2c_types,
+              f"missing PUBREL on one side (c2s={c2s_types}, s2c={s2c_types})")
+
+
 def check_mosq_v5(name, evidence, cap):
     s2c_errs = events_of(cap, "s2c", "error")
     assert_ok(s2c_errs and s2c_errs[0]["hex"] == "2003008700",
@@ -800,11 +977,13 @@ def check_mosq_v5(name, evidence, cap):
 CHECKS = {
     "paho311-full": check_paho311,
     "paho-v5-refused": check_paho_v5,
-    "paho-qos2-refused": check_paho_qos2,
+    "paho-qos2": check_paho_qos2,
     "paho-retain": check_paho_retain,
-    "paho-will-ignored": check_paho_will,
+    "paho-will": check_paho_will,
+    "paho-will-skipped": check_paho_will_skipped,
     "paho-bad-filter": check_paho_bad_filter,
     "mosq-pubsub": check_mosq_pubsub,
+    "mosq-qos2": check_mosq_qos2,
     "mosq-v5-refused": check_mosq_v5,
 }
 
