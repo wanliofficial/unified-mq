@@ -180,7 +180,7 @@ unified-mq/
 
 ### 4.3 Gate S2
 
-- [ ] 三档可靠性等级逐档有自动化测试证明（尤其 `os_buffer` 档的丢失边界）
+- [x] 三档可靠性等级逐档有自动化测试证明（尤其 `os_buffer` 档的丢失边界）——`os_buffer` 替身三场景（CI 常驻）+ `replicated_commit` 显式拒绝；`fsync` 对照。见 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`；dm-flakey 实机报告待特权执行
 - [ ] 慢消费者 / 热点分区场景不导致 OOM
 - [ ] 基准报告已出：单机吞吐、消息大小 / 批量大小 / 分区数 / 订阅数的影响、延迟分位
 - [ ] 无单一 GenServer 成为全局瓶颈（依据 README 7.2 的四项约束逐条检查）

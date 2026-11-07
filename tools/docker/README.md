@@ -12,7 +12,9 @@ cannot expose (WAL high watermark, flushed cursor, replay time).
 |---|---|
 | `docker-compose.s1.yml` | declarative description of the same broker service (data bind mount, port `18830`, OTP image); kept as the §8.1 reference |
 | `entrypoint.sh` | starts epmd, creates the four partitions out of band (`broker_queue:create_partition/1`, H8), then execs the release in `foreground` mode |
+| `mq_harness.py` | the shared harness: container lifecycle, config rendering, one-shot Erlang probes, the paho client and the assertion helpers. Extracted verbatim from `s1_recovery.py` for the S2-B drivers |
 | `s1_recovery.py` | renders `sys.config`, drives paho-mqtt clients, injects kill -9, runs R1a/R1b/R2–R7, writes `run/report-*.json` |
+| `s2_powerloss.py` | S2-B real-machine power loss: loopback ext4 + `dm-flakey drop_writes`; privileged, operator-run (see `docs/benchmarks/reliability/`) |
 | `../../_build/t14/rel/unified_mq` | release built by `rebar3 as t14 release`: `dev_mode=false` (apps are copied, not symlinked) and `include_erts=false` |
 
 The container image is `erlang:28.3.1.0` — the exact OTP/ERTS version the
@@ -84,6 +86,8 @@ to prove the no-loss side (duplicates are allowed inside the regress window).
   `docker kill` / `docker start` commands directly; `docker-compose.s1.yml`
   remains the declarative spec and works unchanged where compose is healthy.
   The container flags (user, mounts, env, port, stop timeout) are identical.
-* `kill -9` still cannot model the `os_buffer` power-loss window (§8.3); that
-  remains S2's dm-flakey/VM work, as recorded in the design and
-  `docs/protocol-compatibility.md`.
+* `kill -9` still cannot model the `os_buffer` power-loss window (§8.3); that is
+  S2-B's job: the CI-resident surrogate is `tools/fault/os_buffer_loss.py`
+  (deterministic fsync-barrier truncation), and `s2_powerloss.py` is the
+  privileged dm-flakey real-machine control.  Evidence:
+  `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`.

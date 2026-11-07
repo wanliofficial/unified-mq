@@ -1,6 +1,6 @@
 # S2-B 执行计划：三档可靠性证明（`os_buffer` 丢失边界）
 
-- **状态**：未开始（设计已冻结；本计划即执行依据）
+- **状态**：**替身档已完成（2026-11-07）**；T-B1/T-B2/T-B3/T-B4 已落地并实测（三场景 3/3 PASS），**T-B5 dm-flakey 实机报告待特权执行**；T-B6 文档已更新。证据见 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`。
 - **对应**：`docs/design/s2-single-node-kernel.md` §4.2；`docs/adr/007-explicit-reliability.md`；`docs/roadmap.md` §4.3 Gate S2 第 1 项
 - **估算**：4 人日
 - **退出条件**：`os_buffer` 丢失边界有 CI 常驻的确定性证明（替身）；`fsync` 档有实机掉电对照（dm-flakey 报告）；`replicated_commit` 在 driver 层被显式拒绝；Gate S2「三档可靠性等级逐档有自动化证明」可勾选。
@@ -32,7 +32,7 @@
 | 文件 | 动作 | 说明 |
 |---|---|---|
 | `tools/docker/mq_harness.py` | 新建 | 从 `s1_recovery.py` 抽出的共享 harness（`docker_args`/`render_config`/`erl_probe`/`probe_recover`/`Client`/`assert_true` 等），`s1_recovery.py` 与两个 S2-B 工具共用 |
-| `tools/fault/__init__.py` + `os_buffer_loss.py` | 新建 | `os_buffer` 丢失替身（CI 常驻）；详见 §4 |
+| `tools/fault/os_buffer_loss.py` | 新建 | `os_buffer` 丢失替身（CI 常驻）；详见 §4。实测偏差：不需要 `__init__.py`，`sys.path` 引入即可 |
 | `tools/docker/s2_powerloss.py` | 新建 | dm-flakey 实机掉电驱动（特权）；详见 §5 |
 | `tools/docker/s1_recovery.py` | 修改 | 改为 import `mq_harness`；**S1 全量矩阵复跑为回归闸**（T-B1） |
 | `docs/benchmarks/reliability/` | 新建目录 | 报告落点（`report-*.json` + `*.md` 说明） |

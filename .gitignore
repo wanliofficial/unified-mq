@@ -39,6 +39,10 @@ spikes/*/.data/
 /tools/docker/data/
 /tools/docker/run/
 /tools/docker/__pycache__/
+/tools/docker/powerloss.img
+
+# S2-B surrogate scratch
+/tools/fault/__pycache__/
 
 # T15 harness scratch: broker data volume, captures, reports, analyzer beam
 /test/protocol-compatibility/mqtt/data/

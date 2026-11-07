@@ -181,6 +181,7 @@
 - **范围**：`os_buffer`（页缓存返回）、`fsync`（已由 T14 R1a 覆盖，补齐"未 fsync 的尾部"对照）、`replicated_commit`（S1/S2 均不可用，必须显式 `{error,{unsupported_sync_mode,_}}` 且 Adapter 早拒）。
 - **证据**：`tools/fault/os_buffer_loss.py`（替身，CI 常驻）+ `tools/docker/s2_powerloss.py`（dm-flakey，需特权，出报告）；报告进 `docs/benchmarks/reliability/`。
 - **断言**：丢弃未 sync 尾部后，已 ACK（PUBACK 过）的消息可读；未 ACK 的尾部不可读但不产生"已提交"假象；恢复后 `high` 回到真实末尾。
+- **状态（2026-11-07）**：**替身档已实现并实测通过**（`tail` / `mqtt` / `replicated` 三场景，K=16 / M=64），证据见 [`docs/benchmarks/reliability/s2-b-osbuffer-loss.md`](../benchmarks/reliability/s2-b-osbuffer-loss.md) 与同目录 `report-osbuffer-*.json`。共享 harness 抽取为 `tools/docker/mq_harness.py`，S1 全量矩阵复跑作回归闸（15/16 PASS，唯一失败 `r3/default` 已用未改动的原始脚本复现为既有 flake）。dm-flakey 实机档驱动已交付（`--skip-prereq` 可核对步骤），**实机报告待特权执行**。
 
 ### 4.3 S2-C QoS2 / Retain / Will
 
