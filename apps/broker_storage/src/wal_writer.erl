@@ -244,7 +244,8 @@ handle_call(close, _From, State) ->
         {ok, State1} ->
             true = wal_index:set_open(State1#st.index, false),
             State2 = State1#st{closed = true},
-            _ = sync_fd(State2),
+            #st{seg = #seg{fd = Fd}} = State1,
+            _ = sync_fd_measured(Fd),
             {reply, ok, State2};
         {stop, Reason, State1} ->
             {stop, Reason, {error, Reason}, State1}
@@ -408,8 +409,14 @@ write_one(Offset, Bin, State, OweSync) ->
                     %% Anchored at the position the record starts at, before the
                     %% append moves the file position.
                     maybe_anchor(Offset, Pos, Path, Start, State1),
+                    EndPos = Pos + byte_size(Bin),
+                    broker_metrics:inc(wal_append_total),
+                    broker_metrics:gauge(segment_bytes, EndPos),
+                    broker_metrics:gauge(queue_depth,
+                                         max(0, State1#st.high
+                                                - State1#st.committed)),
                     {ok, State1#st{seg = Seg#seg{records = Records + 1,
-                                                 end_pos = Pos + byte_size(Bin)},
+                                                 end_pos = EndPos},
                                    stats = bump(records, State1#st.stats)}};
                 {error, Reason} ->
                     {error, {append_failed, Path, Reason}}
@@ -449,7 +456,7 @@ ensure_room(Offset, #st{seg = #seg{fd = Fd, path = Path}, dir = Dir} = State, Ow
 sync_before_close(_Fd, false, State) ->
     {ok, State};
 sync_before_close(Fd, true, State) ->
-    case wal_segment:sync(Fd) of
+    case sync_fd_measured(Fd) of
         ok -> {ok, State#st{stats = bump(syncs, State#st.stats)}};
         {error, Reason} -> {error, {sync_failed, State#st.seg#seg.path, Reason}}
     end.
@@ -469,13 +476,27 @@ open_segment(Offset, Dir, State) ->
     end.
 
 sync_current(#st{seg = #seg{fd = Fd, path = Path}, stats = Stats} = State) ->
-    case wal_segment:sync(Fd) of
+    case sync_fd_measured(Fd) of
         ok -> {ok, State#st{stats = bump(syncs, Stats)}};
         {error, Reason} -> {error, {sync_failed, Path, Reason}}
     end.
 
 sync_fd(#st{seg = #seg{fd = Fd}}) ->
     wal_segment:sync(Fd).
+
+%% One place to measure an fsync: the histogram is the gate's latency evidence
+%% (ADR-016 §16.2) and the counter lets the report compare batches with syncs.
+sync_fd_measured(Fd) ->
+    T0 = erlang:monotonic_time(microsecond),
+    case wal_segment:sync(Fd) of
+        ok ->
+            broker_metrics:observe(wal_sync_latency_us,
+                                   erlang:monotonic_time(microsecond) - T0),
+            broker_metrics:inc(wal_sync_total),
+            ok;
+        {error, _} = Error ->
+            Error
+    end.
 
 %%%_* Watermarks ---------------------------------------------------------
 

@@ -1,0 +1,8 @@
+{application, broker_metrics, [
+    {description, "In-process metrics: counters, gauges and fixed-bucket histograms with no external dependency"},
+    {vsn, "0.1.0"},
+    {registered, [broker_metrics_sup]},
+    {mod, {broker_metrics_app, []}},
+    {applications, [kernel, stdlib, sasl]},
+    {env, []}
+]}.

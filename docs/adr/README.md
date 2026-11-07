@@ -16,7 +16,7 @@
 | [010](010-broker-router-behavior.md) | `broker_router` behavior 与路由/订阅索引边界 | S1 T0.5；ADR-001 |
 | [011](011-broker-storage-behavior.md) | `broker_storage` behavior、能力模型与磁盘协议 | S1 T0.5；S0.3 spike；ADR-007/008 |
 
-### S2 决策（拟议，2026-11-07 起草，待评审签认）
+### S2 决策（已采纳，2026-11-07 冻结）
 
 | ADR | 主题 | 关键依据 |
 |---|---|---|

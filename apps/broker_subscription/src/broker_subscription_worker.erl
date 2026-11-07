@@ -195,7 +195,9 @@ handle_info({'DOWN', Ref, process, Pid, _Reason}, State) ->
 handle_info(cursor_tick, State) ->
     %% K6, the rigid order: every dirty cursor file first, aggregation second.
     State1 = flush_all_dirty_cursors(State),
-    {noreply, rearm(cursor_tick, compute_committed(State1))};
+    State2 = compute_committed(State1),
+    _ = sample_gauges(State2),
+    {noreply, rearm(cursor_tick, State2)};
 
 handle_info(inflight_tick, State) ->
     {noreply, rearm(inflight_tick, flush_all_dirty_inflight(State))};
@@ -502,6 +504,44 @@ compute_committed(State) ->
                   end
           end, Last, Partitions),
     State#{last_committed := NewLast}.
+
+%% ADR-016's backlog gauges, refreshed on the cursor tick (100 ms by default):
+%%
+%%   * subscription_backlog = sum over cursor rows of (High - cursor): messages
+%%     a subscription has not read yet.
+%%   * cursor_lag = sum over partitions of (High - Committed): the window not
+%%     yet acknowledged by *every* subscriber, i.e. what retention may not
+%%     reclaim.
+%%
+%% Both are single aggregate values on purpose -- per-subscription keys would be
+%% unbounded cardinality (ADR-016 §16.2). A watermark failure (a writer crash
+%% between two ticks) simply skips that partition for this sample.
+sample_gauges(#{partitions := Partitions}) ->
+    Marks = maps:from_list(
+              [{P, WM} || P <- Partitions,
+                          WM <- [case (catch broker_queue:watermarks(P)) of
+                                     {ok, _C, _H} = Ok -> Ok;
+                                     _ -> undefined
+                                 end],
+                          WM =/= undefined]),
+    {Backlog, Lag} =
+        lists:foldl(
+          fun({{_SubRef, P}, #{offset := O}}, {B, L}) ->
+                  case maps:get(P, Marks, undefined) of
+                      {ok, _Committed, High} -> {B + max(0, High - O), L};
+                      undefined -> {B, L}
+                  end
+          end, {0, 0}, ets:tab2list(?CURSORS)),
+    {Backlog1, Lag1} =
+        maps:fold(
+          fun(_P, {ok, Committed, High}, {B, L}) ->
+                  {B, L + max(0, High - Committed)};
+             (_P, _Other, Acc) ->
+                  Acc
+          end, {Backlog, Lag}, Marks),
+    broker_metrics:gauge(subscription_backlog, Backlog1),
+    broker_metrics:gauge(cursor_lag, Lag1),
+    ok.
 
 %%%_* inflight (tier 3) ---------------------------------------------------------
 

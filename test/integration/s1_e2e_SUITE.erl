@@ -38,6 +38,7 @@ all() ->
 
 groups() ->
     Cases = [qos0_publish_subscribe_roundtrip,
+             metrics_count_publish_deliver_and_connections,
              qos1_posture_follows_backend_capability,
              subscription_qos_is_not_escalated,
              clean_session_false_restores_the_subscription_set,
@@ -206,6 +207,36 @@ qos0_publish_subscribe_roundtrip(Config) ->
     {ok, C0, H0} = broker_queue:watermarks(Partition),
     ok = close_sock(Sub),
     ok = close_sock(Pub).
+
+
+%% ADR-016 / S2-A: after one real round trip the counters the Gate report leans
+%% on must be non-zero, and the connection gauge must return to zero once both
+%% sockets close. `reset/0' is test-only.
+metrics_count_publish_deliver_and_connections(Config) ->
+    Port = ?config(port, Config),
+    ok = broker_metrics:reset(),
+    Sub = connect(Port),
+    #connack{session_present = 0, return_code = 0} =
+        open(Sub, #{client_id => <<"metrics-sub">>}),
+    #suback{return_codes = [0]} = subscribe(Sub, 1, <<"metrics/#">>, 0),
+    Pub = connect(Port),
+    #connack{return_code = 0} = open(Pub, #{client_id => <<"metrics-pub">>}),
+    ok = publish(Pub, 1, <<"metrics/x">>, <<"metered">>, 0),
+    #publish{qos = 0, topic = <<"metrics/x">>, payload = <<"metered">>} = recv(Sub),
+    S = broker_metrics:snapshot(),
+    true = maps:get(publish_total, S) >= 1,
+    true = maps:get(deliver_total, S) >= 1,
+    true = maps:get(bytes_in, S) > 0,
+    true = maps:get(bytes_out, S) > 0,
+    2 = maps:get(connections_current, S),
+    true = maps:get(connections_peak, S) >= 2,
+    ok = close_sock(Sub),
+    ok = close_sock(Pub),
+    ok = wait_until(fun() ->
+                            maps:get(connections_current,
+                                     broker_metrics:snapshot()) =:= 0
+                    end, connections_current_zero),
+    ok.
 
 %% The Gate's "interchangeable backends" line, observed at the protocol edge.
 %%

@@ -156,7 +156,7 @@ unified-mq/
 
 **目标**：把原型变成能承载真实流量的单机系统，仍无分布式。
 
-**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.1 草案：基线盘点、D1~D9 待定决策、S2-A~S2-I 子项目、里程碑与 Gate 映射）。本阶段先冻结该文 §3 的决策与 ADR-012~017，再逐子项目开执行计划。
+**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.3：O1~O4 已拍板、D1~D9 已结案、ADR-012~017 已签认，S2-A~S2-I 子项目与 Gate 映射）。**S2-A 可观测性最小集已完成（2026-11-07）**，执行计划见 [`docs/design/s2-a-metrics-execution-plan.md`](design/s2-a-metrics-execution-plan.md)；其余子项目逐项开执行计划。
 
 ### 4.1 功能范围
 
@@ -311,12 +311,12 @@ unified-mq/
 | ADR-009 | 统一消息模型 `broker_message` 记录定稿 | S1 |
 | ADR-010 | `broker_router` behavior 与路由/订阅索引边界 | S1 |
 | ADR-011 | `broker_storage` behavior、能力模型与磁盘协议 | S1 |
-| ADR-012 | QoS 2 承诺边界与 release 状态持久化 | S2（拟议） |
-| ADR-013 | 订阅类型、cursor 归属与会话文件 v2 迁移 | S2（拟议） |
-| ADR-014 | retention、物理段删除与慢消费者守卫 | S2（拟议） |
-| ADR-015 | 重投递、DLQ 与消息 TTL 的归属与形状 | S2（拟议） |
-| ADR-016 | 可观测性最小集与「无外部依赖」取舍 | S2（拟议） |
-| ADR-017 | MQTT 5 properties 落位与 3.1.1 兼容边界 | S2.5（拟议） |
+| ADR-012 | QoS 2 承诺边界与 release 状态持久化 | S2（已采纳） |
+| ADR-013 | 订阅类型、cursor 归属与会话文件 v2 迁移 | S2（已采纳） |
+| ADR-014 | retention、物理段删除与慢消费者守卫 | S2（已采纳） |
+| ADR-015 | 重投递、DLQ 与消息 TTL 的归属与形状 | S2（已采纳） |
+| ADR-016 | 可观测性最小集与「无外部依赖」取舍 | S2（已采纳） |
+| ADR-017 | MQTT 5 properties 落位与 3.1.1 兼容边界 | S2.5（已采纳） |
 
 ### 9.2 文档产出物
 
@@ -325,8 +325,8 @@ unified-mq/
 | `docs/adr/00N-*.md` | S0 | 13 |
 | `docs/architecture.md` | S1 | 2 |
 | `docs/storage-and-recovery.md` | S1（v0.1，T16）；S2 / S4 扩写 | 5.3、6 |
-| `docs/design/s2-single-node-kernel.md` | S2（v0.2 决策冻结） | 4、5.2、6.3、7.2、10 |
-| `docs/design/s2-a-metrics-execution-plan.md` | S2-A（待 ADR-016 签认后启动） | 10.2 |
+| `docs/design/s2-single-node-kernel.md` | S2（v0.3 决策冻结） | 4、5.2、6.3、7.2、10 |
+| `docs/design/s2-a-metrics-execution-plan.md` | S2-A（已完成 2026-11-07） | 10.2 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

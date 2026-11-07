@@ -1,10 +1,10 @@
 # UnifiedMQ 架构（S1 垂直切片）
 
-- **文档版本**：v0.1（T16，2026-11-06）
-- **状态**：描述 **S1 已实现并实测**的架构事实；S2 及以后的演进方向只在本文件末尾单列，不与现状混写
+- **文档版本**：v0.2（S2-A，2026-11-07）
+- **状态**：描述 **S1 已实现并实测**的架构事实，外加已落地的 **S2-A `broker_metrics`**；S2 其余演进方向只在本文件末尾单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断"某个行为归哪一层"的测试作者
-- **对应**：`docs/roadmap.md` §3（S1）、`docs/design/s1-mqtt-vertical-slice.md`（设计基线，下称"设计文档"）、ADR-001/007/009/010/011
-- **证据口径**：本文件中"已实测"均指 `rebar3 ct`（264/264）、`tools/docker/`（T14）与 `test/protocol-compatibility/mqtt/`（T15）的产物；引用处给出路径
+- **对应**：`docs/roadmap.md` §3（S1）、`docs/design/s1-mqtt-vertical-slice.md`（设计基线，下称"设计文档"）、ADR-001/007/009/010/011、ADR-016（S2-A）
+- **证据口径**：本文件中"已实测"均指 `rebar3 ct`（S1 264/264；含 S2-A 后 278/278）、`tools/docker/`（T14）与 `test/protocol-compatibility/mqtt/`（T15）的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -30,11 +30,12 @@ S1 是一个**单节点、无复制**的 MQTT 3.1.1 broker 垂直切片，只实
 
 ## 2. 应用划分
 
-### 2.1 8 个应用
+### 2.1 9 个应用（S1 的 8 个 + S2-A 的 `broker_metrics`）
 
 ```
 apps/
 ├── broker_core/          仅 include/broker_message.hrl 与公共类型；无模块、无进程、无 supervisor
+├── broker_metrics/       S2-A：counters/atomics 指标 + snapshot/0 + 周期单行日志（无热路径进程）
 ├── broker_storage/       broker_storage behavior + 内存/WAL 两实现 + WAL 内部七个模块
 ├── broker_router/        broker_router behavior + broker_router_hash 实现（内存索引）
 ├── broker_queue/         分区层：存储句柄生命周期、append/read 编排、{new_messages} 扇出
@@ -47,13 +48,14 @@ apps/
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
 |---|---|---|---|---|
 | `broker_core` | kernel, stdlib | 无 | `broker_message.hrl` 的 `#broker_message{}`、`partition_id()`、`sync_mode()` | 无（纯类型） |
-| `broker_storage` | kernel, stdlib, sasl, broker_core | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
+| `broker_metrics` | kernel, stdlib, sasl | `broker_metrics_server`（仅 `report_interval_ms > 0`；指标本身不在进程里） | `inc/1,2`、`observe/2`、`gauge/2`、`gauge_add/2`、`snapshot/0`、`p99/1`、`keys/0` | `counters`/`atomics` 数组 + `persistent_term` 的 `Key → {Kind,Ref,Idx}` 索引（无 ETS） |
+| `broker_storage` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
-| `broker_queue` | kernel, stdlib, sasl, broker_core, broker_storage, broker_router | `broker_queue_store` + 每分区 `broker_queue_partition` | `append/3`、`read_from/3`、`watermarks/1`、`capability/1`、`subscribe/2`、`create_partition/1` | 分区句柄注册表、每分区订阅者集合 |
-| `broker_subscription` | kernel, stdlib, sasl, broker_core, broker_storage, broker_router, broker_queue | `broker_subscription_worker` | `subscribe/3`、`unsubscribe/2`、`ack/3`、`inflight/2`、`attach/3`、`detach/2`、`dispatch/2`、`cursor/2`、`subscriptions/1`、`session/1` | 四张 ETS（实体/游标/连接绑定/in-flight）+ `data/sessions/*` 三件套 |
+| `broker_queue` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router | `broker_queue_store` + 每分区 `broker_queue_partition` | `append/3`、`read_from/3`、`watermarks/1`、`capability/1`、`subscribe/2`、`create_partition/1` | 分区句柄注册表、每分区订阅者集合 |
+| `broker_subscription` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_queue | `broker_subscription_worker` | `subscribe/3`、`unsubscribe/2`、`ack/3`、`inflight/2`、`attach/3`、`detach/2`、`dispatch/2`、`cursor/2`、`subscriptions/1`、`session/1` | 四张 ETS（实体/游标/连接绑定/in-flight）+ `data/sessions/*` 三件套 |
 | `broker_event` | kernel, stdlib, sasl, broker_core | 空 supervisor | `policy/0`、`apply_policy/1,2`（纯函数读 env；S1 恒等透传）、`#cloud_event{}` 接口位 | 无（配置即状态；S1 数据路径无调用） |
 | `broker_security` | kernel, stdlib, sasl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
-| `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, 其余 7 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener` | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器） |
+| `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 其余 6 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener` | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器） |
 
 ### 2.2 `broker_event` 的真实状态（避免误读）
 
@@ -65,6 +67,8 @@ T11 之后 `broker_event` 有一个**纯函数**模块：`policy/0` 读 `broker_
 
 ```
 broker_core  ←── 所有应用（只依赖类型）
+broker_metrics ←── broker_storage / broker_queue / broker_subscription / broker_proto_mqtt
+                 （只被埋点调用；它自己只依赖 kernel/stdlib/sasl，不反向引用任何 broker app）
 broker_storage ←── broker_queue ←── broker_subscription ←── broker_proto_mqtt
 broker_router  ←── broker_queue ──┘            ↑
 broker_security ───────────────────────────────┘
@@ -79,9 +83,12 @@ broker_event ──────────────────────�
 
 ### 3.1 顶层结构
 
-S1 **没有伞形 `broker_app_sup`**：除 `broker_core` 外的 7 个 app 各有自己的顶层 supervisor，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
+S1 **没有伞形 `broker_app_sup`**：除 `broker_core` 外的 8 个 app 各有自己的顶层 supervisor，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
 
 ```
+broker_metrics_app ────► broker_metrics_sup                        one_for_one, 5/10s
+                          └── broker_metrics_server                 permanent（仅 report_interval_ms > 0）
+
 broker_storage_app ─────► broker_storage_sup                        one_for_all, 1/5s
                           └── broker_storage_wal_sup                 one_for_one, 4/30s
                               └── wal_writer × N（分区，start_child/permanent）
@@ -108,12 +115,13 @@ broker_proto_mqtt_app ──► broker_proto_mqtt_sup                     one_fo
                                  （listener child spec restart=transient）
 ```
 
-7 个顶层 supervisor（`broker_core` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
+8 个顶层 supervisor（`broker_core` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
 
 ### 3.2 重启策略与理由
 
 | 进程 | 策略 | 理由 | 崩溃后的可见行为 |
 |---|---|---|---|
+| `broker_metrics_sup` / `broker_metrics_server` | `one_for_one`, 5 次/10 s | 上报进程崩溃不应连累任何数据面；指标数组在进程外，重启不丢计数 | 最多丢一个上报周期，计数继续累积 |
 | `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_event_sup`、`broker_security_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
 | `broker_storage_wal_sup` | `one_for_one`, 4 次/30 s | 单分区崩溃必须自愈，但不能掩盖崩溃循环；与内存 store 隔离 | 该分区 `wal_writer` 重启并从磁盘 `recover`；旧句柄失效 |
 | `wal_writer` | `permanent` | 分区日志的写者是必需进程，不能"死了就算" | 重启后 offsets 从磁盘重建；重启前的批以 `{writer_stopped,_}` 失败 |
@@ -127,7 +135,7 @@ broker_proto_mqtt_app ──► broker_proto_mqtt_sup                     one_fo
 
 这三条决定了"为什么某些操作看起来绕"：
 
-1. **读路径不进 gen_server，写路径只进那一个写者。** `broker_router_hash:route/3`（先 `broker_router:env/0` 取 Env）、`broker_queue:read_from/3`、`broker_subscription:cursor/2`/`subscriptions/1`/`dispatch/2` 全部在**调用者进程**内查 `protected` ETS 或直接读段文件；`broker_queue:append/3` 同样在调用者进程内查注册表、完成 `wal_codec:encode/1`，只把编码后的二进制交给分区唯一的 `wal_writer`（一次 `gen_server:call`）。写者进程只拥有"写"与"生命周期"。
+1. **读路径不进 gen_server，写路径只进那一个写者。** `broker_router_hash:route/3`（先 `broker_router:env/0` 取 Env）、`broker_queue:read_from/3`、`broker_subscription:cursor/2`/`subscriptions/1`/`dispatch/2` 全部在**调用者进程**内查 `protected` ETS 或直接读段文件；`broker_queue:append/3` 同样在调用者进程内查注册表、完成 `wal_codec:encode/1`，只把编码后的二进制交给分区唯一的 `wal_writer`（一次 `gen_server:call`）。写者进程只拥有"写"与"生命周期"。**`broker_metrics` 也遵守这一条**：`inc/observe/gauge/gauge_add` 直接打 `counters`/`atomics`，`snapshot/0` 在调用者进程读取，热路径上没有指标进程。
 2. **每个可变资源恰有一个写者。** 每分区一个 `wal_writer`、一个 `broker_queue_partition`；索引一个 `broker_router_hash_store`；订阅状态一个 `broker_subscription_worker`；分区注册表一个 `broker_queue_store`。这不是为了整齐，而是 group commit、torn-tail 截断、`min(cursor)-1` 这些算法成立的前提。
 3. **通知永远是提示，不是数据。** `{new_messages, P, From, To}` 与 `{broker_deliver, ...}` 都只负责唤醒；真正的读位置只有 `broker_subscription:cursor/2`。通知可以乱序、重叠、丢失（设计文档 §5.2 T6/T9 批注）。
 
@@ -154,11 +162,13 @@ ranch acceptor: accept(Socket)
 ### 4.1 拓扑序（OTP 28.3.1 实测）
 
 ```
-sasl → broker_core → broker_storage → broker_router → broker_queue
-     → broker_subscription → broker_event → broker_security → broker_proto_mqtt
+sasl → broker_core → broker_metrics → broker_storage
+     → crypto/asn1/public_key/ssl/ranch
+     → broker_router → broker_queue → broker_subscription → broker_event
+     → broker_security → broker_proto_mqtt
 ```
 
-顺序不是装饰：`broker_queue` 在 `init/1` 里 recover 分区，`broker_subscription` 在 `init/1` 里重建订阅并回填 Router，二者都必须早于 listener。
+顺序不是装饰：`broker_queue` 在 `init/1` 里 recover 分区，`broker_subscription` 在 `init/1` 里重建订阅并回填 Router，二者都必须早于 listener。`broker_metrics` 必须早于 `broker_storage`（后者是它的调用者），而它本身只起一个可选的上报进程，不参与任何 boot step。
 
 ### 4.2 四个 boot step
 
@@ -249,6 +259,24 @@ SUBSCRIBE(Filter, QoS)
 - 没有重试定时器/指数退避：QoS1 重发只在重连或 DUP 路径发生。
 - `kill -9` 已验证；掉电（`os_buffer` 真实窗口）未模拟，留 S2。
 
+### 5.5 指标采集（S2-A）
+
+```
+热路径（调用者进程）                          读路径（任意进程，纯读）
+mqtt_conn_fsm ──inc/observe──┐
+wal_writer ────inc/observe───┤→ counters/atomics ──► broker_metrics:snapshot/0
+broker_storage_wal:recover ──┤                              │
+broker_subscription_worker ──┘                              ├→ broker_metrics_server
+                                                            │   每 report_interval_ms 一行
+                                                            └→ 测试 / S2-I 基准
+```
+
+- 写入不经过进程、不分配键：键表在启动时固定，索引存 `persistent_term`；`snapshot/0` 按 `keys/0` 顺序读数组。
+- `enabled=false` 时写 API 仍是 `ok`（`gauge_add/2` 返回 0），`snapshot/0` 返回全零，键集合不变。
+- `connections_current`/`connections_peak` 是唯一需要读改写的地方：`gauge_add/2`（原子 `add_get`）维护当前数，只有更高时才 `gauge/2` 写峰值。
+- `subscription_backlog`/`cursor_lag` 由 `broker_subscription_worker` 每次 cursor tick 采样（默认 100 ms）；`queue_depth`/`segment_bytes` 由分区 `wal_writer` 写，多分区共用一个键，最后写入者覆盖 ⇒ 视为近似全局值，分区精确值读 `broker_queue:watermarks/1`。
+- `redelivery_total`/`dlq_size`/`retention_*`/`cloudevents_*` 目前只登记键，分别等 S2-E / S2-F / S3 接入埋点。
+
 ---
 
 ## 6. 配置面
@@ -266,6 +294,7 @@ S1 没有 `broker_config` 应用，所有配置来自 `config/sys.config.src`（
 | `broker_subscription.cursor_max_regress` / `cursor_flush_interval_ms` / `inflight_flush_interval_ms` | 64 / 100 / 100 | 有界回退窗口；`1/0/0` 选择近零回退档 |
 | `broker_security.users` / `acl` | `guest/guest`、`allow` | 明文用户表与 allow-all ACL 桩 |
 | `broker_event.policy` | `pass_through` | S1 只实现 `pass_through` / `disabled`；其余三档在调用点报 `{policy_not_implemented,_,s3}` |
+| `broker_metrics.enabled` / `report_interval_ms` | `true` / `60000` | 指标总开关；`0` 不启动上报进程，非正整数使 app 启动失败（响亮失败，不静默关掉可观测性） |
 | `broker_proto_mqtt.listeners` | release 配 1883；`.app.src` 默认 `[]` | 每个 map 一个 listener；连接级 knob 随 map 下发（L20 seam） |
 | `broker_proto_mqtt.mqtt_max_qos` | 1 | 必须与后端 capability 一致；内存档必须为 0 |
 | `broker_proto_mqtt.max_inflight` / `pull_page_limit` / `pull_poll_interval_ms` / `inflight_snapshot_ms` / `max_keepalive_ms` | 64 / 32 / 1000 / 20 / 60000 | 投递循环与 keepalive 上限 |
@@ -290,8 +319,9 @@ S1 没有 `broker_config` 应用，所有配置来自 `config/sys.config.src`（
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **264/264**，零 `FAILED` 明细、零 `Skipped`；20 个 `*_SUITE.erl` | `apps/*/test/`、`test/integration/` |
-| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 仅预期 unused-export | CI/本地 |
+| 单元/契约/集成 | `rebar3 ct` → **278/278**（S1 264 + S2-A 12 + e2e metrics 2），零 `FAILED` 明细、零 `Skipped`；21 个 `*_SUITE.erl` | `apps/*/test/`、`test/integration/` |
+| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 仅预期 unused-export（S2-A 新增 3 条：`keys/0`、`reset/0`、`broker_metrics_server:start_link/1`，均为测试/AI 入口） | CI/本地 |
+| 指标端到端 | `broker_metrics_SUITE` 12 例；`s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`，R1a~R7 × 默认/零回退两档 = **16/16 PASS** | `tools/docker/` |
 | 真实客户端 | paho-mqtt 2.x + mosquitto 2.1.2，**8/8 用例、46/46 帧字节一致** | `test/protocol-compatibility/mqtt/` |
 | 端到端 | `wal`/`memory` 双组同一组 6 用例 = **12/12** | `test/integration/s1_e2e_SUITE.erl` |
@@ -310,6 +340,7 @@ S1 没有 `broker_config` 应用，所有配置来自 `config/sys.config.src`（
 | Mnesia 控制面 | 新增表；`.subs`/`.cursors`/`.inflight` 整体迁入 | `broker_subscription` 对外 API |
 | 复制（Raft） | `broker_storage` 增加 `replicated_commit` 能力与新后端 | 同一 behavior；ACK 时机仍由 capability 决定 |
 | 独立 dispatcher / 背压 | 从 `mqtt_conn_fsm` 抽出投递循环 | `cursor/2` 仍是唯一读位置；通知仍是提示 |
+| 可观测性导出层（S6） | 在 `broker_metrics:snapshot/0` 之上加 HTTP/Prometheus/OTel 导出 | 计数点与冻结的键集合不变（S2-A 已落地） |
 | CloudEvents | `broker_event` 从恒等桩变成 codec + 五档策略（接口位已由 T11 预留） | `event` 字段位与 ADR-004 的可选性 |
 
 ---

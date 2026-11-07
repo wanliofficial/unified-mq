@@ -19,6 +19,16 @@
     ]}
   ]},
 
+  {broker_metrics, [
+    %% ADR-016: no external dependency, no process on the hot path. `enabled'
+    %% false still answers every write with ok and snapshot/0 with zeros, so a
+    %% deployment can turn metrics off without changing behaviour.
+    {enabled, true},
+    %% One summary line every 60 s. 0 removes the reporter child entirely;
+    %% anything else that is not a positive integer refuses to boot.
+    {report_interval_ms, 60000}
+  ]},
+
   {broker_storage, [
     {backend, broker_storage_wal},
     %% Absolute and OUTSIDE the release tree (J8): relx's launcher `cd`s to the

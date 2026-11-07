@@ -60,6 +60,8 @@
              pending = #{},                %% Pid => {[SubRef], {Partition, Offset}}
              pending_rev = #{},            %% {Partition, Offset} => Pid
              sent = #{},                   %% Pid => true, SENT BY THIS CONNECTION
+             sent_at = #{},                %% Pid => monotonic us, for ack_latency_us
+             counted = false,              %% this conn's row in connections_current
              inflight_dirty = false}).
 
 %%%_* API ---------------------------------------------------------------------
@@ -124,6 +126,7 @@ handle_event(_Et, Content, StateName, D0) ->
 %%%_* Event matrix ------------------------------------------------------------
 
 event({tcp, _Sock, Data}, StateName, #st{buf = Buf} = D0) ->
+    broker_metrics:inc(bytes_in, byte_size(Data)),
     D = D0#st{buf = <<Buf/binary, Data/binary>>},
     case tcp_frames(D, StateName) of
         {state, S, D1} ->
@@ -146,6 +149,7 @@ event({broker_deliver, _ClientId, _MaxQoS, _Refs, {undefined, undefined, Msg}},
     %% K9: the only real push. QoS0 publishes never enter the log (§4.4), so
     %% there is no offset to pull and no ack to wait for: sending at QoS1 here
     %% would strand a pending entry keyed by `undefined'.
+    note_delivery(Msg),
     {state, connected, send_frame(publish_bin(0, 0, Msg, undefined), D)};
 event({broker_deliver, _ClientId, _MaxQoS, _Refs, {_P, _O, _Msg}}, StateName, D) ->
     %% a wake for a durable position; the tuple's Msg is not read -- the pull
@@ -181,6 +185,7 @@ event(#publish{qos = QoS, topic = Topic}, connected, #st{max_qos = Max} = D)
     %% §4.5 + E12: close, no PUBACK. QoS 2 never reaches here as a record (the
     %% codec rejects the reserved QoS bits), so in practice this is a QoS1
     %% PUBLISH on a session whose effective max is 0.
+    broker_metrics:inc(protocol_errors),
     log(warning, "mqtt_qos2_unsupported_or_above_max: qos=~p max=~p topic=~p",
         [QoS, Max, Topic]),
     {stop, normal, D};
@@ -205,12 +210,15 @@ event(#disconnect{}, connected, D) ->
 event(Frame, awaiting_connect, D) when is_tuple(Frame) ->
     %% §3.1: a frame before CONNECT is a protocol violation, not a retryable
     %% condition -- the stream position is unknown to us.
+    broker_metrics:inc(protocol_errors),
     log(warning, "first frame is not CONNECT: ~p", [element(1, Frame)]),
     {stop, normal, D};
 event(#connect{}, connected, D) ->
+    broker_metrics:inc(protocol_errors),
     log(warning, "CONNECT on an established session", []),
     {stop, normal, D};
 event(Other, StateName, D) ->
+    broker_metrics:inc(protocol_errors),
     log(warning, "unexpected event in ~p: ~p", [StateName, Other]),
     {state, StateName, D}.
 
@@ -229,10 +237,12 @@ tcp_frames(#st{buf = Buf} = D, StateName) ->
         {more, _} ->
             {state, StateName, D};
         {error, Reason} ->
+            broker_metrics:inc(frame_decode_errors),
             decode_error(Reason, StateName, D);
         {'EXIT', Reason} ->
             %% decode/1 promises never to crash; if that ever breaks, the
             %% connection dies and the codec's suite says why.
+            broker_metrics:inc(frame_decode_errors),
             {stop, {decode_crashed, Reason}, D}
     end.
 
@@ -256,6 +266,7 @@ decode_error({unsupported_protocol, Name}, awaiting_connect, D) ->
     log(warning, "unsupported protocol name ~p", [Name]),
     refuse(1, D);
 decode_error(Reason, _StateName, D) ->
+    broker_metrics:inc(protocol_errors),
     log(warning, "malformed packet ~p", [Reason]),
     {stop, normal, D}.
 
@@ -301,11 +312,12 @@ handle_connect(#connect{clean_session = CSbit} = C, D0) ->
                  end,
             case subscribe_partitions(D3) of
                 {ok, D4} ->
+                    D5 = count_connection(D4),
                     log(info, "session up: client_id=~p principal=~p "
                               "clean=~p session_present=~p max_qos=~p "
                               "keepalive_ms=~p",
-                        [C#connect.client_id, D4#st.principal, Clean, SP,
-                         D4#st.max_qos, D4#st.keepalive_ms]),
+                        [C#connect.client_id, D5#st.principal, Clean, SP,
+                         D5#st.max_qos, D5#st.keepalive_ms]),
                     %% E7/R7: the connect-time round is what serves a
                     %% reconnecting session its backlog and its DUP
                     %% resends -- leaving it to the poll tick would make
@@ -313,7 +325,7 @@ handle_connect(#connect{clean_session = CSbit} = C, D0) ->
                     %% even though we know, right here, that the session
                     %% may have unread state.
                     schedule_round(
-                      send_frame(mqtt_frame:connack(SP, 0), D4));
+                      send_frame(mqtt_frame:connack(SP, 0), D5));
                 {error, Reason} ->
                     {stop, {partition_subscribe_failed, Reason}, D3}
             end
@@ -339,6 +351,7 @@ authenticate(#connect{keep_alive = KA, username = User, password = Pass}, D) ->
                 end,
     case Principal of
         denied ->
+            broker_metrics:inc(auth_failures),
             log(warning, "authentication failed for client_id=~p", [D#st.client_id]),
             %% §4.3's error must not distinguish "unknown user" from "wrong
             %% password"; 0x04 covers both.
@@ -404,8 +417,8 @@ clean_session_teardown(D) ->
     %% Clearing the blob here is what makes the boot residue (an empty `.subs'
     %% with no `.inflight') harmless, and is the §4.2 "start from zero".
     _ = (catch broker_subscription:inflight(D#st.client_id, undefined)),
-    D#st{pending = #{}, pending_rev = #{}, sent = #{}, next_pid = 1,
-         inflight_dirty = false}.
+    D#st{pending = #{}, pending_rev = #{}, sent = #{}, sent_at = #{},
+         next_pid = 1, inflight_dirty = false}.
 
 restore_blob(#st{client_id = ClientId} = D) ->
     case broker_subscription:session(ClientId) of
@@ -437,6 +450,7 @@ subscribe_partitions(D) ->
 
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload}, D) ->
+    broker_metrics:inc(publish_total),
     try
         {ok, Env} = broker_router:env(),
         %% route/3 is the ONLY partition oracle (ADR-010): even with no
@@ -469,8 +483,12 @@ store_and_ack(Msg, 0, _Partition, Refs, _WirePid, D) ->
     _ = (catch broker_subscription:dispatch(Refs, {undefined, undefined, Msg})),
     {state, connected, D};
 store_and_ack(Msg, 1, Partition, Refs, WirePid, D) ->
+    T0 = erlang:monotonic_time(microsecond),
     case (catch broker_queue:append(Partition, Msg, fsync)) of
         {ok, Offset} ->
+            broker_metrics:observe(
+              publish_latency_us,
+              erlang:monotonic_time(microsecond) - T0),
             %% (e) PUBACK the moment fsync returned (ADR-007/R1a). The packet
             %% id echoes the client's own (§2.4: an ack carries the id of the
             %% PUBLISH it answers), so it never enters this conn's outbound id
@@ -544,11 +562,14 @@ handle_unsubscribe(#unsubscribe{packet_id = Pid, topics = Filters}, D) ->
 %%%_* PUBACK inbound ----------------------------------------------------------
 
 handle_puback(Pid, #st{pending = Pending} = D) ->
+    broker_metrics:inc(ack_total),
     case maps:take(Pid, Pending) of
         {{Refs, {P, O} = Pos}, Pending1} ->
+            observe_ack(Pid, D),
             D1 = D#st{pending = Pending1,
                       pending_rev = remove_rev(D#st.pending_rev, Pos, Pid),
                       sent = maps:remove(Pid, D#st.sent),
+                      sent_at = maps:remove(Pid, D#st.sent_at),
                       inflight_dirty = true},
             %% The merged subscription set of this delivery advances together:
             %% the worker's contiguous-prefix rule is what tolerates PUBACKs
@@ -566,6 +587,15 @@ remove_rev(Rev, Pos, Pid) ->
     case maps:get(Pos, Rev, undefined) of
         Pid -> maps:remove(Pos, Rev);
         _ -> Rev
+    end.
+
+observe_ack(Pid, #st{sent_at = At}) ->
+    case maps:get(Pid, At, undefined) of
+        T when is_integer(T) ->
+            broker_metrics:observe(
+              ack_latency_us, max(0, erlang:monotonic_time(microsecond) - T));
+        _ ->
+            ok
     end.
 
 %%%_* Pull round (the in-conn dispatcher) -------------------------------------
@@ -726,6 +756,7 @@ handle_stored(P, O, Msg, Rows, D) ->
                 0 ->
                     lists:foreach(fun(Ref) -> ack_skip(Ref, P, O) end,
                                   Others ++ Refs),
+                    note_delivery(Msg),
                     {send_frame(publish_bin(0, 0, Msg, undefined), D), progress};
                 1 ->
                     deliver_qos1(P, O, Msg, Refs, Others, D)
@@ -753,7 +784,9 @@ deliver_qos1(P, O, Msg, Refs, Others, D) ->
                     %% R7: the SAME packet_id with DUP=1. A fresh id would defeat
                     %% the client's duplicate check, which is the one thing an
                     %% at-least-once redelivery has to get right.
-                    {send_frame(publish_bin(1, 1, Msg, Pid), mark_sent(Pid, D)), idle}
+                    note_delivery(Msg),
+                    {send_frame(publish_bin(1, 1, Msg, Pid),
+                                mark_sent_at(Pid, mark_sent(Pid, D))), idle}
             end;
         undefined ->
             case maps:size(D#st.pending) >= opt(max_inflight, 64, D) of
@@ -764,16 +797,30 @@ deliver_qos1(P, O, Msg, Refs, Others, D) ->
                     {D, stalled};
                 false ->
                     {Pid, D1} = take_pid(D),
-                    D2 = mark_sent(Pid, D1#st{
+                    D2 = mark_sent_at(Pid, mark_sent(Pid, D1#st{
                              pending = maps:put(Pid, {Refs, Pos}, D1#st.pending),
                              pending_rev = maps:put(Pos, Pid, D1#st.pending_rev),
-                             inflight_dirty = true}),
+                             inflight_dirty = true})),
+                    note_delivery(Msg),
                     {send_frame(publish_bin(1, 0, Msg, Pid), D2), progress}
             end
     end.
 
 mark_sent(Pid, #st{sent = Sent} = D) ->
     D#st{sent = Sent#{Pid => true}}.
+
+mark_sent_at(Pid, #st{sent_at = At} = D) ->
+    D#st{sent_at = At#{Pid => erlang:monotonic_time(microsecond)}}.
+
+%% A PUBLISH frame hit the wire. `created_at' is the broker's receive time in
+%% milliseconds, so the latency is (now - created) in microseconds -- the path
+%% from accept to wire, not just the pull loop.
+note_delivery(Msg) ->
+    broker_metrics:inc(deliver_total),
+    Created = Msg#broker_message.created_at,
+    broker_metrics:observe(
+      deliver_latency_us,
+      max(0, erlang:system_time(microsecond) - Created * 1000)).
 
 take_pid(#st{next_pid = N} = D) ->
     {N, D#st{next_pid = next_pid_after(N)}}.
@@ -817,6 +864,7 @@ blob(D) ->
 send_frame(Bin, #st{socket = Sock} = D) ->
     case (catch gen_tcp:send(Sock, Bin)) of
         ok ->
+            broker_metrics:inc(bytes_out, byte_size(Bin)),
             D;
         Other ->
             %% A dead socket shows up as {tcp_closed, _} shortly; a failed send
@@ -824,6 +872,30 @@ send_frame(Bin, #st{socket = Sock} = D) ->
             log(warning, "send failed ~p", [Other]),
             D
     end.
+
+%% connections_current is a gauge tracking a live count, so it needs the atomic
+%% read-modify-write of gauge_add/2; the peak is a best-effort max (a lost
+%% update under a connect storm can only under-report, never over-report).
+count_connection(D) ->
+    case broker_metrics:gauge_add(connections_current, 1) of
+        N when is_integer(N), N >= 1 ->
+            case broker_metrics:gauge_add(connections_peak, 0) of
+                Peak when is_integer(Peak), N > Peak ->
+                    broker_metrics:gauge(connections_peak, N);
+                _ ->
+                    ok
+            end,
+            D#st{counted = true};
+        _ ->
+            %% metrics disabled: nothing was added, so nothing may be removed
+            D
+    end.
+
+uncount_connection(#st{counted = true} = D) ->
+    _ = broker_metrics:gauge_add(connections_current, -1),
+    D#st{counted = false};
+uncount_connection(D) ->
+    D.
 
 refuse(Code, D) ->
     {stop, normal, send_frame(mqtt_frame:connack(0, Code), D)}.
@@ -852,6 +924,7 @@ ka_arm(_StateName, D) ->
 %% clean_session has nothing to keep (detach/2 tears it down, K10 guard
 %% included), so its blob write is skipped as well.
 terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
+    _ = uncount_connection(D),
     Persisting = D#st.persist andalso Reason =/= takeover,
     if
         Persisting andalso D#st.inflight_dirty ->

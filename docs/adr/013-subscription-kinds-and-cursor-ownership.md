@@ -1,6 +1,6 @@
 # ADR-013：订阅类型、cursor 归属与会话文件 v2 迁移
 
-- **状态**：拟议（S2 M0 起草，2026-11-07，待评审签认）
+- **状态**：**已采纳（S2 M0 冻结，2026-11-07）**——用户签认；后续修改须走 ADR 修订流程
 - **日期**：2026-11-07
 - **关联**：README §5.2（订阅与 cursor 抽象）/§7.2；roadmap §4.1（订阅抽象）；ADR-009（`#broker_message{}`）、ADR-010（Router 只要求 `sub_ref()` 不透明）；设计文档 `docs/design/s2-single-node-kernel.md` D2 / D9 / §4.4
 

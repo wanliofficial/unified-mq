@@ -1,6 +1,6 @@
 # ADR-017：MQTT 5 properties 的落位与 3.1.1 兼容边界
 
-- **状态**：拟议（S2 M0 起草，2026-11-07，待评审签认；实现排到 S2.5）
+- **状态**：**已采纳（S2 M0 冻结，2026-11-07；实现排到 S2.5）**——用户签认；后续修改须走 ADR 修订流程
 - **日期**：2026-11-07
 - **关联**：README §3.4/§11.1；roadmap §4.1（MQTT 5.0 Session 与 User Properties）；ADR-009 §9.2（`headers` vs `proto_meta` 分工）；设计文档 `docs/design/s2-single-node-kernel.md` D8 / §4.8
 

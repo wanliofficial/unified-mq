@@ -1,6 +1,6 @@
 # S2-A 执行计划：`broker_metrics` 可观测性最小集
 
-- **状态**：待启动（依赖 **ADR-016 签认**；ADR 未采纳前不写产品代码）
+- **状态**：已完成（2026-11-07；全量 `rebar3 ct` 278/278，零 `FAILED`/零 `Skipped`；`dialyzer` 干净；`as t14 release` 含 `broker_metrics` 且可启动）
 - **对应**：`docs/design/s2-single-node-kernel.md` §4.1；`docs/adr/016-observability-minimal-set.md`
 - **估算**：3 人日
 - **退出条件**：`broker_metrics:snapshot/0` 稳定、埋点开/关功能一致、热路径吞吐差异 ≤2%、周期日志可控
@@ -22,7 +22,7 @@
 | `apps/broker_metrics/src/broker_metrics.app.src` | 新建 | `applications = [kernel, stdlib, sasl]`；无外部依赖 |
 | `apps/broker_metrics/src/broker_metrics_app.erl` | 新建 | `start/2` → sup |
 | `apps/broker_metrics/src/broker_metrics_sup.erl` | 新建 | `one_for_one`；子：`broker_metrics_server`（仅在 `report_interval_ms > 0` 时启用） |
-| `apps/broker_metrics/src/broker_metrics.erl` | 新建 | 公共 API：`inc/1,2`、`observe/2`、`gauge/2`、`snapshot/0`、`reset/0`、`keys/0` |
+| `apps/broker_metrics/src/broker_metrics.erl` | 新建 | 公共 API：`inc/1,2`、`observe/2`、`gauge/2`、`gauge_add/2`、`snapshot/0`、`reset/0`、`keys/0`、`p99/1` |
 | `apps/broker_metrics/src/broker_metrics_server.erl` | 新建 | 周期日志；读 `snapshot/0`，一行摘要 |
 | `apps/broker_metrics/test/broker_metrics_SUITE.erl` | 新建 | 见 §6 |
 | `config/sys.config.src` | 修改 | 增加 `{broker_metrics, [{enabled, true}, {report_interval_ms, 60000}]}` |
@@ -35,27 +35,32 @@
 
 ```erlang
 -module(broker_metrics).
--export([inc/1, inc/2, observe/2, gauge/2, snapshot/0, reset/0, keys/0]).
+-export([inc/1, inc/2, observe/2, gauge/2, gauge_add/2,
+         snapshot/0, reset/0, keys/0, p99/1]).
 
 -type key() :: atom().
 -type histogram() :: #{count := non_neg_integer(),
                        sum := non_neg_integer(),
                        buckets := [{Boundary :: non_neg_integer(), Count :: non_neg_integer()}]}.
 
--spec inc(key()) -> ok.
--spec inc(key(), non_neg_integer()) -> ok.
--spec observe(key(), non_neg_integer()) -> ok.   % 微秒
--spec gauge(key(), integer()) -> ok.
+-spec inc(key()) -> ok | {error, term()}.
+-spec inc(key(), non_neg_integer()) -> ok | {error, term()}.
+-spec observe(key(), non_neg_integer()) -> ok | {error, term()}.   % 微秒
+-spec gauge(key(), integer()) -> ok | {error, term()}.
+-spec gauge_add(key(), integer()) -> integer() | {error, term()}.
 -spec snapshot() -> #{key() => integer() | histogram()}.
 -spec reset() -> ok.
 -spec keys() -> [key()].
+-spec p99(histogram()) -> non_neg_integer().
 ```
 
 **语义**：
 
 - `enabled = false` 时三个写 API 是 `ok` 空操作，`snapshot/0` 仍返回所有键的零值（键集合稳定）。
-- 未登记的键：`inc/observe/gauge` 返回 `{error, {unknown_metric, Key}}`，并 `logger:warning` 一次（限频），**不创建新指标**。
+- **`gauge_add/2` 是 `gauge/2` 之外的增补**：原子 read-modify-write，返回新值，供 `connections_current` 这类"活计数"使用；`gauge/2` 仍是"写绝对值"（`connections_peak` 用）。`enabled=false` 或未启动时 `gauge_add/2` 返回 `0`（`inc/gauge/observe` 返回 `ok`），调用方因此能区分"没记账"而不必再查开关。
+- 未登记的键：写 API 返回 `{error, {unknown_metric, Key}}`，并 `logger:warning` 一次（每进程限频），**不创建新指标**；键存在但 Kind 不符返回 `{error, {wrong_kind, Key, Kind}}`。
 - `snapshot/0` 在调用者进程读 `counters`/`atomics`，不经 gen_server。
+- `p99/1` 对 `snapshot/0` 里的直方图取近似 99 分位；桶不足时落在 `+Inf` 槽的观测返回最后一个有限边界（不虚报）。
 - `reset/0` 仅供测试；生产不调用。
 
 ---
@@ -75,18 +80,18 @@
 | `deliver_total` | counter | `mqtt_conn_fsm` 发出 PUBLISH |
 | `ack_total` | counter | `mqtt_conn_fsm` 收到 PUBACK |
 | `bytes_in` / `bytes_out` | counter | `mqtt_conn_fsm` 收/发帧 |
-| `publish_latency_us` | histogram | `broker_queue:append/3` 外层（入队→PUBACK 前） |
-| `deliver_latency_us` | histogram | 消息 append 时间戳 → 发出 PUBLISH |
+| `publish_latency_us` | histogram | `mqtt_conn_fsm:store_and_ack/6` 外层（append 调用 → 返回） |
+| `deliver_latency_us` | histogram | `#broker_message.created_at` → PUBLISH 上线（`note_delivery/1`） |
 | `ack_latency_us` | histogram | PUBLISH 发出 → PUBACK 收到 |
-| `wal_sync_latency_us` | histogram | `wal_writer` group commit 的 sync 段 |
-| `queue_depth` | gauge | `broker_queue_partition` 每次 append/read 后 |
-| `subscription_backlog` | gauge | `broker_subscription` 每订阅（聚合值，不按订阅拆键） |
-| `cursor_lag` | gauge | 同上 |
+| `wal_sync_latency_us` | histogram | `wal_writer` group commit 的 sync 段（`sync_fd_measured/1`） |
+| `queue_depth` | gauge | `wal_writer` append 后写 `high - committed`；**多分区共用一个键，最后写入者覆盖 ⇒ 近似全局值**，分区精确值用 `broker_queue:watermarks/1` |
+| `subscription_backlog` | gauge | `broker_subscription_worker:sample_gauges/1`，每次 cursor tick（默认 100 ms）取 `sum(High - cursor)` 聚合值 |
+| `cursor_lag` | gauge | 同上，取 `sum(High - committed)`（未被全体订阅者 ack 的窗口） |
 | `redelivery_total` | counter | ADR-015 实现后接入（S2-A 只登记键） |
 | `dlq_size` | gauge | ADR-015 实现后接入（只登记键） |
-| `wal_append_total` / `wal_sync_total` | counter | `wal_writer` |
-| `segment_bytes` | gauge | `wal_segment`/`wal_index` |
-| `recovery_time_us` | histogram | `broker_storage:recover/3` 外层 |
+| `wal_append_total` / `wal_sync_total` | counter | `wal_writer`（append 成功 / sync 成功） |
+| `segment_bytes` | gauge | `wal_writer` 每次 append 后写当前段末尾位置；多分区共用一个键（最后写入者覆盖），只用于粗看，精确值看段文件 |
+| `recovery_time_us` | histogram | `broker_storage_wal:recover/2` 外层（含段扫描） |
 | `retention_deleted_bytes` | counter | ADR-014 实现后接入（只登记键） |
 | `cloudevents_validate_ok` / `_failed` | counter | **只登记，S3 埋点** |
 
@@ -120,12 +125,12 @@
 
 按 §4 表逐点接入，**每次只改一个模块并跑该模块的既有 CT 套件**，确保行为不变：
 
-1. `mqtt_conn_fsm`：连接/认证/协议错误/收发计数/延迟。
-2. `wal_writer`：append/sync 计数与 sync 直方图。
-3. `broker_queue`：depth 与 publish 延迟。
-4. `broker_subscription_worker`：backlog/cursor lag 的聚合 gauge（每 N 次刷新一次，避免每次读写都算）。
+1. `mqtt_conn_fsm`：连接/认证/协议错误/收发计数/延迟（`publish_latency_us` 在 append 调用外层计时）。
+2. `wal_writer`：append/sync 计数与 sync 直方图、`segment_bytes`、`queue_depth`。
+3. `broker_subscription_worker`：backlog/cursor lag 的聚合 gauge（每次 cursor tick 采样一次，避免每次读写都算）。
+4. `broker_storage_wal:recover/2`：`recovery_time_us`。
 
-**验收**：全量 `rebar3 ct` 264/264 不变；`enabled=false` 时同样 264/264。
+**验收**：全量 `rebar3 ct` 278/278 不变；`enabled=false` 时同样通过（写 API 空操作）。
 
 ### T-A5 周期日志（0.25 人日）
 
@@ -152,10 +157,12 @@
 | `keys_are_stable` | `keys()` 等于 §4 表；集合变化必须改测试 |
 | `inc_accumulates` | `inc(k, 3)` 后 `snapshot()` 为 3 |
 | `gauge_overwrites` | `gauge(k, 5)`、`gauge(k, 2)` 后为 2 |
+| `gauge_add_accumulates` | `gauge_add/2` 增减与返回值；Kind 不符/未知键被拒 |
 | `observe_buckets` | 0、边界值、超最大桶的桶计数正确 |
 | `snapshot_is_pure_read` | 连续两次 `snapshot()` 不改变值 |
 | `unknown_key_is_rejected` | `inc(bogus)` 返回 `{error, {unknown_metric, bogus}}` |
-| `disabled_is_noop` | `enabled=false` 时写 API 返回 `ok`、snapshot 全零 |
+| `wrong_kind_is_rejected` | 对 counter 调 `gauge/2` 返回 `{error, {wrong_kind, _, _}}` |
+| `disabled_is_noop` | `enabled=false` 时写 API 返回 `ok`（`gauge_add` 返回 `0`）、snapshot 全零 |
 | `reset_clears` | `reset()` 后 snapshot 全零 |
 | `no_high_cardinality_keys` | `keys()` 全是 atom；无 binary/动态键 |
 | `report_line_is_single` | 周期日志一行；`0` 时无输出 |
@@ -170,7 +177,7 @@
 export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"
 rm -rf _build/test/extras
 rebar3 ct --suite apps/broker_metrics/test/broker_metrics_SUITE
-rebar3 ct                     # 264 + 新增，零 FAILED / 零 Skipped
+rebar3 ct                     # 278/278，零 FAILED / 零 Skipped
 rebar3 dialyzer
 rebar3 xref                   # 只允许预期 unused-export
 rebar3 as t14 release

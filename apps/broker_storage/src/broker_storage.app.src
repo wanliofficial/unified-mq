@@ -3,6 +3,6 @@
     {vsn, "0.1.0"},
     {registered, []},
     {mod, {broker_storage_app, []}},
-    {applications, [kernel, stdlib, sasl, broker_core]},
+    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics]},
     {env, []}
 ]}.

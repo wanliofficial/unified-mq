@@ -1,6 +1,6 @@
 # ADR-016：可观测性最小集与「无外部依赖」取舍
 
-- **状态**：拟议（S2 M0 起草，2026-11-07，待评审签认）
+- **状态**：**已采纳（S2 M0 冻结，2026-11-07）**——用户签认；后续修改须走 ADR 修订流程
 - **日期**：2026-11-07
 - **关联**：README §10.2（可观测性）/§7.2（背压）；roadmap §4.1（可观测性最小集）/§4.3 Gate S2；设计文档 `docs/design/s2-single-node-kernel.md` D6 / §4.1
 
@@ -59,6 +59,8 @@ reset()             -> ok.        % 测试用
 
 - 键必须在**编译期或启动期**登记（`broker_metrics:keys/0` 返回固定列表），未登记键在 `inc/1` 时记 `unknown_metric` 并拒绝，避免拼写错误静默产生新指标。
 - `snapshot/0` 是纯读，不阻塞热路径；进程内聚合用 `persistent_term` 指向 ETS/counters 引用，避免每次读数走 gen_server。
+
+> **实施注记（S2-A，2026-11-07）**：落地时在冻结形状之外增补 `gauge_add/2`——`connections_current` 是活计数，需要原子的 read-modify-write 并返回新值，`gauge/2` 保留「写绝对值」语义（峰值用）。`enabled=false` 或 app 未启动时 `gauge_add/2` 返回 `0`，其余写 API 返回 `ok`。直方图的 `snapshot/0` 形状为 `#{count, sum, buckets}`，并新增 `p99/1` 近似分位；键集合与 §16.2 一致。此注记不改变本节决策。
 
 ### 16.4 埋点边界
 

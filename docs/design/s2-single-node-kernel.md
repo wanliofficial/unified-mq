@@ -1,6 +1,6 @@
 # S2 方案设计 — 单机生产内核
 
-- **文档版本**：v0.2（M0 决策冻结草案；O1~O4 已由用户拍板，D1~D9 全部结案，待 ADR-012~017 评审签认）
+- **文档版本**：v0.3（M0 完成；O1~O4 已拍板，D1~D9 结案，ADR-012~017 已签认并冻结）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §4
 - **S1 基线**：`4bf145b`（S1 全部任务含 T11 完成；`rebar3 ct` 264/264，零 FAILED / 零 Skipped，`dialyzer` 干净）
 - **目标 Gate**：roadmap §4.3「Gate S2」
@@ -170,8 +170,9 @@
 
 > 执行计划：[`s2-a-metrics-execution-plan.md`](s2-a-metrics-execution-plan.md)（任务 T-A1~T-A7 + 测试清单 + 验收命令；ADR-016 签认后启动）。
 
+- **状态**：**已实现（2026-11-07）**——`apps/broker_metrics/` 与其 12 例套件已合入；`mqtt_conn_fsm`/`wal_writer`/`broker_storage_wal:recover/2`/`broker_subscription_worker` 完成埋点；全量 `rebar3 ct` 278/278、`dialyzer` 干净、`as t14 release` 含该 app。
 - **范围**：连接数（当前/峰值）、认证失败、协议错误/帧解析失败、发布/消费吞吐、端到端延迟、ACK 延迟、重投递次数、队列深度、订阅积压、cursor lag、DLQ 规模、WAL 写入/刷盘延迟、段大小、恢复时间。
-- **形状**：`counters` + `atomics`（热路径无锁），`broker_metrics:snapshot/0` 聚合；`broker_metrics:inc/1,2`、`observe/2`（直方图用固定桶，避免依赖）。
+- **形状**：`counters` + `atomics`（热路径无锁），`broker_metrics:snapshot/0` 聚合；`broker_metrics:inc/1,2`、`observe/2`（直方图用固定桶，避免依赖）、`gauge/2` 与增补的 `gauge_add/2`（活计数原子读改写）。
 - **测试**：埋点不改变行为（同一 CT 套件开/关计数结果一致）；snapshot 键集合被一条 `keys_are_stable` 用例钉住；周期日志不刷屏。
 - **风险**：热路径原子操作开销；用 S2-I 的前后基准对照，>2% 则改采样。
 
@@ -237,7 +238,7 @@
 
 | 里程碑 | 内容 | 退出条件 |
 |---|---|---|
-| M0 决策冻结 | D1~D9 结案；ADR-012~017 起草并评审 | 每份 ADR 状态=已采纳；本文升 v0.2（**已完成**：O1~O4 已拍板，本文即 v0.2；ADR 待签认） |
+| M0 决策冻结 | D1~D9 结案；ADR-012~017 起草并评审 | 每份 ADR 状态=已采纳；本文升 v0.2+（**已完成**：2026-11-07 六份 ADR 全部签认，本文 v0.3） |
 | M1 观测与证明 | S2-A + S2-B | `os_buffer` 双轨报告可复跑（CI 替身 + dm-flakey）；metrics snapshot 稳定 |
 | M2 协议补齐 | S2-C（QoS2 / Retain / Will） | QoS2/Retain/Will 帧级 + 真实客户端通过；T14 R8 通过。**MQTT 5 已移出本里程碑到 S2.5** |
 | M3 结构改造 | S2-D → S2-E → S2-F | 三种订阅类型（含 Shared 位图 + 连续前缀）、DLQ/TTL、retention 全绿；`.subs` v1→v2 演练通过 |
@@ -283,7 +284,7 @@
 
 ## 8. 文档与证据产出
 
-- 新 ADR：012（QoS2）、013（订阅/cursor）、014（retention）、015（重投递/DLQ/TTL）、016（可观测性）、017（MQTT5 properties）。**均已于 2026-11-07 起草，状态=拟议，待评审签认。**
+- 新 ADR：012（QoS2）、013（订阅/cursor）、014（retention）、015（重投递/DLQ/TTL）、016（可观测性）、017（MQTT5 properties）。**均已于 2026-11-07 起草并经用户签认，状态=已采纳。**
 - `docs/architecture.md`：新增 `broker_metrics`、`broker_retain`、`broker_redelivery`（或模块）的进程边界与数据流；§9 演进表逐项落地。
 - `docs/storage-and-recovery.md`：段 GC、DLQ 存储、TTL 过滤、会话文件 v2 与迁移、R8/R9 矩阵。
 - `docs/protocol-compatibility.md`：MQTT 行升级（QoS2/Retain/Will/5.0 子集），T15 扩为双版本客户端。

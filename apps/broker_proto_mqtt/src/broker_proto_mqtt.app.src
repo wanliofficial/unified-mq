@@ -3,8 +3,9 @@
     {vsn, "0.1.0"},
     {registered, [broker_proto_mqtt_sup, mqtt_conn_sup]},
     {mod, {broker_proto_mqtt_app, []}},
-    {applications, [kernel, stdlib, sasl, ranch, broker_core, broker_storage, broker_router,
-                    broker_queue, broker_subscription, broker_event, broker_security]},
+    {applications, [kernel, stdlib, sasl, ranch, broker_core, broker_metrics,
+                    broker_storage, broker_router, broker_queue, broker_subscription,
+                    broker_event, broker_security]},
     {env, [{%% Empty on purpose: a library/test node binds no port unless the
             %% release config (config/sys.config.src) supplies a listener. T12's
             %% listener suite supplies its own ephemeral port.

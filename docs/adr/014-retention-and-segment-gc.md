@@ -1,6 +1,6 @@
 # ADR-014：retention、物理段删除与慢消费者守卫
 
-- **状态**：拟议（S2 M0 起草，2026-11-07，待评审签认）
+- **状态**：**已采纳（S2 M0 冻结，2026-11-07）**——用户签认；后续修改须走 ADR 修订流程
 - **日期**：2026-11-07
 - **关联**：README §5.3/§7.2；roadmap §4.1（retention）；ADR-011（`broker_storage` 8 回调冻结）；设计文档 `docs/design/s2-single-node-kernel.md` D3 / §4.6
 

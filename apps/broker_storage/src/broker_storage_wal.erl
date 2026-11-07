@@ -69,6 +69,14 @@ create(PartitionId, Config) ->
     end.
 
 recover(PartitionId, Config) ->
+    %% Gate evidence: recovery time per partition, including the segment scan.
+    T0 = erlang:monotonic_time(microsecond),
+    Result = do_recover(PartitionId, Config),
+    broker_metrics:observe(recovery_time_us,
+                           erlang:monotonic_time(microsecond) - T0),
+    Result.
+
+do_recover(PartitionId, Config) ->
     Dir = partition_dir(PartitionId, Config),
     case broker_storage_wal_sup:start_partition(PartitionId, Dir, wal_config(Config)) of
         {ok, Writer} ->
