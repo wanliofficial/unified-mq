@@ -156,6 +156,8 @@ unified-mq/
 
 **目标**：把原型变成能承载真实流量的单机系统，仍无分布式。
 
+**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.1 草案：基线盘点、D1~D9 待定决策、S2-A~S2-I 子项目、里程碑与 Gate 映射）。本阶段先冻结该文 §3 的决策与 ADR-012~017，再逐子项目开执行计划。
+
 ### 4.1 功能范围
 
 - **分区与顺序**：partition 归属、消息有序性边界
@@ -314,6 +316,7 @@ unified-mq/
 | `docs/adr/00N-*.md` | S0 | 13 |
 | `docs/architecture.md` | S1 | 2 |
 | `docs/storage-and-recovery.md` | S1（v0.1，T16）；S2 / S4 扩写 | 5.3、6 |
+| `docs/design/s2-single-node-kernel.md` | S2（v0.1 规划草案） | 4、5.2、6.3、7.2、10 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

@@ -15,7 +15,8 @@
 |---|---|---|
 | S0 技术验证 | ✅ 完成 | 5 个 spike + Gate ADR-001~008 全部落盘并推送 |
 | S1 MQTT 垂直切片 | ✅ **完成（2026-11-06，Gate S1 通过）** | 方案设计 v0.16（四轮评审 46 项整改 + 实现期同步 91 项：H1~H11 / I1~I15 / J1~J11 / K0~K10 / L1~L20 / M1~M16）；ADR 已冻结并经 T17 复核；**T1/T3/T4/T5/T6/T7/T8/T9/T10/T11/T12/T13/T14/T15/T16/T17 全部完成**（264 个 CT 用例，零 FAILED 行、零 Skipped、`dialyzer` 干净；release 实测含 T7 的 R1b 节点级预演、T12 的 ranch listener + paho-mqtt 真实客户端端到端，以及 T12/M10/M11 的“有 QoS1 记录 + 有持久会话时连续重启”恢复；T13 用 `wal`/`memory` 双组同用例跑通 12/12；T14 崩溃矩阵默认档 / 零回退档各 8/8；T15 真实客户端 8/8、46/46 帧字节一致；T16 两份架构/存储文档 v0.1；T17 冻结契约复核 + E1 签认；T11 `broker_event` 恒等桩 + `#cloud_event{}` 接口位）。 |
-| S2/S3 | ⬜ 未开始 | roadmap 标注 S2/S3 可并行，S3 必须早于 S4 |
+| S2 单机生产内核 | 🟡 **规划中（2026-11-07）** | 规划草案 [`docs/design/s2-single-node-kernel.md`](docs/design/s2-single-node-kernel.md) v0.1 已落盘：S1 基线盘点、D1~D9 待定决策（QoS2 / 订阅类型与 cursor 归属 / retention / 重投递 DLQ TTL / 背压 / 可观测性 / `os_buffer` 证明 / MQTT5 / 会话文件 v2 迁移）、S2-A~S2-I 子项目（≈55 人日）、里程碑 M0~M4、Gate S2 映射与风险表。**下一步 M0：冻结决策并起草 ADR-012~017，未定案不写代码** |
+| S3 CloudEvents | ⬜ 未开始 | roadmap 允许 S2/S3 并行；S3 必须早于 S4 |
 | S4+ | ⬜ 未开始 | — |
 
 ## S0 交付物（已提交）
@@ -149,7 +150,7 @@
 
 ## 下一步
 
-**S1 全部任务（含 T11）已完成并推送。下一步是 S2 规划**（roadmap §4「单机生产内核」）：把 4.1 的范围拆成可验收任务——分区有序性边界、Exclusive/Shared/Failover 订阅抽象 + `broker_cursor`、ACK/重投递/重试上限/DLQ/TTL/retention、MQTT QoS2 + Retain + Will + 5.0（Session/User Properties）、三档可靠性逐档证明（尤其 `os_buffer` 的丢失边界）、背压（bounded batch / mailbox 水位 / flow permit）、可观测性最小集；并按 §4.3 的 Gate S2 四项设计验收（尤其"无单一 GenServer 成为全局瓶颈"的四条约束逐条检查与基准报告）。规划时先定 S2 的任务分解与首批实现顺序，再动代码。
+**S1 全部任务（含 T11）已完成并推送；S2 规划草案已落盘**：[`docs/design/s2-single-node-kernel.md`](docs/design/s2-single-node-kernel.md) v0.1——S1 基线盘点、D1~D9 待定决策、S2-A~S2-I 子项目（≈55 人日）、M0~M4 里程碑、Gate S2 对齐与风险表。**下一步 M0：逐条冻结 D1~D9 并起草 ADR-012（QoS2）/013（订阅与 cursor）/014（retention）/015（重投递 DLQ TTL）/016（可观测性）/017（MQTT5 properties），未定案不写代码。** 需要拍板的四件事见该文 §7：Shared ack 语义、DLQ 命名与保留、MQTT5 是否必须落在 S2、`os_buffer` 证明是否接受替身。
 
 T9/T12 交接给 T13 的既定事实（实现期已定，勿再讨论）：SubRef = `{ClientId, Filter}`（K2）；投递形状 `{broker_deliver, ClientId, MaxQoS, [SubRef], {PartitionId, Offset, Msg}}`（K9），带位置者只是唤醒、`cursor/2` 是唯一读位置（J6）；`.inflight` 回退窗口"只多不少"是 R7 契约（MQTT §4.1 允许重发未确认），**且 `inflight_flush_interval_ms = 0` 已是可用的零回退档**（§5.3 修正）；dispatcher **内嵌在 conn_fsm**，S1 无独立 dispatcher 进程（§5.2）；conn 的全部可调参数由 **listener 的 `ProtoOpts`** 提供、无 listener 时回落 app env（L20 → M4）；连接进程仍是 `temporary`，但 **listener 停止会经 ranch 的 conns sup 收口**（M7），测试清理仍保留 `kill_conns/0` 兜底。
 
