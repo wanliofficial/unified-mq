@@ -1,0 +1,14 @@
+{application, broker_retain, [
+    {description, "Retained messages: one per topic, snapshot-persisted (ADR-018 §18.2)"},
+    {vsn, "0.1.0"},
+    {registered, [broker_retain_sup, broker_retain]},
+    {mod, {broker_retain_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics]},
+    {env, [{%% Same absolute path as broker_storage/broker_subscription (J8):
+            %% the retain file must live beside the sessions it serves.
+            data_dir, "data"},
+           {retain_flush_interval_ms, 100},
+           {max_retained, 10000},
+           {max_retained_bytes, 67108864},
+           {max_payload_bytes, 262144}]}
+]}.

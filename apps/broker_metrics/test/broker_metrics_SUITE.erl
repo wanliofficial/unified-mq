@@ -35,7 +35,9 @@ all() ->
          recovery_time_us, retention_deleted_bytes,
          retention_deleted_segments, retention_blocked_by_slow_consumer,
          retention_blocked_by_committed, cloudevents_validate_ok,
-         cloudevents_validate_failed]).
+         cloudevents_validate_failed, retain_updates, retain_clears,
+         retain_overflow, retain_store_errors, will_published,
+         qos2_state_overflow]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.

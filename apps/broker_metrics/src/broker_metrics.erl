@@ -304,4 +304,13 @@ key_specs() ->
      {retention_blocked_by_slow_consumer, counter},
      {retention_blocked_by_committed, counter},
      {cloudevents_validate_ok, counter},
-     {cloudevents_validate_failed, counter}].
+     {cloudevents_validate_failed, counter},
+     %% S2-C (ADR-018 §18.5): retained state, Will publication and QoS 2
+     %% state-cap violations. Same rule as every other key -- a closed atom
+     %% set, no labels, no per-topic suffixes.
+     {retain_updates, counter},
+     {retain_clears, counter},
+     {retain_overflow, counter},
+     {retain_store_errors, counter},
+     {will_published, counter},
+     {qos2_state_overflow, counter}].
