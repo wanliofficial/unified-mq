@@ -308,6 +308,15 @@ unified-mq/
 | ADR-006 | Pulsar 协议兼容与原生存储解耦 | S0 |
 | ADR-007 | 可靠性承诺必须显式化 | S0 |
 | ADR-008+ | 分区 Raft 分组模型、ACK 等级表、存储方案 A/B 取舍 | S0 |
+| ADR-009 | 统一消息模型 `broker_message` 记录定稿 | S1 |
+| ADR-010 | `broker_router` behavior 与路由/订阅索引边界 | S1 |
+| ADR-011 | `broker_storage` behavior、能力模型与磁盘协议 | S1 |
+| ADR-012 | QoS 2 承诺边界与 release 状态持久化 | S2（拟议） |
+| ADR-013 | 订阅类型、cursor 归属与会话文件 v2 迁移 | S2（拟议） |
+| ADR-014 | retention、物理段删除与慢消费者守卫 | S2（拟议） |
+| ADR-015 | 重投递、DLQ 与消息 TTL 的归属与形状 | S2（拟议） |
+| ADR-016 | 可观测性最小集与「无外部依赖」取舍 | S2（拟议） |
+| ADR-017 | MQTT 5 properties 落位与 3.1.1 兼容边界 | S2.5（拟议） |
 
 ### 9.2 文档产出物
 

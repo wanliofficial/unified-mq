@@ -16,6 +16,17 @@
 | [010](010-broker-router-behavior.md) | `broker_router` behavior 与路由/订阅索引边界 | S1 T0.5；ADR-001 |
 | [011](011-broker-storage-behavior.md) | `broker_storage` behavior、能力模型与磁盘协议 | S1 T0.5；S0.3 spike；ADR-007/008 |
 
+### S2 决策（拟议，2026-11-07 起草，待评审签认）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [012](012-qos2-semantics-and-release-state.md) | QoS 2 承诺边界与 release 状态持久化 | MQTT 3.1.1 §4.3.3；ADR-007/009 |
+| [013](013-subscription-kinds-and-cursor-ownership.md) | 订阅类型、cursor 归属与会话文件 v2 迁移 | README §5.2；ADR-010；S2 设计 D2/D9 |
+| [014](014-retention-and-segment-gc.md) | retention、物理段删除与慢消费者守卫 | ADR-011；README §5.3/§7.2 |
+| [015](015-redelivery-dlq-and-ttl.md) | 重投递、DLQ 与消息 TTL 的归属与形状 | ADR-009/013；README §5.2/§10.1 |
+| [016](016-observability-minimal-set.md) | 可观测性最小集与「无外部依赖」取舍 | README §10.2/§7.2 |
+| [017](017-mqtt5-properties-and-compat.md) | MQTT 5 properties 落位与 3.1.1 兼容边界 | ADR-009 §9.2；README §3.4 |
+
 ## Gate S0 验收清单（roadmap §2）
 
 - [x] S0.1（ra 评估）与 S0.3（WAL）产出明确结论（采用 ra / 采用方案 A 自研 WAL）
