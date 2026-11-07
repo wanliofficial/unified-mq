@@ -89,6 +89,9 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_queue, partitions, ?N),
     ok = application:set_env(broker_router, partitions, ?N),
     ok = application:set_env(broker_subscription, data_dir, DataDir),
+    %% The retain snapshot is a fourth per-data-dir artifact (ADR-018 §18.2):
+    %% leaving it unset would make every case share the repo's data/retain.
+    ok = application:set_env(broker_retain, data_dir, DataDir),
     ok = application:set_env(broker_subscription, cursor_max_regress, 64),
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 100),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 100),
@@ -148,6 +151,7 @@ listener_port() ->
 
 stop_all() ->
     _ = application:stop(broker_proto_mqtt),
+    _ = application:stop(broker_retain),
     _ = application:stop(broker_event),
     _ = application:stop(broker_security),
     _ = application:stop(broker_subscription),

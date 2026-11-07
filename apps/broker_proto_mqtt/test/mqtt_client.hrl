@@ -53,7 +53,7 @@ mqtt_connect_frame(Knobs) ->
              password = maps:get(password, Knobs, undefined),
              will_flag = case WillTopic of undefined -> 0; _ -> 1 end,
              will_qos = maps:get(will_qos, Knobs, 0),
-             will_retain = 0,
+             will_retain = maps:get(will_retain, Knobs, 0),
              will_topic = WillTopic,
              will_payload = maps:get(will_payload, Knobs, undefined)}.
 
@@ -99,6 +99,17 @@ mqtt_publish(#{sock := Client}, PacketId, Topic, Payload, QoS) ->
 
 mqtt_puback(#{sock := Client}, PacketId) ->
     ok = gen_tcp:send(Client, mqtt_frame:encode(#puback{packet_id = PacketId})).
+
+%%%_* QoS 2 handshake (ADR-012 / ADR-018 §18.3) --------------------------------
+
+mqtt_pubrec(#{sock := Client}, PacketId) ->
+    ok = gen_tcp:send(Client, mqtt_frame:encode(#pubrec{packet_id = PacketId})).
+
+mqtt_pubrel(#{sock := Client}, PacketId) ->
+    ok = gen_tcp:send(Client, mqtt_frame:encode(#pubrel{packet_id = PacketId})).
+
+mqtt_pubcomp(#{sock := Client}, PacketId) ->
+    ok = gen_tcp:send(Client, mqtt_frame:encode(#pubcomp{packet_id = PacketId})).
 
 mqtt_ping(#{sock := Client}) ->
     ok = gen_tcp:send(Client, mqtt_frame:encode(#ping{kind = req})),
@@ -172,8 +183,8 @@ mqtt_raw_connect(Level, ClientId) ->
              (byte_size(ClientId)):16, ClientId/binary>>,
     <<16#10, (byte_size(Body)), Body/binary>>.
 
-%% A PUBLISH whose QoS bits say 2: the reserved combination §4.5 refuses.
-mqtt_raw_publish_qos2(Topic, Payload) ->
+%% A PUBLISH whose QoS bits say 3: still reserved, still refused (§3.3.1.2).
+mqtt_raw_publish_qos3(Topic, Payload) ->
     Body = <<(byte_size(Topic)):16, Topic/binary, Payload/binary>>,
-    %% type 3 with flags 0b0110 (dup=0, qos=2, retain=0)
+    %% type 3 with flags 0b0110 (dup=0, qos=3, retain=0)
     <<2#00110110, (byte_size(Body)), Body/binary>>.

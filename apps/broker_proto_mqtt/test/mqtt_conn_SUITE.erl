@@ -30,6 +30,7 @@
 -compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
 -include("mqtt_frame.hrl").
 -include_lib("broker_core/include/broker_message.hrl").
 -include("mqtt_client.hrl").
@@ -46,7 +47,12 @@ all() ->
      connect_wrong_protocol_level_is_refused_1,
      frame_before_connect_closes_the_connection,
      connect_on_an_established_session_closes,
-     will_fields_are_parsed_and_ignored,
+     will_is_published_on_tcp_close,
+     will_is_not_published_on_disconnect,
+     will_is_published_on_takeover,
+     will_retain_updates_the_tree,
+     will_is_published_on_a_keepalive_timeout,
+     will_is_not_republished_after_a_broker_restart,
      keepalive_is_clamped_and_only_peer_traffic_restarts_it,
      pingreq_is_answered_pingresp,
      subscribe_grants_the_requested_qos,
@@ -56,9 +62,27 @@ all() ->
      publish_qos1_is_acked_after_the_append_and_delivered,
      the_consumer_puback_advances_the_cursor,
      puback_is_not_blocked_by_the_subscription_worker,
-     qos2_publish_closes_without_an_ack,
+     reserved_qos_bits_close_without_an_ack,
      publish_over_the_effective_max_closes_without_an_ack,
-     retain_is_stripped_and_the_message_still_flows,
+     qos2_inbound_four_steps_delivers_once,
+     qos2_inbound_dup_publish_is_not_redelivered,
+     unknown_pubrel_gets_pubcomp,
+     unknown_pubrec_gets_pubrel,
+     unknown_pubcomp_is_ignored,
+     qos2_state_overflow_disconnects,
+     qos2_outbound_advances_cursor_only_on_pubcomp,
+     puback_for_a_qos2_delivery_does_not_advance_the_cursor,
+     reconnect_before_pubrec_resends_a_dup_publish,
+     reconnect_after_pubrec_resends_pubrel_only,
+     inflight_blob_is_v2_and_skips_retained_entries,
+     subscribe_receives_retained_after_suback,
+     retained_qos_is_capped_by_the_grant,
+     retained_wildcard_delivers_each_topic_in_topic_order,
+     retain_flag_is_zero_for_live_subscribers,
+     zero_length_retain_clears_for_new_subscribers,
+     zero_length_retain_still_reaches_live_subscribers,
+     retained_survives_a_retain_app_restart,
+     retain_overflow_still_delivers_live,
      overlapping_filters_deliver_once_and_both_cursors_move,
      a_qos0_subscription_receives_stored_traffic_at_qos0,
      offline_messages_are_caught_up_in_offset_order,
@@ -98,6 +122,9 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_queue, partitions, ?N),
     ok = application:set_env(broker_router, partitions, ?N),
     ok = application:set_env(broker_subscription, data_dir, DataDir),
+    %% The retain snapshot is a fourth per-data-dir artifact (ADR-018 §18.2):
+    %% leaving it unset would make every case share the repo's data/retain.
+    ok = application:set_env(broker_retain, data_dir, DataDir),
     ok = application:set_env(broker_subscription, cursor_max_regress, 64),
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 100),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 100),
@@ -107,7 +134,8 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 1000),
     ok = application:set_env(broker_proto_mqtt, inflight_snapshot_ms, 20),
     ok = application:set_env(broker_proto_mqtt, max_keepalive_ms, 60000),
-    ok = application:set_env(broker_proto_mqtt, mqtt_max_qos, 1),
+    ok = application:set_env(broker_proto_mqtt, mqtt_max_qos, 2),
+    ok = application:set_env(broker_proto_mqtt, max_qos2_state_per_session, 100),
     ok = case_env(Case),
     {ok, _Started} = application:ensure_all_started(broker_storage),
     [{data_dir, DataDir} | Config].
@@ -128,6 +156,8 @@ end_per_testcase(_Case, _Config) ->
 %% "which case needs which posture" is answerable without reading 27 bodies.
 case_env(keepalive_is_clamped_and_only_peer_traffic_restarts_it) ->
     application:set_env(broker_proto_mqtt, max_keepalive_ms, 200);
+case_env(will_is_published_on_a_keepalive_timeout) ->
+    application:set_env(broker_proto_mqtt, max_keepalive_ms, 200);
 case_env(publish_over_the_effective_max_closes_without_an_ack) ->
     application:set_env(broker_proto_mqtt, mqtt_max_qos, 0);
 case_env(the_memory_backend_serves_the_full_e12_posture) ->
@@ -145,6 +175,7 @@ boot() ->
 
 stop_all() ->
     _ = application:stop(broker_proto_mqtt),
+    _ = application:stop(broker_retain),
     _ = application:stop(broker_subscription),
     _ = application:stop(broker_queue),
     _ = application:stop(broker_router),
@@ -264,18 +295,146 @@ connect_on_an_established_session_closes(_Config) ->
     {ok, normal} = expect_down(Monitor, cpid(Conn)),
     ok.
 
-will_fields_are_parsed_and_ignored(_Config) ->
+%% ADR-018 §18.1: a Will is connection state held in memory, published from
+%% `terminate/3' on every ending EXCEPT a clean DISCONNECT and a broker
+%% shutdown. The four cases below pin the two "yes" endings and the two "no"
+%% ones that do not need a broker restart to observe.
+will_is_published_on_tcp_close(_Config) ->
     ok = boot(),
+    {Watcher, _} = open(<<"watch">>),
+    1 = sub(Watcher, 1, <<"will/#">>, 1),
     {Conn, #connack{return_code = 0}} =
         mqtt_open(#{client_id => <<"c1">>, will_topic => <<"will/c1">>,
-                    will_payload => <<"bye">>}),
-    %% The codec parsed the Will (a malformed one would have been a decode error
-    %% and no CONNACK at all); the conn drops it. No subscription appears for
-    %% the Will topic, and there is nothing stored to publish later (§4.5: S1
-    %% has no Will, and pretending to support one is worse than refusing).
-    [] = broker_subscription:subscriptions(<<"c1">>),
-    [] = broker_subscription:subscriptions(<<"will/c1">>),
+                    will_payload => <<"bye">>, will_qos => 1}),
+    %% A transport death, not a DISCONNECT: §3.1.2.5 requires the Will.
     {ok, normal} = mqtt_close(Conn),
+    {Pub, _} = recv_publish(csock(Watcher)),
+    #publish{qos = 1, retain = 0, topic = <<"will/c1">>,
+             payload = <<"bye">>} = Pub,
+    ok = mqtt_puback(Watcher, Pub#publish.packet_id),
+    {ok, normal} = mqtt_close(Watcher),
+    ok.
+
+will_is_not_published_on_disconnect(_Config) ->
+    ok = boot(),
+    {Watcher, _} = open(<<"watch">>),
+    1 = sub(Watcher, 1, <<"will/#">>, 1),
+    {Conn, _} = open(#{client_id => <<"c1">>, will_topic => <<"will/c1">>,
+                       will_payload => <<"bye">>, will_qos => 1}),
+    %% §3.14: DISCONNECT exists precisely to say "do not publish my Will".
+    ok = mqtt_disconnect(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    true = mqtt_silence(csock(Watcher), 300),
+    {ok, normal} = mqtt_close(Watcher),
+    ok.
+
+will_is_published_on_takeover(_Config) ->
+    ok = boot(),
+    {Watcher, _} = open(<<"watch">>),
+    1 = sub(Watcher, 1, <<"will/#">>, 1),
+    {Old, _} = open(#{client_id => <<"c1">>, clean => false,
+                      will_topic => <<"will/c1">>, will_payload => <<"evicted">>,
+                      will_qos => 1}),
+    OldPid = cpid(Old),
+    Monitor = mqtt_monitor(Old),
+    %% §3.1.4 + §3.1.2.5 taken literally: the old connection is closed without
+    %% DISCONNECT, so its Will fires even though the client id lives on.
+    {_New, _} = open(#{client_id => <<"c1">>, clean => false}),
+    {ok, takeover} = expect_down(Monitor, OldPid),
+    {Pub, _} = recv_publish(csock(Watcher)),
+    #publish{topic = <<"will/c1">>, payload = <<"evicted">>} = Pub,
+    {ok, normal} = mqtt_close(Watcher),
+    ok.
+
+%% C-16's third trigger: the peer went silent past 1.5x keepalive, which is a
+%% connection failure by §3.1.2.10 -- the Will fires even though the socket was
+%% never closed by anyone.
+will_is_published_on_a_keepalive_timeout(_Config) ->
+    ok = boot(),
+    %% No watcher connection: with max_keepalive_ms = 200 (`case_env') the
+    %% watcher's own deadline would expire in the same instant, so the evidence
+    %% is taken from the retain tree -- a retained Will is stored by the same
+    %% publish path an ordinary retained PUBLISH uses.
+    {Conn, _} = open(#{client_id => <<"c1">>, keep_alive => 1,
+                       will_topic => <<"will/ka">>, will_payload => <<"silent">>,
+                       will_qos => 1, will_retain => 1}),
+    Monitor = mqtt_monitor(Conn),
+    %% 1s keepalive is clamped to the 200ms cap, so the deadline is ~300ms and
+    %% the connection dies on its own without any further input.
+    {ok, normal} = expect_down(Monitor, cpid(Conn)),
+    {ok, #broker_message{destination = <<"will/ka">>, payload = <<"silent">>,
+                         proto_meta = Meta}} = broker_retain:lookup(<<"will/ka">>),
+    ?assertEqual(1, maps:get(qos, Meta)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% ADR-018 §18.1 / O5: the Will is connection state and dies with the process.
+%% A broker restart is NOT a reason to publish it, and nothing on disk can be
+%% used to resurrect it -- so a restart must be silent even for a session whose
+%% connection was live when the broker stopped.
+will_is_not_republished_after_a_broker_restart(_Config) ->
+    ok = boot(),
+    {_Conn, _} = open(#{client_id => <<"c1">>, clean => false,
+                        will_topic => <<"will/restart">>,
+                        will_payload => <<"lost">>, will_qos => 1}),
+    %% Stop the whole protocol app the way a broker restart does: connections
+    %% are terminated with `shutdown', which §18.1 exempts from the Will.
+    Before = maps:get(will_published, broker_metrics:snapshot()),
+    ok = application:stop(broker_proto_mqtt),
+    {ok, _} = application:ensure_all_started(broker_proto_mqtt),
+    ?assertEqual(Before, maps:get(will_published, broker_metrics:snapshot())),
+    %% And no Will is sitting anywhere waiting to be replayed: the retain tree
+    %% does not have it, and the session record (`.inflight' blob shape v2) has
+    %% no field that could carry it -- a `will' key there would be exactly the
+    %% persistence O5 forbids.
+    error = broker_retain:lookup(<<"will/restart">>),
+    case broker_subscription:session(<<"c1">>) of
+        {ok, Session} -> ?assertNot(maps:is_key(will, Session));
+        {error, not_found} -> ok
+    end,
+    %% The client id is resumable (clean=false) but carries no Will: a
+    %% subscriber watching the topic hears nothing after the restart.
+    {Watcher2, _} = open(<<"watch2">>),
+    1 = sub(Watcher2, 1, <<"will/#">>, 1),
+    true = mqtt_silence(csock(Watcher2), 300),
+    {ok, normal} = mqtt_close(Watcher2),
+    ok.
+
+%% C-11's second half: clearing a retained value must not swallow the empty
+%% message for subscribers that are already listening (§3.3.1.3 -- retain is
+%% about stored state, not about the live forwarding path).
+zero_length_retain_still_reaches_live_subscribers(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"z/#">>, 1),
+    %% The empty retained publish is NOT retained, so the live frame is all
+    %% there is -- exactly the one the case asserts.
+    #puback{} = pub_retain(Conn, 1, <<"z/live">>, <<>>, 1),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{topic = <<"z/live">>, payload = <<>>, retain = 0} = Pub,
+    ok = mqtt_puback(Conn, Pub#publish.packet_id),
+    error = broker_retain:lookup(<<"z/live">>),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+will_retain_updates_the_tree(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(#{client_id => <<"c1">>, will_topic => <<"will/r">>,
+                       will_payload => <<"last">>, will_qos => 1,
+                       will_retain => 1}),
+    {ok, normal} = mqtt_close(Conn),
+    %% The Will goes through the same retain store a live PUBLISH would, and
+    %% `terminate/3' runs before the process is gone -- so by the time the DOWN
+    %% message arrives the tree already has it.
+    {ok, #broker_message{destination = <<"will/r">>, payload = <<"last">>}} =
+        broker_retain:lookup(<<"will/r">>),
+    %% A late subscriber sees it with retain=1, as retained state always is.
+    {Late, _} = open(<<"late">>),
+    1 = sub(Late, 1, <<"will/#">>, 1),
+    {Pub, _} = recv_publish(csock(Late)),
+    #publish{retain = 1, payload = <<"last">>} = Pub,
+    ok = mqtt_puback(Late, Pub#publish.packet_id),
+    {ok, normal} = mqtt_close(Late),
     ok.
 
 keepalive_is_clamped_and_only_peer_traffic_restarts_it(_Config) ->
@@ -440,19 +599,380 @@ puback_is_not_blocked_by_the_subscription_worker(_Config) ->
     {ok, normal} = mqtt_close(Conn),
     ok.
 
-qos2_publish_closes_without_an_ack(_Config) ->
+reserved_qos_bits_close_without_an_ack(_Config) ->
     ok = boot(),
     {Conn, _} = open(<<"c1">>),
     Monitor = mqtt_monitor(Conn),
-    %% The reserved QoS bits: the codec has no QoS2 record, so the frame is
-    %% refused at parse time, and §4.5's posture for it is "close, no ack" --
-    %% a client that retries with a real QoS2 handshake gets the same answer.
-    ok = mqtt_send(Conn, mqtt_raw_publish_qos2(<<"t/a">>, <<"two">>)),
+    %% QoS bits = 3 are still reserved (§3.3.1.2): the codec refuses the frame
+    %% and §4.5's posture for a malformed packet is "close, no ack".
+    ok = mqtt_send(Conn, mqtt_raw_publish_qos3(<<"t/a">>, <<"three">>)),
     ok = expect_closed(csock(Conn)),
     {ok, normal} = expect_down(Monitor, cpid(Conn)),
     %% Not stored-then-hidden: a PUBLISH that was never acked must not have
     %% entered the log either.
     [ok = assert_empty_page(P) || P <- broker_queue:partition_ids()],
+    ok.
+
+%% ADR-018 §18.3 R5 (Method A): PUBLISH -> PUBREC is the delivery point, so the
+%% subscriber has the message before the publisher's handshake is complete.
+qos2_inbound_four_steps_delivers_once(_Config) ->
+    ok = boot(),
+    {Sub, _} = open(<<"sub">>),
+    1 = sub(Sub, 1, <<"q/#">>, 1),
+    {Pub2, _} = open(<<"pub2">>),
+    P = route_partition(<<"q/a">>),
+    ok = mqtt_publish(Pub2, 7, <<"q/a">>, <<"exactly-twice-at-most">>, 2),
+    #pubrec{packet_id = 7} = mqtt_recv(csock(Pub2)),
+    %% Method A: the dispatch happened at PUBLISH time, before PUBREL.
+    {Delivered, _} = recv_publish(csock(Sub)),
+    #publish{qos = 1, payload = <<"exactly-twice-at-most">>} = Delivered,
+    ok = mqtt_puback(Sub, Delivered#publish.packet_id),
+    %% The message is in the log exactly once, and the retain flag it carries
+    %% says nothing was retained.
+    {ok, [{_Offset, Stored}], _Next} = broker_queue:read_from(P, 0, 10),
+    #broker_message{payload = <<"exactly-twice-at-most">>,
+                    proto_meta = #{qos := 2, retain := 0}} = Stored,
+    ok = mqtt_pubrel(Pub2, 7),
+    #pubcomp{packet_id = 7} = mqtt_recv(csock(Pub2)),
+    %% Nothing else arrives: the handshake completing does not re-deliver.
+    true = mqtt_silence(csock(Sub), 200),
+    {ok, normal} = mqtt_close(Pub2),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+%% R5's dedupe half: the SAME packet id again on the same connection is
+%% answered with PUBREC and never dispatched a second time.
+qos2_inbound_dup_publish_is_not_redelivered(_Config) ->
+    ok = boot(),
+    {Sub, _} = open(<<"sub">>),
+    1 = sub(Sub, 1, <<"q/#">>, 1),
+    {Pub2, _} = open(<<"pub2">>),
+    ok = mqtt_publish(Pub2, 9, <<"q/a">>, <<"once">>, 2),
+    #pubrec{packet_id = 9} = mqtt_recv(csock(Pub2)),
+    {Delivered, _} = recv_publish(csock(Sub)),
+    ok = mqtt_puback(Sub, Delivered#publish.packet_id),
+    %% The client did not see PUBREC and retries the PUBLISH (dup=1 on the
+    %% wire in a real client; the codec's record keeps the id either way).
+    ok = mqtt_publish(Pub2, 9, <<"q/a">>, <<"once">>, 2),
+    #pubrec{packet_id = 9} = mqtt_recv(csock(Pub2)),
+    true = mqtt_silence(csock(Sub), 300),
+    ok = mqtt_pubrel(Pub2, 9),
+    #pubcomp{packet_id = 9} = mqtt_recv(csock(Pub2)),
+    {ok, normal} = mqtt_close(Pub2),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+%% R1/R2: the three idempotent answers. Each is what keeps a client from
+%% looping forever after a crash ate the connection's handshake state.
+unknown_pubrel_gets_pubcomp(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    %% No such inbound QoS2 message ever existed.
+    ok = mqtt_pubrel(Conn, 4242),
+    #pubcomp{packet_id = 4242} = mqtt_recv(csock(Conn)),
+    %% And the connection is still usable afterwards.
+    #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+unknown_pubrec_gets_pubrel(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    ok = mqtt_pubrec(Conn, 4343),
+    #pubrel{packet_id = 4343} = mqtt_recv(csock(Conn)),
+    #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+unknown_pubcomp_is_ignored(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    ok = mqtt_pubcomp(Conn, 4444),
+    %% Silence, not a disconnect: there is nothing to answer with, and the id
+    %% never had a cursor to advance.
+    true = mqtt_silence(csock(Conn), 200),
+    #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% R4: `released ∪ received` over the cap is a deliberate disconnect, never a
+%% silent drop of QoS2 state. Cap of 2 makes the third PUBLISH the one that
+%% trips it.
+qos2_state_overflow_disconnects(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, max_qos2_state_per_session, 2),
+    {Conn, _} = open(<<"c1">>),
+    Monitor = mqtt_monitor(Conn),
+    ok = mqtt_publish(Conn, 1, <<"o/a">>, <<"1">>, 2),
+    #pubrec{packet_id = 1} = mqtt_recv(csock(Conn)),
+    ok = mqtt_publish(Conn, 2, <<"o/b">>, <<"2">>, 2),
+    #pubrec{packet_id = 2} = mqtt_recv(csock(Conn)),
+    ok = mqtt_publish(Conn, 3, <<"o/c">>, <<"3">>, 2),
+    ok = expect_closed(csock(Conn)),
+    {ok, qos2_state_overflow} = expect_down(Monitor, cpid(Conn)),
+    ok.
+
+%% The outbound direction: PUBREC is a halfway mark, PUBCOMP is the ack. Only
+%% the last one may move the cursor -- moving it at PUBREC would lose the
+%% message if the client died before completing the handshake.
+qos2_outbound_advances_cursor_only_on_pubcomp(_Config) ->
+    ok = boot(),
+    %% A separate publisher on purpose: a QoS2 exchange on the SUBSCRIBER's own
+    %% connection would interleave its PUBLISH delivery with the publisher's
+    %% PUBREC/PUBCOMP, and the case would be measuring the wrong handshake.
+    {Publisher, _} = open(<<"pub">>),
+    {Conn, _} = open(<<"c1">>),
+    2 = sub(Conn, 1, <<"q2/#">>, 2),
+    {ok, SubRef} = subscribed(<<"c1">>, <<"q2/#">>, 2),
+    P = route_partition(<<"q2/a">>),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    ok = pub_qos2(Publisher, 3, <<"q2/a">>, <<"two">>),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{qos = 2, dup = 0, payload = <<"two">>, packet_id = OutPid} = Pub,
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    ok = mqtt_pubrec(Conn, OutPid),
+    #pubrel{packet_id = OutPid} = mqtt_recv(csock(Conn)),
+    %% Half a handshake is not an ack: the cursor must still be at Anchor.
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    ok = mqtt_pubcomp(Conn, OutPid),
+    wait_cursor_after(SubRef, P, Anchor),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+%% A PUBACK for a QoS2 delivery is a peer bug. It must NOT advance the cursor
+%% (that would drop a message the peer never completed) and must not disconnect.
+puback_for_a_qos2_delivery_does_not_advance_the_cursor(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    {Conn, _} = open(<<"c1">>),
+    2 = sub(Conn, 1, <<"q2/#">>, 2),
+    {ok, SubRef} = subscribed(<<"c1">>, <<"q2/#">>, 2),
+    P = route_partition(<<"q2/b">>),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    ok = pub_qos2(Publisher, 4, <<"q2/b">>, <<"wrong-ack">>),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{qos = 2, packet_id = OutPid} = Pub,
+    ok = mqtt_puback(Conn, OutPid),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    %% The proper handshake still works on the same entry.
+    ok = mqtt_pubrec(Conn, OutPid),
+    #pubrel{packet_id = OutPid} = mqtt_recv(csock(Conn)),
+    ok = mqtt_pubcomp(Conn, OutPid),
+    wait_cursor_after(SubRef, P, Anchor),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+%% R3's resume rule, half one: crashed BEFORE the PUBREC, so nothing was
+%% released -- the peer gets the same packet id with DUP=1 at the SAME level.
+reconnect_before_pubrec_resends_a_dup_publish(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    {Subscriber, _} = open(#{client_id => <<"c1">>, clean => false}),
+    2 = sub(Subscriber, 1, <<"q2/#">>, 2),
+    ok = pub_qos2(Publisher, 1, <<"q2/a">>, <<"two">>),
+    {Pub, _} = recv_publish(csock(Subscriber)),
+    #publish{qos = 2, dup = 0, packet_id = Pid} = Pub,
+    {ok, normal} = mqtt_close(Subscriber),
+    {Subscriber2, #connack{session_present = 1}} =
+        open(#{client_id => <<"c1">>, clean => false}),
+    {Resent, _} = recv_publish(csock(Subscriber2)),
+    %% Not downgraded to QoS1: the client's state machine would reject a level
+    %% change under the same id.
+    #publish{qos = 2, dup = 1, packet_id = Pid, payload = <<"two">>} = Resent,
+    ok = mqtt_pubrec(Subscriber2, Pid),
+    #pubrel{packet_id = Pid} = mqtt_recv(csock(Subscriber2)),
+    ok = mqtt_pubcomp(Subscriber2, Pid),
+    {ok, normal} = mqtt_close(Subscriber2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+%% Half two: crashed AFTER PUBREC, so the peer is past PUBLISH. It gets PUBREL
+%% and nothing else -- a second PUBLISH would restart a handshake it already
+%% half-completed.
+reconnect_after_pubrec_resends_pubrel_only(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    {Subscriber, _} = open(#{client_id => <<"c1">>, clean => false}),
+    2 = sub(Subscriber, 1, <<"q2/#">>, 2),
+    {ok, SubRef} = subscribed(<<"c1">>, <<"q2/#">>, 2),
+    %% The partition comes from THIS topic: the cursor whose advance the case
+    %% asserts must be the one the message lands in.
+    P = route_partition(<<"q2/a">>),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    ok = pub_qos2(Publisher, 1, <<"q2/a">>, <<"two">>),
+    {Pub, _} = recv_publish(csock(Subscriber)),
+    #publish{qos = 2, packet_id = Pid} = Pub,
+    ok = mqtt_pubrec(Subscriber, Pid),
+    #pubrel{packet_id = Pid} = mqtt_recv(csock(Subscriber)),
+    %% Died holding the PUBREL, before answering PUBCOMP.
+    {ok, normal} = mqtt_close(Subscriber),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    {Subscriber2, #connack{session_present = 1}} =
+        open(#{client_id => <<"c1">>, clean => false}),
+    #pubrel{packet_id = Pid} = mqtt_recv(csock(Subscriber2)),
+    %% And no PUBLISH was replayed first: the very next frame is the PUBREL.
+    ok = mqtt_pubcomp(Subscriber2, Pid),
+    wait_cursor_after(SubRef, P, Anchor),
+    {ok, normal} = mqtt_close(Subscriber2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+%% The blob is what makes the two cases above survive a process death: shape v2
+%% carries the level, the release marks and the inbound set, and a retained
+%% replay (no {Partition, Offset}) is deliberately absent.
+inflight_blob_is_v2_and_skips_retained_entries(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"b/#">>, 1),
+    #puback{} = pub(Conn, 1, <<"b/a">>, <<"durable">>, 1),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{packet_id = OutPid} = Pub,
+    %% An inbound QoS2 half-handshake belongs in the same blob. The topic is
+    %% deliberately OUTSIDE `b/#' above: a topic the client also subscribes to
+    %% would loop back and add an outbound entry of its own.
+    ok = mqtt_publish(Conn, 11, <<"in/in">>, <<"inbound">>, 2),
+    #pubrec{packet_id = 11} = mqtt_recv(csock(Conn)),
+    Blob = wait_inflight(<<"c1">>, fun(B) ->
+                                           maps:get(vsn, B, 0) =:= 2 andalso
+                                           maps:size(maps:get(released, B, #{})) =:= 0
+                                   end),
+    #{vsn := 2, pending := Pending, qos := Qos, received := Received} = Blob,
+    %% One positional entry: the delivery owed a PUBACK. Its offset is the
+    %% stored message's own, so only the partition is pinned here.
+    [{OutPid, {[{<<"c1">>, <<"b/#">>}], {Part, Off}}}] = Pending,
+    ?assertEqual(route_partition(<<"b/a">>), Part),
+    ?assert(is_integer(Off)),
+    ?assertEqual(#{OutPid => 1}, Qos),
+    ?assertEqual(#{11 => true}, Received),
+    ok = mqtt_puback(Conn, OutPid),
+    ok = mqtt_pubrel(Conn, 11),
+    #pubcomp{packet_id = 11} = mqtt_recv(csock(Conn)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% ADR-018 §18.2: retained replay. Ordered, AFTER the SUBACK, retain=1, capped
+%% by the granted QoS, and never merged across topics.
+subscribe_receives_retained_after_suback(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    #puback{} = pub_retain(Publisher, 1, <<"r/a">>, <<"kept">>, 1),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"r/#">>, 1),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{retain = 1, qos = 1, topic = <<"r/a">>, payload = <<"kept">>} = Pub,
+    ok = mqtt_puback(Conn, Pub#publish.packet_id),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+retained_qos_is_capped_by_the_grant(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    #pubrec{} = pub_retain(Publisher, 1, <<"r/a">>, <<"kept">>, 2),
+    ok = mqtt_pubrel(Publisher, 1),
+    #pubcomp{packet_id = 1} = mqtt_recv(csock(Publisher)),
+    %% A QoS0 subscription gets the same message at QoS0: no packet id, no ack,
+    %% and its cursor is not involved either (there is no cursor here at all).
+    {Conn, _} = open(<<"c1">>),
+    0 = sub(Conn, 1, <<"r/#">>, 0),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{retain = 1, qos = 0, packet_id = undefined, payload = <<"kept">>} = Pub,
+    true = mqtt_silence(csock(Conn), 200),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+retained_wildcard_delivers_each_topic_in_topic_order(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    Topics = [<<"w/2">>, <<"w/1">>, <<"w/3">>],
+    lists:foreach(
+      fun({N, Topic}) ->
+              #puback{} = pub_retain(Publisher, N, Topic, Topic, 1)
+      end, lists:zip(lists:seq(1, length(Topics)), Topics)),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"w/#">>, 1),
+    Delivered = [begin
+                     {Pub, _} = recv_publish(csock(Conn)),
+                     ok = mqtt_puback(Conn, Pub#publish.packet_id),
+                     Pub#publish.topic
+                 end || _ <- Topics],
+    %% `entries/0' is sorted, so the replay order is the topic order -- not the
+    %% order the publishes happened to arrive in.
+    ?assertEqual(lists:sort(Topics), Delivered),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+retain_flag_is_zero_for_live_subscribers(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"r/#">>, 1),
+    %% §3.3.1.3: a retained publish forwarded to an EXISTING subscription is a
+    %% live message and must carry retain=0, or clients would re-retain it.
+    #puback{} = pub_retain(Conn, 1, <<"r/a">>, <<"live">>, 1),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{retain = 0, payload = <<"live">>} = Pub,
+    ok = mqtt_puback(Conn, Pub#publish.packet_id),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+zero_length_retain_clears_for_new_subscribers(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    #puback{} = pub_retain(Publisher, 1, <<"z/a">>, <<"v1">>, 1),
+    {ok, _} = broker_retain:lookup(<<"z/a">>),
+    #puback{} = pub_retain(Publisher, 2, <<"z/a">>, <<>>, 1),
+    %% Cleared, and a fresh subscriber gets nothing.
+    error = broker_retain:lookup(<<"z/a">>),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"z/#">>, 1),
+    true = mqtt_silence(csock(Conn), 300),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+retained_survives_a_retain_app_restart(_Config) ->
+    ok = boot(),
+    {Publisher, _} = open(<<"pub">>),
+    #puback{} = pub_retain(Publisher, 1, <<"p/a">>, <<"persisted">>, 1),
+    %% A real stop/start of the retain app: the tree comes back from its file
+    %% alone, which is what makes the PUBACK above a durable promise.
+    ok = application:stop(broker_retain),
+    {ok, _} = application:ensure_all_started(broker_retain),
+    {ok, #broker_message{payload = <<"persisted">>}} = broker_retain:lookup(<<"p/a">>),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"p/#">>, 1),
+    {Pub, _} = recv_publish(csock(Conn)),
+    #publish{retain = 1, payload = <<"persisted">>} = Pub,
+    ok = mqtt_puback(Conn, Pub#publish.packet_id),
+    {ok, normal} = mqtt_close(Conn),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+retain_overflow_still_delivers_live(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_retain, max_retained, 1),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"o/#">>, 1),
+    #puback{} = pub_retain(Conn, 1, <<"o/a">>, <<"first">>, 1),
+    {First, _} = recv_publish(csock(Conn)),
+    ok = mqtt_puback(Conn, First#publish.packet_id),
+    %% The tree is full: the entry is refused, but the live subscriber still
+    %% sees the message and the publisher still gets its ack (ADR-018 §18.2:
+    %% bounded refusal, never a dropped publish).
+    #puback{packet_id = 2} = pub_retain(Conn, 2, <<"o/b">>, <<"second">>, 1),
+    {Second, _} = recv_publish(csock(Conn)),
+    #publish{payload = <<"second">>, retain = 0} = Second,
+    ok = mqtt_puback(Conn, Second#publish.packet_id),
+    error = broker_retain:lookup(<<"o/b">>),
+    ?assertEqual(1, maps:get(count, broker_retain:stats())),
+    %% C-14's observability half: the refusal is counted, so an operator can
+    %% size the cap from data instead of guessing.
+    ?assert(maps:get(retain_overflow, broker_metrics:snapshot()) >= 1),
+    {ok, normal} = mqtt_close(Conn),
     ok.
 
 publish_over_the_effective_max_closes_without_an_ack(_Config) ->
@@ -469,24 +989,6 @@ publish_over_the_effective_max_closes_without_an_ack(_Config) ->
     {ok, normal} = expect_down(Monitor, cpid(Conn)),
     %% The refused subscription is not quietly downgraded into a live one.
     [] = broker_subscription:subscriptions(<<"c1">>),
-    ok.
-
-retain_is_stripped_and_the_message_still_flows(_Config) ->
-    ok = boot(),
-    {Conn, _} = open(<<"c1">>),
-    1 = sub(Conn, 1, <<"t/#">>, 1),
-    ok = mqtt_send(Conn, mqtt_frame:encode(#publish{qos = 1, retain = 1,
-                                                    topic = <<"t/a">>,
-                                                    packet_id = 6,
-                                                    payload = <<"kept">>})),
-    #puback{packet_id = 6} = mqtt_recv(csock(Conn)),
-    {Pub, _Seen} = recv_publish(csock(Conn)),
-    %% There is no retain store in S1: the bit is dropped on the way in and the
-    %% delivered frame says so. The message is NOT discarded -- §4.5 strips, it
-    %% does not reject.
-    #publish{retain = 0, qos = 1, payload = <<"kept">>} = Pub,
-    ok = mqtt_puback(Conn, Pub#publish.packet_id),
-    {ok, normal} = mqtt_close(Conn),
     ok.
 
 %%%_* Delivery levels and the merge (§4.8, H7) --------------------------------
@@ -694,6 +1196,43 @@ subscribed(ClientId, Filter, QoS) ->
 pub(Conn, Pid, Topic, Payload, QoS) ->
     ok = mqtt_publish(Conn, Pid, Topic, Payload, QoS),
     mqtt_recv(csock(Conn)).
+
+%% A retained publish: `retain=1' is what makes the conn touch the retain tree
+%% (ADR-018 §18.2), and it is not something `mqtt_publish/5' can express.
+pub_retain(Conn, Pid, Topic, Payload, QoS) ->
+    ok = mqtt_send(Conn, mqtt_frame:encode(
+                            #publish{qos = QoS, retain = 1, topic = Topic,
+                                     packet_id = Pid, payload = Payload})),
+    mqtt_recv(csock(Conn)).
+
+%% A full QoS2 publish handshake from the client side, answering the broker the
+%% way a real client does. Returns `ok' once PUBCOMP closed the exchange.
+pub_qos2(Conn, Pid, Topic, Payload) ->
+    ok = mqtt_publish(Conn, Pid, Topic, Payload, 2),
+    #pubrec{packet_id = Pid} = mqtt_recv(csock(Conn)),
+    ok = mqtt_pubrel(Conn, Pid),
+    #pubcomp{packet_id = Pid} = mqtt_recv(csock(Conn)),
+    ok.
+
+%% The in-flight blob is written on a timer (`inflight_snapshot_ms') and again
+%% by terminate/3, so a case that wants to read it waits for the shape it
+%% expects rather than sleeping a guess.
+wait_inflight(ClientId, Pred) ->
+    wait_inflight(ClientId, Pred, 3000).
+
+wait_inflight(ClientId, Pred, Budget) ->
+    Blob = case broker_subscription:session(ClientId) of
+               {ok, #{inflight := B}} -> B;
+               _ -> undefined
+           end,
+    case is_map(Blob) andalso Pred(Blob) of
+        true -> Blob;
+        false when Budget > 50 ->
+            timer:sleep(25),
+            wait_inflight(ClientId, Pred, Budget - 25);
+        false ->
+            exit({inflight_stuck, ClientId, Blob})
+    end.
 
 %% Reading until a PUBLISH arrives, keeping whatever came in between -- a
 %% producer's PUBACK legitimately precedes the consumer's delivery, and a case
