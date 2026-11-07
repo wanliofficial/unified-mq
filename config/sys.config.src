@@ -70,7 +70,12 @@
   ]},
 
   {broker_event, [
-    {strategy, pass_through}
+    %% S1 implements the two arms that need no parsing (pass_through /
+    %% disabled). validate_if_present / required / normalize are accepted by
+    %% the type but rejected at the call site -- failing loudly beats shipping
+    %% unvalidated events behind a validated-looking config (design §11.2
+    %% OQ-5, ADR-004).
+    {policy, pass_through}
   ]},
 
   {broker_proto_mqtt, [

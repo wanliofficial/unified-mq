@@ -91,7 +91,7 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_max_regress, 64),
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 100),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 100),
-    ok = application:set_env(broker_event, strategy, pass_through),
+    ok = application:set_env(broker_event, policy, pass_through),
     ok = application:set_env(broker_security, users, []),
     ok = application:set_env(broker_security, acl, allow),
     %% The listener map is the L20 seam: the six connection knobs travel from

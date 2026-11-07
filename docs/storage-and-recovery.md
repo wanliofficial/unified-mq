@@ -4,7 +4,7 @@
 - **状态**：S1 已实现并实测的磁盘格式、刷盘策略与恢复语义；S2/S3/S4 的演进单列于 §14
 - **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、设计文档 §5.3/§7/§8
 - **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`
-- **证据**：`rebar3 ct` 256/256；T14 真实容器 `kill -9` 矩阵（R1a~R7 × 双档 = 16/16，见 `tools/docker/`）
+- **证据**：`rebar3 ct` 264/264；T14 真实容器 `kill -9` 矩阵（R1a~R7 × 双档 = 16/16，见 `tools/docker/`）
 
 > 本文回答三个问题：**盘上有什么、什么时候真正落盘、崩溃后哪些字节会被信任**。架构分层与进程归属见 [`architecture.md`](architecture.md)。
 

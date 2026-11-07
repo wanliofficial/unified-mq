@@ -97,7 +97,7 @@ unified-mq/
 │   ├── broker_queue/         # 分区与队列
 │   ├── broker_subscription/  # 订阅与游标
 │   ├── broker_storage/       # WAL + 内存实现
-│   ├── broker_event/         # CloudEvents codec（S3 填充）
+│   ├── broker_event/         # S1 恒等桩（pass_through）；CloudEvents codec（S3 填充）
 │   └── broker_proto_mqtt/    # 首个协议适配器
 ├── config/
 ├── docs/

@@ -4,7 +4,7 @@
 - **状态**：描述 **S1 已实现并实测**的架构事实；S2 及以后的演进方向只在本文件末尾单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断"某个行为归哪一层"的测试作者
 - **对应**：`docs/roadmap.md` §3（S1）、`docs/design/s1-mqtt-vertical-slice.md`（设计基线，下称"设计文档"）、ADR-001/007/009/010/011
-- **证据口径**：本文件中"已实测"均指 `rebar3 ct`（256/256）、`tools/docker/`（T14）与 `test/protocol-compatibility/mqtt/`（T15）的产物；引用处给出路径
+- **证据口径**：本文件中"已实测"均指 `rebar3 ct`（264/264）、`tools/docker/`（T14）与 `test/protocol-compatibility/mqtt/`（T15）的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -17,7 +17,7 @@ S1 是一个**单节点、无复制**的 MQTT 3.1.1 broker 垂直切片，只实
 | 约束 | 来源 | 在代码里的落点 |
 |---|---|---|
 | 协议适配层不得直接操作磁盘格式 | ADR-001 | `mqtt_conn_fsm` 只经 `broker_router` / `broker_queue` / `broker_subscription` 三个门面接触内核，不 include 任何存储模块（路由只 include `broker_router.hrl` 的 `#route_ctx{}`） |
-| 统一消息模型与 CloudEvents 分离，`event` 只是字段位 | ADR-004/009 | `#broker_message{}` 带 `event` 槽；S1 的 `broker_event` 只是 app 骨架（见 §2.2） |
+| 统一消息模型与 CloudEvents 分离，`event` 只是字段位 | ADR-004/009 | `#broker_message{}` 带 `event` 槽；S1 的 `broker_event` 是纯函数恒等桩，`event` 恒 `undefined`（见 §2.2） |
 | 可靠性承诺显式化：ACK 时机与 sync mode 一一对应 | ADR-007 | `mqtt_conn_fsm` 在 `broker_queue:append/3` 返回后才发 PUBACK |
 | Router 不串行化，路由在发布者进程内完成 | ADR-010 | 句柄/索引在 `protected` ETS，`route/3` 无 `gen_server:call` |
 | 存储只拥有全局 committed 水位，per-sub 位置归订阅层 | ADR-011 | `broker_storage` 的 API 没有订阅概念；cursor 全在 `broker_subscription` |
@@ -39,7 +39,7 @@ apps/
 ├── broker_router/        broker_router behavior + broker_router_hash 实现（内存索引）
 ├── broker_queue/         分区层：存储句柄生命周期、append/read 编排、{new_messages} 扇出
 ├── broker_subscription/  订阅、per-sub cursor、投递唤醒、三层会话持久化
-├── broker_event/         CloudEvents 的 app 骨架（S1 只有 app/sup，无 pass_through 实现）
+├── broker_event/         CloudEvents 策略接口（S1：`policy/0` + 恒等 `apply_policy/1,2` + 保留 `#cloud_event{}` 接口位）
 ├── broker_security/      username/password 认证与 allow-all ACL 桩（纯函数）
 └── broker_proto_mqtt/    MQTT 3.1.1 编解码 + 连接 FSM + ranch listener
 ```
@@ -51,13 +51,15 @@ apps/
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
 | `broker_queue` | kernel, stdlib, sasl, broker_core, broker_storage, broker_router | `broker_queue_store` + 每分区 `broker_queue_partition` | `append/3`、`read_from/3`、`watermarks/1`、`capability/1`、`subscribe/2`、`create_partition/1` | 分区句柄注册表、每分区订阅者集合 |
 | `broker_subscription` | kernel, stdlib, sasl, broker_core, broker_storage, broker_router, broker_queue | `broker_subscription_worker` | `subscribe/3`、`unsubscribe/2`、`ack/3`、`inflight/2`、`attach/3`、`detach/2`、`dispatch/2`、`cursor/2`、`subscriptions/1`、`session/1` | 四张 ETS（实体/游标/连接绑定/in-flight）+ `data/sessions/*` 三件套 |
-| `broker_event` | kernel, stdlib, sasl, broker_core | 空 supervisor | 无（S1 无 `broker_event` 模块） | 无 |
+| `broker_event` | kernel, stdlib, sasl, broker_core | 空 supervisor | `policy/0`、`apply_policy/1,2`（纯函数读 env；S1 恒等透传）、`#cloud_event{}` 接口位 | 无（配置即状态；S1 数据路径无调用） |
 | `broker_security` | kernel, stdlib, sasl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
 | `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, 其余 7 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener` | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器） |
 
 ### 2.2 `broker_event` 的真实状态（避免误读）
 
-`broker_event` 目前只有 `broker_event_app.erl` 与一个空 `one_for_all` supervisor，**没有** `broker_event.erl`、也没有 `pass_through` 实现（T11 仍未做，0.5 人日、不在 Gate S1 关键路径）。它存在的作用是锁定"事件标准化是可插拔的一层"这个 ADR-004 的结构位；S1 的数据路径**不经过它**，`#broker_message{}.event` 由协议层填 `undefined`。
+T11 之后 `broker_event` 有一个**纯函数**模块：`policy/0` 读 `broker_event.policy`（3 参 `get_env`），`apply_policy/1,2` 对 `pass_through` / `disabled` 返回**逐项相同**的消息（payload 字节、`headers`、`event`、`proto_meta` 全不动），对 `validate_if_present` / `required` / `normalize` 返回 `{error, {policy_not_implemented, P, s3}}` —— **响亮失败，不静默降级**。`include/cloud_event.hrl` 保留 README §3.1 的 `#cloud_event{}` 作为 S3 codec 的接口位（它与 ADR-009 的 `event :: undefined | map()` 如何对接是 S3 的判决点，头文件里已注明）。
+
+**S1 数据路径仍然不经过它**：`mqtt_conn_fsm:build_message/5` 直接把 `event` 填 `undefined`，所以 `apply_policy/1` 目前在运行时无调用者（`xref` 的 3 条 unused-export 即此）。这不是遗漏，而是 OQ-5 的选择：MQTT 3.1.1 没有 PUBLISH properties，`content-type` 不在 S1 线路上；要"看见" CloudEvents 只能嗅探 payload 字节，而 ADR-004 禁止强制 CloudEvents、S0.5 也把逐事件解析测成 CPU 成本中心（0 扩展 ~53 µs，1024 扩展 8 ms）。
 
 ### 2.3 依赖方向
 
@@ -66,7 +68,7 @@ broker_core  ←── 所有应用（只依赖类型）
 broker_storage ←── broker_queue ←── broker_subscription ←── broker_proto_mqtt
 broker_router  ←── broker_queue ──┘            ↑
 broker_security ───────────────────────────────┘
-broker_event ──────────────────────────────────┘（结构位，运行时无调用）
+broker_event ──────────────────────────────────┘（纯函数接口，数据路径无调用）
 ```
 
 依赖只允许**向下**：协议层可以调内核，内核任何一层都不得反向引用 `broker_proto_mqtt`；`broker_core` 不依赖任何兄弟应用。`xref` 是这条约束的机械检查（当前只剩预期的 unused-export 告警）。
@@ -263,6 +265,7 @@ S1 没有 `broker_config` 应用，所有配置来自 `config/sys.config.src`（
 | `broker_subscription.data_dir` | 与 storage 相同 | `.subs`/`.cursors`/`.inflight` 根目录 |
 | `broker_subscription.cursor_max_regress` / `cursor_flush_interval_ms` / `inflight_flush_interval_ms` | 64 / 100 / 100 | 有界回退窗口；`1/0/0` 选择近零回退档 |
 | `broker_security.users` / `acl` | `guest/guest`、`allow` | 明文用户表与 allow-all ACL 桩 |
+| `broker_event.policy` | `pass_through` | S1 只实现 `pass_through` / `disabled`；其余三档在调用点报 `{policy_not_implemented,_,s3}` |
 | `broker_proto_mqtt.listeners` | release 配 1883；`.app.src` 默认 `[]` | 每个 map 一个 listener；连接级 knob 随 map 下发（L20 seam） |
 | `broker_proto_mqtt.mqtt_max_qos` | 1 | 必须与后端 capability 一致；内存档必须为 0 |
 | `broker_proto_mqtt.max_inflight` / `pull_page_limit` / `pull_poll_interval_ms` / `inflight_snapshot_ms` / `max_keepalive_ms` | 64 / 32 / 1000 / 20 / 60000 | 投递循环与 keepalive 上限 |
@@ -287,7 +290,7 @@ S1 没有 `broker_config` 应用，所有配置来自 `config/sys.config.src`（
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **256/256**，零 `FAILED` 明细、零 `Skipped`；19 个 `*_SUITE.erl` | `apps/*/test/`、`test/integration/` |
+| 单元/契约/集成 | `rebar3 ct` → **264/264**，零 `FAILED` 明细、零 `Skipped`；20 个 `*_SUITE.erl` | `apps/*/test/`、`test/integration/` |
 | 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 仅预期 unused-export | CI/本地 |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`，R1a~R7 × 默认/零回退两档 = **16/16 PASS** | `tools/docker/` |
 | 真实客户端 | paho-mqtt 2.x + mosquitto 2.1.2，**8/8 用例、46/46 帧字节一致** | `test/protocol-compatibility/mqtt/` |
@@ -307,7 +310,7 @@ S1 没有 `broker_config` 应用，所有配置来自 `config/sys.config.src`（
 | Mnesia 控制面 | 新增表；`.subs`/`.cursors`/`.inflight` 整体迁入 | `broker_subscription` 对外 API |
 | 复制（Raft） | `broker_storage` 增加 `replicated_commit` 能力与新后端 | 同一 behavior；ACK 时机仍由 capability 决定 |
 | 独立 dispatcher / 背压 | 从 `mqtt_conn_fsm` 抽出投递循环 | `cursor/2` 仍是唯一读位置；通知仍是提示 |
-| CloudEvents | `broker_event` 从骨架变成 codec + 策略 | `event` 字段位与 ADR-004 的可选性 |
+| CloudEvents | `broker_event` 从恒等桩变成 codec + 五档策略（接口位已由 T11 预留） | `event` 字段位与 ADR-004 的可选性 |
 
 ---
 
