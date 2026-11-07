@@ -168,6 +168,8 @@
 
 ### 4.1 S2-A 可观测性最小集
 
+> 执行计划：[`s2-a-metrics-execution-plan.md`](s2-a-metrics-execution-plan.md)（任务 T-A1~T-A7 + 测试清单 + 验收命令；ADR-016 签认后启动）。
+
 - **范围**：连接数（当前/峰值）、认证失败、协议错误/帧解析失败、发布/消费吞吐、端到端延迟、ACK 延迟、重投递次数、队列深度、订阅积压、cursor lag、DLQ 规模、WAL 写入/刷盘延迟、段大小、恢复时间。
 - **形状**：`counters` + `atomics`（热路径无锁），`broker_metrics:snapshot/0` 聚合；`broker_metrics:inc/1,2`、`observe/2`（直方图用固定桶，避免依赖）。
 - **测试**：埋点不改变行为（同一 CT 套件开/关计数结果一致）；snapshot 键集合被一条 `keys_are_stable` 用例钉住；周期日志不刷屏。

@@ -325,7 +325,8 @@ unified-mq/
 | `docs/adr/00N-*.md` | S0 | 13 |
 | `docs/architecture.md` | S1 | 2 |
 | `docs/storage-and-recovery.md` | S1（v0.1，T16）；S2 / S4 扩写 | 5.3、6 |
-| `docs/design/s2-single-node-kernel.md` | S2（v0.1 规划草案） | 4、5.2、6.3、7.2、10 |
+| `docs/design/s2-single-node-kernel.md` | S2（v0.2 决策冻结） | 4、5.2、6.3、7.2、10 |
+| `docs/design/s2-a-metrics-execution-plan.md` | S2-A（待 ADR-016 签认后启动） | 10.2 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

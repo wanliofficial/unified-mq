@@ -15,7 +15,7 @@
 |---|---|---|
 | S0 技术验证 | ✅ 完成 | 5 个 spike + Gate ADR-001~008 全部落盘并推送 |
 | S1 MQTT 垂直切片 | ✅ **完成（2026-11-06，Gate S1 通过）** | 方案设计 v0.16（四轮评审 46 项整改 + 实现期同步 91 项：H1~H11 / I1~I15 / J1~J11 / K0~K10 / L1~L20 / M1~M16）；ADR 已冻结并经 T17 复核；**T1/T3/T4/T5/T6/T7/T8/T9/T10/T11/T12/T13/T14/T15/T16/T17 全部完成**（264 个 CT 用例，零 FAILED 行、零 Skipped、`dialyzer` 干净；release 实测含 T7 的 R1b 节点级预演、T12 的 ranch listener + paho-mqtt 真实客户端端到端，以及 T12/M10/M11 的“有 QoS1 记录 + 有持久会话时连续重启”恢复；T13 用 `wal`/`memory` 双组同用例跑通 12/12；T14 崩溃矩阵默认档 / 零回退档各 8/8；T15 真实客户端 8/8、46/46 帧字节一致；T16 两份架构/存储文档 v0.1；T17 冻结契约复核 + E1 签认；T11 `broker_event` 恒等桩 + `#cloud_event{}` 接口位）。 |
-| S2 单机生产内核 | 🟡 **M0 决策冻结完成（2026-11-07）** | 总纲 [`docs/design/s2-single-node-kernel.md`](docs/design/s2-single-node-kernel.md) **v0.2**：O1~O4 已拍板（Shared ack=per-message+连续前缀 / DLQ 按租户可配+独立保留期 / MQTT5 后移 S2.5 / `os_buffer` 双轨证明），D1~D9 全部结案；**ADR-012~017 已起草（状态=拟议）**：012 QoS2、013 订阅与 cursor、014 retention、015 重投递 DLQ TTL、016 可观测性、017 MQTT5。Gate 范围 ≈50 人日（S2.5 ≈7 人日另计）。**下一步：ADR 评审签认 → 开 S2-A（`broker_metrics`）执行计划** |
+| S2 单机生产内核 | 🟡 **M0 决策冻结完成（2026-11-07）** | 总纲 [`docs/design/s2-single-node-kernel.md`](docs/design/s2-single-node-kernel.md) **v0.2**：O1~O4 已拍板（Shared ack=per-message+连续前缀 / DLQ 按租户可配+独立保留期 / MQTT5 后移 S2.5 / `os_buffer` 双轨证明），D1~D9 全部结案；**ADR-012~017 已起草（状态=拟议）**：012 QoS2、013 订阅与 cursor、014 retention、015 重投递 DLQ TTL、016 可观测性、017 MQTT5。Gate 范围 ≈50 人日（S2.5 ≈7 人日另计）。S2-A 执行计划已落盘（[`docs/design/s2-a-metrics-execution-plan.md`](docs/design/s2-a-metrics-execution-plan.md)，T-A1~T-A7）。**下一步：ADR-012~017 评审签认 → 按 S2-A 计划开工** |
 | S3 CloudEvents | ⬜ 未开始 | roadmap 允许 S2/S3 并行；S3 必须早于 S4 |
 | S4+ | ⬜ 未开始 | — |
 
@@ -150,7 +150,7 @@
 
 ## 下一步
 
-**S1 全部任务（含 T11）已完成并推送；S2 M0 决策冻结完成**：[`docs/design/s2-single-node-kernel.md`](docs/design/s2-single-node-kernel.md) **v0.2**——四项产品拍板已落入（O1 Shared ack=per-message + 连续前缀；O2 DLQ 按租户可配命名 + 独立保留期；O3 MQTT 5 后移 S2.5；O4 `os_buffer` 双轨证明），D1~D9 全部结案，Gate 范围 ≈50 人日。**ADR-012~017 已于 2026-11-07 起草（状态=拟议，待评审签认）**：012 QoS2 承诺边界与 release 状态、013 订阅类型/cursor 归属/会话文件 v2、014 retention 与段 GC、015 重投递/DLQ/TTL、016 可观测性最小集、017 MQTT5 properties 落位。**下一步：ADR 评审签认后按顺序开 S2-A（`broker_metrics`）与 S2-B（可靠性证明）的执行计划。**
+**S1 全部任务（含 T11）已完成并推送；S2 M0 决策冻结完成**：[`docs/design/s2-single-node-kernel.md`](docs/design/s2-single-node-kernel.md) **v0.2**——四项产品拍板已落入（O1 Shared ack=per-message + 连续前缀；O2 DLQ 按租户可配命名 + 独立保留期；O3 MQTT 5 后移 S2.5；O4 `os_buffer` 双轨证明），D1~D9 全部结案，Gate 范围 ≈50 人日。**ADR-012~017 已于 2026-11-07 起草（状态=拟议，待评审签认）**：012 QoS2 承诺边界与 release 状态、013 订阅类型/cursor 归属/会话文件 v2、014 retention 与段 GC、015 重投递/DLQ/TTL、016 可观测性最小集、017 MQTT5 properties 落位。**下一步：ADR-012~017 评审签认；S2-A 执行计划（[`docs/design/s2-a-metrics-execution-plan.md`](docs/design/s2-a-metrics-execution-plan.md)）已备好，签认后按 T-A1~T-A7 开工。**
 
 T9/T12 交接给 T13 的既定事实（实现期已定，勿再讨论）：SubRef = `{ClientId, Filter}`（K2）；投递形状 `{broker_deliver, ClientId, MaxQoS, [SubRef], {PartitionId, Offset, Msg}}`（K9），带位置者只是唤醒、`cursor/2` 是唯一读位置（J6）；`.inflight` 回退窗口"只多不少"是 R7 契约（MQTT §4.1 允许重发未确认），**且 `inflight_flush_interval_ms = 0` 已是可用的零回退档**（§5.3 修正）；dispatcher **内嵌在 conn_fsm**，S1 无独立 dispatcher 进程（§5.2）；conn 的全部可调参数由 **listener 的 `ProtoOpts`** 提供、无 listener 时回落 app env（L20 → M4）；连接进程仍是 `temporary`，但 **listener 停止会经 ranch 的 conns sup 收口**（M7），测试清理仍保留 `kill_conns/0` 兜底。
 
