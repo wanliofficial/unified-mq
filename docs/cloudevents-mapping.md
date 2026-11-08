@@ -6,7 +6,7 @@
 S6 的统一头通道扩展（[`protocol-compatibility.md`](protocol-compatibility.md) §4.10）。
 
 - 代码：`apps/broker_event/src/{broker_event.erl,broker_event_codec.erl,broker_event_binding.erl,broker_event_dedup.erl}`
-- 测试：`apps/broker_event/test/broker_event_SUITE.erl`（34 例）
+- 测试：`apps/broker_event/test/broker_event_SUITE.erl`（35 例）
 - 范围：只实现 **CloudEvents 1.0 JSON Format**；Avro/Protobuf 格式不在范围。
 
 ---
@@ -101,12 +101,17 @@ Pulsar `SendError`。拒绝的消息不写 WAL、不 ACK。
 ## 5. 去重与隔离
 
 - **去重键**：`{Tenant, Destination, Source, Id}`，窗口由
-  `broker_event.dedup` 的 `{Tenant, Destination, WindowSeconds}` 配置；
+  `broker_event.dedup` 的 `{Tenant, Destination, WindowMs}` 配置；
   未配置即不去重。命中重复计 `cloudevents_duplicates` 并按成功处理
   （不重复写日志）。
 - **隔离**：`broker_event:quarantine/2` 把非法事件的可持久化副本写到
-  `$dlq/{tenant}/{original}`（前缀可配），计 `cloudevents_quarantined`。
-  隔离目标是普通可订阅 destination，不绕过 ACL。
+  `broker_event.quarantine` 配置的目标（`{Tenant, Destination, Target}`，
+  `Target` 是含 `{tenant}` / `{destination}` 占位符的普通 destination；
+  未配置则返回 `not_configured`，拒绝仍然生效），计
+  `cloudevents_quarantined`。副本带 `event_rejection` 头、新 `message_id`、
+  `expires_at = undefined`，写失败保留拒绝。隔离目标是普通可订阅 destination，
+  不绕过 ACL。它与 S2-E 的订阅重试 DLQ（`dlq_name_pattern`，默认
+  `$dlq/{tenant}/{original}`）是两条独立路径。
 - **事件 ID ≠ Broker ID**：`source + id` 是事件身份；`message_id`、offset、
   packet id 只进 `proto_meta`，永不写 `event.id`（ADR-005 / ADR-020 §D6）。
 
