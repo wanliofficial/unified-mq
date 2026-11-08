@@ -198,6 +198,19 @@
     {poll_ms, 100}
   ]},
 
+  {broker_proto_pulsar, [
+    %% S5 Pulsar adapter. 6650 is the standard binary port; CT binds its own
+    %% ephemeral port. `advertised_host' is what LOOKUP returns so the client
+    %% opens its producer/consumer connection back to this node.
+    {listeners, [
+      #{port => 6650,
+        ref => {pulsar, 6650},
+        num_acceptors => 10,
+        max_connections => 1024}
+    ]},
+    {advertised_host, <<"127.0.0.1">>}
+  ]},
+
   {broker_proto_nats, [
     %% S5 NATS core adapter. 4222 is frequently taken by a local nats-server;
     %% the release default therefore uses 4223. CT binds its own ephemeral

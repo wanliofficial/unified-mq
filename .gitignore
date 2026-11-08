@@ -77,5 +77,12 @@ spikes/*/.data/
 /test/protocol-compatibility/kafka/__pycache__/
 /test/protocol-compatibility/kafka/classes/
 
+# S5 Pulsar harness scratch: broker data volume, compiled classes, boot-module beam, reports
+/test/protocol-compatibility/pulsar/data/
+/test/protocol-compatibility/pulsar/run/
+/test/protocol-compatibility/pulsar/_build/
+/test/protocol-compatibility/pulsar/__pycache__/
+/test/protocol-compatibility/pulsar/classes/
+
 # CLI tool state (not project content)
 /.qoder/

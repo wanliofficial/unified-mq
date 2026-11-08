@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v0.9（S5 协议扩展：WebSocket、NATS、AMQP、Kafka）
-- **最近一次追加**：2026-11-09，§4.8「S5 追加」——Kafka 适配器的范围、限制与真实 `kafka-clients` 证据。§4/§4.1~§4.7 原文保留为当时事实
+- **文档版本**：v1.0（S5 协议扩展全部完成：WebSocket、NATS、AMQP、Kafka、Pulsar）
+- **最近一次追加**：2026-11-09，§4.9「S5 追加」——Pulsar 适配器的范围、限制与真实 `pulsar-client` 证据；§2 替换为 S5 完成态能力矩阵。§4/§4.1~§4.8 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -19,7 +19,7 @@
 | NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth；无 headers/JetStream，见 §4.6 |
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack；见 §4.7 |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅（**S5-Kafka：12/12 用例**） | Produce/Fetch/Metadata/ListOffsets、经典消费组、OffsetCommit/Fetch、RecordBatch v2；单节点协调器、offset 内存态、无压缩/事务/Admin API，见 §4.8 |
-| Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅ | README 5.1 硬性要求官方 Java Client |
+| Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅（**S5-Pulsar：8/8 用例**） | 官方 Java Client 实测：produce/consume、properties、key、batch、ack/redelivery、seek、unsubscribe、producer name；无 BookKeeper/事务/压缩/Key_Shared，见 §4.9 |
 
 ---
 
@@ -36,20 +36,18 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵模板（S5 填充）
+## 2. 能力矩阵（S5 完成态）
 
-每个协议在 S5 末尾在此处追加一行，格式：
+每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
-```
-| <协议> | <已支持/部分支持/计划支持> | <支持的能力> | <已知限制/转换损失> | <测试套件路径> |
-```
-
-示例（S5 完成后替换）：
-
-```
-| MQTT   | 已支持 | QoS0/1、Retain、Will、5.0 元数据 | — | test/protocol-compatibility/mqtt/ |
-| Pulsar | 部分支持 | P1 连通、P2 消费语义 | P3 可靠、P4 扩展待补 | test/protocol-compatibility/pulsar/ |
-```
+| 协议 | 状态 | 支持的能力 | 已知限制 / 转换损失 | 证据路径 |
+|---|---|---|---|---|
+| MQTT | 已支持 | QoS0/1/2、Retain、Will、clean session/persistent session、离线追赶、MQTT 5.0 子集（session expiry、message expiry、reason codes、properties） | 无 shared subscription（MQTT 5 特性未全量）；见 §4/§4.1/§4.2 | `apps/broker_proto_mqtt/test/`、`test/protocol-compatibility/mqtt/` |
+| WebSocket | 已支持 | RFC 6455 握手/掩码/分片/控制帧；自有应用帧 `connect`/`subscribe`/`publish`/`ack`/`unsubscribe`/`ping`/`disconnect` | v1 仅 QoS0/1；`shared` 订阅显式拒绝；应用层帧为 Broker 自有格式；见 §4.5 | `apps/broker_proto_ws/test/`、`test/protocol-compatibility/ws/` |
+| NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth | 无 headers、无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
+| AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
+| Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
+| Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema/认证；订阅游标内存态；单租户、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
 
 ---
 
@@ -467,6 +465,61 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 8. **Metadata 三元组**：topic 项为 `{Name, Partitions, Error}`，FT 里按二元组匹配导致 `badmatch`。
 9. **Fetch 分区项**：v11 在 `high_watermark` 后还有 `last_stable_offset`、`log_start_offset`、aborted transactions、preferred read replica，再才是 records；补读这些字段。
 10. **ListOffsets 分区项**：v5 的响应在 `offset` 后还有 `leader_epoch`，漏读会把后续字段错位。
+
+---
+
+### 4.9 S5 追加（2026-11-09）：Pulsar 适配器（`broker_proto_pulsar`）
+
+> **Pulsar 复用 MQTT 的存储/路由路径**——Produce 经 `broker_queue:append/3` 写入分区日志（fsync），订阅游标和消费者在 `pulsar_subscriptions` 中维护；没有 BookKeeper、没有 Pulsar 专属存储（ADR-006）。topic `t` 映射 destination `pulsar/t`，所有写入落在 broker 分区 0，entry id 是 topic 在该分区内的记录序号（与 Kafka 适配器的约定一致）。
+
+**协议范围（`apps/broker_proto_pulsar/src/` 自实现 Pulsar protobuf 线协议子集）**：
+
+- 帧格式：`[total_size:32][command_size:32][BaseCommand][payload?]`；payload 段 `[16#0e01:16][crc32c:32][metadata_size:32][MessageMetadata][payload]`，CRC32C 覆盖 `metadata_size+metadata+payload`（已知向量 `crc32c(<<"123456789">>) = 16#E3069283`）。
+- 命令：CONNECT/CONNECTED、PARTITIONED_METADATA(+RESPONSE)、LOOKUP(+RESPONSE)、PRODUCER/PRODUCER_SUCCESS、SEND/SEND_RECEIPT、SUBSCRIBE、FLOW、ACK/ACK_RESPONSE、CLOSE_PRODUCER、CLOSE_CONSUMER、UNSUBSCRIBE、PING/PONG、GET_LAST_MESSAGE_ID(+RESPONSE)、SEEK、SUCCESS、ERROR。
+- **协议版本**：CONNECTED 广告 15；`PARTITIONED_METADATA` 回 `partitions=0`（非分区 topic），`LOOKUP` 回 `pulsar://<advertised_host>:<port>`、Connect、authoritative、`proxy_through_service_url=false`（直连 broker，避免代理式反复 lookup）。
+- **SEND**：单条与 batch（`num_messages>1` 时 payload 为重复的 `[meta_size][SingleMessageMetadata][payload]`）；`MessageMetadata` 的 properties、partition_key、event_time、sequence_id、publish_time 入 `headers`/`proto_meta`，投递时原样回填。
+- **订阅**（`pulsar_subscriptions`）：`{Topic, Subscription}` 拥有 cursor（`scan`/`index`/`next`）、消费者集合、每消费者 flow permits、`unacked` 与 `redeliver`；20 ms sweep 前向读取分区、按 destination 过滤后投递；ack 从 `unacked` 移除；消费者断开时其未 ack 消息进入 `redeliver`，重连后重投（durable 订阅）。
+- **InitialPosition**：`earliest` 从 0 开始，`latest` 从当前高水位开始。
+
+**能力矩阵行**（追加进 §2 末尾）：
+
+```
+| Pulsar | 部分支持 | 官方 Java Client 的 Connect/Lookup/PartitionedMetadata/Producer/Send（含 batch）/Subscribe/Flow/Ack/Seek/Unsubscribe/Ping/GetLastMessageId；properties、key、event_time、sequence_id | 无 BookKeeper/ledger（ADR-006）；无事务、无压缩、无 Key_Shared hash range、无 read-compacted、无 schema、无认证/TLS；订阅游标内存态（重启重置）；单租户 `t0`、全部写入分区 0 | apps/broker_proto_pulsar/test/、test/protocol-compatibility/pulsar/ |
+```
+
+**已知限制（协议对端可观察，不是内部 TODO）**：
+
+1. **无 BookKeeper/ledger 存储**：消息仍在 `broker_queue`（ADR-006），Pulsar 的 ledger/entry 语义只是 topic 相对序号的映射；`GET_LAST_MESSAGE_ID` 基于当前分区高水位换算。
+2. **订阅游标内存态**：`pulsar_subscriptions` 的 cursor/unacked 在 broker 重启后重置；durable 订阅的持久化留待后续。
+3. **单分区**：所有 topic 都写入 broker 分区 0，`PARTITIONED_METADATA` 回 0；不支持分区 topic 的 per-partition lookup。
+4. **无事务/压缩/Key_Shared/schema**：`num_messages>1` 视为 batch；压缩位、事务标记、Key_Shared hash range、schema 均不支持；客户端默认不启用这些特性，故 8 例实测通过。
+5. **无认证/TLS**：认证与传输安全留到 S6；`CONNECT` 的 auth 字段被忽略。
+
+**真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
+
+- 套件在 `test/protocol-compatibility/pulsar/`，用 **官方 Apache `pulsar-client` 3.3.1**（S0.4 客户端矩阵指定的 Pulsar 客户端，Java 17、离线 `~/.m2` 依赖）驱动真实的 `erl -noshell -s pulsar_broker_boot run` broker 节点（ranch 临时端口、`port=>0`、WAL 后端、ext4 数据目录）。Java 程序只用 `PulsarClient` / `Producer` / `Consumer` 的公开 API，不手写线协议。
+- **8/8 用例 PASS**（`run/report.json`）：`pulsar-produce-consume`、`pulsar-properties`、`pulsar-key`、`pulsar-batch`（3 条批量顺序）、`pulsar-ack-redelivery`（未 ack 关闭后重连重投）、`pulsar-seek`（seek earliest 回放）、`pulsar-unsubscribe`、`pulsar-producer-name`。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| Pulsar 编解码（`pulsar_codec_SUITE`） | 15 例：CRC32C 已知向量、command_size 前缀、CONNECT/PRODUCER/SUBSCRIBE/SEND/ACK/SEEK 解码、payload 往返、CRC 篡改检测、无 magic 旧格式、batch 负载、MessageMetadata/SingleMessageMetadata 往返、CONNECTED 帧 |
+| Pulsar 连接/订阅（`pulsar_conn_SUITE`） | 16 例：connect、partitioned-metadata=0、lookup broker URL、producer success、单发/批量 SEND→receipt、subscribe/flow 顺序投递、ack 后 unacked 清零、ack response 回显 request id、未 ack 关闭后重投、seek 回放、ping/pong、last-message-id、close producer、unsubscribe、未知 producer 报错 |
+| 真实第三方客户端（`pulsar_compat.py` + `pulsar-client` 3.3.1） | 8/8 PASS（见上） |
+
+**实现期修复**（测试暴露的真实缺陷，已修）：
+
+1. **ranch 过滤 `packet` 选项**：`ranch_tcp` 的 `disallowed_listen_options` 含 `packet`，accept 出来的 socket 是 raw；在 `pulsar_conn` 的 handshake 分支对 accepted socket `setopts([{packet,4}])` 后再 arm。
+2. **简单命令缺 `command_size` 前缀**：`{packet,4}` 只补外层 `total_size`，Pulsar 还需要 `[command_size][BaseCommand]`；统一由 `frame/2` 加前缀。
+3. **`SendReceipt.message_id` 字段号**：在 field 3（field 2 是 sequence id），解码时误读 field 2 导致把整数当嵌套消息；改为按字段位置读取。
+4. **`PRODUCER_SUCCESS.schema_version`**：pulsar-client 3.3.1 解码时把 field 4 视为 required，未设置即抛 `IllegalStateException`；现在总是发送空 bytes。
+5. **LOOKUP `proxy_through_service_url`**：置 true 会让客户端把返回 URL 当代理并反复 lookup；直连 broker 必须为 false。
+6. **record 状态被当 map**：`pulsar_subscriptions` 的 `maps:get(subs, St)` 对 `#st{}` record 调用会 `badmap`；改为 `St#st.subs`。
+7. **投递返回嵌套 state**：`{noreply, send(Frame, St)}` 而 `send/2` 已返回 `{noreply, St}`，导致 state 被包成 `{noreply, St}`；改为直接返回 `send(...)`。
+8. **投递查找 consumer**：连接侧 consumers 以 `{ConsumerId, RequestId}` 为键，投递处理却用裸 `ConsumerId` 查，永远 miss；改用 `find_consumer/2`。
+9. **负 int64 varint**：`MessageId.earliest/latest` 的 `-1` 是 10 字节补码 varint，解码成无符号大数；`message_id_fields/1` 现按 int64 符号扩展。
+10. **partition_key 丢失**：投递 metadata 未回填 key；append 时把 `partition_key` 存入 `proto_meta`，投递时写回 `MessageMetadata`。
 
 ---
 
