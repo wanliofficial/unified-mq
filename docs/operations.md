@@ -107,7 +107,15 @@ curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ### 4.1 备份
 
-备份是 `<data_dir>/wal/*` 与 `<data_dir>/sessions/*` 的 gzip tar，热备份（读取时 broker 仍在运行）。
+备份是 `<data_dir>` **整棵树**（递归）的 gzip tar，热备份（读取时 broker 仍在运行）。当前包含：
+
+- `wal/`：各分区的追加日志、索引与 meta；
+- `sessions/`：`.subs` / `.cursors` / `.inflight`；
+- `retain/retain.v1`：保留消息快照；
+- `mnesia/`、`ra/`：S4 控制面（Mnesia 表 + Metadata Raft）；
+- `config-audit.log`：脱敏配置审计。
+
+热备份对 WAL 是安全的：正在追加的段按原样复制，恢复时走 `wal_recovery` 的撕裂尾规则；会话与 retain 文件用 temp+rename，读者只会看到完整旧文件或完整新文件。**`mnesia/` 与 `ra/` 是活的控制面状态，没有撕裂尾规则**；要求控制面逐字节一致时，先静止写入或停节点再备份。需要逐字节一致的业务数据同样应先静止写入。
 
 ```bash
 # 通过 API
@@ -120,7 +128,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 ```
 
 - 输出目录由 `broker_admin.backup_dir` 决定，必须是 release 树外的绝对路径。
-- 备份期间正在追加的 WAL 段按原样复制；恢复时按 `wal_recovery` 的撕裂尾规则处理，因此**热备份是安全的**。需要逐字节一致时先静止写入。
+- 备份期间正在追加的 WAL 段按原样复制；恢复时按 `wal_recovery` 的撕裂尾规则处理，因此**业务数据的热备份是安全的**。`mnesia/` 与 `ra/` 为控制面，热备份不保证逐字节一致；需要一致时先静止写入或停节点。
 - `GET /api/v1/backups` 返回清单，用于核对备份是否落在预期位置。
 
 ### 4.2 恢复
@@ -136,7 +144,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 
 1. 停目标节点（滚动升级窗口内一次只动一个）。
 2. 解压到 release 树外的新目录（上例 `/srv/unified-mq-restore`）。
-3. 把 `broker_storage.data_dir` / `broker_subscription.data_dir` 指向该目录。
+3. 把**五个**数据目录配置指向恢复树：`broker_storage.data_dir` / `broker_subscription.data_dir` / `broker_retain.data_dir` 指向恢复根；`broker_meta.data_dir` 指向 `<恢复根>/mnesia`，`broker_cluster.data_dir` 指向 `<恢复根>/ra`。
 4. 启动节点，确认 `/readyz` 200 且 `/api/v1/status` 的分区与预期一致。
 5. 校验：发布一条 QoS1 并确认订阅端收到，再检查 `recovery_time_us`。
 

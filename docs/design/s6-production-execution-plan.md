@@ -16,7 +16,7 @@
 | TLS 与轮换 | `broker_security_tls` + 六协议 `*_sup` | `transport/0` 单开关覆盖所有 listener；`reload/0` |
 | 管理 API | `broker_admin_http` + `broker_admin_listener` | `/healthz` `/readyz` `/metrics` `/api/v1/*` |
 | 配置审计 | `broker_config_audit` | 脱敏快照 + SHA-256，落 `config-audit.log` |
-| 备份恢复 | `broker_backup` | gzip tar `wal/` + `sessions/`；列表/恢复 |
+| 备份恢复 | `broker_backup` | gzip tar 整个 `<data_dir>` 树（wal/sessions/retain/mnesia/ra）；列表/恢复 |
 | 版本兼容窗口 | `broker_version` | `data_version` / `compatible/1` |
 | 告警规则 | `config/alerts.yml` | Prometheus 告警 + 记录规则，仅用封闭指标 |
 | 文档 | `docs/security.md`、`docs/operations.md`、三份基准报告 | 只写已实现事实 |

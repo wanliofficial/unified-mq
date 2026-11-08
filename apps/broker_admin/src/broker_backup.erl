@@ -1,17 +1,24 @@
 %% @doc Backup and restore of the broker's on-disk state (S6, roadmap §8.2).
 %%
-%% One backup is a gzipped tar of the two directories whose loss would lose
-%% data the broker promised to keep (ADR-011, ADR-019):
+%% One backup is a gzipped tar of the **whole `<data_dir>` tree** (recursive),
+%% which today holds:
 %%
 %%   * `<data_dir>/wal/<partition>' -- the append-only logs, their index and
 %%     per-partition meta;
-%%   * `<data_dir>/sessions' -- `.subs' / `.cursors' / `.inflight' files.
+%%   * `<data_dir>/sessions' -- `.subs' / `.cursors' / `.inflight' files;
+%%   * `<data_dir>/retain/retain.v1' -- the retained-message snapshot;
+%%   * `<data_dir>/mnesia' and `<data_dir>/ra' -- the S4 control plane
+%%     (Mnesia tables and the Metadata Raft group);
+%%   * `<data_dir>/config-audit.log' -- the redacted config audit trail.
 %%
 %% The backup is **hot**: it reads files while the broker runs. A WAL segment
 %% being appended to at the same moment is copied as-is, which is safe because a
 %% restore replays through `wal_recovery' (partial tail = torn tail, the same
-%% path an unclean shutdown takes). The runbook still recommends a quiesce for
-%% backups that must be byte-exact.
+%% path an unclean shutdown takes); the session and retain files use
+%% temp-file+rename, so a reader sees a whole old or whole new file. The Mnesia
+%% and ra trees are live control-plane state, not a log with a torn-tail rule:
+%% for a byte-exact control plane, quiesce writes (or stop the node) before
+%% taking the backup. The runbook says the same.
 %%
 %% Restore is deliberately explicit and refuses to write anywhere but a target
 %% directory the caller names -- there is no `restore/0' that guesses, because

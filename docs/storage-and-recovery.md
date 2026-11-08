@@ -1,10 +1,10 @@
-# 存储与恢复（S1）
+# 存储与恢复
 
-- **文档版本**：v0.3（S2-D，2026-11-08：§2/§9 改为按 SubRef 的 v2 会话布局，新增 §9.4 v1→v2 迁移与 §10 的 R9）
-- **状态**：已实现并实测的磁盘格式、刷盘策略与恢复语义；S2/S3/S4 的演进单列于 §14
-- **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、ADR-018（retain 树与 `.inflight` v2）、ADR-019（会话文件按 SubRef 与 v1→v2 迁移）、设计文档 §5.3/§7/§8
-- **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`、`apps/broker_retain/src/broker_retain_files.erl`
-- **证据**：`rebar3 ct` 348/348（`mqtt_conn_SUITE` 55 例、`broker_subscription_SUITE` 43 例）；T14 真实容器 `kill -9` 矩阵（R1a~R9 × 双档 = 20/20；R8 为 S2-C 的 QoS2 崩溃场景，R9 为 S2-D 的两成员 Shared 场景）；T15 10/10 真实客户端用例
+- **文档版本**：v1.0（S6，2026-11-09：补 §2 的 Mnesia/ra 目录、更新证据口径）
+- **状态**：已实现并实测的磁盘格式、刷盘策略与恢复语义；S6 之后明确未实现的方向单列于 §14
+- **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、ADR-018（retain 树与 `.inflight` v2）、ADR-019（会话文件按 SubRef 与 v1→v2 迁移）、ADR-021（Metadata Raft 与复制提交）、设计文档 §5.3/§7/§8
+- **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`、`apps/broker_retain/src/broker_retain_files.erl`、`apps/broker_meta/src/broker_meta.erl`、`apps/broker_cluster/src/broker_cluster_meta.erl`
+- **证据**：`rebar3 ct` **631/631**；T14 真实容器 `kill -9` 矩阵（R1a~R9 × 双档）；S2-B 掉电/OS 缓冲注入（`tools/fault/`、`tools/docker/s2_powerloss.py`）；T15 真实客户端 10/10
 
 > 本文回答三个问题：**盘上有什么、什么时候真正落盘、崩溃后哪些字节会被信任**。架构分层与进程归属见 [`architecture.md`](architecture.md)。
 
@@ -12,11 +12,11 @@
 
 ## 1. 不变量（先看这五条）
 
-1. **offset 稠密且从 1 开始。** 每分区一条连续日志；恢复后的 `high` = 最后一条持久记录 + 1。S1 不删段，所以第一条记录必须是 offset 1。
+1. **offset 稠密且从 1 开始。** 每分区一条连续日志；恢复后的 `high` = 最后一条持久记录 + 1。retention（S2-F）只删**段**，不删记录中间，所以现存第一条记录的 offset 等于 `truncate_before`。
 2. **一条记录要么完整，要么不存在。** 记录头带长度与 CRC-32；撕裂尾在恢复时被截断到最后一个完整记录的边界，绝不"修补"半条记录。
 3. **水位只能回退，不能超前。** `committed` 在崩溃后允许变低（代价是重复投递，契约允许），绝不允许高于日志里真实存在的记录（那会让 retention 删掉未确认数据）。
 4. **订阅集合强一致，位置/在途允许有界回退。** `.subs` 每次变化即 fsync；`.cursors`/`.inflight` 按窗口批量落盘。前者是 Gate 的 R1b，后者是"至少一次"。
-5. **ACK 只代表它声明的等级。** `fsync` 档的 PUBACK 发生在 `file:sync` 返回之后；`os_buffer` 档只承诺页缓存，掉电窗口未在 S1 验证。
+5. **ACK 只代表它声明的等级。** `fsync` 档的 PUBACK 发生在 `file:sync` 返回之后；`os_buffer` 档只承诺页缓存，掉电窗口由 S2-B 的注入测试覆盖（`tools/fault/os_buffer_loss.py`）。
 
 ---
 
@@ -30,18 +30,24 @@
 │   │   ├── segment-00000000000000000001.log
 │   │   └── segment-00000000000000001235.log
 │   ├── 1/ …
-│   └── 3/ …                         # S1 固定 4 分区
+│   └── 3/ …                         # 默认 4 分区（`broker_queue.partitions`）
 ├── sessions/
 │   ├── exclusive.Z3Vlc3Q.dC8j.subs    # <kind>.<b64url(Key)>.<b64url(Filter)> + 扩展名
 │   ├── exclusive.Z3Vlc3Q.dC8j.cursors
 │   ├── shared.Z3JvdXA.dC8j.subs       # 一组一文件，consumers 在 body 里（ADR-019 §19.3）
 │   ├── shared.Z3JvdXA.dC8j.cursors
 │   └── Z3Vlc3Q.inflight               # 仍按 client：连接的不透明 blob
-└── retain/
-    └── retain.v1                    # 整棵 retained 树，S2-C 新增（ADR-018 §18.2）
+├── retain/
+│   └── retain.v1                    # 整棵 retained 树，S2-C 新增（ADR-018 §18.2）
+├── mnesia/                          # broker_meta.data_dir（S4 控制面）
+│   └── Mnesia.<node>/               # Mnesia 自行追加节点名
+├── ra/                              # broker_cluster.data_dir（S4 Metadata Raft）
+│   └── <node>/                      # ra 自行追加节点名
+└── config-audit.log                 # broker_admin 的脱敏配置审计（逐行 JSON）
 ```
 
-- `broker_storage.data_dir`、`broker_subscription.data_dir` 与 `broker_retain.data_dir` 必须指向**同一个**绝对路径；否则 `.subs`/`retain.v1` 与 WAL 分居两地，节点重启后互不相认。
+- 五个 `data_dir` 分两类。**业务数据同根**：`broker_storage.data_dir`、`broker_subscription.data_dir`、`broker_retain.data_dir` 必须指向**同一个**绝对路径；否则 `.subs`/`retain.v1` 与 WAL 分居两地，节点重启后互不相认。**控制面在子目录**：`broker_meta.data_dir`（`<根>/mnesia`）与 `broker_cluster.data_dir`（`<根>/ra`）各自独占子目录，避免 Mnesia schema 文件与 ra 段混进 WAL 根目录。`config-audit.log` 也落在 storage 根下。
+- 部署时**五个键都要显式配置为绝对路径**。只改业务三键时，`broker_meta`/`broker_cluster` 会退回相对默认值（`data`、`data/ra`），在只读挂载的 release 容器里会在启动阶段因无法建 Mnesia/ra 目录而中止。
 - retained 树是一棵树、不是一份日志：`retain.v1` 每次变化整文件重写（temp + `file:sync` + `rename`），没有增量记录，也就没有"撕裂的树"。它有 `vsn`，未知版本与解析失败都是**启动失败**并带路径——用空树起来等于告诉每个新订阅者"从来没有过 retained 消息"。
 - 目录名是分区 id（`0..N-1`），不是哈希值；`wal_recovery` 用目录里的段文件重建 offset，不读任何分区清单。
 - `sessions/` 的文件名只是地址：真实身份（kind/key/filter）存在文件内容里（key 与 filter 可含 `/`，不能直接做文件名）。`.inflight` 是唯一仍按 client 命名的文件（ADR-019 §19.3：一条 pending 可同属多个 SubRef）。
@@ -82,7 +88,7 @@ Body 是一个**独立于 `#broker_message{}` 的元组**（磁盘协议 ≠ 内
 Magic=0x4D, Vsn=0x02, CRC32, Len, term_to_binary({2, Committed, TruncateBefore, Retired})
 ```
 
-- 追加写 + **每次 `file:sync`**。文件只增不减，S1 不压缩；最后一条可读记录就是当前水位。
+- 追加写 + **每次 `file:sync`**。段文件只增不减；retention（S2-F）整段删除并把段起点记入 `Retired`，不做记录级压缩。最后一条可读记录就是当前水位。
 - `Retired` 是已物理删除（或已决定删除、尚未 unlink）的段起始 offset 列表（升序去重，S2-F）。v1 body `{1, Committed, TruncateBefore}` 仍可读，解释为 `retired = []`。
 - 尾部撕裂/损坏**不是错误**：`read/1` 返回 `{ok, LastGood, {torn|{corrupt,_}}}`，恢复采用最后一条完整记录并记一条 warning。
 - Magic 与段记录不同（`0x4D` vs `0x55`）：把两种文件指错会**响亮失败**，而不是读出一个看似合理的水位。
@@ -241,7 +247,7 @@ recover(P, Dir):
  5. clamp 水位：committed ≤ high-1；truncate_before ≤ committed+1
  6. 把锚点/边界发布成新的 wal_index ETS
  7. 打开最后一段（append）与 meta.log（append）
- 8. warnings 随 writer state 暴露（state/1），S1 不主动写日志
+ 8. warnings 随 writer state 暴露（state/1），不主动写日志
 ```
 
 ### 7.2 尾部判定表
@@ -404,7 +410,7 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 
 ---
 
-## 10. 恢复矩阵（Gate S1 硬项）
+## 10. 恢复矩阵（Gate S1 硬项，S2 后扩展）
 
 ### 10.1 断言定义与实测结果
 
@@ -434,7 +440,7 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 
 ## 11. 保证与不保证
 
-### 11.1 S1 保证
+### 11.1 当前保证
 
 | 等级 / 层 | 保证 |
 |---|---|
@@ -448,7 +454,7 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 
 ### 11.2 明确不保证
 
-- **掉电（power loss）**：`kill -9` 不覆盖 `os_buffer` 窗口，也没有目录级 fsync（`rename` 后的目录项可能丢）。S0.3 已注明，S2 用 dm-flakey / VM 硬复位补。
+- **掉电（power loss）**：`kill -9` 不覆盖 `os_buffer` 窗口；`os_buffer` 档的掉电丢页缓存已由 S2-B 的 `tools/fault/os_buffer_loss.py` / `tools/docker/s2_powerloss.py` 注入验证。**dm-flakey 实机报告需要 root，尚未补**（`docs/roadmap.md` Gate S2 第 1 项保持未勾选）；目录级 fsync 也未实现。
 - **不重复**：默认档 cursor/in-flight 有回退窗口，重复是契约内行为；只有零回退档能逼近"零重复"。
 - **retention / 空间回收**：S2-F 起整段可删，但边界只到 `committed`；`meta.log` 自身仍只增不减（不压缩）。被慢消费者钉住的段不会被回收。
 - **TTL 不删数据**：`expires_at` 只在读者侧过滤（S2-E）；过期记录仍占段空间，直到 S2-F 的段级 GC 回收。
@@ -498,7 +504,7 @@ erl -noshell -boot no_dot_erlang -config <rel>/releases/0.1.0/sys.config \
 
 ### 12.3 容量与观测
 
-- 段数 ≈ 总记录数 / `segment_max_records`；S1 无自动清理。
+- 段数 ≈ 总记录数 / `segment_max_records`；`wal_gc` 按 retention 策略清理已过期的整段（S2-F）。
 - `wal_writer:stats/1`（`appends/records/batches/syncs/rotations`）是观察 group commit 是否生效的唯一入口：批 8 条应看到 `records=8, batches=1, syncs=1`。
 - `wal_writer:state/1` 的 `warnings` 携带恢复期的截断/夹水位/意外文件信息。
 
@@ -519,16 +525,16 @@ Gate「WAL 与内存实现可互换」的机械检查：`apps/broker_storage/tes
 
 ---
 
-## 14. 演进（S2 及以后）
+## 14. 演进（S6 之后）
 
-| 方向 | 会改什么 | 必须保持 |
+| 方向 | 状态 | 会改什么 / 必须保持 |
 |---|---|---|
-| retention / compaction | ✅ S2-F 已实现段删除（`wal_gc` + `meta.log` v2 retired）；`meta.log` 压缩仍待做 | 记录头格式；水位只低不高 |
-| 掉电验证 | dm-flakey / VM 硬复位；补目录 fsync | `fsync` 档的 ACK 时机 |
-| Mnesia 控制面 | `.subs`/`.cursors`/`.inflight` 迁入 `subscription_meta`/`cursor_meta`/`session_meta` | `broker_subscription` 对外 API |
-| 复制（S3/S4） | 新后端实现 `replicated_commit`；提交点变为共识返回 | 同一 behavior；ACK 与 capability 一一对应 |
-| 慢消费者/背压 | cursor 回收、离线 QoS0 skip、per-consumer 配额 | `committed = min(活 cursor)-1` 的方向性 |
-| retained 树扩容（S2-F/S4） | 增量日志或按 filter 分片，取代整树重写 | `vsn` 字段；损坏即启动失败 |
+| retention / compaction | **部分实现** | ✅ S2-F 已实现段删除（`wal_gc` + `meta.log` v2 retired）；`meta.log` 压缩仍待做。保持记录头格式；水位只低不高 |
+| 掉电验证 | **部分实现** | ✅ S2-B 的 OS 缓冲注入；dm-flakey 实机报告待 root。保持 `fsync` 档的 ACK 时机 |
+| 复制（S4） | **已实现** | ✅ 复制后端 `replicated_commit`，提交点在共识返回后。保持同一 behavior、ACK 与 capability 一一对应 |
+| 慢消费者/背压（S2-G） | **已实现** | ✅ cursor 回收、离线 QoS0 skip、per-consumer 配额。保持 `committed = min(活 cursor)-1` 的方向性 |
+| 会话迁入 Mnesia 控制面 | **未实现** | 把 `.subs`/`.cursors`/`.inflight` 迁入 `subscription_meta`/`cursor_meta`/`session_meta`。保持 `broker_subscription` 对外 API |
+| retained 树扩容 | **未实现** | 增量日志或按 filter 分片，取代整树重写。保持 `vsn` 字段；损坏即启动失败 |
 
 ---
 
