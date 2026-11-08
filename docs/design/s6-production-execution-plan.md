@@ -11,7 +11,7 @@
 | 租户隔离 | `broker_security` + `broker_router_hash_store` + `broker_subscription` | 索引键 `{Tenant, Filter}`；跨租户读写拒绝，先于 ACL |
 | 认证 | `broker_security:authenticate/2` | MQTT CONNECT；失败恒 `bad_username_or_password` |
 | ACL | `broker_security:authorize/2` | 有序 first-match，无匹配 deny；通配与前缀 |
-| 资源上限 | `broker_limits` + `broker_queue:append/3` + `broker_event_codec:validate_limits/1` | 消息体/属性数/属性长度/扩展/JSON 深度 |
+| 资源上限 | `broker_limits` + `broker_queue:append/3` + `broker_event_codec:validate/1` | 消息体/属性数/属性长度/扩展/JSON 深度 |
 | 指标防高基数 | `broker_metrics` `key_specs/0` + `key_types/0` | key 为封闭集合，无用户可控标签 |
 | TLS 与轮换 | `broker_security_tls` + 六协议 `*_sup` | `transport/0` 单开关覆盖所有 listener；`reload/0` |
 | 管理 API | `broker_admin_http` + `broker_admin_listener` | `/healthz` `/readyz` `/metrics` `/api/v1/*` |
@@ -25,7 +25,7 @@
 
 1. `broker_security`：新增 `broker_limits`、`broker_security_tls`；`authorize/2` 租户先于 ACL；`redacted_config/0`；`authorized/2`。
 2. `broker_queue:append/3`：在写前调用 `broker_limits:check_message/1`，超限 `{error, {limit_exceeded, ...}}`。
-3. `broker_event_codec:validate_limits/1`：事件级上限（属性数/扩展长度/JSON 深度）。
+3. `broker_event_codec:validate/1`：事件级上限（属性数/扩展长度/JSON 深度），超限返回 `{invalid_event, {limit_exceeded, ...}}`。
 4. `broker_router_hash_store` / `broker_router_hash` / `broker_subscription*`：索引与路由按 `{Tenant, Filter}` 隔离；`<<"*">>` 保留 legacy 通配。
 5. `mqtt_conn_fsm`：CONNECT 认证 → 取租户 → 发布/订阅经 `broker_security:authorize/2`；失败计 `authz_failures`。
 6. 六协议 `*_sup`：listener 改用 `broker_security_tls:transport/0`，启用且缺 PEM 时启动失败。
