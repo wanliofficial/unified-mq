@@ -127,7 +127,8 @@ def render_config(batch, partitions):
     from config/sys.config.src must fail here rather than silently run the
     previous cell's value.
     """
-    text = (ROOT / "config" / "sys.config.src").read_text()
+    text = H.substitute_data_dirs(
+        (ROOT / "config" / "sys.config.src").read_text())
 
     def sub_once(pattern, repl, count=1):
         nonlocal text
@@ -136,8 +137,6 @@ def render_config(batch, partitions):
             raise RuntimeError(f"sys.config render: {pattern!r} matched {n}, "
                                f"expected {count}")
 
-    sub_once(r'\{data_dir,\s*"[^"]*"\}', '{data_dir, "%s"}'
-             % H.DATA_IN_CONTAINER, count=3)
     sub_once(r'"log/s1\.log"', '"%s/log/s1.log"' % H.DATA_IN_CONTAINER)
     # Two independent partition knobs (router and queue) must agree.
     sub_once(r'\{partitions,\s*\d+\}', "{partitions, %d}" % partitions, count=2)

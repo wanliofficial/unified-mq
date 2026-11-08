@@ -124,6 +124,33 @@ def ensure_release():
             f"(set PATH to /home/wanli/Development/otp-28.3.1/bin)")
 
 
+def substitute_data_dirs(text):
+    """Rewrite every `data_dir' to the bind mount, preserving its suffix.
+
+    Five layers own the key (storage, subscription, retain, and the S4 control
+    plane's Mnesia/ra stores). Keeping the relative suffix means ra lands in
+    `DATA_IN_CONTAINER/ra' instead of at the mount root. The count is asserted
+    so a new app cannot silently keep pointing at the dev host.
+    """
+    data_pat = re.compile(r'\{data_dir,\s*"([^"]*)"\}')
+
+    def map_data_dir(match):
+        host = Path(match.group(1))
+        try:
+            rel = host.relative_to(ROOT / "data")
+        except ValueError:
+            raise RuntimeError(
+                f"sys.config render: data_dir {host} is not under {ROOT / 'data'}")
+        target = DATA_IN_CONTAINER if str(rel) == "." else str(
+            Path(DATA_IN_CONTAINER) / rel)
+        return '{data_dir, "%s"}' % target
+
+    text, n = data_pat.subn(map_data_dir, text)
+    if n != 5:
+        raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
+    return text
+
+
 def render_config(tier):
     """Render the shipped sys.config.src into the release's sys.config.
 
@@ -142,24 +169,8 @@ def render_config(tier):
     # Five layers own a `data_dir' key (storage, subscription, retain, and the
     # S4 control plane's Mnesia/ra stores). Rewrite each to the bind mount while
     # keeping its relative suffix, so ra lands in DATA_IN_CONTAINER/ra instead
-    # of at the mount root. Exactly five is asserted so a new app cannot
-    # silently keep pointing at the dev host.
-    data_pat = re.compile(r'\{data_dir,\s*"([^"]*)"\}')
-
-    def map_data_dir(match):
-        host = Path(match.group(1))
-        try:
-            rel = host.relative_to(ROOT / "data")
-        except ValueError:
-            raise RuntimeError(
-                f"sys.config render: data_dir {host} is not under {ROOT / 'data'}")
-        target = DATA_IN_CONTAINER if str(rel) == "." else str(
-            Path(DATA_IN_CONTAINER) / rel)
-        return '{data_dir, "%s"}' % target
-
-    text, n = data_pat.subn(map_data_dir, text)
-    if n != 5:
-        raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
+    # of at the mount root.
+    text = substitute_data_dirs(text)
     if tier == "default":
         sub_once(r'\{cursor_max_regress,\s*\d+\}', "{cursor_max_regress, 64}")
         sub_once(r'\{cursor_flush_interval_ms,\s*\d+\}', "{cursor_flush_interval_ms, 100}")

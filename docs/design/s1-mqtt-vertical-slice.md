@@ -304,6 +304,8 @@ S1 不实现这些语义，但**不得静默**：
 
 **T15 实测批注（2026-11-06，M16）**：拒绝必须是**对端能解析的帧型**。原实现对 v5 CONNECT 回 4 字节的 3.1.1 CONNACK（`20 02 00 87`）；v5 客户端把 CONNACK 读成 `flags|reason|properties-length`，于是 paho-mqtt 2.x 在属性解码器里抛 `IndexError`、mosquitto 报 network protocol error，**原因码根本到不了用户**。现改为 5 字节 v5 帧型 `20 03 00 87 00`（零属性），paho 与 mosquitto 均读到 `0x87`（"Not authorized"）后关闭；3.1.1 的其它所有响应字节不变。原因码仍按本节冻结值 `0x87`——严格按 v5 规范，"不支持的协议版本"是 `0x84`，`0x87` 是"未授权"；MQTT 5 的完整语义属 S2，此处只保证 S1 的拒绝可读。
 
+**后续批注（S2.5，2026-11-08）**：`Protocol Level = 5` 现在被**接受**，本节"v5 一律拒绝/0x87"的 S1 姿态已被 ADR-017 取代。T15 的 `paho-v5-refused`/`mosq-v5-refused` 因此改为 `paho-v5-connect`/`mosq-v5-pubsub`（真实 paho/mosquitto 均连接成功）；v5 的拒绝只剩未知级别 `0x84` 与空 ClientID `0x85`，且都必须是 v5 帧型（`20 03 00 84 00` / `20 03 00 85 00`）。
+
 ---
 
 ## 5. 数据面流程
