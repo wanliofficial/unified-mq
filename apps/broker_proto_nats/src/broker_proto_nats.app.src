@@ -1,0 +1,14 @@
+{application, broker_proto_nats, [
+    {description, "NATS core protocol adapter: PUB/SUB, queue groups, request/reply over the broker's durable log"},
+    {vsn, "0.1.0"},
+    {registered, [broker_proto_nats_sup]},
+    {mod, {broker_proto_nats_app, []}},
+    {applications, [kernel, stdlib, sasl, ranch, broker_core, broker_metrics,
+                    broker_storage, broker_router, broker_queue, broker_subscription,
+                    broker_event, broker_security]},
+    {env, [{%% No listener unless the release config supplies one; CT binds its
+            %% own ephemeral port, exactly like broker_proto_mqtt / broker_proto_ws.
+            listeners, []},
+           {max_payload, 1048576},
+           {shared_poll_ms, 100}]}
+]}.

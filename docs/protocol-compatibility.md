@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|---|
 | MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x / mosquitto 2.1.2 | ✅（**T15 + S2-C**：10/10 用例） | QoS0/1/2、Retain、Will 已实现并实测；MQTT 5.0 语义在 S2.5 补；逐条限制见本文 §4 |
 | WebSocket | 2 | Python `websocket-client`（应用层帧为 Broker 自有 JSON/二进制） | Python | websocket-client 1.7.0 | ✅（**S5-WS：10/10 用例**） | 传输层用 `websocket-client`，应用层帧由 S5 设计，见 §4.5 |
-| NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.37.0 | ✅ | Pub/Sub、Queue Group、Request/Reply |
+| NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth；无 headers/JetStream，见 §4.6 |
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java | proton (qpid) | ✅ | Proton=AMQP 1.0；需 0.9.1 时换 amqp091/pika |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅ | Produce/Fetch/Metadata/Consumer Group |
 | Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅ | README 5.1 硬性要求官方 Java Client |
@@ -306,6 +306,57 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | WS 连接/应用协议（`ws_conn_SUITE`） | 14 例：connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack |
 | 真实第三方客户端（`ws_compat.py`） | 10/10 PASS（见上） |
 | 全量 | `rebar3 ct` **470/470**；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
+
+---
+
+### 4.6 S5 追加（2026-11-09）：NATS 适配器（`broker_proto_nats`）
+
+> **NATS core 复用 MQTT 的存储/路由/订阅路径**——`PUB` 经 `broker_router` → `broker_queue`（fsync）→ `broker_subscription`，`SUB` 是普通订阅行；没有协议专属存储或投递分支。区别只在「文本线协议」与「at-most-once 语义」。
+
+**协议范围（`apps/broker_proto_nats/src/nats_conn.erl` 自实现 core NATS 文本协议）**：
+
+- 服务端先发 `INFO`（`server_id` / `version` / `proto=1` / `max_payload` / `headers=false` / `auth_required`），随后处理 `CONNECT`、`PING`/`PONG`、`PUB`、`SUB`、`UNSUB`，投递 `MSG <subject> <sid> [reply] <#bytes>`。
+- subject 映射：NATS 的 `.` → broker 的 `/`；订阅通配符 `*` → `+`，`>` → `#`。`>` 的父级匹配差异（NATS `foo.>` 不匹配 `foo`，broker `foo/#` 匹配 `foo`）作为转换损失显式记录，不隐藏。
+- Queue group：`SUB <subject> <queue> <sid>` 映射为 `shared` 订阅（`broker_subscription:join(shared, Queue, ...)` + claim/read/ack），同一 group 每条消息恰好投递给一个成员。
+- Request/Reply：`PUB <subject> <reply> <#bytes>` 的 reply subject 存入 `proto_meta`，投递 `MSG` 时原样回显；适配器本身不发明 request/response 语义。
+- `echo=false`：CONNECT 里 `echo=false` 的客户端不会收到自己发布的消息（消息仍持久化并投递给其他订阅者）。
+- `auth_token`：配置后 `CONNECT` 必须携带匹配的 `auth_token`，否则 `-ERR 'Authorization Violation'`。
+- `verbose=true`：`CONNECT` / `SUB` / `PUB` / `UNSUB` 返回 `+OK`（默认 false，测试用 `PING`/`PONG` 同步）。
+
+**能力矩阵行**（追加进 §2 末尾）：
+
+```
+| NATS | 已支持 | core NATS：INFO/CONNECT/PING/PONG、PUB/SUB/UNSUB、MSG 投递、`*`/`>` 通配符、Queue Group（shared）、Request/Reply（reply subject 透传）、echo=false、token 认证、UNSUB max 自动退订 | 无 HPUB/HMSG headers（2.2 扩展）；无 JetStream；core NATS 本就 at-most-once，适配器写完 MSG 立即推进自己的 cursor（broker 仍先 fsync 落盘，强于 NATS core）；`foo.>` 的父级匹配与 NATS 有差异 | apps/broker_proto_nats/test/、test/protocol-compatibility/nats/ |
+```
+
+**已知限制（协议对端可观察，不是内部 TODO）**：
+
+1. **无 headers / JetStream**：`HPUB` / `HMSG` 明确回 `-ERR 'Unknown Protocol Operation'`；不支持 JetStream 的持久化 consumer/stream 语义。v1 只承诺 core NATS。
+2. **at-most-once**：core NATS 没有 ack 握手。适配器在 MSG 写出后立即 `broker_subscription:ack/4` 自己的 cursor；连接在写出后崩溃可能丢这一条（与 NATS core 一致），但 broker 侧消息已 fsync，可被后续订阅/其他成员读取。
+3. **`>` 父级匹配差异**：broker 的 `#` 匹配父级，NATS 的 `>` 不匹配。已作为转换损失记录。
+4. **每连接一个匿名 client_id**：NATS 无持久会话/客户端标识，重连即新 `ClientId`；不支持 MQTT 式 session takeover。
+5. **单 tenant**：沿用 S1 单租户 `t0`；多租户隔离在 S6。
+
+**真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
+
+- 套件在 `test/protocol-compatibility/nats/`，用 **官方 `nats.go` v1.48.0**（S0.4 客户端矩阵指定的 NATS 客户端）驱动一个真实的 `erl -noshell -s nats_broker_boot run` broker 节点（ranch 临时端口、`port=>0`、WAL 后端、ext4 数据目录、token 认证开启，启动路径与 `nats_conn_SUITE init_per_testcase` 一致）。Go 程序只调用 `nats.Connect` / `SubscribeSync` / `QueueSubscribeSync` / `Publish` / `Request` / `Flush`，不手写线协议。
+- **11/11 用例 PASS**（`run/report.json`）：`nats-connect-info`（真实 CONNECT + INFO + PING/PONG）、`nats-pubsub`、`nats-wildcard`（`*` 单 token、`>` 余下）、`nats-queue-group`（两个成员、10 条消息各恰好一次）、`nats-request-reply`、`nats-no-history`（新订阅不回放历史）、`nats-unsubscribe`、`nats-auto-unsubscribe`（`AutoUnsubscribe(1)` 只投一条）、`nats-echo-false`、`nats-ping-flush`（20 个并发 Flush）、`nats-auth-failure`（错误 token 被拒）。
+- 套件默认从干净数据目录起步，避免上一次运行的 WAL 泄漏进 `nats-no-history`。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| NATS 线协议/连接（`nats_conn_SUITE`） | 15 例：INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK` |
+| 真实第三方客户端（`nats_compat.py` + `nats.go`） | 11/11 PASS（见上） |
+| 全量 | `rebar3 ct` **485/485**（470 + 15）；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
+
+**实现期修复**（测试暴露的真实缺陷，已修）：
+
+1. **空 queue 被当成 shared**：`SUB subject  sid`（或 queue 字段为空）被解析成 `Queue = <<>>`，`open_subscription/4` 走了 `join(shared, <<>>, ...)` 分支；shared 的 claim/read 直接按分区读，不做 subject 过滤，于是 `compat/+/leaf` 收到了 `compat/one/two/leaf`。修法：`do_sub(Subject, <<>>, Sid, St)` 归一化为 `undefined`（exclusive）。
+2. **`send_raw/2` 返回值**：此前返回 `ok`，`handle_line(PING)` 返回 `{noreply, ok}`，下一轮 `parse/2` 对 `ok` 做记录匹配 ⇒ `{badrecord,ok}`。改为返回更新后的 `#st{}`。
+3. **`translate_filter` 兜底**：把普通 token 的兜底子句从 `{error, invalid_subject}` 改为继续累积，避免所有非通配 subject 被拒绝。
+4. **测试侧丢消息**：`queue_group_delivers_once` 的 `recv_msg_any2` 同时填两个 socket 的缓冲，却只回传被取消息的那个连接，另一个已读字节被丢弃；改为返回两个更新后的连接。这是测试 harness 缺陷，不是适配器缺陷（服务端日志证明 10 条全部投递）。
 
 ---
 

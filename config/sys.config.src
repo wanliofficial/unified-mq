@@ -175,6 +175,20 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_nats, [
+    %% S5 NATS core adapter. 4222 is frequently taken by a local nats-server;
+    %% the release default therefore uses 4223. CT binds its own ephemeral
+    %% port. `auth_token' is unset here: set it to require CONNECT auth.
+    {listeners, [
+      #{port => 4223,
+        ref => {nats, 4223},
+        num_acceptors => 10,
+        max_connections => 1024}
+    ]},
+    {max_payload, 1048576},
+    {shared_poll_ms, 100}
+  ]},
+
   {broker_retain, [
     %% J8: same absolute path as broker_storage/broker_subscription -- the
     %% retained snapshot must live beside the sessions it serves.

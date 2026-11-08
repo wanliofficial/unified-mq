@@ -58,5 +58,11 @@ spikes/*/.data/
 /test/protocol-compatibility/ws/_build/
 /test/protocol-compatibility/ws/__pycache__/
 
+# S5 NATS harness scratch: broker data volume, Go binary, boot-module beam, reports
+/test/protocol-compatibility/nats/data/
+/test/protocol-compatibility/nats/run/
+/test/protocol-compatibility/nats/_build/
+/test/protocol-compatibility/nats/__pycache__/
+
 # CLI tool state (not project content)
 /.qoder/
