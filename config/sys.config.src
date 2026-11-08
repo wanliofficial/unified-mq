@@ -175,6 +175,17 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_kafka, [
+    %% S5 Kafka adapter. 9092 is the standard port; 9093 avoids a local
+    %% Kafka. CT binds its own ephemeral port.
+    {listeners, [
+      #{port => 9093,
+        ref => {kafka, 9093},
+        num_acceptors => 10,
+        max_connections => 1024}
+    ]}
+  ]},
+
   {broker_proto_amqp, [
     %% S5 AMQP 0-9-1 adapter. 5672 is the standard port; 5673 avoids a local
     %% RabbitMQ. CT binds its own ephemeral port.

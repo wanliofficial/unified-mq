@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v0.8（S4 集群与一致性：ACK 等级、复制与 Fencing）
-- **最近一次追加**：2026-11-08，§4.4「S4 追加」——`replicated_commit` 的多数派 ACK、Fencing、失去多数派时的协议表现。§4/§4.1/§4.2/§4.3 原文保留为当时事实
+- **文档版本**：v0.9（S5 协议扩展：WebSocket、NATS、AMQP、Kafka）
+- **最近一次追加**：2026-11-09，§4.8「S5 追加」——Kafka 适配器的范围、限制与真实 `kafka-clients` 证据。§4/§4.1~§4.7 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -18,7 +18,7 @@
 | WebSocket | 2 | Python `websocket-client`（应用层帧为 Broker 自有 JSON/二进制） | Python | websocket-client 1.7.0 | ✅（**S5-WS：10/10 用例**） | 传输层用 `websocket-client`，应用层帧由 S5 设计，见 §4.5 |
 | NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth；无 headers/JetStream，见 §4.6 |
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack；见 §4.7 |
-| Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅ | Produce/Fetch/Metadata/Consumer Group |
+| Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅（**S5-Kafka：12/12 用例**） | Produce/Fetch/Metadata/ListOffsets、经典消费组、OffsetCommit/Fetch、RecordBatch v2；单节点协调器、offset 内存态、无压缩/事务/Admin API，见 §4.8 |
 | Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅ | README 5.1 硬性要求官方 Java Client |
 
 ---
@@ -411,6 +411,62 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 5. **`connection.close` 解析**：`binary_part` 结果被当成二元组匹配，删除无用解析，直接回 `close-ok`。
 6. **共享订阅跨队列串扰**：同一分区里不同 destination 的消息会被另一个 shared group 的游标扫到，导致 `ct.rr.miss` 收到本该只投给 `ct.rr.hit` 的消息、多通道互相串消息。修法：AMQP/NATS 适配器在 claim 后按 `Msg#broker_message.destination` 过滤，非本队列/本 subject 的 offset 直接 ack（跳过），不投递。MQTT 的 shared 路径本就用 `mqtt_filter:matches/2` 过滤，无需改动。
 7. **`basic.qos` prefetch 未逐条生效**：一次 claim 最多 32 条，fold 内不检查 prefetch，prefetch=1 仍会一次投多条；改为按 `prefetch - 未 ack 投递数` 作为 claim 上限。
+
+---
+
+### 4.8 S5 追加（2026-11-09）：Kafka 适配器（`broker_proto_kafka`）
+
+> **Kafka 复用 MQTT 的存储/路由路径**——Produce 经 `broker_queue:append/3` 写入分区日志（fsync），同一 destination 的其它协议订阅者由 `broker_subscription` 唤醒；没有 Kafka 专属存储。反过来，MQTT/AMQP/NATS 发到 `kafka/<topic>` 的消息也能被 Kafka 消费者读到。
+
+**协议范围（`apps/broker_proto_kafka/src/` 自实现 Kafka 线协议子集）**：
+
+- 每个 API 只广告**一个精确的非 flexible 版本**（`ApiVersions` 除外）：Produce 8、Fetch 11、ListOffsets 5、Metadata 8、OffsetCommit 7、**OffsetFetch 5**、FindCoordinator 2、JoinGroup 5、Heartbeat 3、LeaveGroup 3、SyncGroup 3、InitProducerId 0、ApiVersions 0–3。
+- **topic 模型**：Kafka topic `t` 映射 destination `kafka/t`；Kafka 分区数 = `broker_queue` 分区数（`partitions` 配置）。Produce(p) 追加到 broker 分区 p，Fetch(p) 读 broker 分区 p 并按 destination 过滤。Metadata 对任意 topic 自动回全量分区（`auto.create.topics` 无需真实建 topic）。
+- **offset 语义**：broker 分区被多个 topic 共享，因此 Kafka offset 是「该 topic 在该分区内的记录序号」（从 0 起）。Produce 返回 `base_offset`，Fetch/ListOffsets 用同一换算；消费组提交的 offset 也是这个值。
+- **记录**：RecordBatch v2（magic=2、CRC32C 覆盖 attributes 起至 batch 末尾）、单条/多条 record、key、value、headers、timestamp；未压缩（attributes 压缩位非 0 时回 `unsupported_compression`）。
+- **消费组**（`kafka_group`）：FindCoordinator 指向本节点；JoinGroup 用 barrier 完成 rebalance（rebalance_timeout 兜底），SyncGroup 下发 leader 的分配，Heartbeat 维持成员，LeaveGroup 移除成员；offset 由客户端提交（`OffsetCommit`/`OffsetFetch`），不做服务端自动提交。
+- **幂等生产**：InitProducerId 返回固定 producer id/epoch，`acks=all` 的 Produce 正常应答；不做真正的幂等去重（见限制）。
+
+**能力矩阵行**（追加进 §2 末尾）：
+
+```
+| Kafka | 部分支持 | Produce/Fetch/Metadata/ListOffsets、经典消费组（FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup）、OffsetCommit/OffsetFetch、RecordBatch v2（key/value/headers/timestamp）、多分区 | 单节点协调器、offset 内存态（重启丢）、无 `__consumer_offsets`、无事务/幂等去重、无压缩、无 Admin API（CreateTopics/DeleteTopics 等）、无 SASL/TLS、单租户 `t0` | apps/broker_proto_kafka/test/、test/protocol-compatibility/kafka/ |
+```
+
+**已知限制（协议对端可观察，不是内部 TODO）**：
+
+1. **offset 是扫描换算，O(n)**：每次 Produce/Fetch/ListOffsets 都要数该 topic 在分区内的记录数；v1 以正确性优先，未做 offset 索引。
+2. **并发 Produce 未串行化**：同一 topic-partition 的并发生产可能得到重复/交错的 base_offset；单连接顺序生产正确。
+3. **消费组 offset 内存态**：`kafka_group` 的 committed offsets 在 broker 重启后清空；无 `__consumer_offsets` 主题，多节点不共享协调器。
+4. **无事务/幂等去重**：InitProducerId 返回固定值，`enable.idempotence=true` 的客户端可连接，但重复批次不会被服务端去重。
+5. **无压缩**：客户端若配置 `compression.type` 非 none，Produce 解码返回错误；官方客户端默认 none，故 12 例实测通过。
+6. **无 Admin API / SASL / TLS**：topic 自动可见但不可创建/删除；认证与传输安全留到 S6。
+
+**真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
+
+- 套件在 `test/protocol-compatibility/kafka/`，用 **Apache `kafka-clients` 3.7.1**（S0.4 客户端矩阵指定的 Kafka 客户端，Java 17、离线 `~/.m2` 依赖）驱动真实的 `erl -noshell -s kafka_broker_boot run` broker 节点（ranch 临时端口、`port=>0`、WAL 后端、ext4 数据目录）。Java 程序只用 `KafkaProducer` / `KafkaConsumer` / `AdminClient` 的公开 API，不手写线协议。
+- **12/12 用例 PASS**（`run/report.json`）：`kafka-metadata`、`kafka-produce-consume`、`kafka-batch-order`（20 条顺序）、`kafka-explicit-partition`、`kafka-key-roundtrip`、`kafka-headers`、`kafka-timestamp`、`kafka-acks-all-idempotent`、`kafka-beginning-end-offsets`、`kafka-consumer-group`（两消费者、6 条各恰好一次、2 分区）、`kafka-offset-commit`（提交 3、重启消费从 c3 继续）、`kafka-seek-replay`（seek 回放 3 条）。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| Kafka 原语/RecordBatch（`kafka_codec_SUITE`） | 11 例：uvarint/varint/varlong、string/bytes/array、compact 值、CRC32C 已知向量、批次往返、多记录偏移、headers/timestamp、CRC 篡改检测、截断批次、空批次 |
+| Kafka 连接/协议（`kafka_conn_SUITE`） | 14 例：ApiVersions v0/v3、Metadata、Produce→Fetch、topic 相对 offset、批次连续 offset、ListOffsets earliest/latest、空 topic、非法分区、FindCoordinator、Join/Sync/Heartbeat、OffsetCommit/Fetch、LeaveGroup、correlation id 回显 |
+| 真实第三方客户端（`kafka_compat.py` + `kafka-clients` 3.7.1） | 12/12 PASS（见上） |
+
+**实现期修复**（测试暴露的真实缺陷，已修）：
+
+1. **RecordBatch CRC 范围**：CRC32C 原先从 `leaderEpoch` 起算，官方客户端按「attributes 起至 batch 末尾」校验；编码/解码两端统一为 attributes 起。
+2. **`decode_record_batches` 返回值**：改为 `{ok, Batches, Tail}` 以支持一个 Fetch 响应里的多个批次；空/`undefined` 仍回 `{ok, []}`。
+3. **JoinGroup v5 的 `protocolName`**：错误路径（`MEMBER_ID_REQUIRED`）也必须写非 nullable 字符串，否则客户端解析崩溃。
+4. **单成员组 barrier 永不完成**：`begin_rebalance` 会把「刚加入的成员」也标成 `joined => false`；改为先启动 rebalance、再把调用者标 `joined => true`，并且先登记 waiter 再判 barrier。
+5. **Heartbeat 的 `maps:find` 解构**：`{maps:find(...), Generation}` 里第一元素是 `{ok, Member}`，原模式 `{ok, M}` 永远不匹配，成员心跳触发 `case_clause`；改为 `{{ok, M}, _}` / `{{ok, _}, G}`。
+6. **OffsetFetch 版本**：v7 是 flexible 编码，原实现按非 flexible 解码，客户端请求直接让连接进程 `badmatch`；广告版本降为 v5。
+7. **ApiVersions 请求头**：v3 的 header 编码与其它 API 不同，强行解析 body 会崩溃；改为不解析 body，并按请求版本 v0/v1-2/v3 分别编码响应。
+8. **Metadata 三元组**：topic 项为 `{Name, Partitions, Error}`，FT 里按二元组匹配导致 `badmatch`。
+9. **Fetch 分区项**：v11 在 `high_watermark` 后还有 `last_stable_offset`、`log_start_offset`、aborted transactions、preferred read replica，再才是 records；补读这些字段。
+10. **ListOffsets 分区项**：v5 的响应在 `offset` 后还有 `leader_epoch`，漏读会把后续字段错位。
 
 ---
 
