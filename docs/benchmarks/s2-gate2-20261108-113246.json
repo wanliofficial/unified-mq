@@ -1,0 +1,26 @@
+{
+  "generated_at": "2026-11-08T11:32:46.819029+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "memory": "MemTotal:       15699532 kB",
+    "kernel": "6.18.48-amd64-desktop-rolling",
+    "filesystem": "/dev/nvme0n1p5 ext4 418547984 353598988 43614504   90% /home",
+    "otp": "28/16.2"
+  },
+  "scenarios": [
+    {
+      "scenario": "slow_consumer",
+      "published": 20000,
+      "elapsed_s": 24.02,
+      "broker_alive": true,
+      "delivered_to_slow_consumer": 0,
+      "baseline_mb": 147.0,
+      "peak_mb": 184.1,
+      "growth_mb": 37.1,
+      "samples": 38,
+      "pass": true
+    }
+  ],
+  "command": "tools/bench/s2_gate2.py --scenario slow_consumer --skip-build"
+}

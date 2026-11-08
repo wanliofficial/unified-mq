@@ -240,12 +240,14 @@
 - **不做**：request/response、topic alias（留 S5）。
 - **测试**：与 paho-mqtt 5 客户端的真实交互（T15 升级为双版本）、properties 往返、非法 properties 断开。
 
-### 4.9 S2-I 基准与 Gate 报告
+### 4.9 S2-I 基准与 Gate 报告（**已完成，2026-11-08**）
 
-- **工具**：`tools/bench/`（Erlang 驱动 + paho/mosquitto 对照），复用 S0.3 的 fsync/batch 口径。
-- **矩阵**：消息大小 {64B, 1KB, 64KB, 1MB} × batch {1,32,256} × 分区 {1,4,16} × 订阅数 {1,10,100}；吞吐、p50/p99/p999、恢复时间。
-- **报告**：`docs/benchmarks/YYYY-MM-DD-s2-baseline.md`，含机器规格、commit、复跑命令。
-- **Gate 4 检查**：四条 §7.2 约束逐条给"反证测试 + 数字"。
+- **工具**：`tools/bench/s2_bench.py`（四维矩阵 + 连接数扫描 + 恢复时间）、`tools/bench/s2_gate2.py`（慢消费者 / 热点分区 / 连接风暴，cgroup RSS 采样）。两者都跑真实 release（容器 + 宿主 ext4 bind mount），原始 JSON 与报告同目录。
+- **矩阵**：消息大小 {64B, 1KB, 64KB, 1MB} × batch {1,32,256} × 分区 {1,4,16} × 订阅数 {1,10,100}；`quick` 每个维度扫一次，`--full` 跑完整 108 格。
+- **报告**：[`docs/benchmarks/2026-11-08-s2-baseline.md`](../benchmarks/2026-11-08-s2-baseline.md)，含机器规格、commit、复跑命令、吞吐 / p50/p99/p999、恢复时间、三组 RSS 曲线。
+- **关键数字**：1 KiB 8 连接 935 msg/s（1 → 8 连接 4.4x，组提交生效）；100 订阅 25 740 投递/s；1 MiB 10.2 msg/s（≈10 MiB/s 持久化写速）；`kill -9` 恢复 4.14 s；慢消费者 +37 MiB、热点分区冷路径 14 ms、300 连接 +0.4 MiB，均未 OOM。
+- **Gate 4 检查**：README §7.2 四条逐条给"代码事实 + 数字"，见报告 §5。
+- **仍缺**：Gate S2 第 1 项的 `dm-flakey` 实机报告需要 root，保持未勾选。
 
 ---
 

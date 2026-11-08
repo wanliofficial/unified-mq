@@ -1,0 +1,26 @@
+{
+  "generated_at": "2026-11-08T11:33:53.538925+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "memory": "MemTotal:       15699532 kB",
+    "kernel": "6.18.48-amd64-desktop-rolling",
+    "filesystem": "/dev/nvme0n1p5 ext4 418547984 353599008 43614484   90% /home",
+    "otp": "28/16.2"
+  },
+  "scenarios": [
+    {
+      "scenario": "connection_storm",
+      "attempted": 300,
+      "connected": 300,
+      "elapsed_s": 1.44,
+      "broker_alive": true,
+      "baseline_mb": 147.3,
+      "peak_mb": 147.7,
+      "growth_mb": 0.4,
+      "samples": 4,
+      "pass": true
+    }
+  ],
+  "command": "tools/bench/s2_gate2.py --scenario connection_storm --skip-build"
+}

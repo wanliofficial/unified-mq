@@ -1,0 +1,203 @@
+{
+  "generated_at": "2026-11-08T11:29:02.167960+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "memory": "MemTotal:       15699532 kB",
+    "kernel": "6.18.48-amd64-desktop-rolling",
+    "filesystem": "/dev/nvme0n1p5 ext4 418547984 353703512 43509980   90% /home",
+    "otp": "28/16.2"
+  },
+  "matrix": "quick",
+  "cells": [
+    {
+      "size_bytes": 64,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 4.749,
+      "throughput_msg_s": 842.4,
+      "latency_ms": {
+        "p50": 22.82,
+        "p99": 61.41,
+        "p999": 74.63,
+        "max": 74.63
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 4.279,
+      "throughput_msg_s": 934.9,
+      "latency_ms": {
+        "p50": 20.43,
+        "p99": 77.63,
+        "p999": 93.97,
+        "max": 93.97
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 65536,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 400,
+      "elapsed_s": 0.709,
+      "throughput_msg_s": 564.3,
+      "latency_ms": {
+        "p50": 135.2,
+        "p99": 357.53,
+        "p999": 384.65,
+        "max": 384.65
+      },
+      "delivered": 100
+    },
+    {
+      "size_bytes": 1048576,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 100,
+      "elapsed_s": 9.78,
+      "throughput_msg_s": 10.2,
+      "latency_ms": {
+        "p50": 2862.72,
+        "p99": 5120.88,
+        "p999": 5120.88,
+        "max": 5120.88
+      },
+      "delivered": 20
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 1,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 5.011,
+      "throughput_msg_s": 798.3,
+      "latency_ms": {
+        "p50": 32.71,
+        "p99": 98.3,
+        "p999": 105.67,
+        "max": 105.67
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 256,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 5.132,
+      "throughput_msg_s": 779.4,
+      "latency_ms": {
+        "p50": 26.98,
+        "p99": 88.14,
+        "p999": 110.65,
+        "max": 110.65
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 1,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 4.574,
+      "throughput_msg_s": 874.5,
+      "latency_ms": {
+        "p50": 13.51,
+        "p99": 48.52,
+        "p999": 64.17,
+        "max": 64.17
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 16,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 3.788,
+      "throughput_msg_s": 1056.0,
+      "latency_ms": {
+        "p50": 81.03,
+        "p99": 235.13,
+        "p999": 254.97,
+        "max": 254.97
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 10,
+      "publishers": 8,
+      "messages": 500,
+      "elapsed_s": 0.912,
+      "throughput_msg_s": 548.3,
+      "latency_ms": {
+        "p50": 195.91,
+        "p99": 467.32,
+        "p999": 480.03,
+        "max": 480.03
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 100,
+      "publishers": 8,
+      "messages": 200,
+      "elapsed_s": 0.777,
+      "throughput_msg_s": 257.4,
+      "latency_ms": {
+        "p50": 4006.17,
+        "p99": 8605.66,
+        "p999": 8611.56,
+        "max": 8611.56
+      },
+      "delivered": 100
+    }
+  ],
+  "recovery": {
+    "size_bytes": 1024,
+    "batch": 32,
+    "partitions": 4,
+    "subscriptions": 1,
+    "publishers": 8,
+    "messages": 4000,
+    "elapsed_s": 4.177,
+    "throughput_msg_s": 957.5,
+    "latency_ms": {
+      "p50": 23.96,
+      "p99": 74.47,
+      "p999": 79.34,
+      "max": 79.34
+    },
+    "delivered": 300,
+    "recovery_s": 4.141
+  },
+  "command": "tools/bench/s2_bench.py --skip-build"
+}

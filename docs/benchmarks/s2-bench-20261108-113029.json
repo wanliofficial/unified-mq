@@ -1,0 +1,84 @@
+{
+  "generated_at": "2026-11-08T11:30:29.015218+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "memory": "MemTotal:       15699532 kB",
+    "kernel": "6.18.48-amd64-desktop-rolling",
+    "filesystem": "/dev/nvme0n1p5 ext4 418547984 353598124 43615368   90% /home",
+    "otp": "28/16.2"
+  },
+  "matrix": "publisher-sweep",
+  "cells": [
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 1,
+      "messages": 4000,
+      "elapsed_s": 20.632,
+      "throughput_msg_s": 193.9,
+      "latency_ms": {
+        "p50": 57.26,
+        "p99": 98.38,
+        "p999": 101.67,
+        "max": 101.67
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 4,
+      "messages": 4000,
+      "elapsed_s": 5.2,
+      "throughput_msg_s": 769.3,
+      "latency_ms": {
+        "p50": 56.96,
+        "p99": 103.19,
+        "p999": 109.54,
+        "max": 109.54
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 4.647,
+      "throughput_msg_s": 860.8,
+      "latency_ms": {
+        "p50": 63.46,
+        "p99": 176.36,
+        "p999": 198.1,
+        "max": 198.1
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 16,
+      "messages": 4000,
+      "elapsed_s": 6.724,
+      "throughput_msg_s": 594.9,
+      "latency_ms": {
+        "p50": 53.94,
+        "p99": 137.41,
+        "p999": 150.4,
+        "max": 150.4
+      },
+      "delivered": 300
+    }
+  ],
+  "recovery": null,
+  "command": "tools/bench/s2_bench.py --skip-build --publisher-sweep"
+}

@@ -44,6 +44,9 @@ spikes/*/.data/
 # S2-B surrogate scratch
 /tools/fault/__pycache__/
 
+# S2-I benchmark driver scratch
+/tools/bench/__pycache__/
+
 # T15 harness scratch: broker data volume, captures, reports, analyzer beam
 /test/protocol-compatibility/mqtt/data/
 /test/protocol-compatibility/mqtt/run/
