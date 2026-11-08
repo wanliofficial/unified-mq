@@ -197,6 +197,8 @@ Client ──PUBLISH(qos=1, pid=P, topic=T)──► mqtt_conn_fsm
    ② 构造 #broker_message{reliability=fsync,
                           proto_meta=#{qos=>1, packet_id=>P, retain=>0},
                           tenant_id=Principal 的 tenant}
+      S2.5：MQTT 5 PUBLISH properties 只进 proto_meta（ADR-017 §17.2），
+      headers 仍是空 map；3.1.1 的 proto_meta 形状完全不变。
    ③ broker_router:env/0 → broker_router_hash:route(T, Ctx, Env)
         → [{PartitionId, [SubRef...]}]        ← 调用者进程内查 ETS
         （`route/3` 是 ADR-010 的唯一分区判据；即使无人订阅也返回
@@ -215,6 +217,19 @@ Client ──PUBLISH(qos=1, pid=P, topic=T)──► mqtt_conn_fsm
 - **⑥ 失败不回滚 ⑤**。下游抖动不撤销生产者已获得的承诺；恢复靠订阅层 cursor 追赶与重投。
 
 `broker_queue:append/3` **不经过** `broker_queue_partition`。真正的串行化点是每分区唯一的 `wal_writer`；若在中间加一次 `gen_server:call`，每批会退化成 1 条，group commit 的 17× 收益归零（设计文档 §5.1 T6 批注，`broker_queue_SUITE` 用挂起 worker 与 writer 计数器两例锁死）。
+
+### 5.1.1 MQTT 5 properties → proto_meta（S2.5）
+
+| MQTT 5 property | `proto_meta` key | 备注 |
+|---|---|---|
+| User Property | `mqtt_user_properties` | `[{K, V}]`，重复键保序累积 |
+| Payload Format Indicator | `mqtt_payload_format` | `0`/`1` |
+| Content Type | `mqtt_content_type` | UTF-8 binary |
+| Response Topic | `mqtt_response_topic` | UTF-8 binary（不做请求/响应语义） |
+| Correlation Data | `mqtt_correlation_data` | binary |
+| Message Expiry Interval | 不单独存键 | 与 `message_ttl_ms` 合流成 `expires_at` 的绝对期限，出站按剩余秒数回填 |
+
+出站 PUBLISH 从同一组键重建 properties；3.1.1 编码路径不读这些字段，因此线上字节不变。
 
 ### 5.2 Subscribe 与投递
 

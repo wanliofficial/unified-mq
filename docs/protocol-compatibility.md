@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v0.5（T17 冻结契约签认）
-- **最近一次追加**：2026-11-07，§4「S2-C 追加」——QoS2（双向四步）、Retain、Will 从「拒绝」变为「实现」，并重跑真实客户端套件（10/10）；§4 原文保留为 S1 当时事实，S2 改动集中在 §4.1 与逐条限制 1/5 的修订行
+- **文档版本**：v0.6（S2.5 MQTT 5 子集实现）
+- **最近一次追加**：2026-11-08，§4.2「S2.5 追加」——MQTT 5.0 CONNECT/PUBLISH/SUBSCRIBE properties、v5 reason codes、session expiry、`$share` 语法；MQTT 行拆为 3.1.1 / 5.0 两行。§4/§4.1 原文保留为 S1/S2-C 当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -84,12 +84,13 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 | 协议 | 状态 | 已支持 | 已知限制 / 转换损失 | 证据 |
 |---|---|---|---|---|
-| MQTT 3.1.1 | **QoS0/1/2 + Retain + Will**（S1 垂直切片 + S2-C 补齐） | CONNECT/CONNACK、PUBLISH QoS0+QoS1+**QoS2**、PUBACK、**PUBREC/PUBREL/PUBCOMP**、SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK、PINGREQ/PINGRESP、DISCONNECT；topic filter 通配符 `+`/`#`（Annex A 校验）；`clean_session` 两半；`keep_alive`（服务端 clamp）；per-session 订阅集合 + cursor + in-flight 跨连接持久化（R1b/R3/R7）；**retained 树持久化 + 订阅补发 + 零长度清除**；**Will 异常发布**；`mqtt_max_qos` 按后端 capability 派生（E2/E12）；`kill -9` 后恢复行为符合 R1a/R1b/R2~R8（T14，默认档/零回退档双档）；真实 paho 2.x + mosquitto 2.1.2 全链路与逐帧字节一致（T15，10/10） | 见下方 7 条（第 1、5 条已按 S2-C 修订） | `apps/broker_proto_mqtt/test/`、`apps/broker_retain/test/`、`apps/broker_security/test/`、`test/integration/s1_e2e_SUITE.erl`、`test/protocol-compatibility/mqtt/`、`tools/docker/s1_recovery.py` |
+| MQTT 3.1.1 | **QoS0/1/2 + Retain + Will**（S1 垂直切片 + S2-C 补齐） | CONNECT/CONNACK、PUBLISH QoS0+QoS1+**QoS2**、PUBACK、**PUBREC/PUBREL/PUBCOMP**、SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK、PINGREQ/PINGRESP、DISCONNECT；topic filter 通配符 `+`/`#`（Annex A 校验）；`clean_session` 两半；`keep_alive`（服务端 clamp）；per-session 订阅集合 + cursor + in-flight 跨连接持久化（R1b/R3/R7）；**retained 树持久化 + 订阅补发 + 零长度清除**；**Will 异常发布**；`mqtt_max_qos` 按后端 capability 派生（E2/E12）；`kill -9` 后恢复行为符合 R1a/R1b/R2~R8（T14，默认档/零回退档双档）；真实 paho 2.x + mosquitto 2.1.2 全链路与逐帧字节一致（T15，10/10） | 见下方 7 条（第 1、5 条已按 S2-C 修订，第 2 条按 S2.5 修订） | `apps/broker_proto_mqtt/test/`、`apps/broker_retain/test/`、`apps/broker_security/test/`、`test/integration/s1_e2e_SUITE.erl`、`test/protocol-compatibility/mqtt/`、`tools/docker/s1_recovery.py` |
+| MQTT 5.0（子集） | **S2.5 已实现**（ADR-017） | CONNECT properties（session expiry、receive maximum、maximum packet size、user properties、will delay 存储）、PUBLISH properties（payload format、message expiry、content type、response topic、correlation data、user properties）、SUBSCRIBE subscription identifier、v5 CONNACK/PUBACK/PUBREC/PUBREL/PUBCOMP/SUBACK/UNSUBACK/DISCONNECT reason codes、session expiry 落盘与 boot 清理、`$share/{group}/{filter}` 复用 Shared 投递、CONNECT `Maximum Packet Size` 出站丢弃 | 不实现 topic alias、request/response、AUTH 扩展认证、server-side 属性回填；QoS2 仍**不是 exactly-once**（跨崩溃至少一次）；`$share` 只做语法与建组，不实现 v5 的 subscription identifier 透传到投递帧 | `apps/broker_proto_mqtt/test/mqtt_frame_SUITE.erl`（31 例）、`mqtt_conn_SUITE.erl`（v5 用例）、`docs/adr/017-mqtt5-properties-and-compat.md` |
 
 **逐条限制（协议对端可观察的行为，不是内部 TODO）**：
 
 1. ~~QoS2 / Retain / Will 一律不实现~~ → **S2-C 已实现**（详见 §4.1）。仍然非静默的只有**超限**：超过 `mqtt_max_qos` 的 PUBLISH（含 `mqtt_max_qos=1` 时的 QoS2）⇒ **直接断连、不发任何 ack**；SUBSCRIBE 里任一 topic 请求的 QoS 超限 ⇒ SUBACK 对应返回 `0x80` 且不建订阅（其余 topic 不受影响）；QoS2 状态超过 `max_qos2_state_per_session` ⇒ 断连并计 `qos2_state_overflow`；retain 树超过上限 ⇒ 不写入但消息正常转发（计数 `retain_overflow`）。
-2. **MQTT 5.0 的拒绝是可读的 v5 帧型，但原因码仍取设计冻结值 `0x87`**（设计 §4.5 + §13 M16/L12）：`Protocol Level = 5` 的 CONNECT 被拒绝时，broker 回 **`20 03 00 87 00`**（v5 CONNACK：flags=0、reason=0x87、零属性）后关闭。paho 2.x 与 mosquitto 2.1.2 都把它读成 **135 = 0x87（"Not authorized"）**——原先的 3.1.1 帧型 `20 02 00 87` 会让两个客户端在属性解码阶段报错（M16，已修）。注意 v5 规范里"不支持的协议版本"是 `0x84`，`0x87` 是"未授权"；S1 按冻结设计保留 `0x87`，MQTT 5 的完整语义属 S2.5（ADR-017）。对 3.1.1 客户端，`0x87` 仍是 3.1.1 的保留返回码，严格实现可能视为畸形字节（L12）。
+2. **MQTT 5.0 已接受（S2.5）**：`Protocol Level = 5` 的 CONNECT 正常解析并回 5 字节 v5 CONNACK（`20 03 00 00 00` 形状）。只有 **>= 5 且本实现不认识的级别**才拒绝，回 **`20 03 00 84 00`**（v5 CONNACK：flags=0、reason=`0x84` Unsupported Protocol Version、零属性）；3.1.1 及更旧的级别仍回 3.1.1 帧型 `20 02 00 01`。旧 T15 的 `paho-v5-refused`/`mosq-v5-refused` 断言（`0x87`）已作废，改由 S2.5 的 v5 连接用例覆盖。
 3. **非法 topic filter 的 SUBSCRIBE 是断连，不是 `0x80`**（§13 L13）：filter 在帧解码阶段就校验（Annex A / §4.7 形状），因此整个 SUBSCRIBE 包属于畸形包 ⇒ 关连接、**无 SUBACK**。`0x80` 只覆盖"请求 QoS 超过有效上限"。客户端若指望逐 topic 部分成功，需要自己保证 filter 合法。
 4. **离线追赶没有优先级、没有独立队列**（设计 §5.2 E7）：重连后从 cursor 顺序读，追赶期间新到的消息与积压消息**按 offset 混在同一序列**投递；积压极深时首条消息延迟随深度线性增长（单连接顺序读）。段文件在 S1 不删，所以"理论全量可追"，但追赶深度上限要等 S2 的 retention 策略才有明确契约。
 5. **at-least-once 的两个形状**（§13 L8 + §5.3 + ADR-018 §18.3）：(a) 一条连接对同一个未确认的消息**只投一次**，没有重试定时器——重发只发生在**重连**（blob 恢复项按 **同一 packet_id + DUP=1** 投一次；QoS2 已 `PUBREC` 的那些改发 `PUBREL`）；(b) `.inflight` 默认攒批刷盘（`inflight_flush_interval_ms`，默认 100 ms），崩溃后 blob 回退可能让**不同消息复用同一 packet_id**（按 id 去重的客户端会误判）。`inflight_flush_interval_ms = 0` 是已实现的零回退档；T14 已按默认档 / 零回退档各跑一轮，两档都不丢消息（R7/R8），默认档允许重发、零回退档把回退窗口压到最小。
@@ -138,6 +139,37 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | retain app（`broker_retain_SUITE`） | 17 例：可见性、覆盖、清除、排序、同步/异步落盘、三个上限、损坏文件 |
 | 崩溃（T14 R8） | QoS2 收 `PUBREC` 后 `kill -9`；重启后客户端重发 `PUBREL`，broker 幂等回 `PUBCOMP`；消息至少投递一次、cursor 最终推进。**默认档与零回退档都 PASS** |
 | 真实客户端（T15） | `paho-qos2`（双向四步 + 字节一致）、`paho-retain`（补发 retain=1 / 转发 retain=0 / 空 payload 清除）、`paho-will`（异常断连发布）、`paho-will-skipped`（DISCONNECT 抑制）、`mosq-qos2`（mosquitto 2.1.2 双向） |
+
+---
+
+### 4.2 S2.5 追加（2026-11-08）：MQTT 5.0 子集
+
+> 范围冻结在 [ADR-017](adr/017-mqtt5-properties-and-compat.md) §17.1；未实现的项（topic alias、request-response、AUTH）不在本子集，继续留 S5。
+
+**帧层（`mqtt_frame`）**
+
+- `decode/2` / `encode/2` 接受 `4 | 5`；`decode/1` / `encode/1` 保持 3.1.1 语义，3.1.1 路径从不读取 properties 长度。
+- v5 CONNECT/PUBLISH/SUBSCRIBE/UNSUBSCRIBE/PUBACK/PUBREC/PUBREL/PUBCOMP/SUBACK/UNSUBACK/DISCONNECT 解析与编码；CONNACK 带属性长度。
+- properties：变长整数长度前缀；未知 id 与重复单值 id **拒绝**；`user_properties` 累积保序。
+- 3.1.1 出站字节不变：`encode(F)` 与 `encode(F, 4)` 逐字节相等（`mqtt_frame_SUITE:v5_311_outbound_bytes_unchanged`）。
+
+**连接层（`mqtt_conn_fsm`）**
+
+- CONNECT properties：`session_expiry_interval`、`receive_maximum`、`maximum_packet_size`、`user_properties`；level 5 的出站帧全部走 `encode/2,5`。
+- `receive_maximum` 收窄出站窗口：`inflight_limit = min(max_inflight, ReceiveMaximum)`；3.1.1 的默认 65535 使该 min 无效。
+- `maximum_packet_size`（服务端配置 `mqtt_max_packet_size`，默认 0=关闭）：入站整帧超限 **断开且不 ack**（`mqtt_packet_too_large`）；出站 PUBLISH 超过客户端上限 **丢弃并计数**（`mqtt_publish_dropped_oversize`），重投递路径仍持有该消息。
+- properties → `proto_meta`（§5.1.1）；`message_expiry_interval` 与 `message_ttl_ms` 取更早的绝对期限，出站按剩余秒数回填。
+- reason code：v5 PUBACK 无匹配订阅回 `0x10`；CONNACK 拒绝按 3.1.1 码映射（1→`0x84`、2→`0x85`、4→`0x86`）。
+- session expiry：`Persist = session_expiry > 0`（3.1.1 仍由 `clean_session` 决定）；断开时把 `session_expires_at` 写入 `.inflight` blob；boot 扫描过期会话并按 clean-session 顺序拆除（disk → Router → memory）。
+- `$share/{group}/{filter}`：非空 group、无通配符、合法真实 filter；`join(shared, ...)` 建组，UNSUBSCRIBE 走 `leave`；SUBACK 返回请求 QoS。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| 帧（`mqtt_frame_SUITE`） | 31 例，含 v5 CONNECT/PUBLISH 属性往返、未知 property 拒绝、level 5 接受、3.1.1 字节不变 |
+| 连接（`mqtt_conn_SUITE`） | v5 CONNACK 形状、级别 6 的 `0x84`、properties 送达订阅端、PUBACK `0x10`、`$share` 单成员投递、`receive_maximum=1` 窗口 |
+| 全量 | `rebar3 ct` **397/397**；`dialyzer` 0 warnings；`xref` 无新增未使用导出 |
 
 ---
 

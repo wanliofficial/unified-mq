@@ -43,7 +43,12 @@ all() ->
     [connect_anonymous_is_granted_with_session_present_zero,
      connect_with_bad_password_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
-     connect_mqtt5_is_refused,
+     connect_mqtt5_is_accepted,
+     connect_mqtt5_unknown_level_gets_the_v5_refusal,
+     v5_publish_properties_reach_the_subscriber,
+     v5_puback_without_a_matching_subscription_is_0x10,
+     v5_shared_subscription_delivers_to_one_member,
+     v5_receive_maximum_bounds_the_outbound_window,
      connect_wrong_protocol_level_is_refused_1,
      frame_before_connect_closes_the_connection,
      connect_on_an_established_session_closes,
@@ -292,26 +297,34 @@ connect_with_empty_client_id_is_refused_2(_Config) ->
     {ok, normal} = mqtt_close(Conn),
     ok.
 
-connect_mqtt5_is_refused(_Config) ->
+connect_mqtt5_is_accepted(_Config) ->
     ok = boot(),
+    Props = #{session_expiry_interval => 30, receive_maximum => 7,
+              maximum_packet_size => 1048576,
+              user_properties => [{<<"who">>, <<"test">>}]},
+    {Conn, #connack{session_present = 0, return_code = 0, props = AckProps}} =
+        mqtt_open_v5(#{client_id => <<"v5c">>, props => Props}),
+    ?assertEqual(#{}, AckProps),
+    #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
+    ok = boot(),
+    %% ADR-017 §17.4: a level >= 5 this build does not know is answered in the
+    %% v5 CONNACK shape (flags|reason|properties-length) with 0x84.
     {Client, Pid} = mqtt_pair(),
     Monitor = erlang:monitor(process, Pid),
-    ok = gen_tcp:send(Client, mqtt_raw_connect(5, <<"c1">>)),
-    %% T15 M16: a v5 client parses CONNACK as flags|reason|properties, so the
-    %% refusal is v5-framed (5 bytes, zero properties). A 3.1.1-shaped 4-byte
-    %% CONNACK makes paho-mqtt raise in its properties decoder instead of
-    %% surfacing 0x87, so the wire bytes are asserted verbatim here and the
-    %% 3.1.1 decoder (rightly) cannot read this frame.
-    {ok, <<16#20, 3, 0, 16#87, 0>>} = gen_tcp:recv(Client, 5, 3000),
+    ok = gen_tcp:send(Client, mqtt_raw_connect(6, <<"c1">>)),
+    {ok, <<16#20, 3, 0, 16#84, 0>>} = gen_tcp:recv(Client, 5, 3000),
     ok = expect_closed(Client),
     {ok, normal} = expect_down(Monitor, Pid),
     ok.
 
 connect_wrong_protocol_level_is_refused_1(_Config) ->
     ok = boot(),
-    %% §4.5: every level that is not 4 is a 0x01, level 5 excepted (the MQTT 5
-    %% refusal above). 6 is the interesting one: it is a *future* version, and
-    %% the conn must not guess that its own codec applies.
+    %% §4.5: every 3.1.1-shaped refusal keeps 0x01. Level 5 is now accepted and
+    %% level 6 gets the v5 0x84 shape (the two cases above).
     lists:foreach(
       fun(Level) ->
               {Client, Pid} = mqtt_pair(),
@@ -320,7 +333,91 @@ connect_wrong_protocol_level_is_refused_1(_Config) ->
               #connack{return_code = 1} = mqtt_recv(Client),
               ok = expect_closed(Client),
               {ok, normal} = expect_down(Monitor, Pid)
-      end, [0, 3, 6]),
+      end, [0, 3]),
+    ok.
+
+v5_publish_properties_reach_the_subscriber(_Config) ->
+    ok = boot(),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"v5sub">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"v5/p">>, 1}], #{}),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5pub">>, props => #{}}),
+    Props = #{payload_format_indicator => 1,
+              content_type => <<"text/plain">>,
+              response_topic => <<"v5/r">>,
+              correlation_data => <<9, 9>>,
+              message_expiry_interval => 30,
+              user_properties => [{<<"a">>, <<"b">>}]},
+    mqtt_publish_v5(Pub, 3, <<"v5/p">>, <<"hello">>, 1, Props),
+    #puback{packet_id = 3, reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    #publish{packet_id = OutPid, topic = <<"v5/p">>, payload = <<"hello">>,
+             props = Got} = mqtt_recv_v5(csock(Sub)),
+    ?assertEqual(1, maps:get(payload_format_indicator, Got)),
+    ?assertEqual(<<"text/plain">>, maps:get(content_type, Got)),
+    ?assertEqual(<<"v5/r">>, maps:get(response_topic, Got)),
+    ?assertEqual(<<9, 9>>, maps:get(correlation_data, Got)),
+    ?assertEqual([{<<"a">>, <<"b">>}], maps:get(user_properties, Got)),
+    Remaining = maps:get(message_expiry_interval, Got),
+    ?assert(Remaining >= 25 andalso Remaining =< 30),
+    mqtt_puback_v5(Sub, OutPid),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+v5_puback_without_a_matching_subscription_is_0x10(_Config) ->
+    ok = boot(),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5np">>, props => #{}}),
+    mqtt_publish_v5(Pub, 5, <<"nobody/here">>, <<"x">>, 1, #{}),
+    #puback{packet_id = 5, reason_code = 16#10} = mqtt_recv_v5(csock(Pub)),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+v5_shared_subscription_delivers_to_one_member(_Config) ->
+    ok = boot(),
+    {A, _} = mqtt_open_v5(#{client_id => <<"v5sa">>, props => #{}}),
+    {B, _} = mqtt_open_v5(#{client_id => <<"v5sb">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(A, 1, [{<<"$share/g/v5sh">>, 1}], #{}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(B, 1, [{<<"$share/g/v5sh">>, 1}], #{}),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5sp">>, props => #{}}),
+    mqtt_publish_v5(Pub, 2, <<"v5sh">>, <<"m">>, 1, #{}),
+    #puback{reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    RA = mqtt_recv_or(csock(A), 1000, silent, 5),
+    RB = mqtt_recv_or(csock(B), 1000, silent, 5),
+    Delivered = [X || X <- [RA, RB], X =/= silent],
+    ?assertEqual(1, length(Delivered)),
+    [Frame] = Delivered,
+    #publish{packet_id = DPid, payload = <<"m">>} = Frame,
+    mqtt_puback_v5(A, DPid),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(A),
+    {ok, normal} = mqtt_close(B),
+    ok.
+
+v5_receive_maximum_bounds_the_outbound_window(_Config) ->
+    ok = boot(),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"v5rmc">>,
+                              props => #{receive_maximum => 1}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"v5rm/#">>, 1}], #{}),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5rmp">>, props => #{}}),
+    lists:foreach(
+      fun(I) ->
+              mqtt_publish_v5(Pub, I, <<"v5rm/a">>, <<"x">>, 1, #{}),
+              #puback{reason_code = 0} = mqtt_recv_v5(csock(Pub))
+      end, [1, 2, 3]),
+    #publish{packet_id = P1} = mqtt_recv_v5(csock(Sub)),
+    %% Receive Maximum = 1: the second delivery waits for the first PUBACK.
+    silent = mqtt_recv_or(csock(Sub), 500, silent, 5),
+    mqtt_puback_v5(Sub, P1),
+    #publish{packet_id = P2} = mqtt_recv_v5(csock(Sub)),
+    silent = mqtt_recv_or(csock(Sub), 500, silent, 5),
+    mqtt_puback_v5(Sub, P2),
+    #publish{packet_id = P3} = mqtt_recv_v5(csock(Sub)),
+    mqtt_puback_v5(Sub, P3),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
     ok.
 
 frame_before_connect_closes_the_connection(_Config) ->

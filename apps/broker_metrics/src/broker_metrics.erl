@@ -339,6 +339,12 @@ key_specs() ->
      %% `terminate/2' decrement (execution plan §2).
      {conn_mailbox_len, gauge},
      {conn_inflight, gauge},
+     %% S2.5 (ADR-017 §17.3): an inbound packet over the configured cap, and an
+     %% outbound PUBLISH the peer's Maximum Packet Size forbids. Both are drops,
+     %% not protocol errors: the first disconnects, the second leaves the
+     %% delivery to the redelivery path.
+     {mqtt_packet_too_large, counter},
+     {mqtt_publish_dropped_oversize, counter},
      {wal_pending_append, gauge},
      {backpressure_pauses, counter},
      {backpressure_disconnects, counter}].

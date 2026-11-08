@@ -24,6 +24,10 @@
            %% default publish-time TTL (0 = no expiry).
            {ack_timeout_ms, 30000},
            {message_ttl_ms, 0},
+           %% S2.5 (ADR-017 §17.3): the inbound packet cap. `0' disables the
+           %% check (S1/S2 default); a non-zero value closes the connection on
+           %% the first frame larger than it, without acking.
+           {mqtt_max_packet_size, 0},
            %% S2-G (design §4.7): the consumer/producer mailbox watermarks. `0'
            %% disables the check; `max_inflight' remains the delivery window.
            {pull_mailbox_limit, 1000},

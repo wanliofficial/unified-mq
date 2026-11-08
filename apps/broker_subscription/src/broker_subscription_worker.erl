@@ -532,13 +532,42 @@ new_row(Kind, Offset) -> broker_cursor:new_plain(Kind, Offset).
 %% In-flight blobs are client-keyed and independent of the subscription scan
 %% (§19.3), so they load once per client after the entities are in place.
 load_all_inflight() ->
+    %% S2.5 (ADR-017): a v5 session whose Expiry Interval elapsed while the
+    %% broker was down must not come back as `session_present=1'. The deadline
+    %% is stamped by the connection at disconnect; boot is the only place that
+    %% can enforce it before a client asks. Expired sessions are torn down
+    %% (disk first, then Router, then memory -- same order as clean_session).
+    Clients = all_clients(),
+    Expired = [C || C <- Clients, inflight_expired(C)],
+    lists:foreach(
+      fun(ClientId) ->
+              log_expired(ClientId),
+              _ = teardown_session(ClientId, #{cursor_dirty => #{},
+                                               inflight_dirty => #{}})
+      end, Expired),
     lists:foreach(
       fun(ClientId) ->
               case broker_subscription_files:read_inflight(ClientId) of
                   {ok, none} -> ok;
                   {ok, Term} -> true = ets:insert(?INFLIGHT, {ClientId, Term})
               end
-      end, all_clients()).
+      end, Clients -- Expired).
+
+inflight_expired(ClientId) ->
+    case broker_subscription_files:read_inflight(ClientId) of
+        {ok, Term} when is_map(Term) ->
+            case maps:get(session_expires_at, Term, undefined) of
+                At when is_integer(At) ->
+                    At =< erlang:system_time(millisecond);
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
+
+log_expired(ClientId) ->
+    logger:info("broker_subscription: session expired at boot ~p", [ClientId]).
 
 all_clients() ->
     lists:usort([C || {{C, _SubRef}} <- ets:tab2list(?MEMBERS)]).

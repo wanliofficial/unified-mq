@@ -41,6 +41,34 @@ mqtt_open(Knobs) ->
     Connack = mqtt_recv(Client),
     {#{sock => Client, pid => Pid}, Connack}.
 
+%% S2.5: the same open dance with level 5 and CONNECT properties.
+mqtt_open_v5(Knobs) ->
+    {Client, Pid} = mqtt_pair(),
+    Frame = mqtt_connect_frame_v5(Knobs),
+    ok = gen_tcp:send(Client, mqtt_frame:encode(Frame, 5)),
+    Connack = mqtt_recv_v5(Client),
+    {#{sock => Client, pid => Pid}, Connack}.
+
+mqtt_connect_frame_v5(Knobs) ->
+    (mqtt_connect_frame(Knobs))#connect{
+      proto_level = 5, props = maps:get(props, Knobs, #{})}.
+
+mqtt_send_v5(#{sock := Client}, Frame) ->
+    ok = gen_tcp:send(Client, mqtt_frame:encode(Frame, 5)).
+
+mqtt_subscribe_v5(Conn, PacketId, Topics, Props) ->
+    ok = mqtt_send_v5(Conn, #subscribe{packet_id = PacketId, topics = Topics,
+                                       props = Props}),
+    mqtt_recv_v5(csock(Conn)).
+
+mqtt_publish_v5(Conn, PacketId, Topic, Payload, QoS, Props) ->
+    ok = mqtt_send_v5(Conn, #publish{qos = QoS, topic = Topic,
+                                     packet_id = PacketId, payload = Payload,
+                                     props = Props}).
+
+mqtt_puback_v5(Conn, PacketId) ->
+    ok = mqtt_send_v5(Conn, #puback{packet_id = PacketId}).
+
 mqtt_connect_frame(Knobs) ->
     ClientId = maps:get(client_id, Knobs),
     WillTopic = maps:get(will_topic, Knobs, undefined),
@@ -123,7 +151,16 @@ mqtt_disconnect(#{sock := Client}) ->
 mqtt_recv(Client) -> mqtt_recv(Client, 5000).
 
 mqtt_recv(Client, Timeout) ->
-    case mqtt_recv_or(Client, Timeout, timeout) of
+    mqtt_recv_vsn(Client, Timeout, auto).
+
+%% S2.5: a v5 peer's CONNACK/PUBLISH/SUBACK carry properties, so the reader has
+%% to decode with the negotiated version. `auto' (the default) is the 3.1.1
+%% path every existing case uses.
+mqtt_recv_v5(Client) ->
+    mqtt_recv_vsn(Client, 5000, 5).
+
+mqtt_recv_vsn(Client, Timeout, Vsn) ->
+    case mqtt_recv_or(Client, Timeout, timeout, Vsn) of
         timeout -> exit({mqtt_recv_timeout, Timeout, mqtt_buf(Client)});
         {error, closed} -> exit({mqtt_recv_closed, mqtt_buf(Client)});
         Frame -> Frame
@@ -133,8 +170,11 @@ mqtt_recv(Client, Timeout) ->
 %% already buffered is tried first, and the socket is only asked when the buffer
 %% holds a prefix. Bytes of a second frame stay in the buffer for the next call.
 mqtt_recv_or(Client, Timeout, Default) ->
+    mqtt_recv_or(Client, Timeout, Default, auto).
+
+mqtt_recv_or(Client, Timeout, Default, Vsn) ->
     Buf = mqtt_buf(Client),
-    case (catch mqtt_frame:decode(Buf)) of
+    case (catch mqtt_frame:decode(Buf, Vsn)) of
         {ok, Frame, Rest} ->
             mqtt_set_buf(Client, Rest),
             Frame;
@@ -142,7 +182,7 @@ mqtt_recv_or(Client, Timeout, Default) ->
             case gen_tcp:recv(Client, 0, Timeout) of
                 {ok, Data} ->
                     mqtt_set_buf(Client, <<Buf/binary, Data/binary>>),
-                    mqtt_recv_or(Client, Timeout, Default);
+                    mqtt_recv_or(Client, Timeout, Default, Vsn);
                 {error, timeout} ->
                     Default;
                 {error, closed} ->

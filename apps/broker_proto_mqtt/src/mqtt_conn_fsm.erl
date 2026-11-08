@@ -73,7 +73,14 @@
              %% S2-G: this connection's last reported contribution to the
              %% cross-process `conn_mailbox_len' / `conn_inflight' gauges.
              reported_mailbox = 0 :: non_neg_integer(),
-             reported_inflight = 0 :: non_neg_integer()}).
+             reported_inflight = 0 :: non_neg_integer(),
+             %% S2.5 (ADR-017): the negotiated MQTT level. `undefined' before
+             %% CONNECT (decode/1's `auto' is legal for exactly one frame).
+             proto_level = undefined :: undefined | 4 | 5,
+             session_expiry = 0 :: non_neg_integer(),   %% seconds, v5 only
+             receive_maximum = 65535 :: pos_integer(),  %% peer's outbound window
+             max_packet_size = undefined :: undefined | pos_integer(),
+             sub_ids = #{} :: #{binary() => pos_integer()}}).
 
 %%%_* API ---------------------------------------------------------------------
 
@@ -161,7 +168,7 @@ event({broker_deliver, _ClientId, _MaxQoS, _Refs, {undefined, undefined, Msg}},
     %% there is no offset to pull and no ack to wait for: sending at QoS1 here
     %% would strand a pending entry keyed by `undefined'.
     note_delivery(Msg),
-    {state, connected, send_frame(publish_bin(0, 0, Msg, undefined), D)};
+    {state, connected, send_frame(publish_bin(0, 0, Msg, undefined, D), D)};
 event({broker_deliver, _ClientId, _MaxQoS, _Refs, {_P, _O, _Msg}}, StateName, D) ->
     %% a wake for a durable position; the tuple's Msg is not read -- the pull
     %% loop is the only reader (J6/K9).
@@ -223,7 +230,7 @@ event(#pubrel{packet_id = Pid}, connected, D) ->
 event(#pubcomp{packet_id = Pid}, connected, D) ->
     handle_pubcomp(Pid, D);
 event(#ping{kind = req}, connected, D) ->
-    {state, connected, send_frame(mqtt_frame:pingresp(), D)};
+    {state, connected, send_frame(enc(#ping{kind = resp}, D), D)};
 event(#disconnect{}, connected, D) ->
     %% §3.14: a normal disconnect DISCARDS the Will (ADR-018 §18.1). Clearing
     %% it here is what tells terminate/3 "clean goodbye": the stop reason stays
@@ -245,17 +252,36 @@ event(Other, StateName, D) ->
     log(warning, "unexpected event in ~p: ~p", [StateName, Other]),
     {state, StateName, D}.
 
+%% The decoder's version window: `auto' until CONNECT settles it (the only
+%% legal pre-CONNECT frame carries its own level), then the negotiated one.
+decode_vsn(#st{proto_level = 5}) -> 5;
+decode_vsn(#st{proto_level = 4}) -> 4;
+decode_vsn(_) -> auto.
+
 %%%_* TCP framing ---------------------------------------------------------------
 
 %% Drain every whole frame the buffer holds. Frames arriving after CONNECT was
 %% answered (MQTT allows pipelining SUBSCRIBE behind it) are dispatched through
 %% the same loop with the new state name.
 tcp_frames(#st{buf = Buf} = D, StateName) ->
-    case (catch mqtt_frame:decode(Buf)) of
+    case (catch mqtt_frame:decode(Buf, decode_vsn(D))) of
         {ok, Frame, Rest} ->
-            case event(Frame, StateName, D#st{buf = Rest}) of
-                {state, S1, D1} -> tcp_frames(D1, S1);
-                {stop, Reason, D1} -> {stop, Reason, D1}
+            case inbound_size_ok(byte_size(Buf) - byte_size(Rest), D) of
+                true ->
+                    case event(Frame, StateName, D#st{buf = Rest}) of
+                        {state, S1, D1} -> tcp_frames(D1, S1);
+                        {stop, Reason, D1} -> {stop, Reason, D1}
+                    end;
+                false ->
+                    %% S2.5 (ADR-017 §17.3): a packet over the server cap is a
+                    %% disconnect, never a partial read and never an ack. The
+                    %% frame is already whole in the buffer; refusing it here is
+                    %% what keeps a 100 MiB PUBLISH from reaching the log.
+                    broker_metrics:inc(mqtt_packet_too_large),
+                    log(warning, "packet over cap: ~p bytes, limit ~p",
+                        [byte_size(Buf) - byte_size(Rest),
+                         opt(mqtt_max_packet_size, 0, D)]),
+                    {stop, normal, D}
             end;
         {more, _} ->
             {state, StateName, D};
@@ -269,19 +295,17 @@ tcp_frames(#st{buf = Buf} = D, StateName) ->
             {stop, {decode_crashed, Reason}, D}
     end.
 
-%% §4.5's version posture is fed by the codec's distinct reasons: an MQTT 5
-%% CONNECT has no 3.1.1 body shape, so it is refused at parse time and the
-%% CONNACK code is derived here rather than from a #connect{} record.
+%% §4.5's version posture is fed by the codec's distinct reasons: an unknown
+%% protocol level has no frame shape we can safely serve, so it is refused.
 %%
-%% The refusal MUST be framed for the version the client asked for. A v5 client
-%% parses CONNACK as `flags|reason|properties-length', so the 4-byte 3.1.1 shape
-%% (`20 02 00 87') makes paho-mqtt 2.x raise inside its properties decoder
-%% instead of surfacing the refusal -- the client never learns why (T15 M16).
-%% Five bytes, zero properties: `20 03 00 87 00'. 3.1.1 stays byte-for-byte as
-%% before for every other version (mqtt_frame:connack/2).
-decode_error({unacceptable_protocol_version, 5}, awaiting_connect, D) ->
-    log(warning, "mqtt 5.0 connect refused", []),
-    {stop, normal, send_frame(<<16#20, 3, 0, 16#87, 0>>, D)};
+%% ADR-017 §17.4: a level >= 5 client parses CONNACK as
+%% `flags|reason|properties-length', so it gets the v5 shape with 0x84
+%% (Unsupported Protocol Version). 3.1.1 and older get the historical 4-byte
+%% shape with 0x01. S2.5 accepts level 5, so the old 0x87 refusal is gone.
+decode_error({unsupported_protocol_version, Other}, awaiting_connect, D)
+  when Other >= 5 ->
+    log(warning, "unsupported protocol level ~p", [Other]),
+    {stop, normal, send_frame(<<16#20, 3, 0, 16#84, 0>>, D)};
 decode_error({unsupported_protocol_version, Other}, awaiting_connect, D) ->
     log(warning, "unsupported protocol level ~p", [Other]),
     refuse(1, D);
@@ -313,19 +337,34 @@ handle_connect(#connect{client_id = <<>>}, D0) ->
     %% (that would make "who owns this session" unanswerable).
     log(warning, "identifier rejected (empty client_id)", []),
     refuse(2, D0);
-handle_connect(#connect{clean_session = CSbit} = C, D0) ->
-    case authenticate(C, D0#st{client_id = C#connect.client_id}) of
+handle_connect(#connect{proto_level = Level} = C, D0) ->
+    %% S2.5 (ADR-017): the negotiated version and the CONNECT-level properties
+    %% become connection state before authentication, so a v5 refusal is framed
+    %% the way that client parses CONNACK.
+    Props = C#connect.props,
+    D0a = D0#st{client_id = C#connect.client_id, proto_level = Level,
+                session_expiry = maps:get(session_expiry_interval, Props, 0),
+                receive_maximum = maps:get(receive_maximum, Props, 65535),
+                max_packet_size = maps:get(maximum_packet_size, Props, undefined)},
+    case authenticate(C, D0a) of
         {error, Code, D} ->
             refuse(Code, D);
         {ok, D1} ->
             %% ADR-018 §18.1: the Will is connection state, held in memory only
             %% (never persisted, never republished after a broker restart).
             D1a = D1#st{will = will_of(C)},
-            Clean = CSbit =:= 1,
+            Clean = C#connect.clean_session =:= 1,
+            %% S2.5: MQTT 5 separates "discard the old session now" (Clean
+            %% Start) from "keep the new one after disconnect" (Session Expiry
+            %% Interval). 3.1.1 ties both to clean_session.
+            Persist = case Level of
+                          5 -> maps:get(session_expiry_interval, Props, 0) > 0;
+                          _ -> not Clean
+                      end,
             %% session_present describes the session the client is about to get
             %% back, so it has to be read before the clean-session teardown.
             SP = session_present(Clean, C#connect.client_id),
-            D2 = attach_session(C#connect.client_id, Clean, D1a),
+            D2 = attach_session(C#connect.client_id, Clean, Persist, D1a),
             D3 = case Clean of
                      true -> clean_session_teardown(D2);
                      false -> restore_blob(D2)
@@ -334,9 +373,9 @@ handle_connect(#connect{clean_session = CSbit} = C, D0) ->
                 {ok, D4} ->
                     D5 = count_connection(D4),
                     log(info, "session up: client_id=~p principal=~p "
-                              "clean=~p session_present=~p max_qos=~p "
-                              "keepalive_ms=~p",
-                        [C#connect.client_id, D5#st.principal, Clean, SP,
+                              "level=~p clean=~p session_present=~p "
+                              "max_qos=~p keepalive_ms=~p",
+                        [C#connect.client_id, D5#st.principal, Level, Clean, SP,
                          D5#st.max_qos, D5#st.keepalive_ms]),
                     %% E7/R7: the connect-time round is what serves a
                     %% reconnecting session its backlog and its DUP
@@ -351,7 +390,7 @@ handle_connect(#connect{clean_session = CSbit} = C, D0) ->
                     %% the round also keeps the two from racing for the same
                     %% packet id.
                     schedule_round(resend_released(
-                                     send_frame(mqtt_frame:connack(SP, 0), D5)));
+                                     send_frame(connack_bin(SP, 0, D5), D5)));
                 {error, Reason} ->
                     {stop, {partition_subscribe_failed, Reason}, D3}
             end
@@ -368,7 +407,7 @@ will_of(#connect{will_topic = Topic, will_payload = Payload,
 %% alone. The restored entries were put in `released' by restore_blob/1.
 resend_released(#st{released = Released} = D) ->
     lists:foldl(fun(Pid, DAcc) ->
-                        send_frame(mqtt_frame:encode(#pubrel{packet_id = Pid}), DAcc)
+                        send_frame(enc(#pubrel{packet_id = Pid}, DAcc), DAcc)
                 end, D, lists:sort(maps:keys(Released))).
 
 %% §4.3's stub, plus the E2 capability derivation: a backend whose capability
@@ -425,7 +464,13 @@ clamp_keepalive(Sec, D) when is_integer(Sec), Sec > 0 ->
 
 session_present(false, ClientId) ->
     case broker_subscription:session(ClientId) of
-        {ok, #{subs := [_ | _]}} -> 1;
+        {ok, #{subs := [_ | _]} = Session} ->
+            %% S2.5: a session whose Expiry Interval elapsed is not resumable
+            %% even if nobody swept it yet.
+            case session_expired(Session) of
+                true -> 0;
+                false -> 1
+            end;
         _ -> 0
     end;
 session_present(true, _ClientId) ->
@@ -433,11 +478,16 @@ session_present(true, _ClientId) ->
     %% from a previous non-clean session is about to be wiped.
     0.
 
-attach_session(ClientId, Clean, D) ->
+session_expired(#{inflight := #{session_expires_at := At}}) when is_integer(At) ->
+    At =< erlang:system_time(millisecond);
+session_expired(_) ->
+    false.
+
+attach_session(ClientId, _Clean, Persist, D) ->
     %% attach/3 answers `{ok, PrevPid}' or raises: a worker that cannot answer is
     %% a dead gen_server call, not an `{error, _}' return, so there is no failure
     %% shape to handle here (dialyzer proved the old `error' clause unreachable).
-    {ok, Prev} = broker_subscription:attach(ClientId, self(), not Clean),
+    {ok, Prev} = broker_subscription:attach(ClientId, self(), Persist),
     case Prev of
         Pid when is_pid(Pid), Pid =/= self() ->
             Pid ! {mqtt_takeover, self()},
@@ -447,7 +497,7 @@ attach_session(ClientId, Clean, D) ->
             %% its own attach): nothing to hand the socket over to.
             ok
     end,
-    D#st{attached = true, persist = not Clean}.
+    D#st{attached = true, persist = Persist}.
 
 clean_session_teardown(D) ->
     %% ADR-019 §19.2: an exclusive subscription is *removed*, a group membership
@@ -521,7 +571,7 @@ subscribe_partitions(D) ->
 %%%_* PUBLISH inbound ---------------------------------------------------------
 
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
-                        payload = Payload, retain = Retain}, D) ->
+                        payload = Payload, retain = Retain, props = Props}, D) ->
     broker_metrics:inc(publish_total),
     %% S2-G (design §4.7): MQTT 3.1.1 has no quota frame, so an overloaded
     %% producer is told by a disconnect before the PUBACK -- never by an ack for
@@ -529,7 +579,7 @@ handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
     case mqtt_backpressure:producer(mailbox_len(),
                                     opt(publish_mailbox_limit, 1000, D)) of
         ok ->
-            handle_publish0(QoS, Topic, WirePid, Payload, Retain, D);
+            handle_publish0(QoS, Topic, WirePid, Payload, Retain, Props, D);
         {reject, mailbox} ->
             broker_metrics:inc(backpressure_disconnects),
             log(warning, "publish refused: mailbox over the limit (topic=~p)",
@@ -537,7 +587,7 @@ handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
             {stop, {backpressure, mailbox}, D}
     end.
 
-handle_publish0(QoS, Topic, WirePid, Payload, Retain, D) ->
+handle_publish0(QoS, Topic, WirePid, Payload, Retain, Props, D) ->
     %% ADR-018 §18.3 R5: a repeated QoS 2 PUBLISH (same packet id, same
     %% connection) is answered with PUBREC and never dispatched twice. This
     %% check runs before any storage work so the dedupe costs nothing.
@@ -545,12 +595,12 @@ handle_publish0(QoS, Topic, WirePid, Payload, Retain, D) ->
         true ->
             log(info, "qos2 duplicate publish pid=~p, re-PUBREC", [WirePid]),
             {state, connected, send_frame(
-                                mqtt_frame:encode(#pubrec{packet_id = WirePid}), D)};
+                                enc(#pubrec{packet_id = WirePid}, D), D)};
         false ->
-            handle_publish1(Topic, Payload, QoS, WirePid, Retain, D)
+            handle_publish1(Topic, Payload, QoS, WirePid, Retain, Props, D)
     end.
 
-handle_publish1(Topic, Payload, QoS, WirePid, Retain, D) ->
+handle_publish1(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
     try
         {ok, Env} = broker_router:env(),
         %% route/3 is the ONLY partition oracle (ADR-010): even with no
@@ -568,7 +618,8 @@ handle_publish1(Topic, Payload, QoS, WirePid, Retain, D) ->
         %% and the surrounding try reports it as ours, not as a silently invented
         %% partition 0.
         [{Partition, Refs} | _] = Routed,
-        Msg = build_message(Topic, Payload, QoS, WirePid, Partition, Retain, D),
+        Msg = build_message(Topic, Payload, QoS, WirePid, Partition, Retain,
+                            Props, D),
         store_and_ack(Msg, QoS, Partition, Refs, WirePid, Retain, D)
     catch
         Class:Reason:Stack ->
@@ -628,7 +679,10 @@ store_and_ack(Msg, QoS, Partition, Refs, WirePid, Retain, D)
 %% answers), so it never enters this conn's outbound id space -- `pending' is
 %% keyed by take_pid numbers alone.
 ack_and_dispatch(Msg, 1, Partition, Offset, Refs, WirePid, D) ->
-    D1 = send_frame(mqtt_frame:puback(D#st.client_id, WirePid), D),
+    %% S2.5: 0x10 (No matching subscribers) is the honest v5 answer when the
+    %% routed set is empty; 3.1.1 keeps the same two-byte PUBACK it always had.
+    RC = case Refs of [] -> 16#10; _ -> 0 end,
+    D1 = send_frame(enc(#puback{packet_id = WirePid, reason_code = RC}, D), D),
     _ = (catch broker_subscription:dispatch(Refs, {Partition, Offset, Msg})),
     {state, connected, D1};
 ack_and_dispatch(Msg, 2, Partition, Offset, Refs, WirePid, D0) ->
@@ -638,7 +692,7 @@ ack_and_dispatch(Msg, 2, Partition, Offset, Refs, WirePid, D0) ->
     %% deliberate disconnect, never a silent drop of the record.
     case remember_received(WirePid, D0) of
         {ok, D1} ->
-            D2 = send_frame(mqtt_frame:encode(#pubrec{packet_id = WirePid}), D1),
+            D2 = send_frame(enc(#pubrec{packet_id = WirePid}, D1), D1),
             _ = (catch broker_subscription:dispatch(Refs, {Partition, Offset, Msg})),
             {state, connected, D2};
         {overflow, D1} ->
@@ -688,7 +742,7 @@ remember_received(Pid, #st{received = R} = D) ->
 reliability_of(0) -> os_buffer;
 reliability_of(_) -> fsync.
 
-build_message(Topic, Payload, QoS, WirePid, Partition, Retain, D) ->
+build_message(Topic, Payload, QoS, WirePid, Partition, Retain, Props, D) ->
     Created = erlang:system_time(millisecond),
     #broker_message{
       message_id = crypto:strong_rand_bytes(16),
@@ -698,12 +752,30 @@ build_message(Topic, Payload, QoS, WirePid, Partition, Retain, D) ->
       payload = Payload,
       payload_encoding = raw,
       headers = #{},
-      proto_meta = #{qos => QoS, dup => 0, retain => Retain, packet_id => WirePid},
+      proto_meta = maps:merge(#{qos => QoS, dup => 0, retain => Retain,
+                                packet_id => WirePid},
+                              mqtt_meta(Props)),
       persistence = case QoS of 0 -> transient; _ -> durable end,
       reliability = reliability_of(QoS),
       created_at = Created,
-      expires_at = expiry(Created, D),
+      expires_at = expiry(Created, Props, D),
       event = undefined}.
+
+%% S2.5 (ADR-017 §17.2): MQTT 5 PUBLISH properties land in `proto_meta', never
+%% in `headers'. Only keys that were actually on the wire are added, so a 3.1.1
+%% publish keeps the exact S2 metadata shape.
+mqtt_meta(Props) ->
+    lists:foldl(fun({Prop, Key}, Acc) ->
+                        case maps:find(Prop, Props) of
+                            {ok, V} -> Acc#{Key => V};
+                            error -> Acc
+                        end
+                end, #{},
+                [{user_properties, mqtt_user_properties},
+                 {payload_format_indicator, mqtt_payload_format},
+                 {content_type, mqtt_content_type},
+                 {response_topic, mqtt_response_topic},
+                 {correlation_data, mqtt_correlation_data}]).
 
 %% TTL (ADR-015 §15.4): `expires_at' is the absolute ms deadline the publisher
 %% path computed from `message_ttl_ms'. `undefined' never expires -- that is the
@@ -713,11 +785,23 @@ expired(#broker_message{expires_at = undefined}) ->
 expired(#broker_message{expires_at = At}) when is_integer(At) ->
     At =< erlang:system_time(millisecond).
 
-expiry(Created, D) ->
-    case opt(message_ttl_ms, 0, D) of
-        TTL when is_integer(TTL), TTL > 0 -> Created + TTL;
-        _ -> undefined
+%% S2.5: a v5 Message Expiry Interval is a second deadline on the same slot.
+%% Both bounds are absolute, so the effective lifetime is the smaller one; an
+%% absent bound is `undefined'.
+expiry(Created, Props, D) ->
+    Config = case opt(message_ttl_ms, 0, D) of
+                 TTL when is_integer(TTL), TTL > 0 -> Created + TTL;
+                 _ -> undefined
+             end,
+    case maps:get(message_expiry_interval, Props, undefined) of
+        Interval when is_integer(Interval), Interval >= 0 ->
+            min_bound(Config, Created + Interval * 1000);
+        _ ->
+            Config
     end.
+
+min_bound(undefined, B) -> B;
+min_bound(A, B) -> min(A, B).
 
 %%%_* Ack timeout -> worker retry (S2-E E-1) ----------------------------------
 
@@ -847,16 +931,31 @@ expire_local(Pid, P, O, D) ->
 
 %%%_* SUBSCRIBE / UNSUBSCRIBE -------------------------------------------------
 
-handle_subscribe(#subscribe{packet_id = Pid, topics = Topics}, D) ->
+handle_subscribe(#subscribe{packet_id = Pid, topics = Topics,
+                            props = Props}, D) ->
     Pairs = [{Filter, grant(Filter, ReqQoS, D)} || {Filter, ReqQoS} <- Topics],
     Codes = [Code || {_Filter, Code} <- Pairs],
     Granted = [{Filter, Code} || {Filter, Code} <- Pairs, Code =/= 128],
-    D1 = send_frame(mqtt_frame:suback(Pid, Codes), D),
+    D1 = send_frame(suback_bin(Pid, Codes, D), D),
+    %% S2.5: a Subscription Identifier rides on every outbound PUBLISH that a
+    %% matching subscription caused; it never enters the message metadata.
+    D2 = remember_sub_ids(Topics, Props, D1),
     %% ADR-018 §18.2: the replay comes AFTER the SUBACK (the client must know
     %% its filter was granted before retained traffic arrives) and is queued
     %% rather than sent inline, because it shares the `max_inflight' window
     %% with ordinary delivery.
-    drain_retained(enqueue_retained(Granted, D1)).
+    drain_retained(enqueue_retained(Granted, D2)).
+
+remember_sub_ids(Topics, Props, D) ->
+    case maps:get(subscription_identifier, Props, undefined) of
+        undefined -> D;
+        Id when is_integer(Id), Id > 0 ->
+            Ids = lists:foldl(fun({Filter, _Q}, Acc) ->
+                                      Acc#{real_filter(Filter) => Id}
+                              end, D#st.sub_ids, Topics),
+            D#st{sub_ids = Ids};
+        _ -> D
+    end.
 
 %% One queue entry per topic even when several granted filters match it (MQTT
 %% §3.3.5 lets a server send duplicates; one message at the strongest granted
@@ -908,10 +1007,10 @@ drain_retained(#st{retained_queue = []} = D) ->
     {state, connected, D};
 drain_retained(#st{retained_queue = [{_Topic, Msg, 0} | Rest]} = D) ->
     note_delivery(Msg),
-    D1 = send_frame(publish_bin(0, 0, 1, Msg, undefined), D),
+    D1 = send_frame(publish_bin(0, 0, 1, Msg, undefined, D), D),
     drain_retained(D1#st{retained_queue = Rest});
 drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
-    case maps:size(D#st.pending) >= opt(max_inflight, 64, D) of
+    case maps:size(D#st.pending) >= inflight_limit(D) of
         true ->
             %% The peer's window is full. Keep the entry (and the rest) queued.
             {state, connected, D};
@@ -927,10 +1026,23 @@ drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
                      retained_queue = Rest,
                      inflight_dirty = true})),
             note_delivery(Msg),
-            drain_retained(send_frame(publish_bin(QoS, 0, 1, Msg, Pid), D2))
+            drain_retained(send_frame(publish_bin(QoS, 0, 1, Msg, Pid, D2), D2))
     end.
 
+%% S2.5 (ADR-017): `$share/{group}/{filter}' becomes a Shared membership; the
+%% literal MQTT syntax never reaches the subscription layer.
 grant(Filter, ReqQoS, D) ->
+    case shared_filter(Filter) of
+        {shared, Group, Real} ->
+            grant_shared(Group, Real, ReqQoS, D);
+        invalid ->
+            log(warning, "invalid shared filter ~p", [Filter]),
+            128;
+        none ->
+            grant_exclusive(Filter, ReqQoS, D)
+    end.
+
+grant_exclusive(Filter, ReqQoS, D) ->
     case {mqtt_filter:validate_filter(Filter), ReqQoS =< D#st.max_qos} of
         {ok, true} ->
             case broker_subscription:subscribe(D#st.client_id, Filter, ReqQoS) of
@@ -953,14 +1065,77 @@ grant(Filter, ReqQoS, D) ->
             128
     end.
 
+grant_shared(Group, Real, ReqQoS, D) ->
+    case {mqtt_filter:validate_filter(Real), ReqQoS =< D#st.max_qos} of
+        {ok, true} ->
+            case broker_subscription:join(shared, Group, D#st.client_id, Real,
+                                          ReqQoS) of
+                {ok, _Ref} -> ReqQoS;
+                {error, Reason} ->
+                    log(warning, "shared join refused ~p/~p: ~p",
+                        [Group, Real, Reason]),
+                    128
+            end;
+        {ok, false} ->
+            log(info, "shared subscribe ~p qos ~p above max ~p",
+                [Real, ReqQoS, D#st.max_qos]),
+            128;
+        {{error, Reason}, _} ->
+            log(warning, "invalid shared filter ~p/~p: ~p", [Group, Real, Reason]),
+            128
+    end.
+
+%% `$share/{group}/{filter}': a non-empty group with no wildcards and a
+%% non-empty, valid real filter. Anything else is a protocol error we refuse
+%% with SUBACK 0x80 rather than guess at.
+shared_filter(<<"$share/", Rest/binary>>) ->
+    case binary:split(Rest, <<"/">>) of
+        [Group, Real] when Group =/= <<>>, Real =/= <<>> ->
+            case binary:match(Group, [<<"+">>, <<"#">>]) of
+                nomatch ->
+                    case mqtt_filter:validate_filter(Real) of
+                        ok -> {shared, Group, Real};
+                        _ -> invalid
+                    end;
+                _ ->
+                    invalid
+            end;
+        _ ->
+            invalid
+    end;
+shared_filter(_) ->
+    none.
+
+%% The identifier map is keyed by the real filter, so `$share/g/t' and `t' do
+%% not collide.
+real_filter(Filter) ->
+    case shared_filter(Filter) of
+        {shared, _Group, Real} -> Real;
+        _ -> Filter
+    end.
+
 handle_unsubscribe(#unsubscribe{packet_id = Pid, topics = Filters}, D) ->
-    lists:foreach(fun(Filter) ->
-                          _ = broker_subscription:unsubscribe(D#st.client_id, Filter)
-                  end, Filters),
+    lists:foreach(fun(Filter) -> unsubscribe_one(Filter, D) end, Filters),
     %% pending is deliberately NOT pruned: a dead subscription's ack is an
     %% idempotent no-op (worker §ack), and pruning here would race the pull loop
     %% that read the subscription set one moment earlier.
-    {state, connected, send_frame(mqtt_frame:unsuback(Pid), D)}.
+    {state, connected,
+     send_frame(unsuback_bin(Pid, length(Filters), D), D)}.
+
+%% S2.5: `$share/{group}/{filter}' removes the consumer from the group; the
+%% group itself only dies with its last member (ADR-019 §19.2).
+unsubscribe_one(Filter, D) ->
+    case shared_filter(Filter) of
+        {shared, Group, Real} ->
+            _ = (catch broker_subscription:leave({shared, Group, Real},
+                                                 D#st.client_id)),
+            ok;
+        invalid ->
+            ok;
+        none ->
+            _ = broker_subscription:unsubscribe(D#st.client_id, Filter),
+            ok
+    end.
 
 %%%_* PUBACK / PUBREC / PUBREL / PUBCOMP inbound ------------------------------
 %%
@@ -1013,7 +1188,7 @@ handle_pubrec(Pid, #st{pending = Pending} = D) ->
             %% PUBREC'd. Answering PUBREL lets it finish instead of retrying
             %% into a closed connection forever.
             log(info, "pubrec ~p matched nothing, replying pubrel", [Pid]),
-            {state, connected, send_frame(mqtt_frame:encode(#pubrel{packet_id = Pid}), D)};
+            {state, connected, send_frame(enc(#pubrel{packet_id = Pid}, D), D)};
         {ok, _Pos} ->
             case maps:get(Pid, D#st.pending_qos, 1) of
                 2 ->
@@ -1029,7 +1204,7 @@ handle_pubrec(Pid, #st{pending = Pending} = D) ->
 
 reply_pubrel(Pid, #st{released = Released} = D) ->
     D1 = D#st{released = Released#{Pid => true}, inflight_dirty = true},
-    {state, connected, send_frame(mqtt_frame:encode(#pubrel{packet_id = Pid}), D1)}.
+    {state, connected, send_frame(enc(#pubrel{packet_id = Pid}, D1), D1)}.
 
 handle_pubrel(Pid, #st{received = Received} = D) ->
     case maps:take(Pid, Received) of
@@ -1038,13 +1213,13 @@ handle_pubrel(Pid, #st{received = Received} = D) ->
             %% PUBLISH time (Method A, R5), so there is no cursor here.
             D1 = D#st{received = Rest, inflight_dirty = true},
             {state, connected,
-             maybe_snapshot(send_frame(mqtt_frame:encode(#pubcomp{packet_id = Pid}), D1))};
+             maybe_snapshot(send_frame(enc(#pubcomp{packet_id = Pid}, D1), D1))};
         error ->
             %% R1: a PUBREL for an id we no longer know (a crash ate the
             %% `received' entry, or a duplicate after reconnect). PUBCOMP is
             %% its idempotent answer; disconnecting would loop the client.
             log(info, "pubrel ~p matched nothing, replying pubcomp", [Pid]),
-            {state, connected, send_frame(mqtt_frame:encode(#pubcomp{packet_id = Pid}), D)}
+            {state, connected, send_frame(enc(#pubcomp{packet_id = Pid}, D), D)}
     end.
 
 handle_pubcomp(Pid, #st{pending = Pending} = D) ->
@@ -1179,7 +1354,14 @@ consumer_verdict(MailboxLen, #st{pending = Pending} = D) ->
     mqtt_backpressure:consumer(
       MailboxLen, maps:size(Pending),
       #{mailbox => opt(pull_mailbox_limit, 1000, D),
-        inflight => opt(max_inflight, 64, D)}).
+        inflight => inflight_limit(D)}).
+
+%% S2.5 (ADR-017 §17.3): the outbound window is the server cap bounded by the
+%% peer's CONNECT Receive Maximum. A v5 client that says 5 must never see a
+%% sixth unacknowledged PUBLISH; 3.1.1 has no such property and keeps using
+%% `max_inflight' alone (its default 65535 makes the min a no-op).
+inflight_limit(#st{receive_maximum = RM} = D) ->
+    max(0, min(opt(max_inflight, 64, D), RM)).
 
 %% The two gauges are cross-process sums: each connection reports only its own
 %% delta, and terminate/3 hands the remainder back. Reading the queue length is
@@ -1467,7 +1649,7 @@ handle_stored1(P, O, Msg, Rows, D) ->
                     lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end,
                                   Others ++ Refs),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(0, 0, Msg, undefined), D), progress};
+                    {send_frame(publish_bin(0, 0, Msg, undefined, D), D), progress};
                 DeliverQoS ->
                     deliver(P, O, Msg, DeliverQoS, Refs, Others, D)
             end
@@ -1501,7 +1683,7 @@ handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D) ->
                 0 ->
                     ack_skip(Ref, P, O, D#st.client_id),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(0, 0, Msg, undefined), D), progress};
+                    {send_frame(publish_bin(0, 0, Msg, undefined, D), D), progress};
                 DeliverQoS ->
                     deliver(P, O, Msg, DeliverQoS, [Ref], [], D)
             end
@@ -1531,7 +1713,7 @@ deliver(P, O, Msg, DeliverQoS, Refs, Others, D) ->
                     resend(Pid, P, O, Msg, D)
             end;
         undefined ->
-            case maps:size(D#st.pending) >= opt(max_inflight, 64, D) of
+            case maps:size(D#st.pending) >= inflight_limit(D) of
                 true ->
                     %% The window is full: the cursor stays at O, so the next
                     %% round lands here again. Not backpressure -- the peer just
@@ -1546,7 +1728,7 @@ deliver(P, O, Msg, DeliverQoS, Refs, Others, D) ->
                              pending_rev = maps:put(Pos, Pid, D1#st.pending_rev),
                              inflight_dirty = true})),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(DeliverQoS, 0, Msg, Pid), D2), progress}
+                    {send_frame(publish_bin(DeliverQoS, 0, Msg, Pid, D2), D2), progress}
             end
     end.
 
@@ -1563,12 +1745,12 @@ resend(Pid, _P, _O, Msg, D) ->
         true ->
             %% Mark it sent so the next round does not repeat the PUBREL every
             %% poll tick; the peer's PUBCOMP is the only thing that can finish it.
-            {send_frame(mqtt_frame:encode(#pubrel{packet_id = Pid}),
+            {send_frame(enc(#pubrel{packet_id = Pid}, D),
                         mark_sent_at(Pid, mark_sent(Pid, D))), idle};
         false ->
             QoS = maps:get(Pid, D#st.pending_qos, 1),
             note_delivery(Msg),
-            {send_frame(publish_bin(QoS, 1, Msg, Pid),
+            {send_frame(publish_bin(QoS, 1, Msg, Pid, D),
                         mark_sent_at(Pid, mark_sent(Pid, D))), idle}
     end.
 
@@ -1606,16 +1788,59 @@ take_pid(N, Pending, Tries, D) ->
 next_pid_after(65535) -> 1;
 next_pid_after(N) -> N + 1.
 
-publish_bin(QoS, Dup, Msg, Pid) ->
-    publish_bin(QoS, Dup, 0, Msg, Pid).
+publish_bin(QoS, Dup, Msg, Pid, D) ->
+    publish_bin(QoS, Dup, 0, Msg, Pid, D).
 
 %% `RetainFlag' is 1 only on a retained replay (§3.3.1.3: a live subscriber
 %% always sees retain=0, a replay always sees retain=1).
-publish_bin(QoS, Dup, RetainFlag, Msg, Pid) ->
-    mqtt_frame:encode(#publish{qos = QoS, dup = Dup, retain = RetainFlag,
-                               topic = Msg#broker_message.destination,
-                               packet_id = Pid,
-                               payload = Msg#broker_message.payload}).
+publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
+    enc(#publish{qos = QoS, dup = Dup, retain = RetainFlag,
+                 topic = Msg#broker_message.destination,
+                 packet_id = Pid,
+                 payload = Msg#broker_message.payload,
+                 props = publish_props(Msg)}, D).
+
+%% S2.5 (ADR-017 §17.2): properties travel in `proto_meta', so an outbound
+%% PUBLISH rebuilds them from there. A 3.1.1 connection ignores the record
+%% field entirely (`encode/2,4' never reads it), which is why this can be
+%% unconditional. Message Expiry is recomputed from the absolute deadline:
+%% what the receiver gets is the remaining lifetime, not the original one.
+publish_props(#broker_message{proto_meta = Meta, expires_at = Expires}) ->
+    Props = lists:foldl(
+              fun({Key, Prop}, Acc) ->
+                      case maps:find(Key, Meta) of
+                          {ok, V} -> Acc#{Prop => V};
+                          error -> Acc
+                      end
+              end, #{},
+              [{mqtt_user_properties, user_properties},
+               {mqtt_payload_format, payload_format_indicator},
+               {mqtt_content_type, content_type},
+               {mqtt_response_topic, response_topic},
+               {mqtt_correlation_data, correlation_data}]),
+    case Expires of
+        At when is_integer(At) ->
+            Remaining = max(0, (At - erlang:system_time(millisecond)) div 1000),
+            Props#{message_expiry_interval => Remaining};
+        _ ->
+            Props
+    end.
+
+%% S2.5 direct builds. 3.1.1 keeps the historical two-byte PUBACK / three-byte
+%% SUBACK; v5 appends the reason code + zero properties so the client's v5
+%% parser sees the shape it expects.
+connack_bin(SP, RC, D) ->
+    enc(#connack{session_present = SP, return_code = RC}, D).
+
+suback_bin(Pid, Codes, D) ->
+    enc(#suback{packet_id = Pid, return_codes = Codes}, D).
+
+unsuback_bin(Pid, N, D) ->
+    Codes = case vsn(D) of
+                5 -> lists:duplicate(N, 0);
+                _ -> []
+            end,
+    enc(#unsuback{packet_id = Pid, reason_codes = Codes}, D).
 
 %% `ack/4' refuses unknown/dead subscriptions idempotently, and answers `ok' for
 %% an ack whose consumer does not hold the offset (ADR-019 §19.2), so this is safe
@@ -1659,22 +1884,78 @@ blob(D) ->
       released => maps:with(Pids, D#st.released),
       received => D#st.received}.
 
+%% v5 only, and only for a positive interval: 3.1.1 and session-expiry 0 keep
+%% the historical "no key means no deadline" shape (0 in v5 already tore the
+%% session down at detach, so there is no blob to stamp).
+session_expiring(#st{proto_level = 5, session_expiry = S})
+  when is_integer(S), S > 0 ->
+    true;
+session_expiring(_) ->
+    false.
+
+blob_with_expiry(D) ->
+    Base = blob(D),
+    case session_expiring(D) of
+        true ->
+            Base#{session_expires_at =>
+                      erlang:system_time(millisecond) + D#st.session_expiry * 1000};
+        false ->
+            Base
+    end.
+
 is_position_entry({_Refs, {P, O}}) -> is_integer(P) andalso is_integer(O);
 is_position_entry(_) -> false.
 
 %%%_* Outbound frames ----------------------------------------------------------
 
+%% S2.5 (ADR-017): the wire version is a property of the connection, decided
+%% once by CONNECT. Before that point nothing is sent except a refusal, which
+%% carries its own literal bytes.
+vsn(#st{proto_level = 5}) -> 5;
+vsn(_) -> 4.
+
+enc(Frame, D) ->
+    mqtt_frame:encode(Frame, vsn(D)).
+
+%% A frame built for the peer. `enc/2' is the only path out of a v5 session;
+%% the 3.1.1 bytes it produces are identical to `encode/1'.
 send_frame(Bin, #st{socket = Sock} = D) ->
-    case (catch gen_tcp:send(Sock, Bin)) of
-        ok ->
-            broker_metrics:inc(bytes_out, byte_size(Bin)),
+    case outbound_size_ok(Bin, D) of
+        false ->
+            %% S2.5 (ADR-017 §17.3): the peer's CONNECT Maximum Packet Size is
+            %% a hard bound. A PUBLISH that cannot fit is dropped (the pending
+            %% entry stays, so the redelivery path still owns it) rather than
+            %% sent and rejected by the client.
+            broker_metrics:inc(mqtt_publish_dropped_oversize),
             D;
-        Other ->
-            %% A dead socket shows up as {tcp_closed, _} shortly; a failed send
-            %% is not a protocol error, and S1 has no backpressure to fail.
-            log(warning, "send failed ~p", [Other]),
-            D
+        true ->
+            case (catch gen_tcp:send(Sock, Bin)) of
+                ok ->
+                    broker_metrics:inc(bytes_out, byte_size(Bin)),
+                    D;
+                Other ->
+                    %% A dead socket shows up as {tcp_closed, _} shortly; a failed
+                    %% send is not a protocol error, and S1 has no backpressure to
+                    %% fail.
+                    log(warning, "send failed ~p", [Other]),
+                    D
+            end
     end.
+
+%% Only PUBLISH is bounded by the CONNECT property: control packets have their
+%% own small fixed shapes, and refusing a CONNACK because a 1-byte packet does
+%% not fit a 0-byte cap would make the cap unusable.
+inbound_size_ok(Size, D) ->
+    case opt(mqtt_max_packet_size, 0, D) of
+        Limit when is_integer(Limit), Limit > 0 -> Size =< Limit;
+        _ -> true
+    end.
+
+outbound_size_ok(<<3:4, _:4, _/binary>> = Bin, #st{max_packet_size = Limit})
+  when is_integer(Limit), Limit > 0 ->
+    byte_size(Bin) =< Limit;
+outbound_size_ok(_Bin, _D) ->
+    true.
 
 %% connections_current is a gauge tracking a live count, so it needs the atomic
 %% read-modify-write of gauge_add/2; the peak is a best-effort max (a lost
@@ -1701,7 +1982,22 @@ uncount_connection(D) ->
     D.
 
 refuse(Code, D) ->
-    {stop, normal, send_frame(mqtt_frame:connack(0, Code), D)}.
+    RC = refuse_code(Code, D),
+    {stop, normal, send_frame(connack_bin(0, RC, D), D)}.
+
+%% S2.5 (ADR-017): 3.1.1 return codes and v5 reason codes are different tables
+%% for the same refusal. Mapping on the way out keeps every caller on the
+%% 3.1.1 numbering it already used.
+refuse_code(Code, #st{proto_level = 5}) -> v5_refuse(Code);
+refuse_code(Code, _) -> Code.
+
+%% Only the codes this build can actually refuse with are listed: dialyzer
+%% proves the caller set is exactly 1|2|4, so a wider table would be dead code
+%% that never runs when a new refusal is added. Add the clause at the same time
+%% as the new `refuse/2' call.
+v5_refuse(1) -> 16#84;   %% Unsupported Protocol Version
+v5_refuse(2) -> 16#85;   %% Client Identifier not valid
+v5_refuse(4) -> 16#86.   %% Bad User Name or Password
 
 %% The keepalive deadline measures the PEER's silence (§3.1.2.10: the server's
 %% timeout is 1.5x the negotiated keepalive), so only bytes from the socket
@@ -1739,11 +2035,18 @@ terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
     _ = uncount_connection(D),
     publish_will(Reason, D),
     Persisting = D#st.persist andalso Reason =/= takeover,
-    if
-        Persisting andalso D#st.inflight_dirty ->
-            _ = (catch broker_subscription:inflight(D#st.client_id, blob(D))),
-            ok;
+    %% S2.5 (ADR-017): a v5 session's expiry deadline starts at disconnect, so
+    %% it is stamped into the final blob here. A periodic snapshot (taken while
+    %% the connection is alive) deliberately leaves it absent -- a live session
+    %% must never look expired to the next CONNECT.
+    WriteBlob = Persisting andalso
+                (D#st.inflight_dirty =:= true orelse session_expiring(D)),
+    case WriteBlob of
         true ->
+            _ = (catch broker_subscription:inflight(D#st.client_id,
+                                                    blob_with_expiry(D))),
+            ok;
+        false ->
             ok
     end,
     lists:foreach(fun(P) -> _ = (catch broker_queue:unsubscribe(P, self())) end, Ps),

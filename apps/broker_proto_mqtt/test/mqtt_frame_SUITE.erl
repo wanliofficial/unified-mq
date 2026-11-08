@@ -37,6 +37,10 @@ all() ->
      qos2_publish_roundtrip,
      subscribe_qos_byte_bounds,
      connect_version_rejections,
+     v5_connect_properties_roundtrip,
+     v5_connect_unknown_property_rejected,
+     v5_publish_properties_roundtrip,
+     v5_311_outbound_bytes_unchanged,
      connect_will_without_flag_rejected,
      connect_will_qos_above_two_rejected,
      connect_will_qos_two_roundtrip,
@@ -209,18 +213,67 @@ subscribe_qos_byte_bounds(_Config) ->
     ok.
 
 connect_version_rejections(_Config) ->
-    %% The §4.5 posture feeds off these distinct reasons: 5 -> 0x87, other
-    %% levels -> 0x01 (the conn maps them; the codec tells them apart).
+    %% ADR-017 §17.4: level 5 is now accepted; a level >= 5 this build does not
+    %% know still reports `unsupported_protocol_version' so the conn can answer
+    %% in the v5 shape (0x84), while 0..3 keep the 3.1.1 shape (0x01).
     C = fun(Level, Name) ->
-            Body = <<(byte_size(Name)):16, Name/binary, Level, 2, 0, 60,
-                    0, 2, "mo">>,
+            %% v5 inserts a zero-length properties block before the client id.
+            Tail = case Level of
+                       5 -> <<0, 60, 0, 0, 2, "mo">>;
+                       _ -> <<0, 60, 0, 2, "mo">>
+                   end,
+            Body = <<(byte_size(Name)):16, Name/binary, Level, 2, Tail/binary>>,
             mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>)
         end,
-    {error, {unacceptable_protocol_version, 5}} = C(5, <<"MQTT">>),
+    {ok, #connect{proto_level = 5, client_id = <<"mo">>}, <<>>} = C(5, <<"MQTT">>),
     {error, {unsupported_protocol_version, 3}} = C(3, <<"MQTT">>),
     {error, {unsupported_protocol_version, 6}} = C(6, <<"MQTT">>),
     {error, {unsupported_protocol, <<"MQT">>}} = C(4, <<"MQT">>),
     {ok, #connect{proto_level = 4}, <<>>} = C(4, <<"MQTT">>),
+    ok.
+
+v5_connect_properties_roundtrip(_Config) ->
+    Props = #{session_expiry_interval => 60,
+              receive_maximum => 7,
+              maximum_packet_size => 4096,
+              user_properties => [{<<"k">>, <<"v">>}]},
+    C = #connect{proto_level = 5, client_id = <<"v5">>, keep_alive = 30,
+                 clean_session = 1, props = Props},
+    {ok, #connect{proto_level = 5, props = Got}, <<>>} =
+        mqtt_frame:decode(mqtt_frame:encode(C, 5), 5),
+    ?assertEqual(Props, Got),
+    ok.
+
+v5_connect_unknown_property_rejected(_Config) ->
+    %% One unknown id (0x7F) after a zero-length client id. The whole CONNECT
+    %% is refused before any session state is touched.
+    Props = <<16#7F, 0>>,
+    Body = <<0, 4, "MQTT", 5, 2, 0, 60,
+             (byte_size(Props)):8, Props/binary,
+             0, 0>>,
+    {error, {malformed_packet, {unknown_property, 16#7F}}} =
+        mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>, 5),
+    ok.
+
+v5_publish_properties_roundtrip(_Config) ->
+    Props = #{payload_format_indicator => 1,
+              message_expiry_interval => 5,
+              content_type => <<"application/json">>,
+              response_topic => <<"r/t">>,
+              correlation_data => <<1, 2, 3>>,
+              user_properties => [{<<"a">>, <<"b">>}, {<<"a">>, <<"c">>}]},
+    F = #publish{qos = 1, topic = <<"t">>, packet_id = 9,
+                 payload = <<"hi">>, props = Props},
+    {ok, #publish{props = Got, payload = <<"hi">>}, <<>>} =
+        mqtt_frame:decode(mqtt_frame:encode(F, 5), 5),
+    ?assertEqual(Props, Got),
+    ok.
+
+v5_311_outbound_bytes_unchanged(_Config) ->
+    F = #publish{qos = 1, topic = <<"a/b">>, packet_id = 3, payload = <<"x">>},
+    ?assertEqual(mqtt_frame:encode(F), mqtt_frame:encode(F, 4)),
+    {ok, #publish{qos = 1, payload = <<"x">>}, <<>>} =
+        mqtt_frame:decode(mqtt_frame:encode(F)),
     ok.
 
 connect_will_without_flag_rejected(_Config) ->
