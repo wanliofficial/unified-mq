@@ -61,3 +61,4 @@ rebar3 xref
 3. Schema Registry 内容校验。
 4. 审计日志签名/防篡改、外部 KMS。
 5. 未知扩展属性「按租户可配拒绝」。
+6. 除 MQTT 外五种协议的**标准** CloudEvents Binding 逐字实现（当前是统一 `ce-*` 头通道的等价映射，非无损点见 `docs/protocol-compatibility.md` §4.10）。
