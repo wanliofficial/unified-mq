@@ -7,7 +7,8 @@
 %% else in a listener map is listener-level: `port`, `ref`, `num_acceptors`,
 %% `max_connections`.
 -define(CONN_KEYS, [mqtt_max_qos, max_keepalive_ms, pull_page_limit,
-                    max_inflight, pull_poll_interval_ms, inflight_snapshot_ms]).
+                    max_inflight, pull_poll_interval_ms, inflight_snapshot_ms,
+                    pull_mailbox_limit, publish_mailbox_limit]).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).

@@ -46,7 +46,13 @@
             max_batch_size => 256,
             batch_delay_ms => #{os_buffer => 0, fsync => 1},
             index_anchor_interval => 256,
-            segment_max_records => 100000}},
+            segment_max_records => 100000,
+            %% S2-G / design §4.7: when this many appends are already waiting in
+            %% the writer's batch queue, a new append is refused with
+            %% `{error, {overloaded, PartitionId}}` instead of growing the queue.
+            %% 0 disables the bound (the S1 shape). The default is a pre-benchmark
+            %% estimate; S2-I will tune it from measurements.
+            max_pending_appends => 4096}},
     %% S2-F / ADR-014 §14.2: whole-segment retention. `max_bytes' and
     %% `max_age_ms' are independent limits; when both are set a segment is
     %% deleted only if BOTH agree (the stricter reading). 0 means "no limit".

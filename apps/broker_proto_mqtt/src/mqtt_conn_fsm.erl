@@ -69,7 +69,11 @@
              retry_reported = #{},         %% Pid => true, timeout already told to the worker
              will = undefined,             %% #{topic, payload, qos, retain} | undefined
              counted = false,              %% this conn's row in connections_current
-             inflight_dirty = false}).
+             inflight_dirty = false,
+             %% S2-G: this connection's last reported contribution to the
+             %% cross-process `conn_mailbox_len' / `conn_inflight' gauges.
+             reported_mailbox = 0 :: non_neg_integer(),
+             reported_inflight = 0 :: non_neg_integer()}).
 
 %%%_* API ---------------------------------------------------------------------
 
@@ -519,6 +523,21 @@ subscribe_partitions(D) ->
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain}, D) ->
     broker_metrics:inc(publish_total),
+    %% S2-G (design §4.7): MQTT 3.1.1 has no quota frame, so an overloaded
+    %% producer is told by a disconnect before the PUBACK -- never by an ack for
+    %% a record the broker refused to take.
+    case mqtt_backpressure:producer(mailbox_len(),
+                                    opt(publish_mailbox_limit, 1000, D)) of
+        ok ->
+            handle_publish0(QoS, Topic, WirePid, Payload, Retain, D);
+        {reject, mailbox} ->
+            broker_metrics:inc(backpressure_disconnects),
+            log(warning, "publish refused: mailbox over the limit (topic=~p)",
+                [Topic]),
+            {stop, {backpressure, mailbox}, D}
+    end.
+
+handle_publish0(QoS, Topic, WirePid, Payload, Retain, D) ->
     %% ADR-018 §18.3 R5: a repeated QoS 2 PUBLISH (same packet id, same
     %% connection) is answered with PUBREC and never dispatched twice. This
     %% check runs before any storage work so the dedupe costs nothing.
@@ -590,7 +609,16 @@ store_and_ack(Msg, QoS, Partition, Refs, WirePid, Retain, D)
             end;
         Other ->
             %% The ack IS the contract: no PUBACK on failure, and the publish
-            %% retry semantics belong to the caller (J7).
+            %% retry semantics belong to the caller (J7). An `overloaded' answer
+            %% is S2-G's bounded-writer refusal: the record was not written, so
+            %% the disconnect is the honest signal and the client's retry owns
+            %% the rest.
+            case Other of
+                {error, {overloaded, _}} ->
+                    broker_metrics:inc(backpressure_disconnects);
+                _ ->
+                    ok
+            end,
             log(warning, "append failed ~p, dropping connection", [Other]),
             {stop, {append_failed, Other}, D}
     end.
@@ -1103,22 +1131,36 @@ arm_poll(_StateName, D) ->
 pull_round(D0) ->
     try
         D0a = report_ack_timeouts(D0),
-        D = D0a#st{round_no = D0a#st.round_no + 1},
-        Subs = broker_subscription:subscriptions(D#st.client_id),
-        %% One partition per round, rotated by the round number: a deep backlog
-        %% on P0 cannot starve P3 (plan §pull loop step 4).
-        case pull_sweep(rotate(D#st.partitions, D#st.round_no), Subs, D) of
-            %% The round's OWN state is what continues: a sweep that sent three
-            %% deliveries and threaded {progress, D3} back into `schedule_round(D)'
-            %% would forget the packet ids it just allocated and never see a
-            %% PUBACK for them.
-            %%
-            %% R7: a new delivery is new in-flight state, so the round schedules
-            %% the blob write (coalesced by `maybe_snapshot'). Without this the
-            %% snapshot would only be written when an ack arrived or at
-            %% terminate/3, and a held PUBACK would leave the blob stale.
-            {progress, D1} -> schedule_round(maybe_snapshot(D1));
-            {_verdict, D1} -> {state, connected, maybe_snapshot(D1)}
+        {MailboxLen, D0b} = report_backpressure(D0a),
+        case consumer_verdict(MailboxLen, D0b) of
+            {pause, Why} ->
+                %% S2-G (design §4.7): do not read a page this connection cannot
+                %% deliver. The poll tick (and every wake) retries, so a pause is
+                %% temporary; the round is simply not re-scheduled from here,
+                %% which is what keeps a throttled conn from spinning.
+                broker_metrics:inc(backpressure_pauses),
+                log(info, "pull round paused (~p) mailbox=~p inflight=~p",
+                    [Why, MailboxLen, maps:size(D0b#st.pending)]),
+                {state, connected, maybe_snapshot(D0b)};
+            ok ->
+                D = D0b#st{round_no = D0b#st.round_no + 1},
+                Subs = broker_subscription:subscriptions(D#st.client_id),
+                %% One partition per round, rotated by the round number: a deep
+                %% backlog on P0 cannot starve P3 (plan §pull loop step 4).
+                case pull_sweep(rotate(D#st.partitions, D#st.round_no), Subs, D) of
+                    %% The round's OWN state is what continues: a sweep that sent
+                    %% three deliveries and threaded {progress, D3} back into
+                    %% `schedule_round(D)' would forget the packet ids it just
+                    %% allocated and never see a PUBACK for them.
+                    %%
+                    %% R7: a new delivery is new in-flight state, so the round
+                    %% schedules the blob write (coalesced by `maybe_snapshot').
+                    %% Without this the snapshot would only be written when an
+                    %% ack arrived or at terminate/3, and a held PUBACK would
+                    %% leave the blob stale.
+                    {progress, D1} -> schedule_round(maybe_snapshot(D1));
+                    {_verdict, D1} -> {state, connected, maybe_snapshot(D1)}
+                end
         end
     catch
         Class:Reason:Stack ->
@@ -1127,6 +1169,39 @@ pull_round(D0) ->
             log(warning, "pull round failed ~p:~p ~p", [Class, Reason, Stack]),
             {state, connected, D0}
     end.
+
+%% S2-G: the pull-round permit. The mailbox is checked first because an inbox
+%% that is already over the limit is not helped by one more page, no matter how
+%% empty the in-flight window looks. Both limits come from config: `0' disables
+%% the mailbox check, while `max_inflight' is a window size and `0' still means
+%% "deliver nothing" (mqtt_backpressure documents the asymmetry).
+consumer_verdict(MailboxLen, #st{pending = Pending} = D) ->
+    mqtt_backpressure:consumer(
+      MailboxLen, maps:size(Pending),
+      #{mailbox => opt(pull_mailbox_limit, 1000, D),
+        inflight => opt(max_inflight, 64, D)}).
+
+%% The two gauges are cross-process sums: each connection reports only its own
+%% delta, and terminate/3 hands the remainder back. Reading the queue length is
+%% one BIF per round, not per message.
+report_backpressure(#st{reported_mailbox = RM, reported_inflight = RI} = D) ->
+    MailboxLen = mailbox_len(),
+    Inflight = maps:size(D#st.pending),
+    _ = report_gauge(conn_mailbox_len, MailboxLen - RM),
+    _ = report_gauge(conn_inflight, Inflight - RI),
+    {MailboxLen, D#st{reported_mailbox = MailboxLen, reported_inflight = Inflight}}.
+
+mailbox_len() ->
+    case erlang:process_info(self(), message_queue_len) of
+        {message_queue_len, N} when is_integer(N) -> N;
+        _ -> 0
+    end.
+
+report_gauge(_Key, 0) ->
+    ok;
+report_gauge(Key, Delta) ->
+    _ = broker_metrics:gauge_add(Key, Delta),
+    ok.
 
 %% The sweep carries the state through the partitions it visits: a delivery made
 %% in P0 is still a delivery when P1 is looked at (and when the round stops early
@@ -1659,6 +1734,8 @@ ka_arm(_StateName, D) ->
 %% restart is not useful). It runs BEFORE detach so a subscriber observing the
 %% Will still sees this session as the owner of the client id.
 terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
+    _ = report_gauge(conn_mailbox_len, -D#st.reported_mailbox),
+    _ = report_gauge(conn_inflight, -D#st.reported_inflight),
     _ = uncount_connection(D),
     publish_will(Reason, D),
     Persisting = D#st.persist andalso Reason =/= takeover,

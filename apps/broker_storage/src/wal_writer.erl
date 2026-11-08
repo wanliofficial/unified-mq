@@ -94,13 +94,17 @@
              timer           :: reference() | undefined,
              warnings        :: [term()],
              stats           :: map(),
+             max_pending = 0 :: non_neg_integer(),
+             reported_pending = 0 :: non_neg_integer(),
              closed = false  :: boolean()}).
 
 -type stats() :: #{appends := non_neg_integer(),
                    records := non_neg_integer(),
                    batches := non_neg_integer(),
                    syncs := non_neg_integer(),
-                   rotations := non_neg_integer()}.
+                   rotations := non_neg_integer(),
+                   pending := non_neg_integer(),
+                   max_pending := non_neg_integer()}.
 
 -export_type([stats/0]).
 
@@ -197,21 +201,33 @@ handle_call({append, Bins, Mode}, From, #st{high = High, policy = Policy} = Stat
         false ->
             {reply, {error, {unsupported_sync_mode, Mode}}, State};
         true ->
-            N = length(Bins),
-            Now = now_ms(),
-            Req = #req{from = From,
-                       offsets = lists:seq(High, High + N - 1),
-                       bins = Bins,
-                       mode = Mode,
-                       deadline = wal_group_committer:deadline(Policy, Mode, Now)},
-            State1 = State#st{high = High + N,
-                              pending = State#st.pending ++ [Req],
-                              min_deadline = erlang:min(State#st.min_deadline,
-                                                        Req#req.deadline),
-                              stats = bump(appends, State#st.stats)},
-            case service(State1) of
-                {ok, State2} -> {noreply, State2};
-                {stop, Reason, State2} -> {stop, Reason, State2}
+            case over_pending_limit(State) of
+                %% S2-G (design §4.7): a full batch queue is answered, never
+                %% grown. The refusal happens before `high' moves, so a
+                %% rejected append leaves no hole in the dense offset sequence
+                %% (`read_from' would otherwise wait forever for it). The caller
+                %% sees a retryable error; the MQTT conn turns it into a
+                %% disconnect without an ack (3.1.1 has no quota frame).
+                true ->
+                    {reply, {error, {overloaded, State#st.id}}, State};
+                false ->
+                    N = length(Bins),
+                    Now = now_ms(),
+                    Req = #req{from = From,
+                               offsets = lists:seq(High, High + N - 1),
+                               bins = Bins,
+                               mode = Mode,
+                               deadline = wal_group_committer:deadline(Policy, Mode,
+                                                                       Now)},
+                    State1 = State#st{high = High + N,
+                                      pending = State#st.pending ++ [Req],
+                                      min_deadline = erlang:min(State#st.min_deadline,
+                                                                Req#req.deadline),
+                                      stats = bump(appends, State#st.stats)},
+                    case service(State1) of
+                        {ok, State2} -> {noreply, report_pending(State2)};
+                        {stop, Reason, State2} -> {stop, Reason, State2}
+                    end
             end
     end;
 
@@ -266,8 +282,9 @@ handle_call(open, _From, #st{index = Index} = State) ->
 handle_call(state, _From, #st{} = State) ->
     {reply, state_map(State), State};
 
-handle_call(stats, _From, #st{stats = Stats} = State) ->
-    {reply, Stats, State};
+handle_call(stats, _From, #st{stats = Stats, pending = Pending,
+                               max_pending = MaxPending} = State) ->
+    {reply, Stats#{pending => length(Pending), max_pending => MaxPending}, State};
 
 handle_call(retention_info, _From, #st{} = State) ->
     {reply, #{id => State#st.id,
@@ -293,10 +310,12 @@ handle_info(_Info, State) ->
 %% pending batch is answered with the error rather than dropped on the floor --
 %% a caller blocked in append/3 would otherwise see a bare exit and have no way
 %% to tell "not written" from "written but unanswered".
-terminate(Reason, #st{pending = Pending} = State) ->
+terminate(Reason, #st{pending = Pending, reported_pending = Reported} = State) ->
     lists:foreach(fun(#req{from = From}) ->
                           gen_server:reply(From, {error, {writer_stopped, Reason}})
                   end, Pending),
+    %% S2-G: hand back this writer's contribution to the cross-partition sum.
+    _ = report_gauge(wal_pending_append, -Reported),
     _ = sync_fd(State),
     _ = wal_segment:close(State#st.seg#seg.fd),
     _ = wal_meta:close(State#st.meta_fd),
@@ -349,6 +368,11 @@ open_partition(PartitionId, Dir, Config, Recovered, FsWarnings) ->
                              min_deadline = infinity,
                              timer = undefined,
                              warnings = Warnings ++ FsWarnings,
+                             %% S2-G: a full batch queue is refused instead of
+                             %% growing the writer's heap. 0 = no limit (the S1
+                             %% behaviour), so the default is applied from
+                             %% config and tests can opt out.
+                             max_pending = maps:get(max_pending_appends, Config, 0),
                              stats = #{appends => 0, records => 0, batches => 0,
                                        syncs => 0, rotations => 0}}}
             end
@@ -400,7 +424,7 @@ flush(#st{pending = Pending, policy = Policy, timer = Timer} = State) ->
             lists:foreach(fun(#req{from = From, offsets = Offsets}) ->
                                   gen_server:reply(From, {ok, Offsets})
                           end, Batch),
-            {ok, State1};
+            {ok, report_pending(State1)};
         {error, Reason} ->
             lists:foreach(fun(#req{from = From}) ->
                                   gen_server:reply(From, {error, Reason})
@@ -697,6 +721,30 @@ parse_mounts(Text) ->
                 end, [], string:split(to_list(Text), "\n", all)).
 
 %%%_* Internal -----------------------------------------------------------
+
+%% S2-G: the batch queue is the producer-side bound. `0' means "no limit", so
+%% the S1 shape is still available to tests that want to observe unbounded
+%% batching; production config sets a finite number.
+over_pending_limit(#st{max_pending = 0}) ->
+    false;
+over_pending_limit(#st{max_pending = Max, pending = Pending}) ->
+    length(Pending) >= Max.
+
+%% The gauge is a cross-partition sum, so a writer reports only the delta it
+%% caused. `report_gauge/2' is a no-op when metrics are off.
+report_pending(#st{pending = Pending, reported_pending = Reported} = State) ->
+    Now = length(Pending),
+    case Now - Reported of
+        0 -> State;
+        Delta -> _ = report_gauge(wal_pending_append, Delta),
+                 State#st{reported_pending = Now}
+    end.
+
+report_gauge(_Key, 0) ->
+    ok;
+report_gauge(Key, Delta) ->
+    _ = broker_metrics:gauge_add(Key, Delta),
+    ok.
 
 state_map(#st{} = State) ->
     #{id => State#st.id,

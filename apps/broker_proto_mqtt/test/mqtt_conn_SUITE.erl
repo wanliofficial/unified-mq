@@ -100,7 +100,11 @@ all() ->
      a_dead_shared_member_hands_its_page_to_the_survivor,
      a_standby_failover_member_receives_nothing,
      failover_promotes_the_next_member_when_the_active_disconnects,
-     a_qos0_publish_reaches_exactly_one_shared_member_over_the_wire].
+     a_qos0_publish_reaches_exactly_one_shared_member_over_the_wire,
+     %% S2-G (design §4.7): bounded consumers and per-partition isolation.
+     a_full_inflight_window_pauses_the_pull_round,
+     a_slow_consumer_stays_bounded,
+     a_hot_partition_does_not_block_the_others].
 
 %%%_* Fixtures ----------------------------------------------------------------
 
@@ -192,6 +196,18 @@ case_env(a_timed_out_delivery_is_redelivered_with_dup_and_the_same_packet_id) ->
     ok = application:set_env(broker_subscription, retry_tick_ms, 50),
     ok = application:set_env(broker_subscription, retry_base_ms, 50);
 case_env(an_expired_message_is_skipped_and_the_cursor_advances) ->
+    ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100);
+%% S2-G: one delivery at a time, so the window is provably the bound.
+case_env(a_full_inflight_window_pauses_the_pull_round) ->
+    ok = application:set_env(broker_proto_mqtt, max_inflight, 1),
+    ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100);
+case_env(a_slow_consumer_stays_bounded) ->
+    ok = application:set_env(broker_proto_mqtt, max_inflight, 1),
+    ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100);
+%% A small page makes the hot backlog need several rounds; the cold topic has
+%% to get its turn through the rotation.
+case_env(a_hot_partition_does_not_block_the_others) ->
+    ok = application:set_env(broker_proto_mqtt, pull_page_limit, 4),
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100);
 case_env(_) ->
     ok.
@@ -1402,6 +1418,104 @@ a_qos0_publish_reaches_exactly_one_shared_member_over_the_wire(_Config) ->
     {ok, normal} = mqtt_close(C2),
     {ok, normal} = mqtt_close(Publisher),
     ok.
+
+%% S2-G: the pull round is the consumer permit. With a one-slot window the
+%% second message cannot be delivered until the first is acked -- and the round
+%% is skipped as a whole, not merely stalled per message, which is what keeps a
+%% slow reader from making the broker read pages it cannot send.
+a_full_inflight_window_pauses_the_pull_round(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"t/#">>, 1),
+    Before = maps:get(backpressure_pauses, broker_metrics:snapshot()),
+    [_ = offline_publish(<<"t/a">>, Payload)
+     || Payload <- [<<"m1">>, <<"m2">>, <<"m3">>]],
+    {#publish{qos = 1, payload = <<"m1">>} = Pub1, _} = recv_publish(csock(Conn)),
+    %% One outstanding delivery fills the window: nothing else arrives, however
+    %% deep the backlog is.
+    true = mqtt_silence(csock(Conn), 300),
+    After = maps:get(backpressure_pauses, broker_metrics:snapshot()),
+    true = After > Before,
+    ok = mqtt_puback(Conn, Pub1#publish.packet_id),
+    {#publish{qos = 1, payload = <<"m2">>} = Pub2, _} = recv_publish(csock(Conn)),
+    ok = mqtt_puback(Conn, Pub2#publish.packet_id),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% The slow-consumer shape Gate S2 asks about: forty stored messages, acked one
+%% at a time. The connection may hold one delivery, its mailbox must not absorb
+%% the backlog, and the process must not grow with the topic.
+a_slow_consumer_stays_bounded(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"t/#">>, 1),
+    [_ = offline_publish(<<"t/a">>, integer_to_binary(N))
+     || N <- lists:seq(1, 40)],
+    lists:foreach(
+      fun(_) ->
+              {#publish{qos = 1} = Pub, _} = recv_publish(csock(Conn)),
+              %% The window stays at one: no second delivery before the ack.
+              true = mqtt_silence(csock(Conn), 50),
+              ok = mqtt_puback(Conn, Pub#publish.packet_id)
+      end, lists:seq(1, 5)),
+    {message_queue_len, MailboxLen} =
+        erlang:process_info(cpid(Conn), message_queue_len),
+    %% 40 wakes are not 40 messages: the queue holds notifications, and even a
+    %% generous bound proves the backlog is not being copied into the process.
+    true = MailboxLen =< 200,
+    {memory, Memory} = erlang:process_info(cpid(Conn), memory),
+    true = Memory < 4 * 1024 * 1024,
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% The rotation claim from the pull loop (plan §pull loop step 4): a deep
+%% backlog on one partition may not starve another.
+a_hot_partition_does_not_block_the_others(_Config) ->
+    ok = boot(),
+    {Conn, _} = open(<<"c1">>),
+    1 = sub(Conn, 1, <<"hot/#">>, 1),
+    1 = sub(Conn, 2, <<"cold/#">>, 1),
+    HotPartition = route_partition(<<"hot/x">>),
+    Cold = topic_on_another_partition(<<"cold/">>, HotPartition),
+    [_ = offline_publish(<<"hot/x">>, integer_to_binary(N))
+     || N <- lists:seq(1, 60)],
+    _ = offline_publish(Cold, <<"cold-message">>),
+    %% Walk the wire until the cold payload shows up. The hot messages stay
+    %% unacked beyond the one-slot window, so this is the rotation doing it.
+    {Payloads, _Pub} = recv_until_payload(csock(Conn), <<"cold-message">>, []),
+    true = lists:member(<<"cold-message">>, Payloads),
+    true = length(Payloads) > 1,
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+recv_until_payload(Client, Wanted, Seen) ->
+    recv_until_payload(Client, Wanted, Seen, 5000).
+
+recv_until_payload(_Client, Wanted, Seen, Budget) when Budget =< 0 ->
+    exit({payload_never_arrived, Wanted, Seen});
+recv_until_payload(Client, Wanted, Seen, Budget) ->
+    case mqtt_recv_or(Client, min(Budget, 500), nothing) of
+        nothing ->
+            recv_until_payload(Client, Wanted, Seen, Budget - 500);
+        {error, closed} ->
+            exit({socket_closed_before, Wanted, Seen});
+        #publish{payload = Wanted} = Pub ->
+            {lists:reverse([Pub#publish.payload | Seen]), Pub};
+        #publish{payload = Other} = _Pub ->
+            recv_until_payload(Client, Wanted, [Other | Seen], Budget);
+        _Other ->
+            recv_until_payload(Client, Wanted, Seen, Budget)
+    end.
+
+%% A topic whose hash lands on a partition other than `Partition'. The router is
+%% the only oracle (ADR-010), so the helper asks it instead of guessing.
+topic_on_another_partition(Prefix, Partition) ->
+    Candidates = [<<Prefix/binary, (integer_to_binary(N))/binary>>
+                  || N <- lists:seq(1, 64)],
+    case [T || T <- Candidates, route_partition(T) =/= Partition] of
+        [T | _] -> T;
+        [] -> exit({no_topic_outside, Partition})
+    end.
 
 %%%_* Helpers -----------------------------------------------------------------
 %% open/1 asserts the grant: a case that expects a refusal calls mqtt_open/1 and

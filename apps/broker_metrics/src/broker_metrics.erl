@@ -330,4 +330,15 @@ key_specs() ->
      %% currently retained (S2-E only grows it -- S2-F decrements on GC).
      {dlq_appends, counter},
      {dlq_append_failed, counter},
-     {ttl_expired_total, counter}].
+     {ttl_expired_total, counter},
+     %% S2-G (design §4.7, D5): the backpressure signals and the two actions.
+     %% The three gauges are maintained as cross-process SUMS (each process adds
+     %% only the delta it caused), because a bare `gauge/2' would be overwritten
+     %% by whichever process wrote last and say nothing. They are diagnostic
+     %% watermarks, not billing-grade: a `kill'ed process cannot report its
+     %% `terminate/2' decrement (execution plan §2).
+     {conn_mailbox_len, gauge},
+     {conn_inflight, gauge},
+     {wal_pending_append, gauge},
+     {backpressure_pauses, counter},
+     {backpressure_disconnects, counter}].

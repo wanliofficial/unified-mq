@@ -39,6 +39,7 @@ all() ->
      a_closed_writer_reopens_on_the_same_log,
      a_stopping_writer_answers_its_queued_callers_instead_of_dropping_them,
      append_rejects_a_mode_outside_the_capability_without_consuming_an_offset,
+     appending_above_the_pending_limit_is_refused_without_consuming_an_offset,
      the_guard_refuses_a_volatile_mount_and_allows_a_durable_one,
      the_guard_can_be_waived_and_then_says_so,
      classify_fs_matches_the_longest_mount_on_a_path_boundary,
@@ -288,6 +289,41 @@ append_rejects_a_mode_outside_the_capability_without_consuming_an_offset(Config)
         wal_writer:append(W, [msg(<<"a">>)], replicated_commit),
     {ok, [1]} = wal_writer:append(W, [msg(<<"b">>)], os_buffer),
     ok.
+
+%% S2-G (design §4.7): the batch queue is bounded. A long fsync window keeps
+%% the first two appends pending, so the next ones meet a full queue and must be
+%% answered without allocating an offset -- a hole there would make `read_from'
+%% wait forever for a record that was never written.
+appending_above_the_pending_limit_is_refused_without_consuming_an_offset(Config) ->
+    W = start(Config, #{batch_delay_ms => #{os_buffer => 0, fsync => 500},
+                        max_pending_appends => 2}),
+    Parent = self(),
+    Pids = [spawn_link(fun() ->
+                              Parent ! {self(), wal_writer:append(W, [msg(<<"p">>)],
+                                                                 fsync)}
+                      end) || _ <- lists:seq(1, 4)],
+    Results = [receive
+                   {Pid, Result} -> Result
+               after 10000 -> ct:fail({no_reply_from, Pid})
+               end || Pid <- Pids],
+    {Accepted, Refused} =
+        lists:partition(fun({ok, _}) -> true; (_) -> false end, Results),
+    2 = length(Accepted),
+    2 = length(Refused),
+    %% The refusal names the partition, so a caller can tell "this partition is
+    %% saturated" from "the writer is gone".
+    lists:foreach(fun(R) -> {error, {overloaded, 1}} = R end, Refused),
+    %% The queue drains on its own deadline: the two accepted appends are dense
+    %% and reach the log, and the refusals left nothing behind.
+    #{high := 3, committed := 0} = await_high(W, 3),
+    #{pending := 0} = wal_writer:stats(W),
+    ok.
+
+await_high(W, High) ->
+    case wal_writer:state(W) of
+        #{high := High} = State -> State;
+        _ -> timer:sleep(20), await_high(W, High)
+    end.
 
 %%%_* The volatile-filesystem guard --------------------------------------
 

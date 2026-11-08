@@ -223,11 +223,14 @@
 - **守卫**：慢消费者钉住时只计数不删；`broker_queue:retention_status/0` 返回 `{PartitionId, OldestSegment, DeletableBytes, BlockedReason}`，`BlockedReason ∈ none | slow_consumer | no_writer`。
 - **测试**：`wal_meta_SUITE` v2/v1、`wal_index_SUITE` prune、`wal_recovery_SUITE` retired 三场景、`broker_storage_wal_SUITE` 整段删除/慢消费者零删除、`wal_gc_SUITE` 8 例纯策略 + status；全量 `rebar3 ct` **376/376**、`dialyzer` 干净、`xref` 61（基线 53 的 8 条新增均记录在 ADR-014 §14.7）。
 
-### 4.7 S2-G 背压与限流
+### 4.7 S2-G 背压与限流（**已实现，2026-11-08**）
 
-- **信号**：`mailbox_len`、`pending_append`、`backlog`（per subscription）、`inflight` 占用；阈值可配。
-- **动作**：超阈值时暂停该 conn 的 pull round（consumer permit）、拒绝新 PUBLISH（3.1.1 断开 / 5.0 回 0x97）、对热点分区限制单连接吞吐。
-- **测试**：慢消费者（读 1 条/秒）不导致 broker RSS 增长；热点分区下其他分区仍可推进；连接风暴不击穿 accept 池。
+- **信号**：`mailbox_len`（连接自身消息队列）、`pending_append`（写入器 batch 队列）、`backlog`（per subscription，聚合）、`inflight` 占用；阈值全部可配，`0` = 关闭该阈值（`max_inflight = 0` 例外：仍是「不交付」）。
+- **动作**：超阈值时**整轮跳过**该 conn 的 pull round 并计数（不再读完一页再逐条 stall）；PUBLISH 前检查生产者 mailbox，超阈值直接断开且不 PUBACK（3.1.1 无背压帧，`0x97` 留给 S2.5）；`wal_writer` 在 `pending` 达上限时回 `{error, {overloaded, PartitionId}}`，且在分配 offset 之前拒绝，保证 offset 稠密。
+- **隔离**：仍保持「每轮只访问一个分区 + 按 `round_no` 轮转」，热点分区的深积压不会饿死其他分区；连接风暴仍由 ranch 的 `max_connections` / `num_acceptors` 兜底。
+- **指标**：`conn_mailbox_len` / `conn_inflight` / `wal_pending_append`（gauge，跨进程求和）、`backpressure_pauses` / `backpressure_disconnects`（counter）；见 ADR-016 §16.2 实施注记。
+- **测试**：纯决策 `mqtt_backpressure_SUITE`；写入器拒绝 `wal_writer_SUITE`；窗口满暂停、慢消费者有界、热点分区隔离 `mqtt_conn_SUITE`。RSS/数字证据由 S2-I 出。
+- **执行计划**：[`s2-g-backpressure-execution-plan.md`](s2-g-backpressure-execution-plan.md)。
 
 ### 4.8 S2-H → S2.5：MQTT 5.0 子集（Gate S2 之外）
 

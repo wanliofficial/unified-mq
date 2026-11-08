@@ -39,7 +39,9 @@ all() ->
          retain_overflow, retain_store_errors, will_published,
          qos2_state_overflow, shared_claims, shared_ack_unowned,
          shared_window_full, shared_claim_rollbacks, failover_promotions,
-         dlq_appends, dlq_append_failed, ttl_expired_total]).
+         dlq_appends, dlq_append_failed, ttl_expired_total,
+         conn_mailbox_len, conn_inflight, wal_pending_append,
+         backpressure_pauses, backpressure_disconnects]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.

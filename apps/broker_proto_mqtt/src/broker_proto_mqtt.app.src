@@ -23,5 +23,9 @@
            %% S2-E (ADR-015 §15.1/§15.4): the ack-timeout failure signal and the
            %% default publish-time TTL (0 = no expiry).
            {ack_timeout_ms, 30000},
-           {message_ttl_ms, 0}]}
+           {message_ttl_ms, 0},
+           %% S2-G (design §4.7): the consumer/producer mailbox watermarks. `0'
+           %% disables the check; `max_inflight' remains the delivery window.
+           {pull_mailbox_limit, 1000},
+           {publish_mailbox_limit, 1000}]}
 ]}.

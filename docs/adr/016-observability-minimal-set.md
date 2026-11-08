@@ -61,6 +61,14 @@ reset()             -> ok.        % 测试用
 - `snapshot/0` 是纯读，不阻塞热路径；进程内聚合用 `persistent_term` 指向 ETS/counters 引用，避免每次读数走 gen_server。
 
 > **实施注记（S2-A，2026-11-07）**：落地时在冻结形状之外增补 `gauge_add/2`——`connections_current` 是活计数，需要原子的 read-modify-write 并返回新值，`gauge/2` 保留「写绝对值」语义（峰值用）。`enabled=false` 或 app 未启动时 `gauge_add/2` 返回 `0`，其余写 API 返回 `ok`。直方图的 `snapshot/0` 形状为 `#{count, sum, buckets}`，并新增 `p99/1` 近似分位；键集合与 §16.2 一致。此注记不改变本节决策。
+>
+> **实施注记（S2-G，2026-11-08）**：背压落地时在「积压」组增补 5 个键，仍然全部是有限原子列表、无高基数标签：
+>
+> - `conn_mailbox_len`（gauge）、`conn_inflight`（gauge）：每个连接自己的 mailbox 长度与未 ack 的交付数。
+> - `wal_pending_append`（gauge）：所有分区写入器 batch 队列里等待的 append 条数。
+> - `backpressure_pauses`（counter）、`backpressure_disconnects`（counter）：被整轮跳过的 pull round 数、因过载被断开的连接数。
+>
+> 三个 gauge 用 `gauge_add/2` 维护**跨进程求和**：每个进程只上报自己的差值，`terminate/2` 减回；单个 `gauge/2` 会被多个进程互相覆盖，读数没有意义。被 `exit(Pid, kill)` 的进程不跑 `terminate/2`，和值会漂移——这三个键的定位是**诊断水位**，不是计费依据，S2-I 的 OOM 证据直接读 `erlang:process_info/2`。`keys_are_stable` 已同步断言新键集。此注记不改变本节决策。
 
 ### 16.4 埋点边界
 
