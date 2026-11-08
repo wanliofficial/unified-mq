@@ -53,7 +53,15 @@ all() ->
      a_dead_attached_process_detaches_and_clean_session_tears_down,
      detach_is_pid_guarded_against_takeover,
      router_store_is_supervised_and_env_reaches_it,
-     the_memory_backend_works_through_the_same_api].
+     the_memory_backend_works_through_the_same_api,
+     %% ADR-019 §19.1/§19.2: the pure row algebra, no application booted.
+     shared_claim_is_disjoint_across_members,
+     claim_does_not_move_low,
+     ack_out_of_order_does_not_promote_low,
+     filling_the_hole_promotes_low_once,
+     acked_below_low_is_idempotent,
+     shared_state_max_refuses_more_claims,
+     release_returns_offsets_to_the_pool].
 
 %%%_* Fixtures ------------------------------------------------------------
 
@@ -528,6 +536,107 @@ the_memory_backend_works_through_the_same_api(_Config) ->
     {ok, 1, 2} = broker_queue:watermarks(0),
     {ok, 2} = broker_subscription:cursor(MemRef, 0),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
+    ok.
+
+%%%_* ADR-019: the pure row algebra ----------------------------------------------
+%%
+%% These cases boot nothing: `broker_cursor' is a pure module (ADR-013 §13.1),
+%% which is exactly why the claim/ack rules can be pinned without an ETS table,
+%% a worker or a data dir. The worker-level cases below cover the parts that do
+%% need state (watermark lookup, dirty ledger, detach); these cover the algebra.
+
+shared_claim_is_disjoint_across_members(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, A, Row1} = broker_cursor:claim(Row0, 3, 100, <<"a">>, 4096),
+    {ok, B, _Row2} = broker_cursor:claim(Row1, 3, 100, <<"b">>, 4096),
+    [1, 2, 3] = A,
+    [4, 5, 6] = B,
+    %% D-4: the two pages do not intersect -- the whole point of claiming in the
+    %% worker instead of letting every member read from `min(cursor)'.
+    [] = [O || O <- A, lists:member(O, B)],
+    ok.
+
+claim_does_not_move_low(_Config) ->
+    Row0 = broker_cursor:new_shared(7),
+    {ok, [7, 8, 9], Row1} = broker_cursor:claim(Row0, 3, 100, <<"a">>, 4096),
+    %% Assignment and completion are different facts: only an ack may move the
+    %% watermark (ADR-019 §19.1).
+    7 = broker_cursor:next_read(Row1),
+    6 = broker_cursor:committed(Row1),
+    %% The tail is an empty page, not an error (D-5).
+    {ok, [], _} = broker_cursor:claim(Row1, 3, 10, <<"b">>, 4096),
+    ok.
+
+claim_stops_before_the_watermark(_Config) ->
+    %% D-6b: `High' is `Last + 1' (broker_storage contract), so offset `High'
+    %% itself does not exist yet. Claiming it would create an assignment that
+    %% can never be acked and pin `low' forever.
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1, 2, 3, 4], Row1} = broker_cursor:claim(Row0, 100, 5, <<"a">>, 4096),
+    #{assigned := Assigned} = Row1,
+    false = maps:is_key(5, Assigned),
+    {ok, [], _} = broker_cursor:claim(Row1, 100, 5, <<"b">>, 4096),
+    ok.
+
+ack_out_of_order_does_not_promote_low(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, _, Row1} = broker_cursor:claim(Row0, 3, 100, <<"a">>, 4096),
+    {ok, Row2} = broker_cursor:ack_shared(Row1, 3, <<"a">>),
+    1 = broker_cursor:next_read(Row2),
+    {ok, Row3} = broker_cursor:ack_shared(Row2, 2, <<"a">>),
+    %% 2 and 3 are acked, 1 is not: the prefix is one long, so `low' is still 1.
+    1 = broker_cursor:next_read(Row3),
+    0 = broker_cursor:committed(Row3),
+    ok.
+
+filling_the_hole_promotes_low_once(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, _, Row1} = broker_cursor:claim(Row0, 3, 100, <<"a">>, 4096),
+    {ok, Row2} = broker_cursor:ack_shared(Row1, 3, <<"a">>),
+    {ok, Row3} = broker_cursor:ack_shared(Row2, 2, <<"a">>),
+    {ok, Row4} = broker_cursor:ack_shared(Row3, 1, <<"a">>),
+    %% The hole filled, so `low' eats the whole buffered run in one step and
+    %% `acked' is left empty (nothing is stranded above the prefix).
+    4 = broker_cursor:next_read(Row4),
+    #{} = maps:get(acked, Row4),
+    #{} = maps:get(assigned, Row4),
+    3 = broker_cursor:committed(Row4),
+    ok.
+
+acked_below_low_is_idempotent(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, _, Row1} = broker_cursor:claim(Row0, 2, 100, <<"a">>, 4096),
+    {ok, Row2} = broker_cursor:ack_shared(Row1, 1, <<"a">>),
+    {ok, Row3} = broker_cursor:ack_shared(Row2, 2, <<"a">>),
+    3 = broker_cursor:next_read(Row3),
+    %% A duplicate ack behind the prefix -- from a retried PUBACK or a late
+    %% packet -- answers `ok' and changes nothing (D-3).
+    {ok, Row3} = broker_cursor:ack_shared(Row3, 1, <<"a">>),
+    {ok, Row3} = broker_cursor:ack_shared(Row3, 2, <<"b">>),
+    ok.
+
+shared_state_max_refuses_more_claims(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1, 2, 3, 4], Row1} = broker_cursor:claim(Row0, 10, 100, <<"a">>, 4),
+    %% D-6: the window is full, so the next claim is refused -- bounded
+    %% rejection, never eviction of a live assignment.
+    {error, overflow} = broker_cursor:claim(Row1, 10, 100, <<"b">>, 4),
+    %% A page that would overflow is trimmed to what fits, not refused.
+    {ok, [5], Row2} = broker_cursor:claim(Row1, 10, 100, <<"b">>, 5),
+    {error, overflow} = broker_cursor:claim(Row2, 10, 100, <<"c">>, 5),
+    %% Acking frees room again.
+    {ok, Row3} = broker_cursor:ack_shared(Row2, 1, <<"a">>),
+    {ok, [6], _} = broker_cursor:claim(Row3, 10, 100, <<"c">>, 5),
+    ok.
+
+release_returns_offsets_to_the_pool(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1, 2, 3], Row1} = broker_cursor:claim(Row0, 3, 100, <<"a">>, 4096),
+    {ok, [4], Row2} = broker_cursor:claim(Row1, 1, 100, <<"b">>, 4096),
+    %% The member died holding 1..3; they go back to the pool and the survivor
+    %% gets them on its next claim (D-8).
+    Row3 = broker_cursor:release(Row2, <<"a">>),
+    {ok, [1, 2, 3], _} = broker_cursor:claim(Row3, 3, 100, <<"b">>, 4096),
     ok.
 
 %%%_* Helpers -------------------------------------------------------------------
