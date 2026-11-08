@@ -13,7 +13,7 @@ cannot expose (WAL high watermark, flushed cursor, replay time).
 | `docker-compose.s1.yml` | declarative description of the same broker service (data bind mount, port `18830`, OTP image); kept as the §8.1 reference |
 | `entrypoint.sh` | starts epmd, creates the four partitions out of band (`broker_queue:create_partition/1`, H8), then execs the release in `foreground` mode |
 | `mq_harness.py` | the shared harness: container lifecycle, config rendering, one-shot Erlang probes, the paho client and the assertion helpers. Extracted verbatim from `s1_recovery.py` for the S2-B drivers |
-| `s1_recovery.py` | renders `sys.config`, drives paho-mqtt clients, injects kill -9, runs R1a/R1b/R2–R7, writes `run/report-*.json` |
+| `s1_recovery.py` | renders `sys.config`, drives paho-mqtt clients, injects kill -9, runs R1a/R1b/R2–R9, writes `run/report-*.json` |
 | `s2_powerloss.py` | S2-B real-machine power loss: loopback ext4 + `dm-flakey drop_writes`; privileged, operator-run (see `docs/benchmarks/reliability/`) |
 | `../../_build/t14/rel/unified_mq` | release built by `rebar3 as t14 release`: `dev_mode=false` (apps are copied, not symlinked) and `include_erts=false` |
 
@@ -25,7 +25,7 @@ inside the container.
 ## Usage
 
 ```sh
-# Full matrix: R1a..R7 in both cursor tiers.
+# Full matrix: R1a..R9 in both cursor tiers.
 python3 tools/docker/s1_recovery.py
 
 # A single scenario while developing.
@@ -68,6 +68,8 @@ to prove the no-loss side (duplicates are allowed inside the regress window).
 | R5 | 10 QoS0 publishes, kill -9 | probe sees 0 stored records and the restarted broker delivers nothing |
 | R6 | 20,000 QoS1 records, kill -9 | throwaway VM recovers all four partitions and reports replay time < 500 ms (measured apart from VM/container startup) |
 | R7 | QoS1 delivered, **not** acked, kill -9 | the message is delivered again after restart (`dup=1` or equivalent cursor catch-up); no loss |
+| R8 | QoS2 PUBLISH answered with PUBREC, kill -9, PUBREL replayed | one stored record before the crash; the replayed PUBREL gets an idempotent PUBCOMP; the subscriber sees the payload at least once and the cursor advances |
+| R9 | two-member Shared group, 6 QoS1 messages, 3 acked, kill -9 | the un-acked offsets are claimed again after restart (never lost); zero tier also pins that acked offsets are **not** redelivered; `low` ends at 7 |
 
 ## Notes / deviations
 

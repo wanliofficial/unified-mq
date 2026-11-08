@@ -42,7 +42,7 @@ PORT = int(os.environ.get("S1_BROKER_PORT", "18830"))
 DATA_IN_CONTAINER = "/var/lib/unified-mq"
 OTP_ROOT = Path("/home/wanli/Development/otp-28.3.1/bin")
 
-SCENARIOS = ["r1a", "r1b", "r2", "r3", "r4", "r5", "r6", "r7", "r8"]
+SCENARIOS = ["r1a", "r1b", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"]
 TIERS = ["default", "zero"]
 
 # R3's hard limit is "20k records replay in under 500 ms" (design §8.2); leave
@@ -293,16 +293,29 @@ def probe_recover(tier, timeout=180):
     return {"highs": highs, "micros": micros, "raw": out}
 
 
-def probe_cursors(client_id, tier):
-    path = DATA / "sessions" / (b64url(client_id) + ".cursors")
+def probe_cursors(client_id, tier, topic_filter, kind="exclusive"):
+    """Read one v2 `<subref>.cursors' file (ADR-019 §19.3).
+
+    The file is `{vsn, 2, SubRef, #{kind, rows}}'; a plain row carries `offset'
+    and a shared row carries `low' (the first offset nobody acked), so the
+    reported `offset' is the last committed position either way.
+    """
+    path = DATA / "sessions" / (subref_name(kind, client_id, topic_filter) + ".cursors")
     if not path.exists():
         return {"exists": False, "cursors": []}
     code = (
         f'Path = "{DATA_IN_CONTAINER}/sessions/{path.name}",'
         'case file:read_file(Path) of '
-        '  {ok, B} -> {vsn, 1, _, Body} = binary_to_term(B),'
-        '    lists:foreach(fun({F, Ps}) -> lists:foreach(fun({P, O}) ->'
-        '      io:format("CURSOR\\t~s\\t~p\\t~p~n", [F, P, O]) end, Ps) end, Body);'
+        '  {ok, B} -> case binary_to_term(B) of'
+        '    {vsn, 2, _SubRef, Body} ->'
+        '      maps:foreach(fun(P, Row) ->'
+        '        K = maps:get(kind, Row),'
+        '        O = case Row of #{low := L} -> L - 1; #{offset := Off} -> Off end,'
+        '        io:format("CURSOR\\t~p\\t~w\\t~p\\t~p~n",'
+        '                  [P, K, O, map_size(maps:get(acked, Row, #{}))])'
+        '      end, maps:get(rows, Body));'
+        '    Other -> io:format("CURSOR_ERR\\t~p~n", [Other])'
+        '  end;'
         '  {error, R} -> io:format("CURSOR_ERR\\t~p~n", [R])'
         'end, halt(0).'
     )
@@ -310,20 +323,58 @@ def probe_cursors(client_id, tier):
     entries = []
     for line in out.splitlines():
         fields = line.split("\t")
-        if len(fields) == 4 and fields[0] == "CURSOR":
-            entries.append({"filter": fields[1], "partition": int(fields[2]),
-                            "offset": int(fields[3])})
+        if len(fields) == 5 and fields[0] == "CURSOR":
+            entries.append({"partition": int(fields[1]), "kind": fields[2],
+                            "offset": int(fields[3]), "acked": int(fields[4])})
         elif line.startswith("CURSOR_ERR"):
             print(line, flush=True)
     return {"exists": True, "cursors": entries}
 
 
-def b64url(client_id):
-    return base64.urlsafe_b64encode(client_id.encode()).decode().rstrip("=")
+def b64url(value):
+    if isinstance(value, str):
+        value = value.encode()
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
 
 
-def subs_path(client_id):
-    return DATA / "sessions" / (b64url(client_id) + ".subs")
+def subref_name(kind, key, topic_filter):
+    """`<kind>.<b64(key)>.<b64(filter)>' -- the v2 filename stem."""
+    return f"{kind}.{b64url(key)}.{b64url(topic_filter)}"
+
+
+def subs_path(client_id, topic_filter, kind="exclusive", key=None):
+    key = client_id if key is None else key
+    return DATA / "sessions" / (subref_name(kind, key, topic_filter) + ".subs")
+
+
+def author_shared_group(tier, group, topic_filter, consumers, qos=1):
+    """Write a Shared `.subs' before boot (ADR-019 §19.3).
+
+    Shared subscriptions have no wire syntax until S2.5 (`$share/...`), so the
+    crash matrix authors the group's session file with the broker's own writer
+    and lets boot restore it exactly the way a real one would be restored.
+    """
+    peers = ", ".join('<<"%s">>' % c for c in consumers)
+    body = (
+        '#{kind => shared, key => <<"%s">>, filter => <<"%s">>, qos => %d,'
+        ' consumers => [%s], init_cursors => [],'
+        ' created_at => erlang:system_time(millisecond)}'
+        % (group, topic_filter, qos, peers)
+    )
+    code = (
+        'application:load(broker_subscription),'
+        f'Body = {body},'
+        f'ok = broker_subscription_files:write_subs('
+        f'{{shared, <<"{group}">>, <<"{topic_filter}">>}}, Body),'
+        'io:format("AUTHORED\\t~s\\n", [broker_subscription_files:subs_path('
+        f'{{shared, <<"{group}">>, <<"{topic_filter}">>}})]),'
+        'halt(0).'
+    )
+    out = erl_probe(code, tier, timeout=60)
+    marker = [l for l in out.splitlines() if l.startswith("AUTHORED")]
+    if not marker:
+        raise RuntimeError(f"shared group was not authored: {out}")
+    return marker[0].split("\t", 1)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +687,7 @@ def offline_subscriber(client_id, topic_filter, qos):
     c.connect()
     c.subscribe(topic_filter, qos)
     c.close()
-    path = subs_path(client_id)
+    path = subs_path(client_id, topic_filter)
     if not path.exists():
         raise RuntimeError(f"R1b/R2 fixture: {path} was not written")
     return path.stat().st_size

@@ -61,12 +61,13 @@ def scenario_r1b(tier):
     sub = Client(cid, clean=False)
     sub.connect()
     sub.subscribe(filter_, 1)
-    subs_before = subs_path(cid).stat().st_size
+    subs_before = subs_path(cid, filter_).stat().st_size
 
     kill_broker(tier)
     sub.force_close()
     start_broker(tier)
-    assert_true(subs_path(cid).exists(), "R1b: .subs disappeared across the crash")
+    assert_true(subs_path(cid, filter_).exists(),
+                "R1b: .subs disappeared across the crash")
 
     sub2, session_present = reconnect(cid)
     assert_true(session_present, "R1b: session_present must be 1")
@@ -80,7 +81,7 @@ def scenario_r1b(tier):
                 f"R1b: restored subscription did not deliver: {msg}")
     sub2.close()
     return {"session_present": session_present, "subs_bytes": subs_before,
-            "subs_after": subs_path(cid).stat().st_size}
+            "subs_after": subs_path(cid, filter_).stat().st_size}
 
 
 def scenario_r2(tier):
@@ -155,7 +156,7 @@ def scenario_r3(tier):
     # regression window this scenario exists to measure.
     kill_broker(tier)
     sub.force_close()
-    cursor = probe_cursors(cid, tier)
+    cursor = probe_cursors(cid, tier, "t14/r3/#")
     offsets = [c["offset"] for c in cursor["cursors"]]
     flushed = max(offsets) if offsets else 1
     assert_true(1 <= flushed <= n + 1,
@@ -372,7 +373,7 @@ def scenario_r8(tier):
         sub.ack(m)
     time.sleep(0.4)  # let the cursor tick land (100 ms window, both tiers)
 
-    cursors = probe_cursors(cid, tier)
+    cursors = probe_cursors(cid, tier, "t14/r8/#")
     advanced = [c for c in cursors["cursors"] if c["offset"] > 0]
     assert_true(advanced, f"R8: cursor never advanced: {cursors['cursors']}")
     sub.close()
@@ -386,6 +387,106 @@ def scenario_r8(tier):
             "cursor": advanced[0]}
 
 
+def collect_round_robin(clients, want, quiet=1.0, budget=20.0):
+    """Drain several connections at once, returning `(client, message)' pairs.
+
+    A Shared group splits one stream across N sockets, so a per-client
+    `collect()' would wait out the quiet window on the member that got the
+    smaller half.
+    """
+    out, last = [], time.monotonic()
+    deadline = time.monotonic() + budget
+    while len(out) < want and time.monotonic() < deadline:
+        got = False
+        for c in clients:
+            msg = c.next_message(timeout=0.1)
+            if msg is not None:
+                out.append((c, msg))
+                got = True
+                last = time.monotonic()
+        if not got and out and time.monotonic() - last >= quiet:
+            break
+    return out
+
+
+def scenario_r9(tier):
+    """Shared group across kill -9: un-acked offsets return, acked ones do not.
+
+    Shared has no wire syntax until S2.5 (`$share/...'), so the group's `.subs'
+    is authored with the broker's own writer before boot -- the same file a
+    join would produce and the same one boot restores (ADR-019 §19.3).
+
+    Six QoS1 messages are split across the two members by `claim/4'; three are
+    acked, then kill -9. On restart the un-acked three must be claimed again
+    ("at least once", never lost) and `low' must end at 7 once everything is
+    acked. The zero tier additionally pins that acked offsets are not
+    redelivered: its cursor flushes on every ack, so the crash cannot rewind
+    over them.
+    """
+    group = f"s2d-r9-{tier}"
+    topic_filter = "t14/r9/#"
+    members = [f"s2d-r9-{tier}-a", f"s2d-r9-{tier}-b"]
+    total, acked_n = 6, 3
+
+    kill_broker(tier)
+    subs_bytes = author_shared_group(tier, group, topic_filter, members, qos=1)
+    start_broker(tier)
+
+    subs = [Client(cid, clean=False, manual_ack=True) for cid in members]
+    for c in subs:
+        c.connect()
+    pub = Client(f"s2d-r9-{tier}-pub")
+    pub.connect()
+    pub.publish_many([topic_filter.rstrip("#") + "0"] * total,
+                     [f"msg-{i:04d}".encode() for i in range(total)], qos=1)
+    pub.close()
+
+    first = collect_round_robin(subs, want=total, quiet=1.0)
+    indices = payload_indices([m for _c, m in first])
+    assert_true(len(indices) == total,
+                f"R9: only {len(indices)}/{total} delivered before the kill")
+    assert_true(sorted(indices) == list(range(total)),
+                f"R9: pre-crash delivery was not one copy per message: {indices}")
+    split = {c.client_id: sum(1 for cc, _m in first if cc is c) for c in subs}
+
+    acked = sorted(indices[:acked_n])
+    unacked = sorted(indices[acked_n:])
+    for client, msg in first[:acked_n]:
+        client.ack(msg)
+    # Let the ack reach the cursor flush (zero flushes each ack, default 100 ms).
+    time.sleep(0.5)
+    kill_broker(tier)
+    for c in subs:
+        c.force_close()
+    start_broker(tier)
+
+    subs2 = [Client(cid, clean=False, manual_ack=True) for cid in members]
+    for c in subs2:
+        c.connect()
+    replay = collect_round_robin(subs2, want=total * 2, quiet=1.5, budget=25.0)
+    ridx = payload_indices([m for _c, m in replay])
+    missing = sorted(set(unacked) - set(ridx))
+    assert_true(not missing, f"R9: un-acked offsets were lost across the crash: {missing}")
+    acked_again = sorted(set(acked) & set(ridx))
+    if tier == "zero":
+        assert_true(not acked_again,
+                    f"R9 zero: acked offsets were redelivered: {acked_again}")
+    for client, msg in replay:
+        client.ack(msg)
+    time.sleep(0.5)
+
+    cursors = probe_cursors(group, tier, topic_filter, kind="shared")
+    low = max((c["offset"] for c in cursors["cursors"]), default=None)
+    assert_true(low == total,
+                f"R9: shared low did not reach {total}: {cursors['cursors']}")
+    for c in subs2:
+        c.close()
+    return {"subs_bytes": subs_bytes, "split": split,
+            "acked": acked, "unacked": unacked,
+            "redelivered": sorted(set(ridx)),
+            "acked_redelivered": acked_again, "low": low}
+
+
 SCENARIO_FUNCS = {
     "r1a": scenario_r1a,
     "r1b": scenario_r1b,
@@ -396,6 +497,7 @@ SCENARIO_FUNCS = {
     "r6": scenario_r6,
     "r7": scenario_r7,
     "r8": scenario_r8,
+    "r9": scenario_r9,
 }
 
 
