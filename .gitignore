@@ -64,5 +64,11 @@ spikes/*/.data/
 /test/protocol-compatibility/nats/_build/
 /test/protocol-compatibility/nats/__pycache__/
 
+# S5 AMQP harness scratch: broker data volume, Go binary, boot-module beam, reports
+/test/protocol-compatibility/amqp/data/
+/test/protocol-compatibility/amqp/run/
+/test/protocol-compatibility/amqp/_build/
+/test/protocol-compatibility/amqp/__pycache__/
+
 # CLI tool state (not project content)
 /.qoder/

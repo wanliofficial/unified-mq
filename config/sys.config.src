@@ -175,6 +175,18 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_amqp, [
+    %% S5 AMQP 0-9-1 adapter. 5672 is the standard port; 5673 avoids a local
+    %% RabbitMQ. CT binds its own ephemeral port.
+    {listeners, [
+      #{port => 5673,
+        ref => {amqp, 5673},
+        num_acceptors => 10,
+        max_connections => 1024}
+    ]},
+    {poll_ms, 100}
+  ]},
+
   {broker_proto_nats, [
     %% S5 NATS core adapter. 4222 is frequently taken by a local nats-server;
     %% the release default therefore uses 4223. CT binds its own ephemeral

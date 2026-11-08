@@ -17,7 +17,7 @@
 | MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x / mosquitto 2.1.2 | ✅（**T15 + S2-C**：10/10 用例） | QoS0/1/2、Retain、Will 已实现并实测；MQTT 5.0 语义在 S2.5 补；逐条限制见本文 §4 |
 | WebSocket | 2 | Python `websocket-client`（应用层帧为 Broker 自有 JSON/二进制） | Python | websocket-client 1.7.0 | ✅（**S5-WS：10/10 用例**） | 传输层用 `websocket-client`，应用层帧由 S5 设计，见 §4.5 |
 | NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth；无 headers/JetStream，见 §4.6 |
-| AMQP | 4 | Qpid Proton / amqp091 | Python / Java | proton (qpid) | ✅ | Proton=AMQP 1.0；需 0.9.1 时换 amqp091/pika |
+| AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack；见 §4.7 |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅ | Produce/Fetch/Metadata/Consumer Group |
 | Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅ | README 5.1 硬性要求官方 Java Client |
 
@@ -357,6 +357,60 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 2. **`send_raw/2` 返回值**：此前返回 `ok`，`handle_line(PING)` 返回 `{noreply, ok}`，下一轮 `parse/2` 对 `ok` 做记录匹配 ⇒ `{badrecord,ok}`。改为返回更新后的 `#st{}`。
 3. **`translate_filter` 兜底**：把普通 token 的兜底子句从 `{error, invalid_subject}` 改为继续累积，避免所有非通配 subject 被拒绝。
 4. **测试侧丢消息**：`queue_group_delivers_once` 的 `recv_msg_any2` 同时填两个 socket 的缓冲，却只回传被取消息的那个连接，另一个已读字节被丢弃；改为返回两个更新后的连接。这是测试 harness 缺陷，不是适配器缺陷（服务端日志证明 10 条全部投递）。
+
+---
+
+### 4.7 S5 追加（2026-11-09）：AMQP 0-9-1 适配器（`broker_proto_amqp`）
+
+> **AMQP 复用 MQTT 的存储/路由/订阅路径**——`basic.publish` 经 `broker_router` → `broker_queue`（fsync）→ `broker_subscription`；没有协议专属的消息存储。交换/队列/绑定是本适配器维护的 **瞬态拓扑**（ETS，重启不保留），消息体仍由 `broker_queue` 持久化。
+
+**协议范围（`apps/broker_proto_amqp/src/` 自实现 AMQP 0-9-1 子集）**：
+
+- 握手：协议头 `AMQP 0 0 9 1` → `connection.start`（0/9 + server-properties + `PLAIN` + `en_US`）→ `start-ok` → `tune`（channel-max 2047、frame-max 131072、heartbeat 0）→ `tune-ok` → `open` → `open-ok`；`connection.close` → `close-ok`。
+- 通道：`channel.open`/`open-ok`、`channel.close`/`close-ok`（服务端错误以 `channel.close` 回复并关闭该通道，不影响连接）。
+- 交换机：`exchange.declare`/`delete`，类型 `direct` / `fanout` / `topic`；`headers` 声明接受但不参与路由。
+- 队列：`queue.declare`（含服务端生成名 `amq.gen-*`；`passive` 声明不存在队列返回 404）、`bind`/`unbind`、`purge`、`delete`。
+- 发布/消费：`basic.publish`（方法 + content header + body 分帧）、`basic.qos`（prefetch 限流）、`basic.consume`/`cancel`、`basic.deliver`、`basic.ack`/`nack`/`reject`（`requeue` 走 `release`，重新投递）、`basic.recover`（回 `recover-ok`）。
+- 路由：queue 映射 destination `amqp/<queue>`，消费者用 `shared` 订阅（`join(shared, Queue, ...)` + claim/read/ack），同一队列的多个消费者获得竞争消费语义（每条消息恰好一个成员）。
+- 手动 ack：`delivery-tag` → `{Ref, PartitionId, Offset}` 映射；未 ack 的投递在连接断开时 `release` 回池；`nack(requeue=true)`/`reject(requeue=true)` 立即释放并重新投递。
+
+**能力矩阵行**（追加进 §2 末尾）：
+
+```
+| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、prefetch 限流、多通道隔离 | 无 `basic.get`（回 get-empty）、无 `mandatory` 的 `basic.return`、无 headers exchange 路由、拓扑瞬态（重启不保留 exchange/queue/binding）、无 publisher confirm/事务、单租户 `t0` | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
+```
+
+**已知限制（协议对端可观察，不是内部 TODO）**：
+
+1. **拓扑瞬态**：exchange/queue/binding 存在 `amqp_topo` 的 ETS 中，broker 重启即丢失；消息体本身仍 fsync 到 `broker_queue`。v1 不承诺 durable queue 的元数据恢复。
+2. **无 `basic.get`**：同步拉取回 `basic.get-empty`；请使用 `basic.consume`。
+3. **无 `basic.return`**：`mandatory=true` 的不可路由消息被丢弃且不回报（不静默改变路由，但也不回 `basic.return`）。
+4. **headers exchange 不路由**：可声明，但不会按 headers 匹配投递。
+5. **消费者加入前已入队的消息不回放**：共享游标在消费者 join 时锚定到分区尾部；v1 的消费语义针对“消费者已在线时发布的消息”。这与 durable queue 的完整语义有差距，已显式记录。
+6. **无 publisher confirm / 事务 / SASL 校验**：`start-ok` 的机制/响应被解析但不做认证；单租户 `t0`，S6 再补。
+
+**真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
+
+- 套件在 `test/protocol-compatibility/amqp/`，用 **`github.com/rabbitmq/amqp091-go` v1.10.0**（S0.4 客户端矩阵指定的 AMQP 0-9-1 客户端）驱动真实的 `erl -noshell -s amqp_broker_boot run` broker 节点（ranch 临时端口、`port=>0`、WAL 后端、ext4 数据目录，启动路径与 `amqp_conn_SUITE init_per_testcase` 一致）。Go 程序只调用 `amqp.Dial` / `Channel` / `ExchangeDeclare` / `QueueDeclare` / `QueueBind` / `Consume` / `Publish` / `Ack` / `Nack` / `Qos`，不手写线协议。
+- **13/13 用例 PASS**（`run/report.json`）：`amqp-connect`、`amqp-pubsub`、`amqp-direct`（routing key 命中/不命中）、`amqp-fanout`（3 队列全收）、`amqp-topic`（`*` 单字、`#` 余下）、`amqp-competing-consumers`（两消费者 10 条各恰好一次）、`amqp-manual-ack`、`amqp-nack-requeue`、`amqp-unbind`、`amqp-queue-delete`（删除后 passive 失败）、`amqp-passive-missing`（不存在 exchange/queue 触发通道错误）、`amqp-prefetch-qos`（prefetch=1 一次一条）、`amqp-multi-channel`（两通道隔离）。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| AMQP 帧/字段表（`amqp_codec_SUITE`） | 14 例：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
+| AMQP 连接/通道（`amqp_conn_SUITE`） | 14 例：握手+通道、direct publish/consume/ack、routing key 隔离、fanout、topic、unbind、queue delete、passive 缺失、nack requeue、prefetch、多通道、connection.close、heartbeat、坏帧尾断开 |
+| 真实第三方客户端（`amqp_compat.py` + `amqp091-go`） | 13/13 PASS（见上） |
+
+**实现期修复**（测试暴露的真实缺陷，已修）：
+
+1. **握手返回值**：`send_start(rearm(St1))` 把 `{noreply, St}` 当成状态传给 `send_start/1`，导致 `send_frame/4` 收到元组；同时客户端先发的 8 字节协议头被当帧解析。改为先 `rearm` 等待协议头，`parse/2` 识别 `<<"AMQP",0,0,9,1>>` 后再发 `connection.start`。
+2. **`reply_ok/5` 裸返回值**：`exchange.declare` 等路径直接返回 `#st{}` 而非 `{noreply, #st{}}`，连接进程以 `bad_return_value` 崩溃；逐个包成 `{noreply, ...}`。
+3. **`basic.consume` 的 `badmap`**：一行遗留的 `maps:get(url, ensure_client(St), undefined)` 对 `#st{}` 做 `maps:get`，删除。
+4. **正文分帧**：`send_body_frames/3` 对小于 frame-max 的正文仍用 `<<Chunk:Max/binary, Rest/binary>>` 强匹配，短正文崩溃；改为按长度判断。
+5. **`connection.close` 解析**：`binary_part` 结果被当成二元组匹配，删除无用解析，直接回 `close-ok`。
+6. **共享订阅跨队列串扰**：同一分区里不同 destination 的消息会被另一个 shared group 的游标扫到，导致 `ct.rr.miss` 收到本该只投给 `ct.rr.hit` 的消息、多通道互相串消息。修法：AMQP/NATS 适配器在 claim 后按 `Msg#broker_message.destination` 过滤，非本队列/本 subject 的 offset 直接 ack（跳过），不投递。MQTT 的 shared 路径本就用 `mqtt_filter:matches/2` 过滤，无需改动。
+7. **`basic.qos` prefetch 未逐条生效**：一次 claim 最多 32 条，fold 内不检查 prefetch，prefetch=1 仍会一次投多条；改为按 `prefetch - 未 ack 投递数` 作为 claim 上限。
 
 ---
 

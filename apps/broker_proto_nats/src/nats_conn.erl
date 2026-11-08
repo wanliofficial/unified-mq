@@ -426,8 +426,22 @@ claim_and_pull(P, Ref, St) ->
             St;
         {ok, Offsets} ->
             {Read, Missing} = read_offsets(P, Offsets),
-            St1 = lists:foldl(fun({O, Msg}, Acc) -> deliver_shared(P, Ref, O, Msg, Acc) end,
-                              St, Read),
+            Filter = element(3, Ref),
+            St1 = lists:foldl(
+                    fun({O, Msg}, Acc) ->
+                            case Msg#broker_message.destination =:= Filter of
+                                true ->
+                                    deliver_shared(P, Ref, O, Msg, Acc);
+                                false ->
+                                    %% Another NATS subject's message shares this
+                                    %% partition. A shared cursor scans the whole
+                                    %% partition, so consume the offset for this
+                                    %% group without delivering it.
+                                    _ = (catch broker_subscription:ack(
+                                                 Ref, P, O, St#st.client_id)),
+                                    Acc
+                            end
+                    end, St, Read),
             case Missing of
                 [] -> ok;
                 _ -> _ = (catch broker_subscription:release(Ref, P, Missing, St1#st.client_id))
