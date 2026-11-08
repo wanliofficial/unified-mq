@@ -56,7 +56,7 @@ claim(SubRef, PartitionId, Max, Consumer) -> {ok, [offset()]} | {error, term()}.
 - 从 `low` 起，取前 `Max` 个**既不在 `acked` 也不在 `assigned`** 的 offset，升序返回，并全部记入 `assigned => Consumer`。
 - **不推进 `low`**。`low` 只由 ack 的连续前缀推进。分配与完成是两件事。
 - 尾部返回 `{ok, []}`（本次没东西可领，不是错误；空页与 `overflow` 是两种不同的信号，前者是常态、后者是拒绝）。
-- **不越过分区高水位**：`claim` 在 worker 内取 `broker_queue:watermarks/1` 的 `High`，返回的 offset 一律 `< High + 1`。否则会为日志里还不存在的 offset 建 `assigned` 条目——它们永远不会被 ack，`low` 就此被钉死，`committed` 也不再前进。水印取不到时返回 `{error, {watermark, P, Reason}}`，调用方本轮退化 `idle`（poll tick 重试），不崩。
+- **不越过分区高水位**：`claim` 在 worker 内取 `broker_queue:watermarks/1` 的 `High`（`broker_storage` 的契约是 `High = Last + 1`，即下一个空位），返回的 offset 一律 `< High`。否则会为日志里还不存在的 offset 建 `assigned` 条目——它们永远不会被 ack，`low` 就此被钉死，`committed` 也不再前进。水印取不到时返回 `{error, {watermark, P, Reason}}`，调用方本轮退化 `idle`（poll tick 重试），不崩。
 - 调用方**必须**把领到的 offset 用完或让它们随连接死亡回到未分配；它不得丢弃后重新 claim 同一批（已 `assigned` 的不会被再发出去，重 claim 只会拿到**新**的一页，把上一页变成泄漏的悬挂分配）。
 - **返回集合可能不连续**（`acked` 里的空洞会让它跳过几个 offset）。调用方按 `[hd | tl]` 的区间读一次日志再按集合过滤即可：区间宽度 ≤ `Max + |acked|`，而 `|acked|` 已被 `shared_state_max` 收口，所以读取量有界。
 
@@ -166,7 +166,7 @@ ack(SubRef, PartitionId, Offset, Consumer) -> ok.
 ## 验证（Validation）
 
 - **形状**：`sub_ref()` 三形状的铸造与解析；`{exclusive, ClientId, Filter}` 与 S1 的 `{ClientId, Filter}` 一一对应（迁移等价性）。
-- **claim**：并发两个成员各 claim 一页，两组 offset **不交集**；`low` 不动；`{ok, []}` 在尾部；`shared_state_max` 触发 `{error, overflow}` 且计数；claim 返回的 offset 全部 `=< High`（不越过高水位）；返回集合允许不连续但仍升序。
+- **claim**：并发两个成员各 claim 一页，两组 offset **不交集**；`low` 不动；`{ok, []}` 在尾部；`shared_state_max` 触发 `{error, overflow}` 且计数；claim 返回的 offset 全部 `< High`（不越过高水位）；返回集合允许不连续但仍升序。
 - **committed**：`low` 只在连续前缀前进；乱序 ack（ack 第 5 条再 ack 第 3 条）不推进 `low`；空洞填满后一次性推进；`low` 之前的 ack 幂等忽略。
 - **归属**：非持有者 ack → `ok` + `ack_unowned`、状态不变；持有者 ack → 从 `assigned` 移入 `acked`。
 - **死亡重投**：成员 A 领了 3 条不 ack 后退出 ⇒ 3 条回到未分配 ⇒ 成员 B 下一轮 claim 全部领到；A 迟到的 ack 不推进任何东西。

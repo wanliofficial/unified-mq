@@ -168,7 +168,7 @@
 ### T-D3 worker 重写（2 人日）
 
 1. `?MEMBERS`（`{{ClientId, SubRef}}`，`protected` set）；`create_tables/0` 加一项。
-2. `handle_call({claim, SubRef, P, Max, Consumer})`：只对 shared 行；`broker_queue:watermarks(P)` 取 `High`，claim 上限不超过 `High`；空页返回 `{ok, []}`。水印失败返回 `{error, {watermark, P, Reason}}`（pull 本轮退化 idle，不崩）。
+2. `handle_call({claim, SubRef, P, Max, Consumer})`：只对 shared 行；`broker_queue:watermarks(P)` 取 `High`（`= Last + 1`），claim 只产出 `< High` 的 offset；空页返回 `{ok, []}`。水印失败返回 `{error, {watermark, P, Reason}}`（pull 本轮退化 idle，不崩）。
 3. `handle_call({ack, SubRef, P, O, Consumer})`：按 Kind 分派到 `broker_cursor`；`unowned` 记 `shared_ack_unowned` 并返回 `ok`。
 4. dirty 账本从 `#{ClientId => Count}` 改为 `#{SubRef => Count}`；`cursors_body(SubRef)`、`flush_sub_cursors/2`。
 5. `do_detach/3`：detach 前对每个 shared 行 `broker_cursor:release(Row, ClientId)`；exclusive/failover 不动。
@@ -226,7 +226,7 @@
 | D-4 | claim | 两成员并发 claim | offset 集合不相交；`low` 不变 |
 | D-5 | claim | 尾部 | `{ok, []}`，不是错误 |
 | D-6 | claim | 上限 | `{error, overflow}` + `shared_window_full` +1 |
-| D-6b | claim | 高水位 | 返回的 offset 全部 `=< High`；跨越时不产生幻影 `assigned` |
+| D-6b | claim | 高水位 | 返回的 offset 全部 `< High`（`High = Last + 1`）；跨越时不产生幻影 `assigned` |
 | D-7 | 归属 | 非持有者 ack | `ok` + `shared_ack_unowned` +1，行不变 |
 | D-8 | 死亡 | 成员领 3 条后退出 | 3 条回未分配；另一成员下一轮全领到 |
 | D-9 | 投递 | N 成员并发 pull | 每条消息**恰好一次**（按 offset 集合断言） |
