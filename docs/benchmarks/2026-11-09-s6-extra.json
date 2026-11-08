@@ -1,0 +1,69 @@
+{
+  "generated_at": "2026-11-08T21:17:00+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "otp": "28/16.2",
+    "filesystem": "ext4"
+  },
+  "backend_comparison": {
+    "shape": "1024 B, 8000 messages, 8 concurrent callers, 4 partitions, via broker_queue:append/3",
+    "wal": {
+      "append_msg_s": 2517,
+      "read_msg_s": 15321,
+      "append_ms": 3178,
+      "read_ms": 522
+    },
+    "memory": {
+      "append_msg_s": 71135,
+      "read_msg_s": 715345,
+      "append_ms": 112,
+      "read_ms": 11
+    },
+    "command": "erl -pa _build/default/lib/*/ebin -pa /tmp/opencode/ebin -noshell -eval 's6_bench_extra:run_all(), halt().'"
+  },
+  "cloudevents_codec": {
+    "shape": "1 KiB JSON data + 2 extensions, 20000 iterations",
+    "structured_bytes": 1103,
+    "decoded_flat_bytes": 632,
+    "decode_ops_s": 34160,
+    "validate_ops_s": 78541,
+    "encode_structured_ops_s": 40020,
+    "encode_binary_ops_s": 49685,
+    "policy_pass_through_ops_s": 5124263,
+    "policy_required_ops_s": 23979,
+    "required_overhead_pct": 21270
+  },
+  "cluster_replication": {
+    "shape": "3 peer nodes, partition 0 owned by node 1 with all 3 nodes as replicas, serial 1024 B appends",
+    "local_fsync": {
+      "mode": "fsync",
+      "ok": 200,
+      "failed": 0,
+      "msg_s": 326,
+      "latency_ms": { "p50": 3, "p99": 5, "max": 5 }
+    },
+    "replicated_3_of_3": {
+      "mode": "replicated_commit",
+      "ok": 200,
+      "failed": 0,
+      "msg_s": 139,
+      "latency_ms": { "p50": 7, "p99": 9, "max": 14 }
+    },
+    "replicated_2_of_3": {
+      "mode": "replicated_commit",
+      "ok": 200,
+      "failed": 0,
+      "msg_s": 142,
+      "latency_ms": { "p50": 7, "p99": 10, "max": 11 }
+    },
+    "replicated_1_of_3_no_majority": {
+      "mode": "replicated_commit",
+      "ok": 0,
+      "failed": 200,
+      "first_error": "{replication_failed,1,2}",
+      "msg_s": 0
+    },
+    "command": "erl -pa _build/test/lib/*/ebin -pa /tmp/opencode/ebin -noshell -eval 's6_cluster_bench:run(200), halt().'"
+  }
+}

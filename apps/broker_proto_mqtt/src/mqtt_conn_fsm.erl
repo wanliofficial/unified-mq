@@ -436,11 +436,42 @@ authenticate(#connect{keep_alive = KA, username = User, password = Pass}, D) ->
             %% password"; 0x04 covers both.
             {error, 4, D};
         Pr ->
-            allow = broker_security:authorize(Pr, {connect, D#st.client_id}),
-            {ok, D#st{max_qos = MaxQos, keepalive_ms = clamp_keepalive(KA, D),
-                      principal = Pr,
-                      tenant_id = broker_security:tenant_id(Pr)}}
+            case broker_security:authorize(Pr, {connect, D#st.client_id}) of
+                allow ->
+                    {ok, D#st{max_qos = MaxQos,
+                              keepalive_ms = clamp_keepalive(KA, D),
+                              principal = Pr,
+                              tenant_id = broker_security:tenant_id(Pr)}};
+                deny ->
+                    broker_metrics:inc(auth_failures),
+                    log(warning, "connect not authorized for client_id=~p",
+                        [D#st.client_id]),
+                    {error, 5, D}
+            end
     end.
+
+%% MQTT 5 has 0x87 (not authorized); 3.1.1 only has 0x80.
+suback_denied(D) ->
+    case vsn(D) of
+        5 -> 16#87;
+        _ -> 128
+    end.
+
+%% S6 authorization hooks. The tenant is part of the request so
+%% `broker_security' can distinguish "wrong tenant" from "wrong topic", and the
+%% principal is `undefined' for an anonymous connection (which keeps the
+%% pre-S6 allow-all posture unless an ACL rule names a principal).
+acl_publish(Topic, D) ->
+    broker_security:authorize(
+      D#st.principal,
+      #{action => publish, tenant_id => D#st.tenant_id,
+        destination => Topic}).
+
+acl_subscribe(Filter, D) ->
+    broker_security:authorize(
+      D#st.principal,
+      #{action => subscribe, tenant_id => D#st.tenant_id,
+        destination => Filter}).
 
 effective_max_qos(ConfigMax) ->
     Ps = broker_queue:partition_ids(),
@@ -601,6 +632,31 @@ handle_publish0(QoS, Topic, WirePid, Payload, Retain, Props, D) ->
     end.
 
 handle_publish1(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
+    case acl_publish(Topic, D) of
+        deny ->
+            broker_metrics:inc(authz_failures),
+            log(warning, "publish not authorized topic=~p", [Topic]),
+            %% Same shape as an event-policy rejection: a v5 client gets an
+            %% explicit reason code, a 3.1.1 client sees a disconnect and will
+            %% not retry a permanent authorization failure forever.
+            case {vsn(D), QoS} of
+                {5, 1} ->
+                    {state, connected,
+                     send_frame(enc(#puback{packet_id = WirePid,
+                                            reason_code = 16#87}, D), D)};
+                {5, 2} ->
+                    {state, connected,
+                     send_frame(enc(#pubrec{packet_id = WirePid,
+                                            reason_code = 16#87}, D), D)};
+                _ ->
+                    {stop, normal, D}
+            end;
+        allow ->
+            handle_publish_allowed(Topic, Payload, QoS, WirePid, Retain,
+                                   Props, D)
+    end.
+
+handle_publish_allowed(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
     try
         {ok, Env} = broker_router:env(),
         %% route/3 is the ONLY partition oracle (ADR-010): even with no
@@ -1120,11 +1176,21 @@ grant(Filter, ReqQoS, D) ->
 grant_exclusive(Filter, ReqQoS, D) ->
     case {mqtt_filter:validate_filter(Filter), ReqQoS =< D#st.max_qos} of
         {ok, true} ->
-            case broker_subscription:subscribe(D#st.client_id, Filter, ReqQoS) of
-                {ok, _Ref} -> ReqQoS;
-                {error, Reason} ->
-                    log(warning, "subscribe refused ~p: ~p", [Filter, Reason]),
-                    128
+            case acl_subscribe(Filter, D) of
+                deny ->
+                    broker_metrics:inc(authz_failures),
+                    log(warning, "subscribe not authorized filter=~p", [Filter]),
+                    suback_denied(D);
+                allow ->
+                    case broker_subscription:subscribe(
+                           D#st.client_id, Filter, ReqQoS,
+                           D#st.tenant_id) of
+                        {ok, _Ref} -> ReqQoS;
+                        {error, Reason} ->
+                            log(warning, "subscribe refused ~p: ~p",
+                                [Filter, Reason]),
+                            128
+                    end
             end;
         {ok, false} ->
             %% E12: an over-cap requested QoS is refused at the SUBACK, never
@@ -1143,13 +1209,22 @@ grant_exclusive(Filter, ReqQoS, D) ->
 grant_shared(Group, Real, ReqQoS, D) ->
     case {mqtt_filter:validate_filter(Real), ReqQoS =< D#st.max_qos} of
         {ok, true} ->
-            case broker_subscription:join(shared, Group, D#st.client_id, Real,
-                                          ReqQoS) of
-                {ok, _Ref} -> ReqQoS;
-                {error, Reason} ->
-                    log(warning, "shared join refused ~p/~p: ~p",
-                        [Group, Real, Reason]),
-                    128
+            case acl_subscribe(Real, D) of
+                deny ->
+                    broker_metrics:inc(authz_failures),
+                    log(warning, "shared subscribe not authorized ~p/~p",
+                        [Group, Real]),
+                    suback_denied(D);
+                allow ->
+                    case broker_subscription:join(
+                           shared, Group, D#st.client_id, Real, ReqQoS,
+                           D#st.tenant_id) of
+                        {ok, _Ref} -> ReqQoS;
+                        {error, Reason} ->
+                            log(warning, "shared join refused ~p/~p: ~p",
+                                [Group, Real, Reason]),
+                            128
+                    end
             end;
         {ok, false} ->
             log(info, "shared subscribe ~p qos ~p above max ~p",

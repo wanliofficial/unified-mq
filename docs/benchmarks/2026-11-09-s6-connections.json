@@ -1,0 +1,84 @@
+{
+  "generated_at": "2026-11-08T21:18:38.823331+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "memory": "MemTotal:       15699532 kB",
+    "kernel": "6.18.48-amd64-desktop-rolling",
+    "filesystem": "/dev/nvme0n1p5 ext4 418547984 355630448 41583044   90% /home",
+    "otp": "28/16.2"
+  },
+  "matrix": "publisher-sweep",
+  "cells": [
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 1,
+      "messages": 4000,
+      "elapsed_s": 19.523,
+      "throughput_msg_s": 204.9,
+      "latency_ms": {
+        "p50": 35.87,
+        "p99": 98.51,
+        "p999": 106.23,
+        "max": 106.23
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 4,
+      "messages": 4000,
+      "elapsed_s": 4.532,
+      "throughput_msg_s": 882.6,
+      "latency_ms": {
+        "p50": 40.78,
+        "p99": 110.96,
+        "p999": 119.45,
+        "max": 119.45
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 8,
+      "messages": 4000,
+      "elapsed_s": 3.629,
+      "throughput_msg_s": 1102.1,
+      "latency_ms": {
+        "p50": 16.84,
+        "p99": 52.57,
+        "p999": 61.68,
+        "max": 61.68
+      },
+      "delivered": 300
+    },
+    {
+      "size_bytes": 1024,
+      "batch": 32,
+      "partitions": 4,
+      "subscriptions": 1,
+      "publishers": 16,
+      "messages": 4000,
+      "elapsed_s": 3.551,
+      "throughput_msg_s": 1126.6,
+      "latency_ms": {
+        "p50": 14.52,
+        "p99": 47.37,
+        "p999": 56.46,
+        "max": 56.46
+      },
+      "delivered": 300
+    }
+  ],
+  "recovery": null,
+  "command": "tools/bench/s2_bench.py --publisher-sweep --skip-build --out docs/benchmarks/2026-11-09-s6-connections.json"
+}

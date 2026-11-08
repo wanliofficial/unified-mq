@@ -33,7 +33,13 @@ replicate(Partition, Msg, Replicas) ->
     Needed = (length(Replicas) div 2) + 1,
     Others = [N || N <- Replicas, N =/= node()],
     Timeout = application:get_env(broker_cluster, replicate_timeout_ms, 2000),
+    Started = erlang:monotonic_time(microsecond),
     Acks = 1 + parallel_append(Partition, Msg, Others, Timeout),
+    %% The local fsync already happened, so this measures the replica round
+    %% only: majority wait on success, timeout when the majority never forms.
+    _ = (catch broker_metrics:observe(
+                   cluster_replication_latency_us,
+                   erlang:monotonic_time(microsecond) - Started)),
     case Acks >= Needed of
         true ->
             ok;
@@ -44,8 +50,17 @@ replicate(Partition, Msg, Replicas) ->
 
 %% Executed on a replica node. `fsync' is the follower's durability level: a
 %% follower that acknowledged must survive its own crash too.
+%%
+%% The contract with `parallel_append/4' is a bare `ok' or `{error, _}': the
+%% local append answers `{ok, Offset}', and returning that verbatim made every
+%% real cross-node replica look like a failure (the offset tuple fell into the
+%% `_Error' branch). Normalising here is what keeps a majority of successful
+%% followers counted as success.
 remote_append(Partition, Msg) ->
-    broker_queue:append_replica(Partition, Msg, fsync).
+    case broker_queue:append_replica(Partition, Msg, fsync) of
+        {ok, _Offset} -> ok;
+        {error, _Reason} = Error -> Error
+    end.
 
 %%%_* Internal ------------------------------------------------------------
 

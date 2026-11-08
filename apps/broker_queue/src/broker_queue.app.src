@@ -4,7 +4,7 @@
     {registered, [broker_queue_sup, broker_queue_store]},
     {mod, {broker_queue_app, []}},
     {applications, [kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage,
-                    broker_router]},
+                    broker_router, broker_security]},
     %% S1 fixes the partition set (design §1.2: online repartitioning is S4), so
     %% this is not a knob an operator tunes at runtime. It is also the authority
     %% create_partition/1 checks against, which is what keeps a stray partition

@@ -46,7 +46,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([start_link/0,
-         subscribe/3, join/5, unsubscribe/2, leave/2,
+         subscribe/3, subscribe/4, join/5, join/6, unsubscribe/2, leave/2,
          ack/4, claim/4, release/4, retry/4,
          inflight/2, attach/3, detach/2]).
 
@@ -63,11 +63,20 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+%% S6: the 4-arity form carries the authenticated tenant. The 3-arity form is
+%% the pre-S6 API and registers as `<<"*">>' (visible to every tenant), which
+%% keeps existing tests and out-of-band callers working unchanged.
 subscribe(ClientId, Filter, QoS) ->
-    gen_server:call(?MODULE, {subscribe, ClientId, Filter, QoS}).
+    subscribe(ClientId, Filter, QoS, <<"*">>).
+
+subscribe(ClientId, Filter, QoS, Tenant) ->
+    gen_server:call(?MODULE, {subscribe, ClientId, Filter, QoS, Tenant}).
 
 join(Kind, Group, ClientId, Filter, QoS) ->
-    gen_server:call(?MODULE, {join, Kind, Group, ClientId, Filter, QoS}).
+    join(Kind, Group, ClientId, Filter, QoS, <<"*">>).
+
+join(Kind, Group, ClientId, Filter, QoS, Tenant) ->
+    gen_server:call(?MODULE, {join, Kind, Group, ClientId, Filter, QoS, Tenant}).
 
 unsubscribe(ClientId, Filter) ->
     gen_server:call(?MODULE, {unsubscribe, ClientId, Filter}).
@@ -149,7 +158,9 @@ dlq_pattern() ->
     application:get_env(broker_subscription, dlq_name_pattern,
                         <<"$dlq/{tenant}/{original}">>).
 
-handle_call({subscribe, ClientId, Filter, QoS}, _From, State) ->
+handle_call({subscribe, ClientId, Filter, QoS}, From, State) ->
+    handle_call({subscribe, ClientId, Filter, QoS, <<"*">>}, From, State);
+handle_call({subscribe, ClientId, Filter, QoS, Tenant}, _From, State) ->
     SubRef = {exclusive, ClientId, Filter},
     case ets:lookup(?ENTITIES, SubRef) of
         [_] ->
@@ -163,11 +174,15 @@ handle_call({subscribe, ClientId, Filter, QoS}, _From, State) ->
         [] ->
             reply_new_subscribe(SubRef, #{kind => exclusive, key => ClientId,
                                           filter => Filter, qos => QoS,
+                                          tenant_id => Tenant,
                                           consumers => [ClientId]},
                                 State)
     end;
 
-handle_call({join, Kind, Group, ClientId, Filter, QoS}, _From, State)
+handle_call({join, Kind, Group, ClientId, Filter, QoS}, From, State)
+  when Kind =:= shared; Kind =:= failover ->
+    handle_call({join, Kind, Group, ClientId, Filter, QoS, <<"*">>}, From, State);
+handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant}, _From, State)
   when Kind =:= shared; Kind =:= failover ->
     SubRef = {Kind, Group, Filter},
     case ets:lookup(?ENTITIES, SubRef) of
@@ -203,18 +218,22 @@ handle_call({join, Kind, Group, ClientId, Filter, QoS}, _From, State)
                     end
             end;
         [] ->
-            case broker_router:register(Filter, SubRef, #{qos => QoS}) of
+            case broker_router:register(Filter, SubRef,
+                                        #{qos => QoS, tenant_id => Tenant}) of
                 Result when Result =:= ok;
                             Result =:= {error, {already_registered, SubRef}} ->
                     Info = #{kind => Kind, key => Group, filter => Filter,
-                             qos => QoS, consumers => [ClientId]},
+                             qos => QoS, tenant_id => Tenant,
+                             consumers => [ClientId]},
                     reply_new_subscribe2(SubRef, Info, State);
                 {error, Reason} ->
                     {reply, {error, {router_register, Reason}}, State}
             end
     end;
 
-handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS}, _From, State) ->
+handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS}, From, State) ->
+    handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, <<"*">>}, From, State);
+handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, _Tenant}, _From, State) ->
     {reply, {error, wrong_kind}, State};
 
 handle_call({unsubscribe, ClientId, Filter}, _From, State) ->
@@ -496,7 +515,7 @@ load_subscription(SubRef, Body, Partitions, WM) ->
                       Row = restored_row(Kind, P, Flushed, Init, WM),
                       true = ets:insert(?CURSORS, {{SubRef, P}, Row})
                   end, Partitions),
-                {ok, {SubRef, Filter}}
+                {ok, {SubRef, Filter, maps:get(tenant_id, Body, <<"*">>)}}
             catch
                 Class:Reason -> {error, {load_failed, Class, Reason}}
             end;
@@ -576,8 +595,8 @@ all_clients() ->
 %% crash window that orphans a Router entry ends with exactly this file on disk
 %% and this SubRef still indexed, and refusing to boot over it would let a
 %% bookkeeping gap in one layer take down another.
-backfill([{SubRef, Filter} | Rest]) ->
-    case broker_router:register(Filter, SubRef, #{}) of
+backfill([{SubRef, Filter, Tenant} | Rest]) ->
+    case broker_router:register(Filter, SubRef, #{tenant_id => Tenant}) of
         ok -> backfill(Rest);
         {error, {already_registered, SubRef}} -> backfill(Rest);
         {error, Reason} -> {error, {backfill, SubRef, Reason}}
@@ -600,7 +619,9 @@ reply_resubscribe(SubRef = {_Kind, _Key, _Filter}, QoS, State) ->
 
 reply_new_subscribe(SubRef, Info, State) ->
     #{filter := Filter} = Info,
-    case broker_router:register(Filter, SubRef, #{qos => maps:get(qos, Info)}) of
+    SubOpts = #{qos => maps:get(qos, Info),
+                tenant_id => maps:get(tenant_id, Info, <<"*">>)},
+    case broker_router:register(Filter, SubRef, SubOpts) of
         Result when Result =:= ok;
                     Result =:= {error, {already_registered, SubRef}} ->
             reply_new_subscribe2(SubRef, Info, State);
@@ -652,6 +673,7 @@ persist_entity(SubRef, #{kind := Kind, key := Key, filter := Filter, qos := QoS,
     broker_subscription_files:write_subs(
       SubRef, #{kind => Kind, key => Key, filter => Filter, qos => QoS,
                 consumers => Consumers, init_cursors => Init,
+                tenant_id => maps:get(tenant_id, Info, <<"*">>),
                 created_at => maps:get(created_at, Info, 0)}).
 
 %%%_* unsubscribe / leave ---------------------------------------------------

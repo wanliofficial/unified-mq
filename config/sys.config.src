@@ -105,7 +105,44 @@
     {users, [
       {<<"guest">>, #{password => <<"guest">>, tenant_id => <<"t0">>}}
     ]},
-    {acl, allow}
+    %% S6 ACL: `allow' keeps the pre-S6 allow-all posture. Replace with an
+    %% ordered first-match rule list to enforce policy:
+    %%   [{#{effect => deny,  principal => <<"*">>, action => <<"*">>,
+    %%       pattern => <<"$sys/*">>},
+    %%    #{effect => allow, principal => <<"*">>, action => publish,
+    %%       pattern => <<"t0/*">>}}]
+    %% A principal can never widen its tenant: tenant isolation is checked
+    %% before any rule.
+    {acl, allow},
+    %% S6 resource limits (README §10.1). Missing keys use the defaults below.
+    {limits, #{max_message_bytes => 1048576,
+               max_header_count => 32,
+               max_header_value_bytes => 8192,
+               max_event_attributes => 64,
+               max_extension_value_bytes => 4096,
+               max_json_depth => 16}},
+    %% S6 TLS: disabled by default so an existing plaintext deployment keeps
+    %% working. Enable it and point at PEM files to terminate TLS; rotate by
+    %% replacing the files and POSTing /api/v1/tls/reload.
+    {tls, #{enabled => false,
+            certfile => undefined,
+            keyfile => undefined,
+            cacertfile => undefined,
+            verify => verify_none,
+            fail_if_no_peer_cert => false,
+            versions => ['tlsv1.2', 'tlsv1.3']}}
+  ]},
+
+  {broker_admin, [
+    %% S6 management API. Loopback by default: the API can create backups and
+    %% reload TLS, so binding it wide has to be a deliberate change.
+    {enabled, true},
+    {bind, {127, 0, 0, 1}},
+    {port, 8090},
+    %% Empty token = no authentication. Set it whenever `bind' is not loopback.
+    {token, <<>>},
+    %% Absolute path outside the release tree, same discipline as data_dir.
+    {backup_dir, "/home/wanli/workspace/unified-mq/backups"}
   ]},
 
   {broker_event, [

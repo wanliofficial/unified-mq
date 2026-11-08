@@ -41,10 +41,13 @@ listeners() ->
 listener_spec(Spec) when is_map(Spec) ->
     Port = maps:get(port, Spec),
     Ref = maps:get(ref, Spec, {mqtt, Port}),
-    TransOpts = #{socket_opts => [{port, Port}],
+    %% S6: TLS is a listener-wide decision; `transport/0' reads the
+    %% configured PEM paths and returns ranch_tcp when disabled.
+    {Transport, TlsOpts} = broker_security_tls:transport(),
+    TransOpts = #{socket_opts => [{port, Port} | TlsOpts],
                   num_acceptors => maps:get(num_acceptors, Spec, 10),
                   max_connections => maps:get(max_connections, Spec, 1024)},
     ProtoOpts = maps:with(?CONN_KEYS, Spec),
-    (ranch:child_spec(Ref, ranch_tcp, TransOpts, mqtt_listener, ProtoOpts))#{
+    (ranch:child_spec(Ref, Transport, TransOpts, mqtt_listener, ProtoOpts))#{
         restart => transient
     }.

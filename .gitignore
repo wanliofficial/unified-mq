@@ -35,6 +35,9 @@ spikes/*/.data/
 /data/
 /log/
 
+# S6 admin backups (broker_admin.backup_dir default)
+/backups/
+
 # T14 harness scratch: rendered sys.config/vm.args, crash-test data, reports
 /tools/docker/data/
 /tools/docker/run/

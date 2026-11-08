@@ -8,7 +8,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/1, register/3, unregister/2, table/1]).
+-export([start_link/1, register/4, unregister/2, table/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -17,8 +17,11 @@
 start_link(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, [], []).
 
-register(Store, Filter, SubRef) ->
-    gen_server:call(Store, {register, Filter, SubRef}).
+%% S6: the tenant is part of the index key, so `route/3' can filter without a
+%% second lookup. `<<"*">>' means "legacy subscription, visible to every tenant"
+%% (the pre-S6 behaviour preserved for sessions that predate tenant metadata).
+register(Store, Tenant, Filter, SubRef) ->
+    gen_server:call(Store, {register, Tenant, Filter, SubRef}).
 
 unregister(Store, SubRef) ->
     gen_server:call(Store, {unregister, SubRef}).
@@ -34,27 +37,31 @@ init([]) ->
     Subs = ets:new(subs, [set, protected, {read_concurrency, true}]),
     {ok, #st{index = Index, subs = Subs}}.
 
-%% {Filter, [{SubRef, Seq}]} -- Seq is monotonic, so each filter's list is
-%% already in registration order and route/3 can restore a global order cheaply.
-handle_call({register, Filter, SubRef}, _From, #st{index = Index, subs = Subs} = State) ->
+%% {{Tenant, Filter}, [{SubRef, Seq}]} -- Seq is monotonic, so each filter's
+%% list is already in registration order and route/3 can restore a global order
+%% cheaply. The tenant in the key is what makes cross-tenant delivery impossible
+%% at the read path: a publisher with tenant T never even sees another tenant's
+%% entries.
+handle_call({register, Tenant, Filter, SubRef}, _From, #st{index = Index, subs = Subs} = State) ->
     #st{seq = Seq} = State,
     case ets:lookup(Subs, SubRef) of
         [_] ->
             {reply, {error, {already_registered, SubRef}}, State};
         [] ->
-            New = existing(Filter, Index) ++ [{SubRef, Seq + 1}],
-            true = ets:insert(Index, {Filter, New}),
-            true = ets:insert(Subs, {SubRef, Filter}),
+            Key = {normalize_tenant(Tenant), Filter},
+            New = existing(Key, Index) ++ [{SubRef, Seq + 1}],
+            true = ets:insert(Index, {Key, New}),
+            true = ets:insert(Subs, {SubRef, Key}),
             {reply, ok, State#st{seq = Seq + 1}}
     end;
 
 handle_call({unregister, SubRef}, _From, #st{index = Index, subs = Subs} = State) ->
     case ets:lookup(Subs, SubRef) of
-        [{SubRef, Filter}] ->
-            Rest = lists:filter(fun({S, _Seq}) -> S =/= SubRef end, existing(Filter, Index)),
+        [{SubRef, Key}] ->
+            Rest = lists:filter(fun({S, _Seq}) -> S =/= SubRef end, existing(Key, Index)),
             case Rest of
-                [] -> true = ets:delete(Index, Filter);
-                _ -> true = ets:insert(Index, {Filter, Rest})
+                [] -> true = ets:delete(Index, Key);
+                _ -> true = ets:insert(Index, {Key, Rest})
             end,
             true = ets:delete(Subs, SubRef),
             {reply, ok, State};
@@ -76,8 +83,11 @@ terminate(_Reason, _State) ->
 
 %%%_* Internal -----------------------------------------------------------
 
-existing(Filter, Index) ->
-    case ets:lookup(Index, Filter) of
-        [{Filter, Subs}] -> Subs;
+existing(Key, Index) ->
+    case ets:lookup(Index, Key) of
+        [{Key, Subs}] -> Subs;
         [] -> []
     end.
+
+normalize_tenant(T) when is_binary(T), T =/= <<>> -> T;
+normalize_tenant(_) -> <<"*">>.

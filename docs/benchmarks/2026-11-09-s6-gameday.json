@@ -1,0 +1,52 @@
+{
+  "generated_at": "2026-11-08T21:04:06.909293+00:00",
+  "host": {
+    "cpu": "AMD Ryzen 7 4800U with Radeon Graphics",
+    "cores": 16,
+    "memory": "MemTotal:       15699532 kB",
+    "kernel": "6.18.48-amd64-desktop-rolling",
+    "filesystem": "/dev/nvme0n1p5 ext4 418547984 356204916 41008576   90% /home",
+    "otp": "28/16.2"
+  },
+  "scenarios": [
+    {
+      "scenario": "crash",
+      "recovery_s": 3.956,
+      "session_present": true,
+      "delivered_after_restart": true,
+      "payload_ok": true,
+      "pass": true
+    },
+    {
+      "scenario": "slow_consumer",
+      "published": 20000,
+      "elapsed_s": 15.2,
+      "broker_alive": true,
+      "delivered_to_slow_consumer": 0,
+      "baseline_mb": 134.0,
+      "peak_mb": 176.8,
+      "growth_mb": 42.8,
+      "samples": 36,
+      "pass": true
+    },
+    {
+      "scenario": "disk_readonly",
+      "refused_to_boot": true,
+      "ack_withheld": true,
+      "first_error": null,
+      "recovery_s": 3.559,
+      "session_present_after_restore": true,
+      "durable_message_survived": true,
+      "pass": true
+    },
+    {
+      "scenario": "partition",
+      "suite": "broker_cluster_dist_SUITE",
+      "elapsed_s": 25.0,
+      "exit_code": 0,
+      "summary": "All 4 tests passed.",
+      "pass": true
+    }
+  ],
+  "command": "tools/bench/s6_gameday.py --skip-build --out docs/benchmarks/2026-11-09-s6-gameday.json"
+}

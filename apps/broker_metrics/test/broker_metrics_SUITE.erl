@@ -27,6 +27,7 @@ all() ->
 
 -define(KEYS,
         [connections_current, connections_peak, auth_failures,
+         authz_failures,
          protocol_errors, frame_decode_errors, publish_total, deliver_total,
          ack_total, bytes_in, bytes_out, publish_latency_us,
          deliver_latency_us, ack_latency_us, wal_sync_latency_us,
@@ -45,7 +46,8 @@ all() ->
          mqtt_packet_too_large, mqtt_publish_dropped_oversize,
          wal_pending_append, backpressure_pauses, backpressure_disconnects,
          cluster_owner_changes, cluster_fencing_rejected,
-         cluster_replication_failed, cluster_no_quorum]).
+         cluster_replication_failed, cluster_replication_latency_us,
+         cluster_no_quorum]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.

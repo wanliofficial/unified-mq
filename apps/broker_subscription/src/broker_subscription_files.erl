@@ -55,6 +55,7 @@
                           qos := 0..2,
                           consumers := [binary()],
                           init_cursors := [{partition_id(), offset()}],
+                          tenant_id => binary(),
                           created_at := integer()}.
 -type cursors_body() :: #{kind := exclusive | shared | failover,
                           rows := #{partition_id() => map()}}.

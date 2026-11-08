@@ -71,10 +71,10 @@ S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面�
 
 ### Gate S0
 
-- [ ] S0.1 与 S0.3 产出明确结论（采用 / 拒绝均有依据）
-- [ ] S0.4 的客户端与版本矩阵被采纳为 S5 全部协议测试的基线
-- [ ] ADR-001 ~ ADR-007 从 README 摘要升级为 `docs/adr/00N-*.md` 正式文件
-- [ ] S0.2 产出分区分组决策，记录故障域定义
+- [x] S0.1 与 S0.3 产出明确结论（采用 / 拒绝均有依据）—— ADR-003（采用 `rabbitmq/ra` 3.2.0）、ADR-008（自研 WAL + 分组模型）
+- [x] S0.4 的客户端与版本矩阵被采纳为 S5 全部协议测试的基线 —— `docs/protocol-compatibility.md` §0
+- [x] ADR-001 ~ ADR-007 从 README 摘要升级为 `docs/adr/00N-*.md` 正式文件 —— 7 份文件均存在
+- [x] S0.2 产出分区分组决策，记录故障域定义 —— ADR-008 §8.1（G=16 折中，故障域 = 组大小）
 
 ---
 
@@ -272,9 +272,11 @@ unified-mq/
 
 ### Gate S5
 
-- [ ] 每个协议通过真实第三方客户端集成测试，无自编客户端互测
-- [ ] 各协议 Binding 的往返测试通过，转换损失项有明确清单
-- [ ] 能力矩阵文档更新，覆盖 README 11.1 全部验证维度
+- [x] 每个协议通过真实第三方客户端集成测试，无自编客户端互测 —— mqtt 10/10（paho+mosquitto）、ws 10/10（websocket-client）、nats 11/11（nats.go）、amqp 13/13（amqp091-go）、kafka 12/12（kafka-clients）、pulsar 8/8（官方 Java Client）；见 `docs/protocol-compatibility.md` §0 与 §4.5~§4.9
+- [x] 各协议 Binding 的往返测试通过，转换损失项有明确清单 —— **CloudEvents Binding 由 [ADR-020](adr/020-cloudevents-codec-policy-binding.md) 冻结为 MQTT 绑定**：MQTT 3.1.1/5.0 正反向映射 + 显式损失报告（`broker_event_SUITE` 31 例，含 `cross_protocol_roundtrip_keeps_identity`）；其余五种协议把 payload 逐字节透传（Structured Mode 因此无损保留），**per-protocol Binary Mode 元数据映射未实现**，见 `docs/protocol-compatibility.md` §4.10
+- [x] 能力矩阵文档更新，覆盖 README 11.1 全部验证维度 —— `docs/protocol-compatibility.md` §2 能力矩阵 + §4.5~§4.9 每协议限制清单
+
+> **口径说明**：第 2 项按 ADR-020 的冻结范围判定通过；它**不是**「五种协议都实现了完整标准 Binding」的声明。README §4 的映射表本身也写明是架构建议、非已完成声明。per-protocol Binary Mode 绑定列入 S6 之后待办（`docs/security.md` §12 同列）。
 
 ---
 
@@ -296,11 +298,11 @@ unified-mq/
 
 ### 8.3 Gate S6
 
-- [ ] 安全审计通过（租户越权、ACL 绕过、事件属性越权三项专项检查）
-- [ ] 压测报告覆盖 README 11.4 全部维度
-- [ ] 故障演练记录：崩溃、分区、磁盘故障、慢消费者场景的实测恢复时间
-- [ ] 运维手册与告警规则交付
-- [ ] CI 分层流水线：common test → 协议兼容 → chaos → performance
+- [x] 安全审计通过（租户越权、ACL 绕过、事件属性越权三项专项检查）——`broker_security_audit_SUITE` 9 例；见 `docs/security.md`
+- [x] 压测报告覆盖 README 11.4 全部维度——`docs/benchmarks/2026-11-09-s6-capacity.md`（含连接数、内存 vs 持久化、CloudEvents 开销、3 节点复制与恢复）
+- [x] 故障演练记录：崩溃、分区、磁盘故障、慢消费者场景的实测恢复时间——`docs/benchmarks/2026-11-09-s6-gameday.md`（crash 3.956 s / disk 3.559 s / slow_consumer +42.8 MiB / partition 4/4）
+- [x] 运维手册与告警规则交付——`docs/operations.md` + `config/alerts.yml`
+- [x] CI 分层流水线：common test → 协议兼容 → chaos → performance——`.github/workflows/ci.yml`
 
 ---
 

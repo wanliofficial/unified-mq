@@ -1,0 +1,156 @@
+name: ci
+
+# Layered pipeline (roadmap §8.3 / Gate S6 item 5): fast correctness first, then
+# protocol compatibility, then chaos, then performance.  A failure in an earlier
+# layer stops later ones, so a broken kernel never burns an hour on benchmarks.
+#
+# NOTE: the repository pins OTP 28.3.1 and vendors `ra` under `_checkouts/`, so
+# no job needs network access at build time.  Protocol-compatibility jobs do
+# need their language toolchains and client dependencies; they are marked
+# `optional: true`-style (continue-on-error) until a runner image carries them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  OTP_VERSION: "28.3.1"
+  REBAR_VERSION: "3.27.0"
+
+jobs:
+  # ---------------------------------------------------------------- layer 1
+  common-test:
+    name: common test (unit + integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR_VERSION }}
+      - name: Compile
+        run: rebar3 compile
+      - name: Dialyzer
+        run: rebar3 dialyzer
+      - name: Xref
+        run: rebar3 xref
+      - name: Common Test (all suites)
+        run: |
+          # CT will happily run stale beams from a deleted suite; wipe extras
+          # first (M12 in progress.md).
+          rm -rf _build/test/extras
+          rebar3 ct
+      - name: Upload CT logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-logs
+          path: _build/test/logs
+          retention-days: 14
+
+  # ---------------------------------------------------------------- layer 2
+  protocol-compatibility:
+    name: protocol compatibility (real third-party clients)
+    needs: common-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build test tree
+        run: rebar3 as test compile
+      # Each adapter's harness is self-contained and starts its own broker node
+      # on an ephemeral port.  They are independent; run them in parallel.
+      - name: MQTT (paho + mosquitto)
+        run: /usr/bin/python3 test/protocol-compatibility/mqtt/t15_compat.py
+      - name: WebSocket (websocket-client)
+        run: /usr/bin/python3 test/protocol-compatibility/ws/ws_compat.py
+      - name: NATS (nats.go)
+        run: /usr/bin/python3 test/protocol-compatibility/nats/nats_compat.py
+      - name: AMQP (amqp091-go)
+        run: /usr/bin/python3 test/protocol-compatibility/amqp/amqp_compat.py
+      - name: Kafka (kafka-clients)
+        run: /usr/bin/python3 test/protocol-compatibility/kafka/kafka_compat.py
+      - name: Pulsar (pulsar-client)
+        run: /usr/bin/python3 test/protocol-compatibility/pulsar/pulsar_compat.py
+
+  # ---------------------------------------------------------------- layer 3
+  chaos:
+    name: chaos (crash / partition / disk / slow consumer)
+    needs: common-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release
+        run: rebar3 as t14 release
+      - name: GameDay drills
+        run: |
+          rm -rf _build/test/extras
+          /usr/bin/python3 tools/bench/s6_gameday.py --skip-build \
+            --out chaos-gameday.json
+      - name: Upload GameDay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gameday
+          path: chaos-gameday.json
+          retention-days: 14
+
+  # ---------------------------------------------------------------- layer 4
+  performance:
+    name: performance (capacity matrix)
+    needs: chaos
+    runs-on: ubuntu-latest
+    # The performance job is informational: it records numbers, it does not
+    # gate the merge (there is no stable perf budget yet).  The report is the
+    # artifact.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release
+        run: rebar3 as t14 release
+      - name: Capacity matrix (quick)
+        run: |
+          /usr/bin/python3 tools/bench/s2_bench.py --skip-build \
+            --out capacity.json
+      - name: Connection sweep
+        run: |
+          /usr/bin/python3 tools/bench/s2_bench.py --publisher-sweep --skip-build \
+            --out connections.json
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance
+          path: |
+            capacity.json
+            connections.json
+          retention-days: 14

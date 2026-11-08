@@ -81,12 +81,25 @@ validate(Event) when is_map(Event) ->
     Required = [specversion, id, source, type],
     case missing(Required, Event) of
         [] ->
-            validate_required(Required, Event);
+            %% S6 (README §10.1): the configurable attribute/extension/depth
+            %% bounds run after the schema checks, so a malformed event keeps
+            %% its precise reason and a merely oversized one says `limit_exceeded'.
+            case validate_required(Required, Event) of
+                ok -> validate_limits(Event);
+                {error, _} = Error -> Error
+            end;
         Missing ->
             {error, {invalid_event, {missing, Missing}}}
     end;
 validate(Other) ->
     {error, {invalid_event, {not_a_map, Other}}}.
+
+%% S6 limits: attribute count, extension value length and JSON depth.
+validate_limits(Event) ->
+    case broker_limits:check_event(Event) of
+        ok -> ok;
+        {error, Violation} -> {error, {invalid_event, Violation}}
+    end.
 
 %% @doc Cheap "does this JSON object look like a CloudEvents event?" used for
 %% detection. It does NOT validate; `decode_structured/1' does.

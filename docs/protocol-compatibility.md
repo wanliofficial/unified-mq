@@ -254,7 +254,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 - 配置 `{on_quorum_loss, reject | os_buffer_only}`：`reject`（默认）拒绝 `replicated_commit` append；`os_buffer_only` 仅允许 QoS0 的 `os_buffer` 继续。
 - 连接层不静默降级：MQTT 5 回 `0x83`，MQTT 3.1.1 断开连接。
 
-**指标**：`cluster_owner_changes`、`cluster_fenced_rejects`、`cluster_replication_failed`、`cluster_no_quorum`。
+**指标**：`cluster_owner_changes`、`cluster_fencing_rejected`、`cluster_replication_failed`、`cluster_replication_latency_us`、`cluster_no_quorum`。
 
 **证据**
 
@@ -520,6 +520,23 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 8. **投递查找 consumer**：连接侧 consumers 以 `{ConsumerId, RequestId}` 为键，投递处理却用裸 `ConsumerId` 查，永远 miss；改用 `find_consumer/2`。
 9. **负 int64 varint**：`MessageId.earliest/latest` 的 `-1` 是 10 字节补码 varint，解码成无符号大数；`message_id_fields/1` 现按 int64 符号扩展。
 10. **partition_key 丢失**：投递 metadata 未回填 key；append 时把 `partition_key` 存入 `proto_meta`，投递时写回 `MessageMetadata`。
+
+---
+
+### 4.10 CloudEvents Binding 现状（S5 口径）
+
+ADR-020 把 CloudEvents Binding 的冻结范围限定为 **MQTT**。S5 的五个新协议没有各自的 Binary Mode Binding，本节把实际行为写清楚，避免被读成「所有协议都实现了标准绑定」：
+
+| 协议 | Structured Mode（事件 JSON 在消息体） | Binary Mode（上下文 → 协议元数据） | 说明 |
+|---|---|---|---|
+| MQTT | ✅ 正向 + 反向 + 损失报告 | ✅ 仅 MQTT 5（`ce-*` User Properties）；3.1.1 返回损失清单 | `broker_event_binding`，§4.3 |
+| WebSocket | ✅ payload 逐字节透传 | ❌ 未实现 | 应用帧 `Header` 是 Broker 自有 JSON，不是 CE 元数据通道 |
+| NATS | ✅ payload 逐字节透传 | ❌ 未实现（NATS headers/HPUB 本身未实现） | core NATS |
+| AMQP | ✅ payload 逐字节透传 | ❌ 未实现 | 未把 `ce-*` 映射到 properties/application headers |
+| Kafka | ✅ payload 逐字节透传 | ❌ 未实现 | 未把 `ce-*` 映射到 Record Headers |
+| Pulsar | ✅ payload 逐字节透传 | ❌ 未实现 | 未把 `ce-*` 映射到 Message properties |
+
+「逐字节透传」意味着：一个合法的 Structured CloudEvents JSON 通过这五个协议发布再消费，**字节不变**（因此 `id`/`source`/`type`/扩展都保留）；但 `broker_event:apply_policy/1` 目前只在 MQTT 发布路径调用，其它协议不会执行 `required`/`normalize`/去重/隔离策略。per-protocol Binary Mode 与统一策略执行列为 S6 之后待办。
 
 ---
 

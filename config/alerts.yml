@@ -1,0 +1,257 @@
+# UnifiedMQ Prometheus alerting + recording rules (S6, roadmap §8.2 / Gate S6 item 4).
+#
+# Every rule reads a metric that is part of broker_metrics' CLOSED key set
+# (ADR-016). There are no user-controlled labels (`source`, `subject`, `id`,
+# destination), so a malicious producer cannot blow up cardinality through these
+# rules (README §10.1). The scrape job name below (`unifiedmq`) is the only
+# label selector; adjust it to your Prometheus config.
+#
+# Wire it in:
+#
+#   rule_files:
+#     - /etc/prometheus/alerts.yml
+#
+# The metric exposition comes from the admin API:
+#
+#   scrape_configs:
+#     - job_name: unifiedmq
+#       static_configs:
+#         - targets: ["127.0.0.1:8090"]
+#       metrics_path: /metrics
+
+groups:
+  - name: unifiedmq-liveness
+    rules:
+      - alert: UnifiedMQDown
+        expr: up{job="unifiedmq"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "UnifiedMQ admin/metrics endpoint is unreachable"
+          description: >-
+            The admin API has been unscrapeable for 1m. Either the node is down
+            or the admin listener failed. Check `docker logs` / `data/log/s1.log`
+            and the process supervisor.
+
+      # /readyz 503 is exposed as a gauge by the deployment's blackbox probe; if
+      # you do not run one, use broker app presence from your own exporter. The
+      # rule below assumes a `unifiedmq_ready` gauge written by such a probe.
+      - alert: UnifiedMQNotReady
+        expr: unifiedmq_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "UnifiedMQ reports not-ready"
+          description: >-
+            /readyz has returned 503 for 2m. The required apps are not all up;
+            check which app is missing in the /readyz body.
+
+  - name: unifiedmq-security
+    rules:
+      - alert: UnifiedMQAuthFailures
+        expr: rate(auth_failures[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated authentication failures"
+          description: >-
+            More than 1 auth failure/s for 10m. This is a credential problem
+            (bad username/password), not an ACL problem.
+
+      - alert: UnifiedMQAuthzFailures
+        expr: rate(authz_failures[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated authorization (ACL/tenant) failures"
+          description: >-
+            Authentication succeeded but authorization was denied more than
+            1/s for 10m. Check `broker_security.acl` and tenant assignments;
+            a misconfigured rule fails closed.
+
+      - alert: UnifiedMQProtocolErrors
+        expr: rate(frame_decode_errors[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated frame decode errors"
+          description: >-
+            More than 5 frame decode errors/s for 5m. A misbehaving or
+            incompatible client, or a network middlebox corrupting bytes.
+
+  - name: unifiedmq-backlog
+    rules:
+      - alert: UnifiedMQQueueDepthHigh
+        expr: queue_depth > 100000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue depth is high"
+          description: "queue_depth > 100000 for 10m; producers outpace the durable path."
+
+      - alert: UnifiedMQSubscriptionBacklog
+        expr: subscription_backlog > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Subscription backlog is high"
+          description: >-
+            subscription_backlog > 50000 for 10m. Consumers are not keeping up
+            with delivery, or a subscriber is gone but its cursor is retained.
+
+      - alert: UnifiedMQCursorLag
+        expr: cursor_lag > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cursor lag is high"
+          description: "cursor_lag > 50000 for 10m; the slowest subscription is far behind."
+
+      - alert: UnifiedMQDLQGrowing
+        expr: increase(dlq_size[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead-letter queue is growing"
+          description: >-
+            dlq_size increased in the last 15m. Consumers are failing
+            repeatedly; inspect the DLQ destination and the consumer error.
+
+  - name: unifiedmq-storage
+    rules:
+      - alert: UnifiedMQWalSyncSlow
+        expr: histogram_quantile(0.99, rate(wal_sync_latency_us_bucket[5m])) > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WAL fsync p99 is above 50 ms"
+          description: >-
+            p99 fsync latency > 50ms for 10m. Disk pressure or a noisy
+            neighbour; every QoS1 publish waits on this.
+
+      - alert: UnifiedMQWalPendingAppend
+        expr: wal_pending_append > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WAL append queue is long"
+          description: "More than 1000 appends are waiting for the writer/disk."
+
+      - alert: UnifiedMQRecoverySlow
+        expr: histogram_quantile(0.99, rate(recovery_time_us_bucket[1h])) > 60000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node recovery took over 60 s"
+          description: >-
+            p99 recovery_time_us > 60s. Log growth or a cold page cache;
+            compare with the capacity report's recovery baseline.
+
+      - alert: UnifiedMQRetentionPinnedBySlowConsumer
+        expr: increase(retention_blocked_by_slow_consumer[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retention is pinned by a slow consumer"
+          description: >-
+            Segment GC was blocked because a subscription did not advance.
+            Disk will fill if this persists; find the unacked subscription.
+
+      - alert: UnifiedMQBackpressure
+        expr: increase(backpressure_disconnects[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Producers were disconnected for backpressure"
+          description: >-
+            The broker shed load by disconnecting producers. Sustained means
+            the write path is overloaded: scale out or reduce produce rate.
+
+  - name: unifiedmq-cluster
+    rules:
+      - alert: UnifiedMQNoQuorum
+        expr: cluster_no_quorum > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cluster has lost majority quorum"
+          description: >-
+            Metadata writes are being rejected with `{error, no_quorum}`.
+            Restore the majority before accepting control-plane changes.
+
+      - alert: UnifiedMQOwnerFlapping
+        expr: increase(cluster_owner_changes[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Partition ownership is changing repeatedly"
+          description: >-
+            More than 3 owner changes in 15m. Unstable nodes or network
+            partitions; expect increased latency during each migration.
+
+      - alert: UnifiedMQFencingRejected
+        expr: increase(cluster_fencing_rejected[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stale owners were fenced"
+          description: >-
+            A node whose cache still claimed ownership tried to write and was
+            fenced. Correct behaviour, but frequent fencing means the cache
+            is not converging; investigate the control plane.
+
+      - alert: UnifiedMQReplicationFailing
+        expr: increase(cluster_replication_failed[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "replicated_commit cannot reach a majority"
+          description: >-
+            Appends with `replicated_commit' are returning
+            `{error, {replication_failed, Acks, Needed}}' and are not ACKed.
+            Check replica health and `replicate_timeout_ms'.
+
+      - alert: UnifiedMQReplicationSlow
+        expr: histogram_quantile(0.99, rate(cluster_replication_latency_us_bucket[5m])) > 1000000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replica round p99 above 1 s"
+          description: >-
+            The owner waits more than a second for a replica majority at p99.
+            Compare with `wal_sync_latency_us`; sustained means the replicas
+            or the network between them are the bottleneck.
+
+  - name: unifiedmq-recording
+    rules:
+      # Cheap derived series so dashboards and the alerts above do not recompute
+      # rates everywhere.
+      - record: unifiedmq:publish_rate:5m
+        expr: rate(publish_total[5m])
+      - record: unifiedmq:deliver_rate:5m
+        expr: rate(deliver_total[5m])
+      - record: unifiedmq:ack_rate:5m
+        expr: rate(ack_total[5m])
+      - record: unifiedmq:rule_errors:5m
+        expr: rate(cloudevents_validate_failed[5m])
+      - record: unifiedmq:backlog:5m
+        expr: queue_depth + subscription_backlog

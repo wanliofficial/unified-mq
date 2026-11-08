@@ -42,7 +42,7 @@
 
 -include_lib("broker_core/include/broker_message.hrl").
 
--export([subscribe/3, join/5, unsubscribe/2, leave/2,
+-export([subscribe/3, subscribe/4, join/5, join/6, unsubscribe/2, leave/2,
          ack/4, claim/4, release/4, retry/4,
          inflight/2, attach/3, detach/2, dispatch/2]).
 -export([subscriptions/1, cursor/2, session/1, role/2]).
@@ -80,6 +80,14 @@
 subscribe(ClientId, Filter, QoS) ->
     broker_subscription_worker:subscribe(ClientId, Filter, QoS).
 
+%% @doc Tenant-aware subscribe (S6). The authenticated connection passes the
+%% tenant it was admitted under; the Router then only returns this
+%% subscription to publishers of the same tenant.
+-spec subscribe(binary(), binary(), 0..2, binary()) ->
+          {ok, sub_ref()} | {error, term()}.
+subscribe(ClientId, Filter, QoS, Tenant) ->
+    broker_subscription_worker:subscribe(ClientId, Filter, QoS, Tenant).
+
 %% @doc Join a Shared/Failover group (ADR-019 §19.4). The SubRef is
 %% `{Kind, Group, Filter}': it exists -> the consumer is appended to the end of
 %% the member list; it does not -> it is created with this consumer as the first
@@ -89,6 +97,12 @@ subscribe(ClientId, Filter, QoS) ->
           {ok, sub_ref()} | {error, term()}.
 join(Kind, Group, ClientId, Filter, QoS) ->
     broker_subscription_worker:join(Kind, Group, ClientId, Filter, QoS).
+
+%% @doc Tenant-aware group join (S6).
+-spec join(sub_kind(), binary(), binary(), binary(), 0..2, binary()) ->
+          {ok, sub_ref()} | {error, term()}.
+join(Kind, Group, ClientId, Filter, QoS, Tenant) ->
+    broker_subscription_worker:join(Kind, Group, ClientId, Filter, QoS, Tenant).
 
 %% @doc Drop an **exclusive** subscription: unregister from the Router, delete
 %% the entity and its cursors, remove the files. Idempotent (MQTT §4.10:

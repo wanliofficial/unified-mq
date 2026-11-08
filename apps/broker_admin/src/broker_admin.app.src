@@ -1,0 +1,21 @@
+{application, broker_admin, [
+    {description, "S6 admin API: health, metrics, status, config audit, backup"},
+    {vsn, "0.1.0"},
+    {registered, [broker_admin_sup, broker_admin_listener]},
+    {mod, {broker_admin_app, []}},
+    %% Deliberately narrow: the admin API reads other layers lazily (a missing
+    %% broker_queue just means `/api/v1/status' has no partitions yet), so the
+    %% management surface can boot and be tested before the data plane. The
+    %% release still starts those apps; readiness reflects their state.
+    {applications, [kernel, stdlib, sasl, crypto, broker_core, broker_metrics,
+                    broker_security]},
+    {env, [{enabled, true},
+           %% Loopback by default: the API can create backups and reload TLS,
+           %% so exposing it on every interface must be a deliberate config
+           %% change, not the default.
+           {bind, {127, 0, 0, 1}},
+           {port, 8090},
+           %% Empty token = no authentication (acceptable on loopback only).
+           {token, <<>>},
+           {backup_dir, "/home/wanli/workspace/unified-mq/backups"}]}
+]}.

@@ -23,7 +23,7 @@
 -module(broker_metrics).
 
 -export([init/0, inc/1, inc/2, observe/2, gauge/2, gauge_add/2,
-         snapshot/0, reset/0, keys/0, p99/1]).
+         snapshot/0, reset/0, keys/0, key_types/0, p99/1]).
 
 -export_type([key/0, histogram/0]).
 
@@ -247,6 +247,12 @@ reset() ->
 keys() ->
     [K || {K, _} <- key_specs()].
 
+%% @doc The kind of each key (`counter' | `gauge' | `histogram'). The admin API's
+%% Prometheus rendering uses this so it does not have to guess from the value.
+-spec key_types() -> #{key() => counter | gauge | histogram}.
+key_types() ->
+    maps:from_list(key_specs()).
+
 %%%_* Internals ------------------------------------------------------------
 
 with_key(Key, Fun) ->
@@ -279,6 +285,10 @@ key_specs() ->
     [{connections_current, gauge},
      {connections_peak, gauge},
      {auth_failures, counter},
+     %% S6: ACL/tenant rejections (authentication succeeded, authorization did
+     %% not). Kept separate from auth_failures so an operator can tell a
+     %% credential problem from a policy problem.
+     {authz_failures, counter},
      {protocol_errors, counter},
      {frame_decode_errors, counter},
      {publish_total, counter},
@@ -359,4 +369,9 @@ key_specs() ->
      {cluster_owner_changes, counter},
      {cluster_fencing_rejected, counter},
      {cluster_replication_failed, counter},
+     %% Wall-clock cost of one replication round on the owner: local fsync has
+     %% already happened, so this is the wait for the replica majority (or the
+     %% timeout when it never arrives). README §10.2 asks for replication
+     %% latency next to the failure counter.
+     {cluster_replication_latency_us, histogram},
      {cluster_no_quorum, counter}].

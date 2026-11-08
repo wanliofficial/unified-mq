@@ -23,6 +23,7 @@ all() ->
      guard_uses_the_epoch_carried_in_proto_meta,
      replication_is_ok_on_a_single_replica,
      replication_without_a_majority_fails,
+     remote_append_normalises_a_successful_append,
      hooks_can_be_installed_and_removed,
      queue_accepts_replicated_commit_only_with_a_replicator,
      queue_refuses_replicated_commit_without_a_replicator].
@@ -146,6 +147,17 @@ replication_without_a_majority_fails(_Config) ->
     {ok, 1} = broker_cluster:assign(0, node(), [node(), 'ghost@nowhere'], 1),
     {error, {replication_failed, 1, 2}} =
         broker_cluster:replicate(0, msg(#{})),
+    ok.
+
+%% Regression (found by the S6 cluster benchmark): the follower-side entry point
+%% used to return `{ok, Offset}', which `collect/2' does not count as success --
+%% so every real cross-node replication reported `{replication_failed, 1, N}'
+%% even when all followers stored the message. Single-replica and no-majority
+%% cases never exercised this branch.
+remote_append_normalises_a_successful_append(Config) ->
+    start_queue(Config),
+    ok = broker_cluster_rep:remote_append(0, msg(#{})),
+    {ok, [{1, _}], _} = broker_queue:read_from(0, 0, 10),
     ok.
 
 %%%_* Hooks and the queue ---------------------------------------------------

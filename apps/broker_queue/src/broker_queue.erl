@@ -121,9 +121,18 @@ retention_status() ->
 -spec append(partition_id(), #broker_message{}, sync_mode()) ->
     {ok, offset()} | {error, term()}.
 append(PartitionId, Msg, Mode) ->
-    case append_guard(PartitionId, Msg, Mode) of
-        ok -> append_checked(PartitionId, Msg, Mode);
-        {error, _Reason} = Error -> Error
+    %% S6 (README §10.1): the single append path is where every protocol's
+    %% message meets the configured size/attribute/depth bounds. A refusal is
+    %% an ordinary `{error, {limit_exceeded, ...}}' answer, so adapters keep
+    %% their existing "do not ack" behaviour instead of growing a second one.
+    case broker_limits:check_message(Msg) of
+        ok ->
+            case append_guard(PartitionId, Msg, Mode) of
+                ok -> append_checked(PartitionId, Msg, Mode);
+                {error, _Reason} = Error -> Error
+            end;
+        {error, _Reason} = Error ->
+            Error
     end.
 
 %% @doc Follower-side append (ADR-021 §D5). No guard -- only the owner decides

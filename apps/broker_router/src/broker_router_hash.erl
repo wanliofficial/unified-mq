@@ -53,29 +53,48 @@ init(Config) ->
 %% forbids -- that belongs to broker_subscription (design §13 H7).
 -spec route(binary(), route_ctx(), env()) ->
     {ok, [{partition_id(), [broker_router:sub_ref()]}]}.
-%% S1 does not consult Ctx: this deployment is single-tenant (broker_security is
-%% a stub with one user), and SubOpts is not indexed either. Multi-tenant filter
-%% isolation has to be added where the tenant becomes part of the index key --
-%% see progress.md S1 residual items.
-route(Destination, _Ctx, #{tab := Tab, partitions := N, hash := Hash}) ->
+%% S6: the tenant is part of the index key. A publisher sees only its own
+%% tenant's subscriptions plus legacy entries registered as `<<"*">>' (the
+%% pre-S6 shape, kept so existing sessions keep working). This is the read-path
+%% half of tenant isolation; the write path is `broker_security:authorize/2'.
+route(Destination, Ctx, #{tab := Tab, partitions := N, hash := Hash} = Env) ->
+    Tenant = ctx_tenant(Ctx),
     TopicLevels = levels(Destination),
     Matches =
         lists:flatmap(
-            fun({Filter, Subs}) ->
-                case match(TopicLevels, levels(Filter)) of
-                    true -> Subs;
-                    false -> []
+            fun({{EntryTenant, Filter}, Subs}) ->
+                case tenant_visible(EntryTenant, Tenant) of
+                    false -> [];
+                    true ->
+                        case match(TopicLevels, levels(Filter)) of
+                            true -> Subs;
+                            false -> []
+                        end
                 end
             end,
             ets:tab2list(Tab)),
+    _ = Env,
     {ok, [{partition(Destination, N, Hash), ordered_unique(lists:keysort(2, Matches))}]}.
 
+ctx_tenant(#route_ctx{tenant_id = T}) when is_binary(T), T =/= <<>> -> T;
+ctx_tenant(_) -> <<"default">>.
+
+tenant_visible(<<"*">>, _Tenant) -> true;
+tenant_visible(Tenant, Tenant) -> true;
+tenant_visible(_, _) -> false.
+
 -spec register(env(), binary(), broker_router:sub_ref(), map()) -> ok | {error, term()}.
-register(#{store := Store}, Filter, SubRef, _SubOpts) ->
+register(#{store := Store}, Filter, SubRef, SubOpts) ->
     case valid_filter(Filter) of
-        ok -> broker_router_hash_store:register(Store, Filter, SubRef);
+        ok -> broker_router_hash_store:register(Store, tenant_of(SubOpts), Filter, SubRef);
         invalid -> {error, {invalid_filter, Filter}}
     end.
+
+%% A subscription without explicit tenant metadata is the legacy wildcard. The
+%% MQTT adapter supplies the authenticated tenant; test/backfill paths that
+%% never name one keep the pre-S6 visibility.
+tenant_of(#{tenant_id := T}) when is_binary(T), T =/= <<>> -> T;
+tenant_of(_) -> <<"*">>.
 
 -spec unregister(env(), broker_router:sub_ref()) -> ok | {error, term()}.
 unregister(#{store := Store}, SubRef) ->
