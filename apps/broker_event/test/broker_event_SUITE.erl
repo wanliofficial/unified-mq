@@ -43,6 +43,7 @@ all() ->
      header_binding_roundtrip_for_all_targets,
      header_binding_structured_mode,
      header_binding_detect_from_header_channel,
+     cross_protocol_headers_survive_a_hop,
      cross_protocol_roundtrip_keeps_identity,
      event_id_does_not_overwrite_broker_id,
      policy_resolution_per_tenant_and_destination,
@@ -338,6 +339,49 @@ header_binding_detect_from_header_channel(_Config) ->
     ?assertEqual(Event, Event2),
     %% No `ce-*' anywhere: not an event, and `detect' must not guess.
     none = broker_event_binding:detect((message(<<"plain">>))#broker_message{headers = #{}}),
+    ok.
+
+%% README §11.2 "cross-protocol conversion roundtrip": an event published on
+%% one protocol must survive a hop through the broker and be re-published on
+%% another protocol with the same identity and the same data bytes. The header
+%% channel is protocol-neutral, so the second encode is a pure re-encode of the
+%% first decode -- no path through MQTT metadata.
+cross_protocol_headers_survive_a_hop(_Config) ->
+    Original = #{specversion => <<"1.0">>,
+                 id => <<"hop-1">>,
+                 source => <<"/origin">>,
+                 type => <<"demo.hop">>,
+                 datacontenttype => <<"application/octet-stream">>,
+                 extensions => #{<<"traceparent">> => <<"00-abc-def-01">>},
+                 data => <<0, 1, 2, 255>>},
+    %% Kafka record header -> broker header map -> WebSocket frame header ->
+    %% broker header map -> NATS header block. Every hop decodes and re-encodes
+    %% from the same neutral header map.
+    {ok, Body1, KafkaHeaders, Report1} =
+        broker_event_binding:to_headers(Original, kafka, binary),
+    #{mode := binary, target := kafka, losses := []} = Report1,
+    {ok, Decoded1} = broker_event_binding:from_headers(Body1, KafkaHeaders, undefined),
+    ?assertEqual(Original, Decoded1),
+    {ok, Body2, WsHeaders, Report2} =
+        broker_event_binding:to_headers(Decoded1, ws, binary),
+    #{mode := binary, target := ws, losses := []} = Report2,
+    {ok, Decoded2} = broker_event_binding:from_headers(Body2, WsHeaders, undefined),
+    ?assertEqual(Original, Decoded2),
+    {ok, Body3, NatsHeaders, Report3} =
+        broker_event_binding:to_headers(Decoded2, nats, binary),
+    #{mode := binary, target := nats, losses := []} = Report3,
+    {ok, Decoded3} = broker_event_binding:from_headers(Body3, NatsHeaders, undefined),
+    ?assertEqual(Original, Decoded3),
+    %% The identity attributes and the data bytes never change across hops.
+    lists:foreach(
+      fun(Key) ->
+              ?assertEqual(maps:get(Key, Original), maps:get(Key, Decoded3))
+      end, [specversion, id, source, type, datacontenttype]),
+    ?assertEqual(maps:get(data, Original), maps:get(data, Decoded3)),
+    ?assertEqual(maps:get(extensions, Original), maps:get(extensions, Decoded3)),
+    %% And the wire body is byte-identical at every hop.
+    ?assertEqual(Body1, Body2),
+    ?assertEqual(Body2, Body3),
     ok.
 
 cross_protocol_roundtrip_keeps_identity(_Config) ->

@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|---|
 | MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x / mosquitto 2.1.2 | ✅（**T15 + S2-C**：10/10 用例） | QoS0/1/2、Retain、Will 已实现并实测；MQTT 5.0 语义在 S2.5 补；逐条限制见本文 §4 |
 | WebSocket | 2 | Python `websocket-client`（应用层帧为 Broker 自有 JSON/二进制） | Python | websocket-client 1.7.0 | ✅（**S5-WS：10/10 用例**） | 传输层用 `websocket-client`，应用层帧由 S5 设计，见 §4.5 |
-| NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth；无 headers/JetStream，见 §4.6 |
+| NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth、HPUB/HMSG headers；无 JetStream，见 §4.6 |
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack；见 §4.7 |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅（**S5-Kafka：12/12 用例**） | Produce/Fetch/Metadata/ListOffsets、经典消费组、OffsetCommit/Fetch、RecordBatch v2；单节点协调器、offset 内存态、无压缩/事务/Admin API，见 §4.8 |
 | Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅（**S5-Pulsar：8/8 用例**） | 官方 Java Client 实测：produce/consume、properties、key、batch、ack/redelivery、seek、unsubscribe、producer name；无 BookKeeper/事务/压缩/Key_Shared，见 §4.9 |
@@ -44,7 +44,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 |---|---|---|---|---|
 | MQTT | 已支持 | QoS0/1/2、Retain、Will、clean session/persistent session、离线追赶、MQTT 5.0 子集（session expiry、message expiry、reason codes、properties） | 无 shared subscription（MQTT 5 特性未全量）；见 §4/§4.1/§4.2 | `apps/broker_proto_mqtt/test/`、`test/protocol-compatibility/mqtt/` |
 | WebSocket | 已支持 | RFC 6455 握手/掩码/分片/控制帧；自有应用帧 `connect`/`subscribe`/`publish`/`ack`/`unsubscribe`/`ping`/`disconnect` | v1 仅 QoS0/1；`shared` 订阅显式拒绝；应用层帧为 Broker 自有格式；见 §4.5 | `apps/broker_proto_ws/test/`、`test/protocol-compatibility/ws/` |
-| NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth | 无 headers、无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
+| NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth、HPUB/HMSG headers（`ce-*`） | 无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
 | Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema/认证；订阅游标内存态；单租户、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
@@ -324,12 +324,12 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| NATS | 已支持 | core NATS：INFO/CONNECT/PING/PONG、PUB/SUB/UNSUB、MSG 投递、`*`/`>` 通配符、Queue Group（shared）、Request/Reply（reply subject 透传）、echo=false、token 认证、UNSUB max 自动退订 | 无 HPUB/HMSG headers（2.2 扩展）；无 JetStream；core NATS 本就 at-most-once，适配器写完 MSG 立即推进自己的 cursor（broker 仍先 fsync 落盘，强于 NATS core）；`foo.>` 的父级匹配与 NATS 有差异 | apps/broker_proto_nats/test/、test/protocol-compatibility/nats/ |
+| NATS | 已支持 | core NATS：INFO/CONNECT/PING/PONG、PUB/SUB/UNSUB、MSG 投递、`*`/`>` 通配符、Queue Group（shared）、Request/Reply（reply subject 透传）、echo=false、token 认证、UNSUB max 自动退订、HPUB/HMSG（2.2 headers，`ce-*` → 消息头） | 无 JetStream；core NATS 本就 at-most-once，适配器写完 MSG 立即推进自己的 cursor（broker 仍先 fsync 落盘，强于 NATS core）；`foo.>` 的父级匹配与 NATS 有差异；未协商 `headers` 的客户端收 `MSG`，`ce-*` 属性丢失 | apps/broker_proto_nats/test/、test/protocol-compatibility/nats/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
 
-1. **无 headers / JetStream**：`HPUB` / `HMSG` 明确回 `-ERR 'Unknown Protocol Operation'`；不支持 JetStream 的持久化 consumer/stream 语义。v1 只承诺 core NATS。
+1. **无 JetStream**：不支持 Stream/持久化 consumer 语义。headers 支持 NATS 2.2 的 `HPUB`/`HMSG`（`ce-*` 作为 CloudEvents Binary Mode 通道，见 §4.10）；未在 CONNECT 声明 `headers: true` 的客户端收 `MSG`，`ce-*` 属性丢失。
 2. **at-most-once**：core NATS 没有 ack 握手。适配器在 MSG 写出后立即 `broker_subscription:ack/4` 自己的 cursor；连接在写出后崩溃可能丢这一条（与 NATS core 一致），但 broker 侧消息已 fsync，可被后续订阅/其他成员读取。
 3. **`>` 父级匹配差异**：broker 的 `#` 匹配父级，NATS 的 `>` 不匹配。已作为转换损失记录。
 4. **每连接一个匿名 client_id**：NATS 无持久会话/客户端标识，重连即新 `ClientId`；不支持 MQTT 式 session takeover。
