@@ -84,7 +84,7 @@
 - **选项**：(a) `sub_ref` 从 `{ClientId, Filter}` 泛化为 `{Kind, Key, Filter}`，cursor 仍按 SubRef 持久化（Exclusive 的 Key=ClientId，Shared/Failover 的 Key=Group）；(b) 另建 `broker_cursor` 表按 `{Kind, Group, Partition}`，SubRef 不动。
 - **已定案（D2 = (a)，M0 采纳；见 ADR-013）**：**单一真相**——cursor 的 owner 就是 SubRef，避免两张表对账。roadmap §4.1 提到的 `broker_cursor` 落成 `broker_subscription` **内部模块**（同一 app、同一 owner），不新开 app，否则又出现第二个 cursor 真相。Router 只要求 `sub_ref()` 不透明（ADR-010 §10.1），形状改变**不触发 ADR-010 修订**；但 `.subs`/`.cursors` 的 body 与文件名要升 `vsn 2`（现有文件已是 `{vsn,1,ClientId,Body}`，有天然迁移位）。
 - **已定案（O1）：Shared 的 ack = per-message ack + 连续前缀**（Pulsar 风格）。组内记录每条消息被哪个 consumer ack（`{SubRef, Partition} -> #{AckedOffsets :: gb_sets, Consumers :: ...}` 或等价 bitmap），`committed` 取**最小连续前缀**（从 `low` 起第一条未 ack 的 offset 的前一条），而不是取组内最慢 consumer 的标量 cursor。好处：一条慢消费者不会把整个组的水位钉住；坏处：状态比标量 cursor 大，需要位图压缩与快照。Exclusive 退化为单 consumer 的连续前缀（与 S1 等价），Failover 只对 active consumer 取前缀、standby 不推进。
-- **影响**：`broker_subscription`（实体/游标/绑定三张表 + Shared 的 ack 位图）、`mqtt_conn_fsm`（订阅集合读取）、`broker_subscription_files`、boot step 2+3。
+- **影响**：`broker_subscription`（实体/游标/绑定三张表 + Shared 的 acked/assigned 行）、`mqtt_conn_fsm`（订阅集合读取）、`broker_subscription_files`、boot step 2+3。
 - **需要 ADR**：是（ADR-013）。
 
 ### D3 retention / truncate 的物理删除
@@ -152,7 +152,7 @@
 | S2-A | 可观测性最小集 | `broker_metrics` app + 埋点 + `snapshot/0` + 周期日志 | — | 3 | 无单一瓶颈的证据基础 | ADR-016 |
 | S2-B | 三档可靠性证明 | `os_buffer` 丢失边界（dm-flakey + 替身）、`fsync` 对照、`replicated_commit` 显式拒绝 | S2-A（计数） | 4 | Gate 1 | — |
 | S2-C | QoS2 / Retain / Will | 四步握手（双向）、retain 树、Will 延迟发布 | — | 6 | — | ADR-012 |
-| S2-D | 订阅语义与 cursor 重构 | `{Kind,Key,Filter}`、Shared/Failover、Shared ack 位图 + 连续前缀、`.subs/.cursors` v2 + 迁移 | S2-C（同改 FSM） | 10 | Gate 2 的结构前提 | ADR-013 |
+| S2-D | 订阅语义与 cursor 重构 | `{Kind,Key,Filter}`、Shared/Failover、Shared 的 worker 原子 claim + 最小连续前缀、`.subs/.cursors` v2 + 迁移 | S2-C（同改 FSM） | 10 | Gate 2 的结构前提 | ADR-013（经 ADR-019 修订） |
 | S2-E | 重投递 / DLQ / TTL | `broker_redelivery`、可配 `$dlq/*` + 独立保留期、`expires_at` 生效 | S2-D、S2-F | 6 | Gate 2 | ADR-015 |
 | S2-F | retention 与慢消费者守卫 | 段 GC、`max_bytes/max_age`、钉住告警 | S2-D | 5 | Gate 2 | ADR-014 |
 | S2-G | 背压与限流 | mailbox/pending/积压水位、permit、生产者限制 | S2-A | 4 | Gate 2 | — |
@@ -194,11 +194,17 @@
 
 ### 4.4 S2-D 订阅语义与 cursor 重构
 
-- **数据模型**：`SubRef = {Kind, Key, Filter}`；`Kind ∈ {exclusive, shared, failover}`；`Key = ClientId | Group`。实体表 key 仍是 SubRef；新增 `CONSUMERS` 表 `{SubRef, ClientId} -> #{pid, weight, order}`。
-- **投递**：Exclusive 取唯一 consumer；Shared 轮询（按 `order`/权重）；Failover 取 `order` 最小且存活的 consumer，死亡按序顶上。
-- **cursor（D2 + O1 已定案）**：per SubRef per Partition。Exclusive = 单 consumer 连续前缀（与 S1 等价）；**Shared = per-message ack 位图 + 最小连续前缀**——组内每条 offset 记录被谁 ack，`committed` 取从 `low` 起的连续前缀，位图按 256/1024 位分块并支持快照；Failover = 只对 active consumer 取前缀，standby 不推进。`broker_cursor` 是 `broker_subscription` 的内部模块，不是新 app。
-- **迁移**：`.subs`/`.cursors` v1 → v2 自动重写；`$share/{group}/{filter}` 语法在 SUBSCRIBE 解析。
-- **测试**：三种类型的投递归属、consumer 死亡接管、组内不重复、**Shared 位图在前缀空洞/乱序 ack/consumer 退出三场景下的 committed 正确性**、`.subs` v2 回填、v1 迁移演练、Router 回填（boot step 2+3）。
+> **状态：计划（冻结 2026-11-07，未实现）**。决策见 [ADR-013](../adr/013-subscription-kinds-and-cursor-ownership.md) 与修订它的 **[ADR-019](../adr/019-shared-assignment-ack-ownership-and-session-layout.md)**；任务与用例见 [`s2-d-subscription-kinds-execution-plan.md`](s2-d-subscription-kinds-execution-plan.md)。下面是 ADR-019 冻结的实现契约。
+
+- **数据模型**：`SubRef = {Kind, Key, Filter}`；`Kind ∈ {exclusive, shared, failover}`；`Key = ClientId | Group`。实体表 key 仍是 SubRef；不建 `CONSUMERS` 表——成员顺序就是 `.subs` body 里的有序 `consumers`，failover 的 active = 列表中第一个有 live attachment 的成员。
+- **Shared 的分配**：**worker 原子 `claim/4`**。cursor 行是 `#{kind, low, acked, assigned}`；conn 每轮向 worker 领一整页 offset（`Max = pull_page_limit`），worker 在单个 gen_server 内串行分配并记入 `assigned => Consumer`。pull 只读领到的那些 offset；`low` 只由 ack 的连续前缀推进，分配不移动它。保留「cursor 是唯一读位置」（J6）。代价是每页多一次 `gen_server` call（不是每条一次）。
+- **Shared 的 committed**：`low - 1`；一条慢 consumer 只钉住它没 ack 的那几条，不钉住整组。
+- **ack 归属**：`ack/4` 带 consumer，校验 `assigned[Offset] =:= Consumer`；不符者 `ok` + `shared_ack_unowned`，不改状态、不断连。consumer 死亡时 `do_detach` 把它名下未 ack 的 offset 清回未分配，下一轮 claim 自然重投。**S2-D 不加重试定时器**：重投只来自成员死亡与连接重连，重试上限/退避/DLQ 是 ADR-015 的 S2-E。
+- **上界**：`shared_state_max`（默认 4096）限制 `acked ∪ assigned`；超限 `claim` 返回 overflow，conn 本轮不投递并记 `shared_window_full`——有界拒绝，不驱逐。
+- **dispatch 归属**：位置型 wake 发给 Shared 组内**所有** attached 成员（wake 只是提示）；非位置型（QoS0，推送即投递）只发给 `order` 最小且 attached 的一个。
+- **会话文件**：`.subs`/`.cursors` 按 SubRef（`"<kind>.<b64url(Key)>.<b64url(Filter)>.subs"`），内容为 `vsn 2`；**`.inflight` 仍按 client**（它是 conn FSM 的 blob，一条 pending 可同属多个 SubRef）。`assigned` 不落盘。boot 从 `.subs` 内容重建 `ClientId→SubRef` 索引；v1→v2 迁移在 boot step 2 内**先写后删**、幂等，失败拒绝启动。
+- **不在 S2-D**：`$share` 线上语法（S2.5）、消费权重、位图的位级表示（S2-I 压测后再定）。
+- **测试**：三种类型的投递归属、claim 并发不相交、`low` 在乱序 ack/空洞/成员退出三场景的正确性、Shared 组内不重复、failover 接管、`.subs` v2 与 v1 迁移演练（含中途失败）、Router 回填（boot step 2+3）、T14 R9。
 
 ### 4.5 S2-E 重投递 / DLQ / TTL
 
@@ -244,7 +250,7 @@
 | M0 决策冻结 | D1~D9 结案；ADR-012~017 起草并评审 | 每份 ADR 状态=已采纳；本文升 v0.2+（**已完成**：2026-11-07 六份 ADR 全部签认，本文 v0.3） |
 | M1 观测与证明 | S2-A + S2-B | `os_buffer` 双轨报告可复跑（CI 替身 + dm-flakey）；metrics snapshot 稳定 |
 | M2 协议补齐 | S2-C（QoS2 / Retain / Will） | ✅ **已完成（2026-11-07）**：帧级 27 例 + 连接级 20 例 + retain 17 例；T14 R8 默认档/零回退档双档 PASS；T15 新增 5 例、全套 10/10 PASS。**MQTT 5 已移出本里程碑到 S2.5** |
-| M3 结构改造 | S2-D → S2-E → S2-F | 三种订阅类型（含 Shared 位图 + 连续前缀）、DLQ/TTL、retention 全绿；`.subs` v1→v2 演练通过 |
+| M3 结构改造 | S2-D → S2-E → S2-F | 三种订阅类型（Shared 的 worker 原子 claim + 最小连续前缀，ADR-019）、DLQ/TTL、retention 全绿；`.subs` v1→v2 演练通过 |
 | M4 收口 | S2-G + S2-I + Gate S2 报告 | Gate 四项证据齐备，全量回归零 FAILED |
 | （S2.5） | MQTT 5 子集 | 独立跟踪，不阻塞 Gate S2 |
 
@@ -274,7 +280,7 @@
 | R5 | metrics 热路径开销 | 低-中（吞吐） | 固定桶直方图 + atomics；>2% 回退到采样 |
 | R6 | MQTT5 properties 落位（`proto_meta` vs `headers`） | 中（跨协议污染） | ADR-017 按 ADR-009 §9.2 分工定案；仅在 Adapter 内解析；且 5.0 已移出 Gate 路径 |
 | R7 | S2 范围过大导致 Gate 拖延 | 中（进度） | 已消除最大项：MQTT 5 移出 Gate（O3），Gate 范围 ≈50 人日；按里程碑分批验收 |
-| R8 | Shared 位图的内存与快照成本随积压线性增长 | 中（内存 / 恢复时间） | 位图分块（256/1024 位）按需分配、只保留未连续前缀的窗口；S2-I 压测把积压上限与 RSS 曲线写进 Gate 2 证据 |
+| R8 | Shared 的 `acked ∪ assigned` 内存随积压线性增长 | 中（内存 / 恢复时间） | `shared_state_max = 4096` 按 `{SubRef, Partition}` 有界拒绝（ADR-019 §19.1）；S2-I 压测把积压上限与 RSS 曲线写进 Gate 2 证据 |
 
 **已定案的产品决策（原 O1~O4）**：
 

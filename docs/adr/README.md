@@ -27,6 +27,7 @@
 | [016](016-observability-minimal-set.md) | 可观测性最小集与「无外部依赖」取舍 | README §10.2/§7.2 |
 | [017](017-mqtt5-properties-and-compat.md) | MQTT 5 properties 落位与 3.1.1 兼容边界 | ADR-009 §9.2；README §3.4 |
 | [018](018-retain-will-and-qos2-amendments.md) | Retain/Will 语义与持久化边界；QoS 2 握手幂等与 `.inflight` v2 形状修订 | MQTT 3.1.1 §3.1.2.5/§3.3.1.3/§3.6.1；ADR-007/012；S2 设计 §4.3 |
+| [019](019-shared-assignment-ack-ownership-and-session-layout.md) | Shared 的 worker 原子 claim、`ack/4` 归属校验与会话文件按 SubRef 布局 | README §5.2；ADR-010/**013（修订 §13.2/§13.3/§13.5）**/015；S2 设计 §4.4 |
 
 ## Gate S0 验收清单（roadmap §2）
 

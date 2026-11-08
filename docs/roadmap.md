@@ -156,7 +156,7 @@ unified-mq/
 
 **目标**：把原型变成能承载真实流量的单机系统，仍无分布式。
 
-**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.3：O1~O4 已拍板、D1~D9 已结案、ADR-012~017 已签认，S2-A~S2-I 子项目与 Gate 映射）。**S2-A 可观测性最小集（2026-11-07）、S2-B 替身档（2026-11-07）、S2-C QoS2/Retain/Will（2026-11-07）已完成**；执行计划见 [`s2-a-metrics-execution-plan.md`](design/s2-a-metrics-execution-plan.md)、[`s2-b-reliability-execution-plan.md`](design/s2-b-reliability-execution-plan.md)、[`s2-c-protocol-completion-execution-plan.md`](design/s2-c-protocol-completion-execution-plan.md)；其余子项目逐项开执行计划。
+**详细规划**：[`docs/design/s2-single-node-kernel.md`](design/s2-single-node-kernel.md)（v0.3：O1~O4 已拍板、D1~D9 已结案、ADR-012~017 已签认，S2-A~S2-I 子项目与 Gate 映射）。**S2-A 可观测性最小集（2026-11-07）、S2-B 替身档（2026-11-07）、S2-C QoS2/Retain/Will（2026-11-07）已完成**；执行计划见 [`s2-a-metrics-execution-plan.md`](design/s2-a-metrics-execution-plan.md)、[`s2-b-reliability-execution-plan.md`](design/s2-b-reliability-execution-plan.md)、[`s2-c-protocol-completion-execution-plan.md`](design/s2-c-protocol-completion-execution-plan.md)；**S2-D 已计划冻结**，见 [`s2-d-subscription-kinds-execution-plan.md`](design/s2-d-subscription-kinds-execution-plan.md)（决策 [ADR-019](adr/019-shared-assignment-ack-ownership-and-session-layout.md) 修订 ADR-013 的 §13.2/§13.3/§13.5）；其余子项目逐项开执行计划。
 
 ### 4.1 功能范围
 
@@ -317,6 +317,8 @@ unified-mq/
 | ADR-015 | 重投递、DLQ 与消息 TTL 的归属与形状 | S2（已采纳） |
 | ADR-016 | 可观测性最小集与「无外部依赖」取舍 | S2（已采纳） |
 | ADR-017 | MQTT 5 properties 落位与 3.1.1 兼容边界 | S2.5（已采纳） |
+| ADR-018 | Retain/Will 语义与持久化边界；QoS 2 握手幂等 | S2（已采纳） |
+| ADR-019 | Shared 分配、`ack/4` 归属与会话文件按 SubRef 布局 | S2（已采纳） |
 
 ### 9.2 文档产出物
 
@@ -329,6 +331,7 @@ unified-mq/
 | `docs/design/s2-a-metrics-execution-plan.md` | S2-A（已完成 2026-11-07） | 10.2 |
 | `docs/design/s2-b-reliability-execution-plan.md` | S2-B（替身档已完成 2026-11-07） | 6.3、10 |
 | `docs/design/s2-c-protocol-completion-execution-plan.md` | S2-C（已完成 2026-11-07） | 4.1、11.1 |
+| `docs/design/s2-d-subscription-kinds-execution-plan.md` | S2-D（计划冻结 2026-11-07，未实现） | 5.2 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

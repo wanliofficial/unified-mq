@@ -1,6 +1,7 @@
 # ADR-013：订阅类型、cursor 归属与会话文件 v2 迁移
 
 - **状态**：**已采纳（S2 M0 冻结，2026-11-07）**——用户签认；后续修改须走 ADR 修订流程
+- **修订**：§13.2 的 cursor 行形状、§13.3 的 Shared 分配路径、§13.5 的会话文件布局由 **ADR-019（D-1~D-3）** 修订；本文其余条款继续有效
 - **日期**：2026-11-07
 - **关联**：README §5.2（订阅与 cursor 抽象）/§7.2；roadmap §4.1（订阅抽象）；ADR-009（`#broker_message{}`）、ADR-010（Router 只要求 `sub_ref()` 不透明）；设计文档 `docs/design/s2-single-node-kernel.md` D2 / D9 / §4.4
 
@@ -34,6 +35,8 @@ S1 只有一种订阅语义：**Exclusive**。`SubRef = {ClientId, Filter}`（K2
 
 ### 13.2 cursor 数据结构：Exclusive = 标量前缀；Shared = 位图 + 最小连续前缀
 
+> **2026-11-07 修订（ADR-019 §19.1）**：`shared` 行的实际形状是 `#{kind, low, acked, assigned}`，`acked` 是有序 offset 集合而非分块位图（`shared_state_max` 已给窗口收口，位图在低密度下纯亏）。「per-message ack + 最小连续前缀」的语义不变；下面的位图描述保留为**该语义的说明**，不是落盘形状。
+
 cursor 按 `{SubRef, Partition}` 维护，每种 Kind 的推进规则不同：
 
 | Kind | 状态 | `committed` 定义 |
@@ -53,6 +56,8 @@ cursor 按 `{SubRef, Partition}` 维护，每种 Kind 的推进规则不同：
 
 ### 13.3 投递规则
 
+> **2026-11-07 修订（ADR-019 §19.1）**：「轮询选择 consumer」不足以决定唯一投递——本项目的连接自己 pull，共享 cursor 会被两个成员读到同一条。实际机制是 **worker 原子 `claim/3`**：一次领一页 offset 记入 `assigned`，pull 只读领到的那些。选定 consumer 的动作因此发生在 claim 里，而不是在 dispatch 里。
+
 - **Exclusive**：唯一 consumer；consumer 不在线时消息留在日志里，重连按 cursor 补发（S1 行为）。
 - **Shared**：组内按 round-robin（`order` 稳定排序，默认按加入顺序）选择**在线且未超过 inflight 上限**的 consumer；一条消息在组内只投一次。consumer 死亡后其未 ack 的消息进入重投递（ADR-015），不重新广播给全组。
 - **Failover**：按 `order` 最小的存活 consumer 作为 active；active 死亡后下一个存活者接管，从**已 committed 位置**继续（不是从 active 死亡瞬间的位置），避免漏消息、允许少量重复。
@@ -64,6 +69,8 @@ cursor 按 `{SubRef, Partition}` 维护，每种 Kind 的推进规则不同：
 - 解析出的 `{shared, Group, Filter}` 直接作为 SubRef；`$share` 前缀不进入 Router 的 filter 索引（Router 看到的是真实 Filter），由 `broker_subscription` 在解析时剥离。
 
 ### 13.5 持久化：`.subs` / `.cursors` 升 `vsn 2`
+
+> **2026-11-07 修订（ADR-019 §19.3）**：文件名确定为 `"<kind>.<b64url(Key)>.<b64url(Filter)>.subs"`，不用 `base64url(term_to_binary(SubRef))`（后者跨 OTP 版本不保证稳定）；`.inflight` **保持按 client**，不随 SubRef 拆分（它是 conn FSM 的 blob，一条 pending 可同属多个 SubRef）；`.cursors` 不落 `assigned`；迁移是「先写 v2、全部成功后删 v1」的幂等流程。下面的 v1/v2 形状描述仍有效。
 
 现有文件格式是 `term_to_binary({vsn, 1, ClientId, Body})`。S2 改为：
 
