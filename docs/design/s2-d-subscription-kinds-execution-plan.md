@@ -1,6 +1,6 @@
 # S2-D 执行计划：订阅语义与 cursor 重构
 
-- **状态**：**计划冻结（2026-11-07）**；实现未开始。决策见 [ADR-013](../adr/013-subscription-kinds-and-cursor-ownership.md)（原冻结）与 **[ADR-019](../adr/019-shared-assignment-ack-ownership-and-session-layout.md)**（修订 §13.2/§13.3/§13.5）。
+- **状态**：**已实现并验收（2026-11-08）**。决策见 [ADR-013](../adr/013-subscription-kinds-and-cursor-ownership.md)（原冻结）与 **[ADR-019](../adr/019-shared-assignment-ack-ownership-and-session-layout.md)**（修订 §13.2/§13.3/§13.5，含实现期 §19.5 的读验证与退回）。交付记录见 §8。
 - **对应**：`docs/design/s2-single-node-kernel.md` §4.4 / §5（M3）；roadmap §4.3 Gate S2（M3 结构前提）
 - **估算**：10 人日（T-D0 ~ T-D8）
 - **退出条件**：三种订阅类型的投递归属有确定性用例；Shared 的「一条消息只投给组内一个 consumer」在 N 个成员并发 pull 下可机械断言；`low` 的连续前缀在乱序 ack / 空洞 / 成员退出三场景正确；`.subs`/`.cursors` v2 与 v1 迁移演练通过；`broker_subscription` 的公共 API 变更在 `mqtt_conn_SUITE` + `s1_e2e_SUITE` 全绿；T14 崩溃矩阵含 Shared 场景；全量回归零 FAILED。
@@ -62,6 +62,7 @@
 | `leave(SubRef, ClientId) -> ok` | 从组订阅摘除一个 consumer；最后一人离开时删除 SubRef（实体、cursor、Router、文件） |
 | `ack(SubRef, Partition, Offset, Consumer) -> ok` | **`ack/3` 删除**；归属校验见 ADR-019 §19.2 |
 | `claim(SubRef, Partition, Max, Consumer) -> {ok, [Offset]} \| {error, term()}` | 只对 `shared` 有效；其余 Kind 返回 `{error, wrong_kind}` |
+| `release(SubRef, Partition, Offsets, Consumer) -> ok` | ADR-019 §19.5：把 claim 领到但读回时不可读的 offset 退回未分配（按 consumer 校验；ack 胜出） |
 | `role(SubRef, ClientId) -> active \| standby \| not_consumer` | failover 的 active 判定；exclusive 恒 `active`（当它是 owner） |
 | `subscriptions(ClientId) -> [subscription()]` | 该客户端**作为 consumer** 的所有订阅（跨 Kind） |
 | `cursor(SubRef, Partition) -> {ok, offset()} \| {error, term()}` | 返回 `low`（shared）或 `offset`（exclusive/failover） |
@@ -114,6 +115,7 @@
 | `shared_claims` | counter | `claim/4` 成功返回非空页的次数 |
 | `shared_ack_unowned` | counter | 归属校验失败的 ack 次数 |
 | `shared_window_full` | counter | `claim/4` 因 `shared_state_max` 返回 overflow 的次数 |
+| `shared_claim_rollbacks` | counter | §19.5 的退回次数（claim 领到尚未可读的尾部，读回后退回） |
 | `failover_promotions` | counter | standby 顶上成为 active 的次数 |
 
 ---
@@ -281,6 +283,56 @@ rebar3 as t14 release
 
 ---
 
-## 8. 交付记录
+## 8. 交付记录（2026-11-08）
 
-（实现完成后填写：验收结果表、场景 → 真实用例名对照、实现期偏差。）
+**状态：已实现并验收。** 决策 [ADR-019](../adr/019-shared-assignment-ack-ownership-and-session-layout.md)（含实现期新增的 §19.5）；本文的任务 T-D0~T-D8 全部完成。
+
+### 8.1 验收结果
+
+| 项 | 结果 |
+|---|---|
+| `rebar3 ct` | **349/349，0 FAILED / 0 Skipped**（23 suites） |
+| `mqtt_conn_SUITE` | **55/55**（新增 5 个 Shared/Failover 端到端用例） |
+| `broker_subscription_SUITE` | **44/44**（新增 22 例：行代数、worker claim/ack、成员顺序、v1→v2 迁移、QoS0 收件人） |
+| `s1_e2e_SUITE` | **14/14**（会话文件断言改到 v2 路径） |
+| `broker_metrics_SUITE` | **12/12**（单独运行；新增 `shared_claim_rollbacks` 键） |
+| `rebar3 dialyzer` | **干净**（无新增 warning） |
+| `rebar3 xref` | **51 条**（HEAD `60c6400` 为 57，净减 6；新增的 4 条 `broker_subscription:join/5`、`broker_subscription_files:{read_subscription/1,subref_name/1,subref_from_name/2}` 均为「仅套件调用」的公开 API） |
+| T14 R9 | **双档 PASS**（`--scenario r9`；默认档 5/1 分片、零回退档 4/2 分片，均未丢未 ack 消息、已 ack 零重投、`low` 到 7） |
+| T15 | **10/10**（Shared 无线上语法，此项只确认 Exclusive 未回归） |
+
+> `broker_metrics_SUITE` 与 `broker_subscription_SUITE` 同一节点顺序运行时，`report_line_is_single` 会失败（`whereis(broker_metrics_server)` 已被前一个套件启动的应用非 `undefined`）。这是既有测试卫生缺陷：在干净 HEAD `60c6400` 上同样复现，与 S2-D 改动无关。全量 `rebar3 ct` 的套件顺序不触发它；两个套件单独运行均全绿。
+
+### 8.2 场景 → 真实用例
+
+| # | 场景 | 用例 |
+|---|---|---|
+| D-1 | SubRef 三形状 | `broker_subscription_SUITE:subscribe_mints_a_subref_the_route_can_see` |
+| D-2 | 入组顺序 | `join_adds_a_consumer_in_order` |
+| D-3 | 离组 / 最后一人 | `leave_promotes_the_next_member`、`leave_of_the_last_member_removes_the_subref` |
+| D-4 | claim 互不交集 / 上界 | `shared_claim_is_disjoint_across_members`、`shared_state_max_refuses_more_claims` |
+| D-5 | claim 不推 `low` / 不越水位 | `claim_does_not_move_low`、`claim_stops_before_the_watermark`、`the_worker_never_claims_past_the_watermark` |
+| D-6 | 乱序 ack 与空洞 | `ack_out_of_order_does_not_promote_low`、`filling_the_hole_promotes_low_once`、`acked_below_low_is_idempotent` |
+| D-7 | 非持有者 ack | `a_non_holder_ack_counts_and_changes_nothing` |
+| D-8 | 成员死亡回收 | `a_dead_consumer_releases_its_whole_page`、`mqtt_conn_SUITE:a_dead_shared_member_hands_its_page_to_the_survivor` |
+| D-9 | 组内恰好一次 | `mqtt_conn_SUITE:a_shared_group_delivers_each_message_exactly_once` |
+| D-10 | Shared QoS0 单人收 | `broker_subscription_SUITE:a_qos0_publish_reaches_exactly_one_shared_member`、`mqtt_conn_SUITE:..._over_the_wire` |
+| D-11 | standby 不投递 | `mqtt_conn_SUITE:a_standby_failover_member_receives_nothing` |
+| D-12 | active 死亡顶替 | `mqtt_conn_SUITE:failover_promotes_the_next_member_when_the_active_disconnects` |
+| D-13 | SubRef 文件布局 | `broker_subscription_SUITE:boot_fails_loudly_on_a_corrupt_subs_file`、`a_lost_cursors_file_falls_back_to_the_subs_origin_not_committed` |
+| D-14 | `.inflight` 仍按 client | `inflight_stays_client_keyed`、`persisted_inflight_blob_decodes_without_the_mqtt_apps_atoms` |
+| D-15 | v1→v2 迁移 | `migration_rewrites_v1_subs_and_cursors` |
+| D-16 | 迁移中途失败 / 幂等 | `migration_is_idempotent_after_a_partial_write`、`migration_refuses_to_boot_on_a_corrupt_v1_file`、`orphan_cursors_files_are_removed_at_boot` |
+| D-17 | 崩溃 R9 | `tools/docker/s1_recovery.py --scenario r9`（双档） |
+| D-18 | 回归 | 全量 349/349；T13 12/12；T15 10/10 |
+| D-4′ | 读验证与退回（§19.5） | `rollback_only_returns_what_is_still_held` + `mqtt_conn_SUITE` 的 5 个 shared 用例 |
+| — | 持久化唤醒 vs QoS0 收件人 | `a_durable_wake_reaches_every_shared_member` |
+
+### 8.3 实现期偏差（已写入 ADR / 代码，非计划遗留）
+
+1. **`claim/5` 而不是 `claim/4`**：`claim(Row, Max, High, Consumer, Limit)`。高水位是 IO 边界（`broker_queue:watermarks/1`），上限是应用配置；两者都由 worker 传入，`broker_cursor` 保持纯函数。
+2. **新增 D-4 / ADR-019 §19.5**：`watermarks/1` 的 `High` 是**预留**指针而非可读边界（WAL 在 group commit 前就前移，memory 后端先 `update_counter` 再 `insert`）。claim 因此可能领到「已预留、尚不可读」的 offset；读回空页后租约永久泄漏。修法是调用方读回后求差集，用新的 `release/4` 按 consumer 校验退回，并记 `shared_claim_rollbacks`。**不改 storage**（ADR-011 冻结）。
+3. **`release/4`（facade + worker）** 是计划外新增的公开 API；`broker_cursor:rollback/3` 是它的纯函数内核。
+4. **`broker_cursor:grow/2`** 仅用于构造测试状态，不在数据路径。
+5. **`role/2` 由 facade 在调用方进程直接读 ETS**（failover active = `first_attached(Consumers)`）；worker 另有 `refresh_active/2` 维护 `active_of` 以计数 `failover_promotions`，因此该计数晚于 facade 的 role 答案一个 `DOWN` 消息——断言须轮询 `broker_metrics:snapshot()`。
+6. **R9 的 Shared 组由 `.subs` 写入器预置**：`$share/...` 线上语法属于 S2.5，T14 用 broker 自己的 `broker_subscription_files:write_subs/2` 造出与真实 join 相同的一组文件，再由 boot 正常恢复。

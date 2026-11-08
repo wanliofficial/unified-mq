@@ -194,17 +194,18 @@
 
 ### 4.4 S2-D 订阅语义与 cursor 重构
 
-> **状态：计划（冻结 2026-11-07，未实现）**。决策见 [ADR-013](../adr/013-subscription-kinds-and-cursor-ownership.md) 与修订它的 **[ADR-019](../adr/019-shared-assignment-ack-ownership-and-session-layout.md)**；任务与用例见 [`s2-d-subscription-kinds-execution-plan.md`](s2-d-subscription-kinds-execution-plan.md)。下面是 ADR-019 冻结的实现契约。
+- **状态**：**已实现（S2-D，2026-11-08）**。决策见 [ADR-013](../adr/013-subscription-kinds-and-cursor-ownership.md) 与修订它的 **[ADR-019](../adr/019-shared-assignment-ack-ownership-and-session-layout.md)**；任务与用例见 [`s2-d-subscription-kinds-execution-plan.md`](s2-d-subscription-kinds-execution-plan.md)（§8 交付记录）。下面是 ADR-019 冻结的实现契约。
 
 - **数据模型**：`SubRef = {Kind, Key, Filter}`；`Kind ∈ {exclusive, shared, failover}`；`Key = ClientId | Group`。实体表 key 仍是 SubRef；不建 `CONSUMERS` 表——成员顺序就是 `.subs` body 里的有序 `consumers`，failover 的 active = 列表中第一个有 live attachment 的成员。
 - **Shared 的分配**：**worker 原子 `claim/4`**。cursor 行是 `#{kind, low, acked, assigned}`；conn 每轮向 worker 领一整页 offset（`Max = pull_page_limit`），worker 在单个 gen_server 内串行分配并记入 `assigned => Consumer`。pull 只读领到的那些 offset；`low` 只由 ack 的连续前缀推进，分配不移动它。保留「cursor 是唯一读位置」（J6）。代价是每页多一次 `gen_server` call（不是每条一次）。
+- **claim 的读验证与退回（ADR-019 §19.5，实现期新增）**：`broker_queue:watermarks/1` 的 `High` 是**预留**指针，不是「已可读」边界（WAL 在 group commit 前就前移；memory 后端先 `update_counter` 再 `insert`）。因此 claim 可能领到「已预留、尚不可读」的 offset：`read_from` 返回空页，而它已记在 `assigned` 里，再没有出口。conn 读回后求差集，用 `release/4` 按 consumer 校验退回（ack 胜出），本轮该 ref 记 `stalled`，下一个 append wake / poll tick 再领。计数 `shared_claim_rollbacks`。`< High` 与读验证叠加才完整：前者保证不产生幻影 offset，后者保证不产生悬挂租约。
 - **Shared 的 committed**：`low - 1`；一条慢 consumer 只钉住它没 ack 的那几条，不钉住整组。
 - **ack 归属**：`ack/4` 带 consumer，校验 `assigned[Offset] =:= Consumer`；不符者 `ok` + `shared_ack_unowned`，不改状态、不断连。consumer 死亡时 `do_detach` 把它名下未 ack 的 offset 清回未分配，下一轮 claim 自然重投。**S2-D 不加重试定时器**：重投只来自成员死亡与连接重连，重试上限/退避/DLQ 是 ADR-015 的 S2-E。
 - **上界**：`shared_state_max`（默认 4096）限制 `acked ∪ assigned`；超限 `claim` 返回 overflow，conn 本轮不投递并记 `shared_window_full`——有界拒绝，不驱逐。
 - **dispatch 归属**：位置型 wake 发给 Shared 组内**所有** attached 成员（wake 只是提示）；非位置型（QoS0，推送即投递）只发给 `order` 最小且 attached 的一个。
 - **会话文件**：`.subs`/`.cursors` 按 SubRef（`"<kind>.<b64url(Key)>.<b64url(Filter)>.subs"`），内容为 `vsn 2`；**`.inflight` 仍按 client**（它是 conn FSM 的 blob，一条 pending 可同属多个 SubRef）。`assigned` 不落盘。boot 从 `.subs` 内容重建 `ClientId→SubRef` 索引；v1→v2 迁移在 boot step 2 内**先写后删**、幂等，失败拒绝启动。
 - **不在 S2-D**：`$share` 线上语法（S2.5）、消费权重、位图的位级表示（S2-I 压测后再定）。
-- **测试**：三种类型的投递归属、claim 并发不相交、`low` 在乱序 ack/空洞/成员退出三场景的正确性、Shared 组内不重复、failover 接管、`.subs` v2 与 v1 迁移演练（含中途失败）、Router 回填（boot step 2+3）、T14 R9。
+- **测试**：三种类型的投递归属、claim 并发不相交、`low` 在乱序 ack/空洞/成员退出三场景的正确性、Shared 组内不重复、failover 接管、`.subs` v2 与 v1 迁移演练（含中途失败）、Router 回填（boot step 2+3）、T14 R9。**结果（2026-11-08）**：`broker_subscription_SUITE` 44/44、`mqtt_conn_SUITE` 55/55、全量 `rebar3 ct` 349/349、T14 R9 双档 PASS、`dialyzer` 干净；明细见执行计划 §8。
 
 ### 4.5 S2-E 重投递 / DLQ / TTL
 
@@ -250,7 +251,7 @@
 | M0 决策冻结 | D1~D9 结案；ADR-012~017 起草并评审 | 每份 ADR 状态=已采纳；本文升 v0.2+（**已完成**：2026-11-07 六份 ADR 全部签认，本文 v0.3） |
 | M1 观测与证明 | S2-A + S2-B | `os_buffer` 双轨报告可复跑（CI 替身 + dm-flakey）；metrics snapshot 稳定 |
 | M2 协议补齐 | S2-C（QoS2 / Retain / Will） | ✅ **已完成（2026-11-07）**：帧级 27 例 + 连接级 20 例 + retain 17 例；T14 R8 默认档/零回退档双档 PASS；T15 新增 5 例、全套 10/10 PASS。**MQTT 5 已移出本里程碑到 S2.5** |
-| M3 结构改造 | S2-D → S2-E → S2-F | 三种订阅类型（Shared 的 worker 原子 claim + 最小连续前缀，ADR-019）、DLQ/TTL、retention 全绿；`.subs` v1→v2 演练通过 |
+| M3 结构改造 | S2-D → S2-E → S2-F | ✅ **S2-D 已完成（2026-11-08）**：三种订阅类型（worker 原子 claim + 最小连续前缀 + §19.5 读验证）、`.subs` v1→v2 迁移、T14 R9 双档全绿；S2-E（DLQ/TTL）与 S2-F（retention）未开始 |
 | M4 收口 | S2-G + S2-I + Gate S2 报告 | Gate 四项证据齐备，全量回归零 FAILED |
 | （S2.5） | MQTT 5 子集 | 独立跟踪，不阻塞 Gate S2 |
 

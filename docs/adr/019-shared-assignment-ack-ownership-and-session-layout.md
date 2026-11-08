@@ -1,6 +1,6 @@
 # ADR-019：Shared 分配、ack 归属与会话文件按 SubRef 布局
 
-- **状态**：**已采纳（S2-D 决策冻结，2026-11-07）**——用户签认 D-1 / D-2 / D-3；后续修改须走 ADR 修订流程
+- **状态**：**已实现并验收（2026-11-08）**——D-1/D-2/D-3 于 2026-11-07 签认，实现期新增 §19.5（D-4）；后续修改须走 ADR 修订流程
 - **日期**：2026-11-07
 - **关联**：README §5.2/§7.2；roadmap §4.1；**ADR-013（本 ADR §19.1/§19.2/§19.3 修订其 §13.2/§13.3/§13.5）**、ADR-012（`.inflight` 形状，本 ADR 不动它）、ADR-015（重投递，本 ADR 把重投递的时机划给它）、ADR-010（Router 只要求 `sub_ref()` 不透明）；设计文档 `docs/design/s2-single-node-kernel.md` §4.4
 - **修订**：`amends` ADR-013 §13.2（cursor 行形状）、§13.3（Shared 的分配路径）、§13.5（会话文件布局与迁移顺序）
@@ -57,7 +57,7 @@ claim(SubRef, PartitionId, Max, Consumer) -> {ok, [offset()]} | {error, term()}.
 - **不推进 `low`**。`low` 只由 ack 的连续前缀推进。分配与完成是两件事。
 - 尾部返回 `{ok, []}`（本次没东西可领，不是错误；空页与 `overflow` 是两种不同的信号，前者是常态、后者是拒绝）。
 - **不越过分区高水位**：`claim` 在 worker 内取 `broker_queue:watermarks/1` 的 `High`（`broker_storage` 的契约是 `High = Last + 1`，即下一个空位），返回的 offset 一律 `< High`。否则会为日志里还不存在的 offset 建 `assigned` 条目——它们永远不会被 ack，`low` 就此被钉死，`committed` 也不再前进。水印取不到时返回 `{error, {watermark, P, Reason}}`，调用方本轮退化 `idle`（poll tick 重试），不崩。
-- 调用方**必须**把领到的 offset 用完或让它们随连接死亡回到未分配；它不得丢弃后重新 claim 同一批（已 `assigned` 的不会被再发出去，重 claim 只会拿到**新**的一页，把上一页变成泄漏的悬挂分配）。
+- 调用方**必须**把领到的 offset 用完、读不到时**退回**（§19.5），或让它们随连接死亡回到未分配；它不得静默丢弃后重新 claim 同一批（已 `assigned` 的不会被再发出去，重 claim 只会拿到**新**的一页，把上一页变成泄漏的悬挂分配）。
 - **返回集合可能不连续**（`acked` 里的空洞会让它跳过几个 offset）。调用方按 `[hd | tl]` 的区间读一次日志再按集合过滤即可：区间宽度 ≤ `Max + |acked|`，而 `|acked|` 已被 `shared_state_max` 收口，所以读取量有界。
 
 **上界（故意的失败模式）**：`shared_state_max`（默认 `4096`）限制 `map_size(acked) + map_size(assigned)`。达到上界时 `claim/4` 返回 `{error, overflow}`，conn 本轮不投递、记 `shared_window_full` 计数并保持连接。**不驱逐、不静默丢**——与 Retain 上限（ADR-018 §18.2）同一姿态：驱逐会把「已 ack 的事实」变成随机值，拒绝是可观测且有界的。这个上界也是「一个卡住的 consumer 不会让组的状态无限增长」的机制回答（ADR-013 §13.2 的动机）。
@@ -150,6 +150,34 @@ ack(SubRef, PartitionId, Offset, Consumer) -> ok.
 - Router 形状不变（ADR-010 只要求 `sub_ref()` 不透明 `term()`）。
 - `.inflight` 形状（ADR-018 §18.3 R3）不动。
 
+### 19.5 D-4：claim 的读验证与退回（实现期修订，2026-11-08）
+
+**缺口**：`watermarks/1` 的 `High` **不是**「已可读」的边界，而是「已预留」的边界。WAL 后端的 `wal_writer` 在**分配** offset 时就把 `high` 前移（`handle_call({append, ...})` 里 `State1 = State#st{high = High + N}`），真正的记录要等到 group commit 的 `flush/1` 落盘后才有 `wal_index` 锚点、才 `read_from/3` 可见。`broker_storage_memory` 同理：`do_append` 先 `ets:update_counter` 拿号，再逐条 `ets:insert`。
+
+于是 §19.1 那条「不越过 `High`」**方向对但不够**：claim 仍可能领到「已预留、尚未可读」的 offset。一旦领到，`read_run/3` 的 `read_from` 返回空页（WAL 把「读不到」当作日志末尾，ADR-011 §11.4 第 2 条），该 offset 却已记在 `assigned` 里，没有任何路径会再把它们还回去——`assigned` 只有两个出口（ack 成功、consumer 死亡）。**消息就此永久不投递**，`low` 也被钉死。这不是理论风险：`mqtt_conn_SUITE` 的 shared 端到端用例里以 4 条消息稳定复现（claim 领到 offset 3/4，`read_from(3)` 空页，`low` 卡在 1）。
+
+**契约上没有别的修法**（三条都被否掉）：
+
+| 候选 | 否决理由 |
+|---|---|
+| storage 提供「已可读高水位」 | 要改 ADR-011 的 `watermarks/1` 返回值形状，且把「预留 vs 落盘」两个事实压回一个标量，正是 ADR-011 §11.4 第 2 条刻意不暴露的那个观察窗口 |
+| caller 只用 `Committed` 做上界 | `Committed` 是**全局已确认**水位（所有订阅者都 ack 过），用它当 claim 上界会让组永远读不到任何未提交流量——组订阅将无法工作 |
+| 空页即重试（不退回） | 领到的 offset 仍留在 `assigned`，重试只会再拿到**新**的一页，泄漏照旧（§19.1 已经写明）。而且会无限领新页直到 `shared_state_max` 打满 |
+
+**决策**：**claim 的调用方在读回之后退回读不到的 offset**，实现为一个新的 worker 调用：
+
+```erlang
+%% 把 Consumer 名下这些 offset 退回未分配。只删「确实仍归该 Consumer」的条目，
+%% 因此与 ack 的竞态是安全的：已 ack 的不会因为退回而复活。
+release(SubRef, PartitionId, [offset()], Consumer) -> ok.
+```
+
+- **只读验证，不做「等待就绪」**：`read_run/3` 拿到页后，把领到的集合与页里实际出现的 offset 求差；差集非空即 `release/4`，本轮该 ref 记 `stalled`（不是 `progress`，否则会空转烧轮次）。退回的 offset 在下一轮 claim 里自然被重新分配——append 完成后的 `{new_messages, ...}` wake 或 poll tick 会带来下一轮。
+- **不引入重试计数**：本节的退回与 §19.2 的「不加重试定时器」不矛盾。退回不是一次重投尝试，而是**纠正一次尚未成立的分配**（那条消息此刻还不可读，从未投出去过，所以没有「投毒」的可能）。真正的重试计数仍归 S2-E 的 DLQ。
+- **不改变 `High` 的用法**：`< High` 仍是上界（它保证了退回的 offset 一定**存在**、只是暂时不可读；没有它，退回会变成永远领不到的死循环）。两个约束叠加才是完整的：`< High` 保证不产生幻影 offset，读验证保证不产生悬挂租约。
+- **计数**：退回记 `shared_claim_rollbacks`，可观测「claim 领到了尚未落盘的尾部」的频度。它与 `shared_window_full` 是两种不同信号（后者是拒绝，前者是纠正）。
+- **代价**：每页读回后多一次集合差（`O(Max)`），差集非空时多一次 `gen_server` call。稳态下（尾部已落盘）差集为空，零额外调用。
+
 ## 后果（Consequences）
 
 - **+** Shared 有了确定的「一条消息只给一个 consumer」机制，不再依赖两个连接读同一位置后靠时序去重。
@@ -165,8 +193,11 @@ ack(SubRef, PartitionId, Offset, Consumer) -> ok.
 
 ## 验证（Validation）
 
+**实现结果（2026-11-08）**：`rebar3 ct` **349/349**（`broker_subscription_SUITE` 44、`mqtt_conn_SUITE` 55、`s1_e2e_SUITE` 14）；`rebar3 dialyzer` 干净；`rebar3 xref` 51 条（较 HEAD `60c6400` 净减 6）；T14 `--scenario r9` **双档 PASS**（默认档 6 条消息按 claim 分成 5/1、零回退档 4/2；两档均「已 ack 零重投、未 ack 全部重投、`low` 终值为 7」）。用例映射与实现期偏差见 [`s2-d-subscription-kinds-execution-plan.md`](../design/s2-d-subscription-kinds-execution-plan.md) §8。下面各项均有对应用例：
+
 - **形状**：`sub_ref()` 三形状的铸造与解析；`{exclusive, ClientId, Filter}` 与 S1 的 `{ClientId, Filter}` 一一对应（迁移等价性）。
 - **claim**：并发两个成员各 claim 一页，两组 offset **不交集**；`low` 不动；`{ok, []}` 在尾部；`shared_state_max` 触发 `{error, overflow}` 且计数；claim 返回的 offset 全部 `< High`（不越过高水位）；返回集合允许不连续但仍升序。
+- **读验证与退回（§19.5）**：claim 领到已预留未可读的 offset ⇒ 读回差集非空 ⇒ `release/4` 退回、记 `shared_claim_rollbacks`、本轮记 `stalled`；退回只删仍归该 consumer 的条目（已 ack 的不复活、他人名下的不动）；下一轮 claim 能重新领到被退回的 offset；退回后 `committed` 不前移。
 - **committed**：`low` 只在连续前缀前进；乱序 ack（ack 第 5 条再 ack 第 3 条）不推进 `low`；空洞填满后一次性推进；`low` 之前的 ack 幂等忽略。
 - **归属**：非持有者 ack → `ok` + `ack_unowned`、状态不变；持有者 ack → 从 `assigned` 移入 `acked`。
 - **死亡重投**：成员 A 领了 3 条不 ack 后退出 ⇒ 3 条回到未分配 ⇒ 成员 B 下一轮 claim 全部领到；A 迟到的 ack 不推进任何东西。
@@ -175,5 +206,5 @@ ack(SubRef, PartitionId, Offset, Consumer) -> ok.
 - **QoS0 + Shared**：一次发布只被组内**一个**成员收到。
 - **迁移**：v1 `.subs`/`.cursors`（含一个客户端两条 filter）⇒ v2 文件逐个齐全、内容等价、v1 删除；损坏 v1 ⇒ 拒绝启动且错误含路径；迁移中途失败注入 ⇒ 重启后仍能从两份文件之一恢复（幂等）。
 - **文件布局**：`.inflight` 仍按 client 命名且内容 vsn 不变；孤儿 `.cursors` 在 boot 时被删除。
-- **回归**：Exclusive 的 `rebar3 ct` 全绿、T13 端到端双组 12/12、T14 崩溃矩阵 18/18、T15 真实客户端 10/10 保持不变。
+- **回归**：Exclusive 的 `rebar3 ct` 全绿、T13 端到端双组 12/12、T14 崩溃矩阵 20/20（R1a~R9 × 双档）、T15 真实客户端 10/10 保持不变。
 - **文档**：`docs/storage-and-recovery.md` §9 会话文件布局、设计 §4.4 状态、ADR-013 顶部状态行。
