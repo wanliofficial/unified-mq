@@ -63,7 +63,7 @@
 1. S0.1 原报告称 ra 仅支持 OTP 27、需锁版本 —— 实测 OTP 28.3.1 完全可用，全项目统一 OTP 28.3.1。
 2. `.gitignore` 修正：新增 `spikes/*/.data/` 忽略规则（S0.2 运行时数据目录此前未被忽略）。
 
-## S1 进展（进行中）
+## S1 进展（已全部完成）
 
 | 步骤 | 状态 | 产物 |
 |---|---|---|
@@ -152,7 +152,7 @@
 - **T14 实测暴露 3 项（M13~M15，详见设计文档 §13），产品代码与冻结 API 未改**：M13 把 MQTT 客户端驱动放在宿主（kill -9 的注入者必须与 socket 同一控制流）；M14 把 R6 限定为 `broker_storage_wal:recover/2` 计时（不含容器/VM 启动）；M15 因参考机 `docker compose` 不存在、`docker-compose` 1.29.2 与 docker-py 6.1.3 的 `http+docker` scheme 不兼容，驱动改用等价的 `docker run/kill/start` CLI，compose 文件保留为声明式参考。
 - **T15 实测暴露 1 项（M16，详见设计文档 §13）**：v5 CONNECT 的拒绝帧原为 4 字节 3.1.1 CONNACK `20 02 00 87`，paho 2.x 在 v5 属性解码器抛 `IndexError`、mosquitto 报 network protocol error——**两个真实客户端都拿不到 0x87**。改为 5 字节 v5 帧型 `20 03 00 87 00`（零属性）后，两者都读出 135（0x87）再关闭；3.1.1 响应字节不变。冻结 API 未改，设计 §4.5 的 `0x87` 也未改。
 
-## S2 进展（进行中）
+## S2 进展（已完成；Gate 第 1 项待 root）
 
 | 子项目 | 状态 | 产物 / 证据 |
 |---|---|---|
