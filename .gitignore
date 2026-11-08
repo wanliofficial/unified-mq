@@ -52,5 +52,11 @@ spikes/*/.data/
 /test/protocol-compatibility/mqtt/run/
 /test/protocol-compatibility/mqtt/__pycache__/
 
+# S5 WS harness scratch: broker data volume, boot-module beam, reports
+/test/protocol-compatibility/ws/data/
+/test/protocol-compatibility/ws/run/
+/test/protocol-compatibility/ws/_build/
+/test/protocol-compatibility/ws/__pycache__/
+
 # CLI tool state (not project content)
 /.qoder/

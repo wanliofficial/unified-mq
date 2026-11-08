@@ -720,15 +720,26 @@ absorb_advance(SubRef, Delta, State) ->
 
 flush_sub_cursors(SubRef, State) ->
     #{cursor_dirty := Dirty} = State,
-    case broker_subscription_files:write_cursors(SubRef, cursors_body(SubRef)) of
-        ok ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [] ->
+            %% The subscription was torn down between its cursor was marked
+            %% dirty and this flush tick -- a clean-session teardown or a
+            %% takeover can race the tick (the WS compat suite hits this with
+            %% rapid real-client connect/subscribe/disconnect churn). There is
+            %% no entity and no cursor file to write; drop the stale key so the
+            %% next tick does not trip over it again.
             State#{cursor_dirty := maps:remove(SubRef, Dirty)};
-        {error, _Reason} ->
-            %% The in-memory cursor is still correct to read (a restart is the
-            %% only consumer of the file); the tick retries. The regress bound
-            %% degrades to "as good as the next tick", which is what the
-            %% interval knob already promises.
-            State
+        [_] ->
+            case broker_subscription_files:write_cursors(SubRef, cursors_body(SubRef)) of
+                ok ->
+                    State#{cursor_dirty := maps:remove(SubRef, Dirty)};
+                {error, _Reason} ->
+                    %% The in-memory cursor is still correct to read (a restart is the
+                    %% only consumer of the file); the tick retries. The regress bound
+                    %% degrades to "as good as the next tick", which is what the
+                    %% interval knob already promises.
+                    State
+            end
     end.
 
 cursors_body(SubRef) ->
@@ -1142,27 +1153,41 @@ release_member_claims(ClientId, State) ->
 %% files the client believes deleted. Exclusive subscriptions are deleted
 %% outright; group memberships only lose this consumer (§19.2).
 teardown_session(ClientId, State) ->
-    lists:foreach(fun({SubRef, Info}) -> teardown_one(SubRef, Info, ClientId) end,
-                  entities_of(ClientId)),
+    Removed = lists:foldl(
+                fun({SubRef, Info}, Acc) ->
+                        case teardown_one(SubRef, Info, ClientId) of
+                            removed -> [SubRef | Acc];
+                            kept -> Acc
+                        end
+                end, [], entities_of(ClientId)),
     true = ets:delete(?INFLIGHT, ClientId),
     ok = broker_subscription_files:delete_inflight(ClientId),
     #{cursor_dirty := CD, inflight_dirty := ID} = State,
-    State#{cursor_dirty := maps:remove(ClientId, CD),
+    %% `cursor_dirty' is SubRef-keyed (mark_cursor_dirty/4); a torn-down
+    %% subscription must drop its key here, otherwise the next cursor_tick
+    %% would try to flush a cursor file for an entity that no longer exists.
+    %% `inflight_dirty' is ClientId-keyed, so that one removes by ClientId.
+    State#{cursor_dirty := lists:foldl(fun(S, Acc) -> maps:remove(S, Acc) end, CD, Removed),
            inflight_dirty := maps:remove(ClientId, ID)}.
 
+%% Returns `removed' when the entity was deleted outright, `kept' when a shared
+%% subscription survives with a reduced consumer list (its cursor is still live).
 teardown_one(SubRef, #{kind := exclusive}, _ClientId) ->
     ok = broker_subscription_files:delete_subscription(SubRef),
     _ = broker_router:unregister(SubRef),
-    remove_local(SubRef);
+    remove_local(SubRef),
+    removed;
 teardown_one(SubRef, #{consumers := Consumers} = Info, ClientId) ->
     case lists:delete(ClientId, Consumers) of
         [] ->
             ok = broker_subscription_files:delete_subscription(SubRef),
             _ = broker_router:unregister(SubRef),
-            remove_local(SubRef);
+            remove_local(SubRef),
+            removed;
         Rest ->
             ok = persist_entity(SubRef, Info#{consumers => Rest}),
-            true = ets:insert(?ENTITIES, {SubRef, Info#{consumers => Rest}})
+            true = ets:insert(?ENTITIES, {SubRef, Info#{consumers => Rest}}),
+            kept
     end.
 
 remove_local(SubRef) ->

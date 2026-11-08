@@ -15,7 +15,7 @@
 | 协议 | S5 顺序 | 推荐客户端 | 语言 | 基线版本 | 验证 | 备注 |
 |---|---|---|---|---|---|---|
 | MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x / mosquitto 2.1.2 | ✅（**T15 + S2-C**：10/10 用例） | QoS0/1/2、Retain、Will 已实现并实测；MQTT 5.0 语义在 S2.5 补；逐条限制见本文 §4 |
-| WebSocket | 2 | `ws`（Broker 自有 JSON/二进制帧） | Node | ws 8.x | ✅ | 传输层用 ws，应用层帧由 S5 设计 |
+| WebSocket | 2 | Python `websocket-client`（应用层帧为 Broker 自有 JSON/二进制） | Python | websocket-client 1.7.0 | ✅（**S5-WS：10/10 用例**） | 传输层用 `websocket-client`，应用层帧由 S5 设计，见 §4.5 |
 | NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.37.0 | ✅ | Pub/Sub、Queue Group、Request/Reply |
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java | proton (qpid) | ✅ | Proton=AMQP 1.0；需 0.9.1 时换 amqp091/pika |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅ | Produce/Fetch/Metadata/Consumer Group |
@@ -266,6 +266,46 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 单节点集群语义（`broker_cluster_SUITE`） | 11 例：assign/epoch、Fencing、迁移两阶段、no-quorum、quorum 前后 ACK、副本不足不 ACK |
 | 分布式（`broker_cluster_dist_SUITE`） | 4 例：3 节点组形成/复制、Leader 故障切换、失去多数派、迁移后旧 Owner Fencing |
 | 全量 | `rebar3 ct` **447/447**；`dialyzer` 0 warnings；`xref` 121 条均为预期 unused-export |
+
+### 4.5 S5 追加（2026-11-09）：WebSocket 适配器（`broker_proto_ws`）
+
+> 决策与冻结契约见 [`adr/012-qos2-semantics-and-release-state.md`](adr/012-qos2-semantics-and-release-state.md)、[`adr/013-subscription-kinds-and-cursor-ownership.md`](adr/013-subscription-kinds-and-cursor-ownership.md) 与 §2 能力矩阵。**WebSocket 复用 MQTT 的存储/路由/订阅路径**——没有协议专属的存储或投递分支；区别只在「线协议」与「QoS 集合」。
+
+**应用层帧格式**（`apps/broker_proto_ws/src/ws_frame.erl` 拥有 RFC 6455 帧编解码，连接层在 `ws_conn.erl`）：
+
+- 传输层是标准 RFC 6455（握手 + `Sec-WebSocket-Accept` + 帧掩码/分片/close/ping/pong），由 `ws_frame` 自实现，不引入 WS 依赖。
+- **文本帧** = 一个带 `op` 字段的 JSON 对象；**二进制帧** = `<<Op:8, HeaderLen:32, Header/binary, Payload/binary>>`，`Header` 是同一份 JSON，`Payload` 是原始消息体。
+- 操作：`connect` / `subscribe` / `unsubscribe` / `publish` / `ack` / `ping` / `disconnect`。每条消息经 `broker_router` → `broker_queue`（fsync）→ `broker_subscription`，与 MQTT 完全同路。
+
+**能力矩阵行**（追加进 §2 末尾）：
+
+```
+| WebSocket | 已支持 | RFC 6455 传输 + connect/connack、subscribe/suback、publish(qos0/1)/puback、message 二进制投递、ack/ackack、unsubscribe/unsuback、ping/pong、clean_start=false 会话 + 离线追赶、同 client_id takeover | v1 仅 QoS0/1（无 QoS2 握手）；v1 不支持 shared 订阅（明确拒绝）；二进制投递帧（op=3）无 MQTT 风格 QoS2；无 retained/will（归 MQTT 侧） | apps/broker_proto_ws/test/、test/protocol-compatibility/ws/ |
+```
+
+**已知限制（协议对端可观察，不是内部 TODO）**：
+
+1. **QoS 仅 0/1**：v1 没有 QoS2 四步握手；`publish` 带 `qos=2` ⇒ `error/bad_qos`。
+2. **shared 订阅明确拒绝**：`subscribe` 带 `kind=shared` ⇒ `suback` 返回 `granted=false` + reason（不是断连，也不是静默）。
+3. **二进制投递帧无 QoS2 语义**：投递帧（op=3）是「消息」投递，其 `qos` 只取订阅侧 0/1。
+4. **retained / will 不在 WS 侧**：这两项由 MQTT 侧 `broker_retain` / 连接 FSM 拥有；WS v1 不复制它们。
+
+**真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
+
+- 套件在 `test/protocol-compatibility/ws/ws_compat.py`，用 **Python `websocket-client` 1.7.0**（S0.4 客户端矩阵指定的 WS 客户端）驱动一个真实的 `erl -noshell -s ws_broker_boot run` broker 节点（ranch 临时端口、`port=>0`、WAL 后端、ext4 数据目录，启动路径与 `ws_conn_SUITE init_per_testcase` 完全一致）。脚本**不 poke `ws_conn` 内部**，只用浏览器/Node `ws` 会用的同一套 WS 握手与帧 API。
+- **10/10 用例 PASS**（`run/report.json`）：`ws-handshake`（RFC 6455 握手 + accept 校验）、`ws-connect-connack`（含重复 connect 拒绝）、`ws-pubsub-qos1`（订阅→qos1 发布→二进制 message→ack→ackack，puback 回显 offsets）、`ws-qos0-no-ack`（qos0 投递 `delivery_id=null`、无需 ack）、`ws-binary-frame`（二进制发布帧 body 字节精确）、`ws-offline-catchup`（`clean_start=false` 重连补发离线消息）、`ws-ping-pong`、`ws-unsubscribe-stops`、`ws-refusals`（非法 filter / shared / qos2 / 未知 op / 坏 JSON / 超限 payload 全部显式拒绝，不崩不挂）、`ws-reconnect-takeover`（同 client_id 二次 connect 触发 takeover，旧连接被关、新连接继续收投递）。
+- 套件默认从干净数据目录起步（`--keep-data` 可保留），避免上一次运行的持久会话泄漏进 `ws-offline-catchup`。
+
+**联带修复**（WS 压测暴露的真实缺陷，已修）：`broker_subscription_worker` 的 `cursor_tick` 在快速 connect/subscribe/disconnect churn 下会崩——`cursors_body/1` 对已被 tear-down 的 SubRef 做无条件 `badmatch`（`ets:lookup(?ENTITIES, SubRef)` 返回 `[]`）。修法两处：(a) `flush_sub_cursors/2` 先查 `?ENTITIES`，实体不存在则丢弃 `cursor_dirty` 键并跳过写盘；(b) `teardown_session/2` 改为按 SubRef（而非此前错误的 ClientId）清理 `cursor_dirty`。修复后 `broker_subscription_SUITE` 53/53、全量 CT 无回归。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| WS 帧编解码（`ws_frame_SUITE`） | 9 例：握手 accept、掩码/分片、控制帧、close 载荷 |
+| WS 连接/应用协议（`ws_conn_SUITE`） | 14 例：connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack |
+| 真实第三方客户端（`ws_compat.py`） | 10/10 PASS（见上） |
+| 全量 | `rebar3 ct` **470/470**；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 
 ---
 

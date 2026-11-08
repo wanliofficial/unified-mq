@@ -159,6 +159,22 @@
     {mqtt_max_packet_size, 0}
   ]},
 
+  {broker_proto_ws, [
+    %% Same posture as broker_proto_mqtt: a map per listener makes the port
+    %% exist; CT supplies its own ephemeral listener. The application keys
+    %% below are the defaults for connections started outside a listener.
+    {listeners, [
+      #{port => 8080,
+        ref => {ws, 8080},
+        num_acceptors => 10,
+        max_connections => 1024}
+    ]},
+    %% S5 WebSocket v1: QoS 0/1 only (v1 has no QoS 2 handshake). Over the cap
+    %% the publish is refused with `payload_too_large'.
+    {max_publish_bytes, 1048576},
+    {max_frame_bytes, 16777216}
+  ]},
+
   {broker_retain, [
     %% J8: same absolute path as broker_storage/broker_subscription -- the
     %% retained snapshot must live beside the sessions it serves.
