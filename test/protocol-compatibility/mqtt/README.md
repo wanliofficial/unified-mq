@@ -58,7 +58,7 @@ directions.
 | Case | What it proves |
 |---|---|
 | `paho311-full` | CONNECT (clean, keepalive=1, credentials), SUBSCRIBE, QoS1 PUBLISH, PUBACK in **both** directions, PINGREQ/PINGRESP (keepalive timer), DISCONNECT; all frames byte-identical; CONNACK `20020000`, SUBACK `9003000101` |
-| `paho-v5-refused` | MQTT 5 CONNECT is rejected at parse time; real paho reports reason **135 = 0x87** ("Not authorized") and the broker closes. Wire bytes `2003008700` (v5 framing, zero properties) |
+| `paho-v5-connect` | **S2.5 (ADR-017)**: a real paho MQTT 5 client connects successfully. CONNACK is v5-framed (`2003000000`: 3-byte remaining length, zero properties) and the client reads reason `0x00`. The S1-era `paho-v5-refused` assertion (`0x87`) is obsolete |
 | `paho-qos2` | **S2-C**: full QoS2 both ways. Inbound: paho drives PUBLISH→PUBREC→PUBREL→PUBCOMP and returns only on PUBCOMP. Outbound: the subscriber receives at QoS2, so paho runs the receiver half (PUBREC / PUBREL / PUBCOMP) against us. Every frame byte-identical |
 | `paho-retain` | **S2-C**: stored on publish, replayed to a later subscriber with `retain=1`, forwarded live with `retain=0`, and an empty-payload `retain=1` publish clears it (a fresh subscriber then gets nothing) |
 | `paho-will` | **S2-C**: Will published after an abnormal TCP close, at its configured QoS, with the configured payload |
@@ -66,7 +66,7 @@ directions.
 | `paho-bad-filter` | a filter containing U+0000 passes paho's own validation, reaches the broker, and is rejected in the codec (`embedded_null`): close with **no SUBACK** |
 | `mosq-pubsub` | mosquitto 2.1.2 QoS1 round trip; SUBSCRIBE/SUBACK and PUBLISH/PUBACK bytes match, SUBACK `9003000101` |
 | `mosq-qos2` | **S2-C**: mosquitto 2.1.2 QoS2 round trip; PUBREC/PUBREL/PUBCOMP present on both sides of the tee |
-| `mosq-v5-refused` | mosquitto MQTT5 reads the same `2003008700` refusal (`Connection error: Not authorized`) |
+| `mosq-v5-pubsub` | **S2.5**: mosquitto 2.1.2 speaking MQTT 5.0 connects and publishes successfully (`rc=0`), receiving the same v5-framed CONNACK |
 
 ## Deviations / known limits
 
@@ -76,12 +76,12 @@ directions.
 * **Empty client ids are refused** by design (T9: the session table is keyed by
   ClientID). `mosquitto_sub`/`mosquitto_pub` default to an empty id under
   MQTT 3.1.1, hence the explicit `-i` in both commands.
-* **MQTT 5 CONNACK framing (M16)**: the refusal is now v5-framed. A
-  `20 02 00 87` 3.1.1 CONNACK made paho raise inside its properties decoder and
-  mosquitto report a network protocol error instead of the reason code. Fixed in
-  `mqtt_conn_fsm`; 3.1.1 responses are unchanged. The reason code stays `0x87`
-  per design §4.5, although v5's spec-correct "Unsupported Protocol Version" is
-  `0x84` — MQTT 5 is S2 scope.
+* **MQTT 5 CONNACK framing (M16, superseded by S2.5)**: the S1-era refusal was
+  made v5-framed so paho/mosquitto could read reason `0x87` instead of failing
+  inside their property decoders. S2.5 (ADR-017) now **accepts** Protocol Level
+  5, so the two v5 cases above assert successful connection (`0x00`); an
+  unknown level gets the v5-framed `0x84`, and an empty ClientID gets the
+  v5-framed `0x85` (both covered by `mqtt_conn_SUITE`).
 * **QoS 2 / Retain / Will** were refusal or strip-and-drop postures in S1
   (design §4.5). S2-C replaced them with real support (ADR-018): the old
   `paho-qos2-refused` and `paho-will-ignored` cases were deleted, not skipped —

@@ -15,7 +15,7 @@ Clients:
 Cases:
   paho311-full       CONNECT(+creds)/SUBSCRIBE/PUBLISH qos1/PUBACK/PINGREQ/
                      PINGRESP/DISCONNECT, every client frame byte-identical
-  paho-v5-refused    MQTT 5 CONNECT -> CONNACK 0x87 (20 02 00 87) then close
+  paho-v5-connect    MQTT 5 CONNECT accepted (S2.5): v5 CONNACK 0x00
   paho-qos2          full QoS2 in both directions (S2-C, ADR-018 §18.3)
   paho-retain        retain stored on subscribe, retain=0 on forward,
                      empty payload clears it
@@ -23,7 +23,7 @@ Cases:
   paho-bad-filter    NUL in filter (client accepts it) -> close, no SUBACK
   mosq-pubsub        mosquitto 2.1.2 QoS1 round trip + byte-level compare
   mosq-qos2          mosquitto 2.1.2 QoS2 round trip
-  mosq-v5-refused    mosquitto MQTT 5 -> CONNACK 0x87
+  mosq-v5-pubsub     mosquitto MQTT 5 publish accepted (S2.5)
 
 Usage:
     python3 test/protocol-compatibility/mqtt/t15_compat.py
@@ -65,9 +65,9 @@ DATA_IN_CONTAINER = "/var/lib/unified-mq"
 OTP_ROOT = Path("/home/wanli/Development/otp-28.3.1/bin")
 ANALYZER_SRC = MQTT_DIR / "t15_capture.erl"
 
-CASES = ["paho311-full", "paho-v5-refused", "paho-qos2", "paho-retain",
+CASES = ["paho311-full", "paho-v5-connect", "paho-qos2", "paho-retain",
          "paho-will", "paho-will-skipped", "paho-bad-filter", "mosq-pubsub",
-         "mosq-qos2", "mosq-v5-refused"]
+         "mosq-qos2", "mosq-v5-pubsub"]
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +111,27 @@ def compile_analyzer():
 
 def render_config():
     text = (ROOT / "config" / "sys.config.src").read_text()
-    text, n = re.subn(r'\{data_dir,\s*"[^"]*"\}',
-                      '{data_dir, "%s"}' % DATA_IN_CONTAINER, text)
-    # Three layers own a `data_dir' key (storage, subscription, retain); they
-    # must stay the same absolute path, and the count is asserted so a new app
-    # cannot silently keep pointing at the dev host.
-    if n != 3:
-        raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 3")
+    # Five layers own a `data_dir' key (storage, subscription, retain, and the
+    # S4 control plane's Mnesia/ra stores). Rewrite each to the bind mount while
+    # keeping its relative suffix, so ra lands in DATA_IN_CONTAINER/ra instead
+    # of at the mount root; the count is asserted so a new app cannot silently
+    # keep pointing at the dev host.
+    data_pat = re.compile(r'\{data_dir,\s*"([^"]*)"\}')
+
+    def map_data_dir(match):
+        host = Path(match.group(1))
+        try:
+            rel = host.relative_to(ROOT / "data")
+        except ValueError:
+            raise RuntimeError(
+                f"sys.config render: data_dir {host} is not under {ROOT / 'data'}")
+        target = DATA_IN_CONTAINER if str(rel) == "." else str(
+            Path(DATA_IN_CONTAINER) / rel)
+        return '{data_dir, "%s"}' % target
+
+    text, n = data_pat.subn(map_data_dir, text)
+    if n != 5:
+        raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
     text, n = re.subn(r'"log/s1\.log"', '"%s/log/s1.log"' % DATA_IN_CONTAINER, text)
     if n != 1:
         raise RuntimeError(f"sys.config render: log path matched {n}, expected 1")
@@ -506,6 +520,18 @@ def events_of(cap, direction, kind):
     return out
 
 
+def s2c_hexes(cap):
+    """Every raw broker->client byte chunk: decoded frames, errors and tails.
+
+    A v5-framed CONNACK is not necessarily a `frame` for the 3.1.1 analyzer,
+    so the v5 checks search all three event shapes.
+    """
+    out = [ev["hex"] for ev in frames(cap, "s2c")]
+    out += [ev["hex"] for ev in events_of(cap, "s2c", "error")]
+    out += [ev["hex"] for ev in events_of(cap, "s2c", "partial")]
+    return out
+
+
 def assert_ok(cond, message):
     if not cond:
         raise AssertionError(message)
@@ -543,15 +569,20 @@ def case_paho311_full():
             "delivered_qos": msg.qos, "payload": msg.payload.decode()}
 
 
-def case_paho_v5_refused():
+def case_paho_v5_connect():
+    """S2.5 (ADR-017): a v5 CONNECT is accepted, not refused.
+
+    The S1-era v5 refusal case asserted a `0x87` refusal because the
+    codec spoke 3.1.1 only. S2.5 implements the v5 subset, so the same real
+    paho v5 client must now see reason `0x00` and a v5-framed CONNACK.
+    """
     c = Client("t15-paho-v5", clean=True, protocol=mqtt.MQTTv5)
     sp = c.connect(timeout=5.0)
     reason = c._connect_reason
     code = int(getattr(reason, "value", reason))
-    closed = c.wait_disconnect(5.0)
-    c.abort()
+    c.close()
     return {"client": "paho-mqtt5", "reason_code": code,
-            "reason": str(reason), "session_present": sp, "closed": closed}
+            "reason": str(reason), "session_present": sp}
 
 
 def case_paho_qos2():
@@ -734,18 +765,20 @@ def case_mosq_qos2():
     return {"payload": out.strip(), "pub_rc": pub.returncode}
 
 
-def case_mosq_v5_refused():
+def case_mosq_v5_pubsub():
+    """S2.5: mosquitto 2.1.2 speaking MQTT 5.0 can publish to the broker."""
     pub = mosq(["mosquitto_pub", "-h", HOST, "-p", str(PROXY_PORT),
-                "-V", "mqttv5", "-t", "t15/v5/a", "-m", "x"], timeout=30)
-    assert_ok(pub.returncode != 0,
-              "mosquitto MQTT5 publish unexpectedly succeeded")
+                "-V", "mqttv5", "-i", "t15-mosq-v5",
+                "-t", "t15/v5/a", "-m", "x"], timeout=30)
+    assert_ok(pub.returncode == 0,
+              f"mosquitto MQTT5 publish failed: {pub.stderr}")
     return {"pub_rc": pub.returncode,
             "stderr": (pub.stderr or "").strip().splitlines()[:2]}
 
 
 CASE_FUNCS = {
     "paho311-full": case_paho311_full,
-    "paho-v5-refused": case_paho_v5_refused,
+    "paho-v5-connect": case_paho_v5_connect,
     "paho-qos2": case_paho_qos2,
     "paho-retain": case_paho_retain,
     "paho-will": case_paho_will,
@@ -753,7 +786,7 @@ CASE_FUNCS = {
     "paho-bad-filter": case_paho_bad_filter,
     "mosq-pubsub": case_mosq_pubsub,
     "mosq-qos2": case_mosq_qos2,
-    "mosq-v5-refused": case_mosq_v5_refused,
+    "mosq-v5-pubsub": case_mosq_v5_pubsub,
 }
 
 
@@ -810,23 +843,24 @@ def check_paho311(name, evidence, cap):
 
 
 def check_paho_v5(name, evidence, cap):
-    assert_ok(evidence["reason_code"] == 0x87,
-              f"paho v5 read reason {evidence['reason_code']:#04x}, not 0x87")
-    assert_ok(evidence["closed"], "broker did not close after the v5 refusal")
-    assert_ok(events_of(cap, "c2s", "error"),
-              "MQTT5 CONNECT was not rejected at parse time")
-    err = events_of(cap, "c2s", "error")[0]
-    assert_ok("unacceptable_protocol_version" in err["reason"],
-              f"unexpected parse error {err['reason']}")
-    assert_ok(err["hex"].startswith("10"), f"v5 CONNECT bytes {err['hex'][:20]}")
-    # The analyzer deliberately cannot decode a v5 CONNACK (the S1 codec speaks
-    # 3.1.1 only); the verbatim refusal bytes are the assertion.
-    s2c_errs = events_of(cap, "s2c", "error")
-    assert_ok(s2c_errs, "no v5 CONNACK captured")
-    assert_ok(s2c_errs[0]["hex"] == "2003008700",
-              f"v5 CONNACK bytes {s2c_errs[0]['hex']} != 2003008700")
-    assert_ok(not frames(cap, "s2c"),
-              "decoded an s2c frame, so the v5 CONNACK leaked a 3.1.1 shape")
+    assert_ok(evidence["reason_code"] == 0x00,
+              f"paho v5 read reason {evidence['reason_code']:#04x}, not 0x00")
+    connect = next((e for e in frames(cap, "c2s", "connect")), None)
+    assert_ok(connect and connect["info"]["proto_level"] == "5",
+              f"CONNECT proto_level {connect['info'] if connect else None} != 5")
+    # S2.5 answers a v5 CONNECT with a v5-framed CONNACK (3-byte remaining
+    # length, zero properties). The analyzer is a 3.1.1 decoder, so depending
+    # on where it stops the bytes may surface as a frame, an error or a
+    # partial tail; assert on the raw prefix seen in any of them.
+    assert_ok(any(h.startswith("20030000") for h in s2c_hexes(cap)),
+              f"no v5 CONNACK success captured: {s2c_hexes(cap)}")
+
+
+def check_mosq_v5(name, evidence, cap):
+    assert_ok(evidence["pub_rc"] == 0,
+              f"mosquitto MQTT5 publish failed: {evidence['stderr']}")
+    assert_ok(any(h.startswith("20030000") for h in s2c_hexes(cap)),
+              f"no v5 CONNACK success captured: {s2c_hexes(cap)}")
 
 
 def _publishes(cap, direction, topic_prefix):
@@ -967,16 +1001,17 @@ def check_mosq_qos2(name, evidence, cap):
 
 
 def check_mosq_v5(name, evidence, cap):
-    s2c_errs = events_of(cap, "s2c", "error")
-    assert_ok(s2c_errs and s2c_errs[0]["hex"] == "2003008700",
-              f"v5 CONNACK bytes {[e['hex'] for e in s2c_errs]}")
-    assert_ok(evidence["pub_rc"] != 0,
-              "mosquitto MQTT5 publish unexpectedly succeeded")
+    assert_ok(evidence["pub_rc"] == 0,
+              f"mosquitto MQTT5 publish failed: {evidence['stderr']}")
+    s2c = [e["hex"] for e in events_of(cap, "s2c", "error")]
+    s2c += [e["hex"] for e in events_of(cap, "s2c", "partial")]
+    assert_ok(any(h.startswith("20030000") for h in s2c),
+              f"no v5 CONNACK success captured: {s2c}")
 
 
 CHECKS = {
     "paho311-full": check_paho311,
-    "paho-v5-refused": check_paho_v5,
+    "paho-v5-connect": check_paho_v5,
     "paho-qos2": check_paho_qos2,
     "paho-retain": check_paho_retain,
     "paho-will": check_paho_will,
@@ -984,7 +1019,7 @@ CHECKS = {
     "paho-bad-filter": check_paho_bad_filter,
     "mosq-pubsub": check_mosq_pubsub,
     "mosq-qos2": check_mosq_qos2,
-    "mosq-v5-refused": check_mosq_v5,
+    "mosq-v5-pubsub": check_mosq_v5,
 }
 
 

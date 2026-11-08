@@ -262,6 +262,22 @@
     {shared_poll_ms, 100}
   ]},
 
+  {broker_meta, [
+    %% S4 control plane: Mnesia appends `Mnesia.<node>' below this directory.
+    %% Absolute and OUTSIDE the release tree (J8), in its own subdirectory so
+    %% the schema files sit beside -- not among -- the WAL segments.
+    {data_dir, "/home/wanli/workspace/unified-mq/data/mnesia"}
+  ]},
+
+  {broker_cluster, [
+    %% S4 metadata Raft (ra). ra appends `<node>' below this directory. It MUST
+    %% be absolute and outside the release tree: the built-in default
+    %% "data/ra" is relative to the node CWD (the release root), so a release
+    %% mounted read-only would abort boot with "Ra could not create its data
+    %% directory". Same J8 discipline as broker_storage's data_dir.
+    {data_dir, "/home/wanli/workspace/unified-mq/data/ra"}
+  ]},
+
   {broker_retain, [
     %% J8: same absolute path as broker_storage/broker_subscription -- the
     %% retained snapshot must live beside the sessions it serves.

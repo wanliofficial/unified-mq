@@ -331,12 +331,15 @@ active_once(#st{socket = Sock}) ->
 
 %%%_* CONNECT -----------------------------------------------------------------
 
-handle_connect(#connect{client_id = <<>>}, D0) ->
+handle_connect(#connect{client_id = <<>>, proto_level = Level}, D0) ->
     %% §3.1.3.1: an empty ClientID is representable on the wire; this S1 session
     %% table is keyed by it, so it is rejected rather than given a generated id
     %% (that would make "who owns this session" unanswerable).
+    %% ADR-017 §17.4: remember the client's level *before* refusing, otherwise
+    %% a v5 CONNECT gets a 3.1.1-framed CONNACK and the real client reports a
+    %% malformed packet instead of reading reason 0x85.
     log(warning, "identifier rejected (empty client_id)", []),
-    refuse(2, D0);
+    refuse(2, D0#st{proto_level = Level});
 handle_connect(#connect{proto_level = Level} = C, D0) ->
     %% S2.5 (ADR-017): the negotiated version and the CONNECT-level properties
     %% become connection state before authentication, so a v5 refusal is framed

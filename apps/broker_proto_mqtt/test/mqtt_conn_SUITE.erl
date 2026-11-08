@@ -45,6 +45,7 @@ all() ->
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
+     connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
      v5_publish_properties_reach_the_subscriber,
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
@@ -326,6 +327,22 @@ connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
     Monitor = erlang:monitor(process, Pid),
     ok = gen_tcp:send(Client, mqtt_raw_connect(6, <<"c1">>)),
     {ok, <<16#20, 3, 0, 16#84, 0>>} = gen_tcp:recv(Client, 5, 3000),
+    ok = expect_closed(Client),
+    {ok, normal} = expect_down(Monitor, Pid),
+    ok.
+
+connect_mqtt5_with_empty_client_id_gets_the_v5_refusal(_Config) ->
+    ok = boot(),
+    %% ADR-017 §17.4: an empty ClientID is refused (2 -> 0x85) but the refusal
+    %% must still use the v5 CONNACK shape. A 3.1.1 frame here makes a real v5
+    %% client (mosquitto 2.1.2) report "Malformed packet" instead of the reason.
+    {Client, Pid} = mqtt_pair(),
+    Monitor = erlang:monitor(process, Pid),
+    %% v5 CONNECT carries a properties-length byte (here 0) between keepalive
+    %% and the client identifier, unlike the 3.1.1-shaped helper.
+    Body = <<4:16, "MQTT", 5, 2#00000010, 0:16, 0, 0:16>>,
+    ok = gen_tcp:send(Client, <<16#10, (byte_size(Body)), Body/binary>>),
+    {ok, <<16#20, 3, 0, 16#85, 0>>} = gen_tcp:recv(Client, 5, 3000),
     ok = expect_closed(Client),
     {ok, normal} = expect_down(Monitor, Pid),
     ok.
