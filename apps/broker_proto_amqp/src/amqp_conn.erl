@@ -34,6 +34,7 @@
 
 -record(ch, {
     pending = undefined :: undefined | {binary(), binary(), non_neg_integer(), binary()},
+    headers = #{} :: map(),
     deliveries = #{} :: map(),
     next_tag = 1 :: pos_integer(),
     prefetch = 0 :: non_neg_integer(),
@@ -372,11 +373,13 @@ reply_ok(Channel, Class, Method, false, Args, St) ->
 
 handle_header(Channel, Payload, St) ->
     case amqp_codec:decode_content_header(Payload) of
-        {60, _Weight, BodySize, _Props} ->
+        {60, _Weight, BodySize, PropsBin} ->
             Ch = ch(Channel, St),
             case Ch#ch.pending of
                 {Exchange, RK, _Old, _Acc} ->
-                    Ch1 = Ch#ch{pending = {Exchange, RK, BodySize, <<>>}},
+                    {Props, _Rest} = amqp_codec:decode_properties(PropsBin),
+                    Ch1 = Ch#ch{pending = {Exchange, RK, BodySize, <<>>},
+                                headers = props_to_headers(Props)},
                     St1 = put_ch(Channel, Ch1, St),
                     case BodySize of
                         0 -> {noreply, complete_publish(Channel, St1)};
@@ -388,6 +391,29 @@ handle_header(Channel, Payload, St) ->
         _ ->
             {noreply, St}
     end.
+
+%% AMQP basic-properties -> the broker's protocol-neutral header map. The
+%% `headers' table is exactly where a CloudEvents client puts `ce-*' keys
+%% (project binding, docs/protocol-compatibility.md §4.10); `content_type'
+%% becomes the ordinary `content-type' header so the shared binding decoder
+%% sees the same shape as the other protocols.
+props_to_headers(Props) ->
+    Table = case maps:get(headers, Props, #{}) of
+                T when is_map(T) -> T;
+                _ -> #{}
+            end,
+    case maps:get(content_type, Props, undefined) of
+        undefined -> Table;
+        CT -> Table#{<<"content-type">> => CT}
+    end.
+
+headers_to_props(#{<<"content-type">> := CT} = Headers) ->
+    Table = maps:remove(<<"content-type">>, Headers),
+    #{content_type => CT, headers => Table};
+headers_to_props(Headers) when map_size(Headers) > 0 ->
+    #{headers => Headers};
+headers_to_props(_) ->
+    #{}.
 
 handle_body(Channel, Payload, St) ->
     Ch = ch(Channel, St),
@@ -411,20 +437,23 @@ complete_publish(Channel, St) ->
     Ch = ch(Channel, St),
     case Ch#ch.pending of
         {Exchange, RK, _Size, Body} ->
-            publish(Exchange, RK, Body, St),
-            put_ch(Channel, Ch#ch{pending = undefined}, St);
+            publish(Channel, Exchange, RK, Body, Ch#ch.headers, St),
+            put_ch(Channel, Ch#ch{pending = undefined, headers = #{}}, St);
         undefined ->
             St
     end.
 
 %%%_* Publish --------------------------------------------------------------
 
-publish(Exchange, RK, Body, St) ->
+publish(Channel, Exchange, RK, Body, Headers, St) ->
     Queues = amqp_topo:queues_for(Exchange, RK),
-    lists:foreach(fun(Q) -> publish_to_queue(Q, Exchange, RK, Body, St) end, Queues),
+    lists:foreach(fun(Q) ->
+                          publish_to_queue(Channel, Q, Exchange, RK, Body,
+                                           Headers, St)
+                  end, Queues),
     ok.
 
-publish_to_queue(Queue, Exchange, RK, Body, St) ->
+publish_to_queue(Channel, Queue, Exchange, RK, Body, Headers, St) ->
     Destination = queue_filter(Queue),
     Meta = #{<<"amqp">> => #{<<"exchange">> => Exchange,
                              <<"routing_key">> => RK,
@@ -435,7 +464,7 @@ publish_to_queue(Queue, Exchange, RK, Body, St) ->
                           partition_id = 0,
                           payload = Body,
                           payload_encoding = raw,
-                          headers = #{},
+                          headers = Headers,
                           proto_meta = Meta,
                           persistence = durable,
                           reliability = fsync,
@@ -445,6 +474,19 @@ publish_to_queue(Queue, Exchange, RK, Body, St) ->
     Ctx = #route_ctx{tenant_id = St#st.tenant,
                      publisher = St#st.client_id,
                      reliability = fsync},
+    case broker_event:apply_policy(Msg) of
+        {ok, Accepted} ->
+            route_and_store(Destination, Accepted, Ctx);
+        {error, EventReason} ->
+            %% AMQP 0-9-1 basic.publish has no per-message negative ack; the
+            %% honest signal is a channel error, not a silent drop.
+            Text = iolist_to_binary(
+                     io_lib:format("cloudevent rejected: ~p", [EventReason])),
+            {noreply, St1} = channel_error(Channel, 406, Text, 60, 40, St),
+            St1
+    end.
+
+route_and_store(Destination, Msg, Ctx) ->
     case broker_router:env() of
         {ok, Env} ->
             Backend = application:get_env(broker_router, backend, broker_router_hash),
@@ -558,7 +600,8 @@ deliver(Channel, Ref, _Queue, NoAck, P, O, Msg, St) ->
                            (amqp_codec:encode_shortstr(Exchange))/binary,
                            (amqp_codec:encode_shortstr(RK))/binary>>,
             St1 = send_method(Channel, 60, 60, DeliverArgs, St),
-            St2 = send_content(Channel, Msg#broker_message.payload, St1),
+            St2 = send_content(Channel, Msg#broker_message.payload,
+                               Msg#broker_message.headers, St1),
             case NoAck of
                 true ->
                     _ = (catch broker_subscription:ack(Ref, P, O, St2#st.client_id)),
@@ -599,8 +642,9 @@ send_tune(St) ->
 send_method(Channel, Class, Method, Args, St) ->
     send_frame(?FRAME_METHOD, Channel, amqp_codec:encode_method(Class, Method, Args), St).
 
-send_content(Channel, Body, St) ->
-    Header = amqp_codec:encode_content_header(byte_size(Body)),
+send_content(Channel, Body, Headers, St) ->
+    Header = amqp_codec:encode_content_header(byte_size(Body),
+                                              headers_to_props(Headers)),
     St1 = send_frame(?FRAME_HEADER, Channel, Header, St),
     send_body_frames(Channel, Body, St1).
 

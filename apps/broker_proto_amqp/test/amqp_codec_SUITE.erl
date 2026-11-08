@@ -23,7 +23,8 @@ all() ->
      table_roundtrip,
      table_nested,
      empty_table,
-     content_header_roundtrip].
+     content_header_roundtrip,
+     properties_roundtrip_with_ce_headers].
 
 suite() -> [{timetrap, {seconds, 20}}].
 
@@ -104,4 +105,25 @@ empty_table(_Config) ->
 content_header_roundtrip(_Config) ->
     Bin = amqp_codec:encode_content_header(11),
     {60, 0, 11, <<0:16>>} = amqp_codec:decode_content_header(Bin),
+    ok.
+
+%% CloudEvents Binary Mode rides on the basic-properties `headers' table; the
+%% adapter must encode and decode it losslessly (project binding §4.10).
+properties_roundtrip_with_ce_headers(_Config) ->
+    Headers = #{<<"ce-specversion">> => <<"1.0">>,
+                <<"ce-id">> => <<"e1">>,
+                <<"ce-source">> => <<"/s5">>,
+                <<"ce-type">> => <<"demo">>,
+                <<"text/plain">> => <<"not-a-ce-key">>},
+    Props = #{content_type => <<"text/plain">>, headers => Headers,
+              delivery_mode => 2, priority => 0},
+    Bin = amqp_codec:encode_content_header(5, Props),
+    {60, 0, 5, PropsBin} = amqp_codec:decode_content_header(Bin),
+    {Decoded, <<>>} = amqp_codec:decode_properties(PropsBin),
+    ?assertEqual(<<"text/plain">>, maps:get(content_type, Decoded)),
+    ?assertEqual(Headers, maps:get(headers, Decoded)),
+    ?assertEqual(2, maps:get(delivery_mode, Decoded)),
+    ?assertEqual(0, maps:get(priority, Decoded)),
+    %% No properties at all is still the compact form.
+    <<60:16, 0:16, 0:64, 0:16>> = amqp_codec:encode_content_header(0, #{}),
     ok.

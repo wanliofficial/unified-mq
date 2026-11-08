@@ -407,7 +407,7 @@ do_publish(Map, St) ->
             MaxBytes = max_publish_bytes(),
             case {valid_qos(QoS), payload(Map)} of
                 {true, {ok, Payload}} when byte_size(Payload) =< MaxBytes ->
-                    publish(Destination, QoS, Payload, Id, St);
+                    publish(Destination, QoS, Payload, Id, ce_headers(Map), St);
                 {true, {ok, _TooBig}} ->
                     {noreply, send_error(<<"payload_too_large">>, <<"max_publish_bytes">>, St)};
                 {true, {error, Reason}} ->
@@ -419,7 +419,7 @@ do_publish(Map, St) ->
             {noreply, send_error(<<"bad_request">>, <<"destination is required">>, St)}
     end.
 
-publish(Destination, QoS, Payload, Id, #st{client_id = ClientId, tenant = Tenant} = St) ->
+publish(Destination, QoS, Payload, Id, Headers, #st{client_id = ClientId, tenant = Tenant} = St) ->
     MsgId = message_id(),
     Msg = #broker_message{message_id = MsgId,
                           tenant_id = Tenant,
@@ -427,7 +427,7 @@ publish(Destination, QoS, Payload, Id, #st{client_id = ClientId, tenant = Tenant
                           partition_id = 0,
                           payload = Payload,
                           payload_encoding = payload_encoding(Payload),
-                          headers = #{},
+                          headers = Headers,
                           proto_meta = #{<<"ws">> => #{<<"client_id">> => ClientId}},
                           persistence = durable,
                           reliability = fsync,
@@ -435,6 +435,15 @@ publish(Destination, QoS, Payload, Id, #st{client_id = ClientId, tenant = Tenant
                           expires_at = undefined,
                           event = undefined},
     Ctx = #route_ctx{tenant_id = Tenant, publisher = ClientId, reliability = fsync},
+    case broker_event:apply_policy(Msg) of
+        {ok, Accepted} ->
+            route_and_store(Destination, QoS, Id, Accepted, Ctx, St);
+        {error, EventReason} ->
+            {noreply, send_error(<<"cloudevent_rejected">>,
+                                 reason_bin(EventReason), St)}
+    end.
+
+route_and_store(Destination, QoS, Id, Msg, Ctx, St) ->
     case broker_router:env() of
         {ok, Env} ->
             Backend = application:get_env(broker_router, backend, broker_router_hash),
@@ -455,6 +464,18 @@ publish(Destination, QoS, Payload, Id, #st{client_id = ClientId, tenant = Tenant
         {error, Reason} ->
             {noreply, send_error(<<"router_unavailable">>, reason_bin(Reason), St)}
     end.
+
+%% The WS application frame is a JSON object; CloudEvents Binary Mode rides on
+%% top-level `ce-*' keys (project binding, docs/protocol-compatibility.md
+%% §4.10). Only binary values are binding attributes.
+ce_headers(Map) ->
+    maps:filter(fun(K, V) ->
+                        is_binary(K) andalso is_binary(V) andalso
+                            (is_ce_key(K) orelse K =:= <<"content-type">>)
+                end, Map).
+
+is_ce_key(<<"ce-", _/binary>>) -> true;
+is_ce_key(_) -> false.
 
 store_routes([], _Msg, Acc) ->
     {ok, lists:reverse(Acc)};
@@ -535,7 +556,11 @@ deliver(Refs, QoS, P, O, Msg, St) ->
                                                              St#st.pending)}}
                         end,
             Header1 = Header#{<<"delivery_id">> => Id},
-            _ = send_binary(3, Header1, Msg#broker_message.payload, St1),
+            %% CloudEvents Binary Mode round-trips through the same JSON
+            %% envelope: every `ce-*' header the publisher supplied is echoed
+            %% with the delivery, so a consumer can rebuild the event view.
+            Header2 = maps:merge(Header1, ce_headers(Msg#broker_message.headers)),
+            _ = send_binary(3, Header2, Msg#broker_message.payload, St1),
             Seen = lists:foldl(fun(Ref, Acc) -> maps:put({Ref, P}, O, Acc) end,
                                St1#st.seen, Refs),
             St1#st{seen = Seen}

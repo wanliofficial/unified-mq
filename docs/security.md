@@ -186,6 +186,6 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 3. Schema Registry 内容校验。
 4. 审计日志签名与防篡改、外部 KMS。
 5. 每条规则可配置的「未知扩展属性拒绝」策略。
-6. 除 MQTT 外五种协议的 CloudEvents 策略执行与 Binary Mode Binding（当前只逐字节透传 payload，见 `docs/protocol-compatibility.md` §4.10）。
+6. 除 MQTT 外五种协议的 **标准** CloudEvents Binding 逐字实现（当前是统一 `ce-*` 头通道的等价映射，非无损点见 `docs/protocol-compatibility.md` §4.10）；统一认证仍只覆盖 MQTT。
 
 这些在 `progress.md` 的 S6 结论里同样标注为待办，不作为 Gate 通过的依据。

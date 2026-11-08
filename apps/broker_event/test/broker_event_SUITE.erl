@@ -40,6 +40,9 @@ all() ->
      mqtt_structured_binding_roundtrip,
      mqtt_binary_binding_v5_roundtrip,
      mqtt_binary_binding_311_reports_losses,
+     header_binding_roundtrip_for_all_targets,
+     header_binding_structured_mode,
+     header_binding_detect_from_header_channel,
      cross_protocol_roundtrip_keeps_identity,
      event_id_does_not_overwrite_broker_id,
      policy_resolution_per_tenant_and_destination,
@@ -289,6 +292,52 @@ mqtt_binary_binding_311_reports_losses(_Config) ->
     true = lists:member(<<"ce-specversion">>, Losses),
     true = lists:member(<<"ce-source">>, Losses),
     true = lists:member(<<"ce-type">>, Losses),
+    ok.
+
+header_binding_roundtrip_for_all_targets(_Config) ->
+    Event = event(<<"binary-data">>),
+    lists:foreach(
+      fun(Target) ->
+              {ok, Body, Headers, Report} =
+                  broker_event_binding:to_headers(Event, Target, binary),
+              <<"binary-data">> = Body,
+              #{mode := binary, target := Target, losses := []} = Report,
+              <<"e1">> = maps:get(<<"ce-id">>, Headers),
+              <<"1.0">> = maps:get(<<"ce-specversion">>, Headers),
+              %% Reverse mapping reads the same header map without re-deriving
+              %% per-protocol rules.
+              {ok, Decoded} = broker_event_binding:from_headers(Body, Headers, undefined),
+              ?assertEqual(Event, Decoded),
+              %% And as a proplist, the shape AMQP/Kafka hand over.
+              Pairs = maps:to_list(Headers),
+              {ok, Decoded2} = broker_event_binding:from_headers(Body, Pairs, undefined),
+              ?assertEqual(Event, Decoded2)
+      end, [ws, nats, amqp, kafka, pulsar]),
+    ok.
+
+header_binding_structured_mode(_Config) ->
+    Event = event(<<"binary-data">>),
+    {ok, Body, Headers, Report} =
+        broker_event_binding:to_headers(Event, kafka, structured),
+    #{mode := structured, target := kafka, losses := []} = Report,
+    <<"application/cloudevents+json">> = maps:get(<<"content-type">>, Headers),
+    Map = json:decode(Body),
+    <<"1.0">> = maps:get(<<"specversion">>, Map),
+    ok.
+
+%% A publisher that puts `ce-*' straight into the broker header map (WS JSON
+%% frame, NATS HPUB, AMQP headers table, Kafka record header, Pulsar property)
+%% is recognised as Binary Mode without any MQTT metadata.
+header_binding_detect_from_header_channel(_Config) ->
+    Event = event(<<"binary-data">>),
+    {ok, Body, Headers, _} = broker_event_binding:to_headers(Event, nats, binary),
+    Msg = (message(Body))#broker_message{headers = Headers},
+    {binary, Props} = broker_event_binding:detect(Msg),
+    true = lists:keymember(<<"ce-specversion">>, 1, Props),
+    {ok, Event2, binary} = broker_event_binding:decode(Msg),
+    ?assertEqual(Event, Event2),
+    %% No `ce-*' anywhere: not an event, and `detect' must not guess.
+    none = broker_event_binding:detect((message(<<"plain">>))#broker_message{headers = #{}}),
     ok.
 
 cross_protocol_roundtrip_keeps_identity(_Config) ->

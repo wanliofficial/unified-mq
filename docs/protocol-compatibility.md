@@ -523,20 +523,33 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-### 4.10 CloudEvents Binding 现状（S5 口径）
+### 4.10 CloudEvents Binding 现状（S5/S6 口径）
 
-ADR-020 把 CloudEvents Binding 的冻结范围限定为 **MQTT**。S5 的五个新协议没有各自的 Binary Mode Binding，本节把实际行为写清楚，避免被读成「所有协议都实现了标准绑定」：
+ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S6 补齐其余五个协议的 **Binary Mode**，统一采用协议中立的头通道：
+
+> payload = 事件数据字节；上下文写传输协议的元数据字段，键名统一为 `ce-<属性名>`
+> （`ce-specversion`、`ce-id`、`ce-source`、`ce-type`、可选属性与 `ce-<扩展名>`），
+> `datacontenttype` 写 `content-type`。所有键落在 `#broker_message.headers`，
+> 因此同一事件可以不重算映射地在协议之间转发。
 
 | 协议 | Structured Mode（事件 JSON 在消息体） | Binary Mode（上下文 → 协议元数据） | 说明 |
 |---|---|---|---|
 | MQTT | ✅ 正向 + 反向 + 损失报告 | ✅ 仅 MQTT 5（`ce-*` User Properties）；3.1.1 返回损失清单 | `broker_event_binding`，§4.3 |
-| WebSocket | ✅ payload 逐字节透传 | ❌ 未实现 | 应用帧 `Header` 是 Broker 自有 JSON，不是 CE 元数据通道 |
-| NATS | ✅ payload 逐字节透传 | ❌ 未实现（NATS headers/HPUB 本身未实现） | core NATS |
-| AMQP | ✅ payload 逐字节透传 | ❌ 未实现 | 未把 `ce-*` 映射到 properties/application headers |
-| Kafka | ✅ payload 逐字节透传 | ❌ 未实现 | 未把 `ce-*` 映射到 Record Headers |
-| Pulsar | ✅ payload 逐字节透传 | ❌ 未实现 | 未把 `ce-*` 映射到 Message properties |
+| WebSocket | ✅ payload 逐字节透传 | ✅ 应用帧顶层 `ce-*` 键 + `content-type`；投递帧原样回传 | `broker_event_binding:to_headers/3` |
+| NATS | ✅ payload 逐字节透传 | ✅ `HPUB` 头块 `ce-*`；投递用 `HMSG`（客户端须在 CONNECT 声明 `headers: true`，否则退化为 `MSG` 并丢失属性） | NATS 2.2 headers |
+| AMQP | ✅ payload 逐字节透传 | ✅ basic properties 的 `headers` table 放 `ce-*`，`content_type` 放 `content-type`；投递写回 properties | AMQP 0-9-1 |
+| Kafka | ✅ payload 逐字节透传 | ✅ Record Headers 放 `ce-*`；投递写回 Record Headers | Kafka 0.11+ record batch |
+| Pulsar | ✅ payload 逐字节透传 | ✅ Message properties 放 `ce-*`；投递写回 properties | Pulsar 2.10+ |
 
-「逐字节透传」意味着：一个合法的 Structured CloudEvents JSON 通过这五个协议发布再消费，**字节不变**（因此 `id`/`source`/`type`/扩展都保留）；但 `broker_event:apply_policy/1` 目前只在 MQTT 发布路径调用，其它协议不会执行 `required`/`normalize`/去重/隔离策略。per-protocol Binary Mode 与统一策略执行列为 S6 之后待办。
+**统一策略执行**：六个协议在写入前都调用 `broker_event:apply_policy/1`（默认 `pass_through` 为 no-op）。拒绝路径按协议各自的错误语义表达：MQTT 5 → `0x83`；WS → `{"op":"error","error":"cloudevent_rejected"}`；NATS → `-ERR` 并断开；AMQP → channel error 406；Kafka → `INVALID_RECORD`（87）；Pulsar → SendError。
+
+**已声明的非无损点**（`report/5` 的 `losses` 必须被调用方读取）：
+
+- Binary Mode 的扩展属性值被序列化为文本；`data` 若是 JSON 对象则变为序列化字节。
+- NATS 客户端未声明 `headers` 时，`ce-*` 全部丢失；这是协议能力限制，不是静默丢弃（适配器在 CONNECT 后按 `headers_cap` 决定 MSG/HMSG）。
+- AMQP 0-9-1 的 `basic.publish` 没有逐消息否认；策略拒绝表现为 channel error 406，客户端必须重新打开 channel。
+
+「逐字节透传」意味着：一个合法的 Structured CloudEvents JSON 通过这五个协议发布再消费，**字节不变**（因此 `id`/`source`/`type`/扩展都保留）。
 
 ---
 

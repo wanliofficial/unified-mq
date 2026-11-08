@@ -12,7 +12,10 @@
 %% §4.6):
 %%   * PUB / SUB / UNSUB / PING / PONG, queue groups and request/reply (the
 %%     reply subject travels in `proto_meta' and is echoed on MSG);
-%%   * no NATS headers (HPUB/HMSG) and no JetStream -- core NATS only;
+%%   * HPUB / HMSG (NATS 2.2 headers): `ce-*' header keys are the CloudEvents
+%%     Binary Mode channel; a client that does not set `headers' in CONNECT
+%%     gets plain MSG and the attributes are lost (reported, §4.10);
+%%   * no JetStream -- core NATS only;
 %%   * core NATS is at-most-once: no ack handshake. The broker still stores
 %%     each publish durably (a strictly stronger guarantee than NATS core)
 %%     and the adapter acks its own cursor right after the MSG write.
@@ -46,7 +49,14 @@
     %%           queue := binary() | undefined,
     %%           remaining := infinity | pos_integer()}
     subs = #{} :: map(),
-    pending_pub = undefined :: undefined | {binary(), binary() | undefined, non_neg_integer()},
+    %% `{Subject, Reply, TotalSize, HeaderSize}'. `HeaderSize = 0' is a plain
+    %% PUB; HPUB carries a NATS/1.0 header block of that many bytes first.
+    pending_pub = undefined :: undefined |
+                   {binary(), binary() | undefined, non_neg_integer(),
+                    non_neg_integer()},
+    %% CONNECT `headers' capability: a client that did not negotiate headers
+    %% gets MSG without the `ce-*' block (documented loss in §4.10).
+    headers_cap = false :: boolean(),
     tick :: reference() | undefined,
     closing = false :: boolean()
 }).
@@ -114,15 +124,16 @@ rearm(St) ->
         {error, Reason} -> {stop, {socket_error, Reason}, St}
     end.
 
-parse(Buffer, #st{pending_pub = {Subject, Reply, Size}} = St) ->
+parse(Buffer, #st{pending_pub = {Subject, Reply, Size, HeaderSize}} = St) ->
     Need = Size + 2,
     case byte_size(Buffer) of
         N when N >= Need ->
-            <<Payload:Size/binary, Tail:2/binary, Rest/binary>> = Buffer,
+            <<Body:Size/binary, Tail:2/binary, Rest/binary>> = Buffer,
             case Tail of
                 <<"\r\n">> ->
                     St1 = St#st{pending_pub = undefined},
-                    case handle_pub(Subject, Reply, Payload, St1) of
+                    {Headers, Payload} = split_headers(Body, HeaderSize),
+                    case handle_pub(Subject, Reply, Headers, Payload, St1) of
                         {noreply, St2} -> parse(Rest, St2);
                         Stop -> Stop
                     end;
@@ -158,9 +169,8 @@ handle_line(<<"UNSUB ", Rest/binary>>, St) ->
     handle_unsub(Rest, St);
 handle_line(<<"PUB ", Rest/binary>>, St) ->
     handle_pub_args(Rest, St);
-handle_line(<<"HPUB ", _/binary>>, St) ->
-    %% Headers are a NATS 2.2 extension; v1 of this adapter is core NATS.
-    err_close(<<"Unknown Protocol Operation">>, St);
+handle_line(<<"HPUB ", Rest/binary>>, St) ->
+    handle_hpub_args(Rest, St);
 handle_line(<<>>, St) ->
     {noreply, St};
 handle_line(_Line, St) ->
@@ -177,7 +187,8 @@ handle_connect(Json, St) ->
             case check_auth(Map) of
                 ok ->
                     St1 = ensure_client(St#st{verbose = maps:get(<<"verbose">>, Map, false),
-                                              echo = maps:get(<<"echo">>, Map, true)}),
+                                              echo = maps:get(<<"echo">>, Map, true),
+                                              headers_cap = maps:get(<<"headers">>, Map, false) =:= true}),
                     maybe_ok(St1);
                 {error, _} ->
                     err_close(<<"Authorization Violation">>, St)
@@ -294,6 +305,22 @@ handle_pub_args(Rest, St) ->
             end
     end.
 
+%% HPUB <subject> [reply] <hdr_len> <total_len>
+handle_hpub_args(Rest, St) ->
+    case connected(St) of
+        false ->
+            err_close(<<"Protocol Violation">>, St);
+        true ->
+            case binary:split(Rest, <<" ">>, [global]) of
+                [Subject, HdrBin, TotalBin] ->
+                    hpub_pending(Subject, undefined, HdrBin, TotalBin, St);
+                [Subject, Reply, HdrBin, TotalBin] ->
+                    hpub_pending(Subject, Reply, HdrBin, TotalBin, St);
+                _ ->
+                    err_close(<<"Protocol Violation">>, St)
+            end
+    end.
+
 pub_pending(Subject, Reply, SizeBin, St) ->
     case {valid_subject(Subject, publish), valid_sid(Reply), catch binary_to_integer(SizeBin)} of
         {true, true, Size} when is_integer(Size), Size >= 0 ->
@@ -301,21 +328,70 @@ pub_pending(Subject, Reply, SizeBin, St) ->
                 true ->
                     err_close(<<"Maximum Payload Violation">>, St);
                 false ->
-                    {noreply, St#st{pending_pub = {Subject, Reply, Size}}}
+                    {noreply, St#st{pending_pub = {Subject, Reply, Size, 0}}}
             end;
         _ ->
             err_close(<<"Protocol Violation">>, St)
     end.
 
-handle_pub(Subject, Reply, Payload, St) ->
-    case publish(Subject, Reply, Payload, St) of
+hpub_pending(Subject, Reply, HdrBin, TotalBin, St) ->
+    Hdr = catch binary_to_integer(HdrBin),
+    Total = catch binary_to_integer(TotalBin),
+    Max = max_payload(),
+    case {valid_subject(Subject, publish), valid_sid(Reply), Hdr, Total} of
+        {true, true, H, T} when is_integer(H), is_integer(T),
+                                H >= 0, T >= H, T =< Max ->
+            {noreply, St#st{pending_pub = {Subject, Reply, T, H}}};
+        _ ->
+            err_close(<<"Protocol Violation">>, St)
+    end.
+
+%% The body is `<header block><payload>'; the block itself starts with the
+%% `NATS/1.0' status line and ends with a blank line.
+split_headers(Body, 0) ->
+    {#{}, Body};
+split_headers(Body, HeaderSize) when byte_size(Body) >= HeaderSize ->
+    <<Block:HeaderSize/binary, Payload/binary>> = Body,
+    {parse_header_block(Block), Payload};
+split_headers(Body, _HeaderSize) ->
+    {#{}, Body}.
+
+parse_header_block(Block) ->
+    case binary:split(Block, <<"\r\n">>) of
+        [_Status, Rest] -> parse_header_lines(Rest, #{});
+        _ -> #{}
+    end.
+
+parse_header_lines(<<>>, Acc) ->
+    Acc;
+parse_header_lines(Bin, Acc) ->
+    case binary:split(Bin, <<"\r\n">>) of
+        [<<>>, _] ->
+            Acc;
+        [Line, Rest] ->
+            case binary:split(Line, <<": ">>) of
+                [K, V] -> parse_header_lines(Rest, Acc#{K => V});
+                _ -> parse_header_lines(Rest, Acc)
+            end;
+        [_Partial] ->
+            Acc
+    end.
+
+encode_header_block(Headers) ->
+    Lines = [[K, <<": ">>, V, <<"\r\n">>]
+             || {K, V} <- maps:to_list(Headers),
+                is_binary(K), is_binary(V)],
+    iolist_to_binary([<<"NATS/1.0\r\n">>, Lines, <<"\r\n">>]).
+
+handle_pub(Subject, Reply, Headers, Payload, St) ->
+    case publish(Subject, Reply, Headers, Payload, St) of
         ok ->
             maybe_ok(St);
         {error, Reason} ->
             err_close(reason_bin(Reason), St)
     end.
 
-publish(Subject, Reply, Payload, St) ->
+publish(Subject, Reply, Headers, Payload, St) ->
     Destination = subject_to_destination(Subject),
     Base = #{<<"publisher">> => St#st.client_id},
     Meta = case Reply of
@@ -329,13 +405,19 @@ publish(Subject, Reply, Payload, St) ->
                           partition_id = 0,
                           payload = Payload,
                           payload_encoding = payload_encoding(Payload),
-                          headers = #{},
+                          headers = ce_headers(Headers),
                           proto_meta = Meta,
                           persistence = durable,
                           reliability = fsync,
                           created_at = erlang:system_time(millisecond),
                           expires_at = undefined,
                           event = undefined},
+    case broker_event:apply_policy(Msg) of
+        {ok, Accepted} -> route_message(Destination, Accepted, St);
+        {error, Reason} -> {error, Reason}
+    end.
+
+route_message(Destination, Msg, St) ->
     Ctx = #route_ctx{tenant_id = St#st.tenant,
                      publisher = St#st.client_id,
                      reliability = fsync},
@@ -350,6 +432,15 @@ publish(Subject, Reply, Payload, St) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+ce_headers(Headers) ->
+    maps:filter(fun(K, V) ->
+                        is_binary(K) andalso is_binary(V) andalso
+                            (is_ce_key(K) orelse K =:= <<"content-type">>)
+                end, Headers).
+
+is_ce_key(<<"ce-", _/binary>>) -> true;
+is_ce_key(_) -> false.
 
 store_routes([], _Msg) ->
     ok;
@@ -396,7 +487,7 @@ deliver_to_sid(Sid, _P, _O, Msg, St) ->
         {ok, _Sub} ->
             SubjectBin = subject_out(Msg#broker_message.destination),
             Reply = reply_of(Msg),
-            _ = send_msg(SubjectBin, Sid, Reply, Msg#broker_message.payload, St),
+            _ = send_msg(SubjectBin, Sid, Reply, Msg, St),
             after_send(Sid, St);
         error ->
             St
@@ -539,7 +630,7 @@ send_info(St) ->
              <<"proto">> => 1,
              <<"host">> => <<"127.0.0.1">>,
              <<"port">> => listener_port(St),
-             <<"headers">> => false,
+             <<"headers">> => true,
              <<"auth_required">> => auth_required(),
              <<"max_payload">> => max_payload()},
     send_raw([<<"INFO ">>, json:encode(Info), <<"\r\n">>], St).
@@ -550,7 +641,30 @@ listener_port(#st{ref = Ref}) ->
         _ -> 0
     end.
 
-send_msg(Subject, Sid, Reply, Payload, St) ->
+%% Deliver with `HMSG' when the message carries `ce-*' headers and the client
+%% negotiated `headers' in CONNECT; otherwise plain `MSG'. `HMSG <subject>
+%% <sid> [reply] <hdr_len> <total_len>'.
+send_msg(Subject, Sid, Reply, Msg, #st{headers_cap = Cap} = St) ->
+    case {Cap, ce_headers(Msg#broker_message.headers)} of
+        {true, Headers} when map_size(Headers) > 0 ->
+            send_hmsg(Subject, Sid, Reply, Headers, Msg#broker_message.payload, St);
+        _ ->
+            send_msg_plain(Subject, Sid, Reply, Msg#broker_message.payload, St)
+    end.
+
+send_hmsg(Subject, Sid, Reply, Headers, Payload, St) ->
+    ReplyPart = case Reply of
+                    undefined -> [];
+                    <<>> -> [];
+                    _ -> [<<" ">>, Reply]
+                end,
+    Block = encode_header_block(Headers),
+    Total = byte_size(Block) + byte_size(Payload),
+    send_raw([<<"HMSG ">>, Subject, <<" ">>, Sid, ReplyPart, <<" ">>,
+              integer_to_binary(byte_size(Block)), <<" ">>,
+              integer_to_binary(Total), <<"\r\n">>, Block, Payload, <<"\r\n">>], St).
+
+send_msg_plain(Subject, Sid, Reply, Payload, St) ->
     ReplyPart = case Reply of
                     undefined -> [];
                     <<>> -> [];

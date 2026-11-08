@@ -12,7 +12,8 @@
          encode_method/3, decode_method/1,
          get_shortstr/1, get_longstr/1, get_table/1, get_bits/2,
          encode_shortstr/1, encode_longstr/1, encode_table/1,
-         encode_bits/1, encode_content_header/1, decode_content_header/1]).
+         encode_bits/1, encode_content_header/1, encode_content_header/2,
+         decode_content_header/1, decode_properties/1, encode_properties/1]).
 
 -define(FRAME_END, 16#CE).
 
@@ -127,3 +128,67 @@ decode_content_header(<<Class:16, Weight:16, BodySize:64, Rest/binary>>) ->
 encode_content_header(BodySize) ->
     %% class 60 (basic), weight 0, no property flags.
     <<60:16, 0:16, BodySize:64, 0:16>>.
+
+%% @doc Content header that carries basic properties. `Props' is a map keyed by
+%% `content_type' / `headers' / `delivery_mode' / ...; only present keys are
+%% flagged, everything absent costs nothing (the protocol's own encoding).
+encode_content_header(BodySize, Props) when map_size(Props) =:= 0 ->
+    encode_content_header(BodySize);
+encode_content_header(BodySize, Props) ->
+    PropsBin = encode_properties(Props),
+    <<60:16, 0:16, BodySize:64, PropsBin/binary>>.
+
+%% Basic-properties field order and flag bits (AMQP 0-9-1 §4.2.6.1).
+properties() ->
+    [{15, content_type, shortstr},
+     {14, content_encoding, shortstr},
+     {13, headers, table},
+     {12, delivery_mode, octet},
+     {11, priority, octet},
+     {10, correlation_id, shortstr},
+     {9, reply_to, shortstr},
+     {8, expiration, shortstr},
+     {7, message_id, shortstr},
+     {6, timestamp, longlong},
+     {5, type, shortstr},
+     {4, user_id, shortstr},
+     {3, app_id, shortstr},
+     {2, cluster_id, shortstr}].
+
+%% @doc Decode the basic-properties block that follows `BodySize' in a content
+%% header frame. Returns a map and the bytes after the block.
+-spec decode_properties(binary()) -> {map(), binary()}.
+decode_properties(<<Flags:16, Rest0/binary>>) ->
+    lists:foldl(
+      fun({Bit, Name, Type}, {Acc, Bin}) ->
+              case Flags band (1 bsl Bit) of
+                  0 -> {Acc, Bin};
+                  _ ->
+                      {Value, Rest} = decode_prop(Type, Bin),
+                      {Acc#{Name => Value}, Rest}
+              end
+      end, {#{}, Rest0}, properties());
+decode_properties(_) ->
+    {#{}, <<>>}.
+
+encode_properties(Props) when is_map(Props) ->
+    {Flags, Parts} =
+        lists:foldl(
+          fun({Bit, Name, Type}, {F, Acc}) ->
+                  case maps:find(Name, Props) of
+                      error -> {F, Acc};
+                      {ok, Value} -> {F bor (1 bsl Bit),
+                                      [encode_prop(Type, Value) | Acc]}
+                  end
+          end, {0, []}, properties()),
+    <<Flags:16, (iolist_to_binary(lists:reverse(Parts)))/binary>>.
+
+decode_prop(shortstr, Bin) -> get_shortstr(Bin);
+decode_prop(table, Bin) -> get_table(Bin);
+decode_prop(octet, <<V:8, Rest/binary>>) -> {V, Rest};
+decode_prop(longlong, <<V:64/signed, Rest/binary>>) -> {V, Rest}.
+
+encode_prop(shortstr, V) -> encode_shortstr(V);
+encode_prop(table, V) -> encode_table(V);
+encode_prop(octet, V) -> <<V:8>>;
+encode_prop(longlong, V) -> <<V:64/signed>>.

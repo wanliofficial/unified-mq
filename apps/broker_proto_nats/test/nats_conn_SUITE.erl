@@ -27,6 +27,7 @@ all() ->
      unsubscribe_stops_delivery,
      unsub_max_auto_unsubscribes,
      echo_false_suppresses_own_messages,
+     cloudevent_headers_roundtrip,
      invalid_subject_is_refused,
      oversized_payload_is_refused,
      auth_failure_is_refused,
@@ -120,7 +121,7 @@ info_is_sent_first(Config) ->
     {Line, _C1} = recv_line(C),
     <<"INFO ", Json/binary>> = Line,
     #{<<"server_id">> := _, <<"proto">> := 1, <<"max_payload">> := 64,
-      <<"headers">> := false} = json:decode(Json),
+      <<"headers">> := true} = json:decode(Json),
     close(C),
     ok.
 
@@ -227,6 +228,38 @@ echo_false_suppresses_own_messages(Config) ->
     {<<"e.a">>, <<"2">>, undefined, <<"mine">>, Other2} = recv_msg(Other1),
     assert_no_msg(Self2, 300),
     close(Self2), close(Other2),
+    ok.
+
+%% NATS 2.2 headers: HPUB carries the CE context, and HMSG returns it only
+%% when the client negotiated `headers' in CONNECT (project binding §4.10).
+cloudevent_headers_roundtrip(Config) ->
+    %% The header block counts against `max_payload'; this case needs room for
+    %% the CE attributes, while `oversized_payload_is_refused' keeps the
+    %% fixture's 64-byte limit.
+    ok = application:set_env(broker_proto_nats, max_payload, 1024),
+    Sub = open(Config, #{<<"headers">> => true}),
+    Pub = open(Config, #{<<"headers">> => true}),
+    {_, Sub1} = sub(Sub, <<"ce.a">>, undefined, <<"1">>),
+    {_, Pub1} = pub_headers(Pub, <<"ce.a">>, undefined,
+                            #{<<"ce-specversion">> => <<"1.0">>,
+                              <<"ce-id">> => <<"e1">>,
+                              <<"ce-source">> => <<"/s5">>,
+                              <<"ce-type">> => <<"demo">>,
+                              <<"content-type">> => <<"text/plain">>},
+                            <<"binary-data">>),
+    {<<"ce.a">>, <<"1">>, undefined, Headers, <<"binary-data">>, Sub2} =
+        recv_hmsg(Sub1),
+    <<"e1">> = maps:get(<<"ce-id">>, Headers),
+    <<"1.0">> = maps:get(<<"ce-specversion">>, Headers),
+    <<"text/plain">> = maps:get(<<"content-type">>, Headers),
+    %% A client that did not negotiate headers gets a plain MSG: the binding
+    %% is lost, which is the documented NATS limitation.
+    Plain = open(Config),
+    {_, Plain1} = sub(Plain, <<"ce.b">>, undefined, <<"2">>),
+    {_, Pub2} = pub_headers(Pub1, <<"ce.b">>, undefined,
+                            #{<<"ce-id">> => <<"e2">>}, <<"x">>),
+    {<<"ce.b">>, <<"2">>, undefined, <<"x">>, Plain2} = recv_msg(Plain1),
+    close(Sub2), close(Pub2), close(Plain2),
     ok.
 
 invalid_subject_is_refused(Config) ->
@@ -381,6 +414,22 @@ pub(C, Subject, Reply, Payload) ->
     C1 = send_raw(C, [Line, Payload, <<"\r\n">>]),
     ping(C1).
 
+%% HPUB <subject> [reply] <hdr_len> <total_len>\r\n<NATS/1.0 header block><payload>\r\n
+pub_headers(C, Subject, Reply, Headers, Payload) ->
+    Block = iolist_to_binary(
+              [<<"NATS/1.0\r\n">>,
+               [[K, <<": ">>, V, <<"\r\n">>]
+                || {K, V} <- maps:to_list(Headers)], <<"\r\n">>]),
+    Total = integer_to_binary(byte_size(Block) + byte_size(Payload)),
+    Hdr = integer_to_binary(byte_size(Block)),
+    Line = case Reply of
+               undefined -> [<<"HPUB ">>, Subject, <<" ">>, Hdr, <<" ">>, Total, <<"\r\n">>];
+               _ -> [<<"HPUB ">>, Subject, <<" ">>, Reply, <<" ">>, Hdr, <<" ">>,
+                     Total, <<"\r\n">>]
+           end,
+    C1 = send_raw(C, [Line, Block, Payload, <<"\r\n">>]),
+    ping(C1).
+
 close(#c{s = S}) ->
     gen_tcp:close(S).
 
@@ -425,6 +474,44 @@ recv_payload(C, Size) ->
     {Buf, C1} = recv_exact(C, Size + 2),
     <<Payload:Size/binary, "\r\n">> = Buf,
     {Payload, C1}.
+
+%% HMSG <subject> <sid> [reply] <hdr_len> <total_len>\r\n<header block><payload>\r\n
+recv_hmsg(C) ->
+    {Line, C1} = recv_line(C),
+    case binary:split(Line, <<" ">>, [global]) of
+        [<<"HMSG">>, Subject, Sid, HdrBin, TotalBin] ->
+            recv_hmsg_body(C1, Subject, Sid, undefined, HdrBin, TotalBin);
+        [<<"HMSG">>, Subject, Sid, Reply, HdrBin, TotalBin] ->
+            recv_hmsg_body(C1, Subject, Sid, Reply, HdrBin, TotalBin);
+        _ ->
+            ct:fail({unexpected_line, Line})
+    end.
+
+recv_hmsg_body(C, Subject, Sid, Reply, HdrBin, TotalBin) ->
+    HdrSize = binary_to_integer(HdrBin),
+    Total = binary_to_integer(TotalBin),
+    {Buf, C1} = recv_exact(C, Total + 2),
+    <<Block:HdrSize/binary, Payload:(Total - HdrSize)/binary, "\r\n">> = Buf,
+    {Subject, Sid, Reply, parse_header_block(Block), Payload, C1}.
+
+parse_header_block(Block) ->
+    case binary:split(Block, <<"\r\n">>) of
+        [_Status, Rest] -> parse_header_lines(Rest, #{});
+        _ -> #{}
+    end.
+
+parse_header_lines(<<>>, Acc) ->
+    Acc;
+parse_header_lines(Bin, Acc) ->
+    case binary:split(Bin, <<"\r\n">>) of
+        [<<>>, _] -> Acc;
+        [Line, Rest] ->
+            case binary:split(Line, <<": ">>) of
+                [K, V] -> parse_header_lines(Rest, Acc#{K => V});
+                _ -> parse_header_lines(Rest, Acc)
+            end;
+        [_] -> Acc
+    end.
 
 recv_exact(#c{buf = Buf} = C, N) when byte_size(Buf) >= N ->
     <<Take:N/binary, Rest/binary>> = Buf,

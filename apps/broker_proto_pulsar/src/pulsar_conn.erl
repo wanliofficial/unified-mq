@@ -252,17 +252,27 @@ handle_send(Cmd, Tail, St) ->
                     Records = split_records(Meta, Payload,
                                             maps:get(num_messages, Cmd)),
                     Base = topic_count(destination(Topic)),
-                    lists:foldl(
-                      fun({Index, Record}, _Acc) ->
-                              append_record(Topic, Base + Index, Record)
-                      end, ok, lists:zip(lists:seq(0, length(Records) - 1),
-                                         Records)),
-                    Receipt = pulsar_codec:encode_send_receipt(
-                                ProducerId,
-                                maps:get(sequence_id, Cmd),
-                                Base,
-                                maps:get(highest_sequence_id, Cmd, 0)),
-                    send(Receipt, St);
+                    Results = lists:map(
+                                fun({Index, Record}) ->
+                                        append_record(Topic, Base + Index, Record)
+                                end,
+                                lists:zip(lists:seq(0, length(Records) - 1),
+                                          Records)),
+                    case first_error(Results) of
+                        ok ->
+                            Receipt = pulsar_codec:encode_send_receipt(
+                                        ProducerId,
+                                        maps:get(sequence_id, Cmd),
+                                        Base,
+                                        maps:get(highest_sequence_id, Cmd, 0)),
+                            send(Receipt, St);
+                        {error, {cloudevent_rejected, Reason}} ->
+                            send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
+                                       reason_bin(Reason), St);
+                        {error, Reason} ->
+                            send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
+                                       reason_bin(Reason), St)
+                    end;
                 {error, _Reason} ->
                     send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
                                <<"bad payload">>, St)
@@ -328,8 +338,23 @@ append_record(Topic, EntryId, {Meta, Payload}) ->
                           created_at = created_at(Meta),
                           expires_at = undefined,
                           event = undefined},
-    _ = (catch broker_queue:append(?PARTITION, Msg, fsync)),
-    ok.
+    case broker_event:apply_policy(Msg) of
+        {ok, Accepted} ->
+            case (catch broker_queue:append(?PARTITION, Accepted, fsync)) of
+                {ok, _Offset} -> ok;
+                {error, Reason} -> {error, Reason};
+                Other -> {error, {append_crashed, Other}}
+            end;
+        {error, Reason} ->
+            {error, {cloudevent_rejected, Reason}}
+    end.
+
+first_error([]) -> ok;
+first_error([ok | Rest]) -> first_error(Rest);
+first_error([{error, _} = Error | _]) -> Error.
+
+reason_bin(Reason) when is_binary(Reason) -> Reason;
+reason_bin(Reason) -> iolist_to_binary(io_lib:format("~p", [Reason])).
 
 created_at(Meta) ->
     case maps:get(publish_time, Meta, 0) of

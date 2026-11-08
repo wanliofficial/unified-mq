@@ -273,10 +273,10 @@ unified-mq/
 ### Gate S5
 
 - [x] 每个协议通过真实第三方客户端集成测试，无自编客户端互测 —— mqtt 10/10（paho+mosquitto）、ws 10/10（websocket-client）、nats 11/11（nats.go）、amqp 13/13（amqp091-go）、kafka 12/12（kafka-clients）、pulsar 8/8（官方 Java Client）；见 `docs/protocol-compatibility.md` §0 与 §4.5~§4.9
-- [x] 各协议 Binding 的往返测试通过，转换损失项有明确清单 —— **CloudEvents Binding 由 [ADR-020](adr/020-cloudevents-codec-policy-binding.md) 冻结为 MQTT 绑定**：MQTT 3.1.1/5.0 正反向映射 + 显式损失报告（`broker_event_SUITE` 31 例，含 `cross_protocol_roundtrip_keeps_identity`）；其余五种协议把 payload 逐字节透传（Structured Mode 因此无损保留），**per-protocol Binary Mode 元数据映射未实现**，见 `docs/protocol-compatibility.md` §4.10
+- [x] 各协议 Binding 的往返测试通过，转换损失项有明确清单 —— **MQTT**：ADR-020 冻结的正反向映射 + 显式损失报告（`broker_event_SUITE`，含 `cross_protocol_roundtrip_keeps_identity`）；**WS/NATS/AMQP/Kafka/Pulsar**：S6 补齐的协议中立 Binary Mode（`ce-*` 头 + `content-type` → `#broker_message.headers`），`to_headers/3` / `from_headers/3` 对五个目标各做正反向往返（`header_binding_roundtrip_for_all_targets`），损失清单见 `docs/protocol-compatibility.md` §4.10
 - [x] 能力矩阵文档更新，覆盖 README 11.1 全部验证维度 —— `docs/protocol-compatibility.md` §2 能力矩阵 + §4.5~§4.9 每协议限制清单
 
-> **口径说明**：第 2 项按 ADR-020 的冻结范围判定通过；它**不是**「五种协议都实现了完整标准 Binding」的声明。README §4 的映射表本身也写明是架构建议、非已完成声明。per-protocol Binary Mode 绑定列入 S6 之后待办（`docs/security.md` §12 同列）。
+> **口径说明**：第 2 项覆盖六个协议的 Binding 往返。MQTT 走 ADR-020 的 `mqtt_user_properties` 通道；其余五个协议走统一 `ce-*` 头通道（不是各协议标准 CloudEvents Binding 的逐字实现，非无损点已在 §4.10 列明）。
 
 ---
 

@@ -324,11 +324,17 @@ append_batches(Topic, Partition, Batches, St) ->
     Destination = destination(Topic),
     Refs = route_refs(Destination, St),
     Base = topic_count(Partition, Destination),
-    lists:foreach(
-      fun(Record) ->
-              _ = append_record(Topic, Partition, Record, Destination, Refs, St)
-      end, lists:append([Records || #{records := Records} <- Batches])),
-    produce_ok(Partition, Base).
+    Results = [append_record(Topic, Partition, Record, Destination, Refs, St)
+               || Record <- lists:append([Records || #{records := Records} <- Batches])],
+    case first_error(Results) of
+        ok -> produce_ok(Partition, Base);
+        {error, {cloudevent_rejected, _}} -> produce_error(Partition, 87); % INVALID_RECORD
+        {error, _Reason} -> produce_error(Partition, 2)                    % CORRUPT_MESSAGE
+    end.
+
+first_error([]) -> ok;
+first_error([ok | Rest]) -> first_error(Rest);
+first_error([{error, _} = Error | _]) -> Error.
 
 produce_ok(Partition, BaseOffset) ->
     iolist_to_binary(
@@ -359,12 +365,20 @@ append_record(Topic, Partition, Record, Destination, Refs, St) ->
                                                 erlang:system_time(millisecond)),
                           expires_at = undefined,
                           event = undefined},
-    case (catch broker_queue:append(Partition, Msg, fsync)) of
-        {ok, Offset} ->
-            _ = (catch broker_subscription:dispatch(Refs, {Partition, Offset, Msg})),
-            Offset;
-        _ ->
-            undefined
+    case broker_event:apply_policy(Msg) of
+        {ok, Accepted} ->
+            case (catch broker_queue:append(Partition, Accepted, fsync)) of
+                {ok, Offset} ->
+                    _ = (catch broker_subscription:dispatch(
+                                 Refs, {Partition, Offset, Accepted})),
+                    ok;
+                {error, Reason} ->
+                    {error, Reason};
+                Other ->
+                    {error, {append_crashed, Other}}
+            end;
+        {error, Reason} ->
+            {error, {cloudevent_rejected, Reason}}
     end.
 
 value_of(Record) ->
