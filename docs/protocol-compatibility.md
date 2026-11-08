@@ -142,7 +142,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ### 4.2 S2.5 追加（2026-11-08）：MQTT 5.0 子集
 
-> 范围冻结在 [ADR-017](adr/017-mqtt5-properties-and-compat.md) §17.1；未实现的项（topic alias、request-response、AUTH）不在本子集，继续留 S5。
+> 范围冻结在 [ADR-017](adr/017-mqtt5-properties-and-compat.md) §17.1；未实现的项（topic alias、request-response、AUTH）不在本子集，**S5 也未纳入，仍未实现**（列为 S6 之后的可选项）。
 
 **帧层（`mqtt_frame`）**
 
@@ -438,7 +438,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 3. **消费组 offset 内存态**：`kafka_group` 的 committed offsets 在 broker 重启后清空；无 `__consumer_offsets` 主题，多节点不共享协调器。
 4. **无事务/幂等去重**：InitProducerId 返回固定值，`enable.idempotence=true` 的客户端可连接，但重复批次不会被服务端去重。
 5. **无压缩**：客户端若配置 `compression.type` 非 none，Produce 解码返回错误；官方客户端默认 none，故 12 例实测通过。
-6. **无 Admin API / SASL / TLS**：topic 自动可见但不可创建/删除；认证与传输安全留到 S6。
+6. **无 Admin API / SASL**：topic 自动可见但不可创建/删除；TLS 已由 S6 的 `broker_security_tls` 覆盖（六协议统一开关），SASL/统一认证仍未实现（`docs/security.md` §12）。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -490,10 +490,10 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 **已知限制（协议对端可观察，不是内部 TODO）**：
 
 1. **无 BookKeeper/ledger 存储**：消息仍在 `broker_queue`（ADR-006），Pulsar 的 ledger/entry 语义只是 topic 相对序号的映射；`GET_LAST_MESSAGE_ID` 基于当前分区高水位换算。
-2. **订阅游标内存态**：`pulsar_subscriptions` 的 cursor/unacked 在 broker 重启后重置；durable 订阅的持久化留待后续。
+2. **订阅游标内存态**：`pulsar_subscriptions` 的 cursor/unacked 在 broker 重启后重置；durable 订阅的持久化尚未实现（S6 之后）。
 3. **单分区**：所有 topic 都写入 broker 分区 0，`PARTITIONED_METADATA` 回 0；不支持分区 topic 的 per-partition lookup。
 4. **无事务/压缩/Key_Shared/schema**：`num_messages>1` 视为 batch；压缩位、事务标记、Key_Shared hash range、schema 均不支持；客户端默认不启用这些特性，故 8 例实测通过。
-5. **无认证/TLS**：认证与传输安全留到 S6；`CONNECT` 的 auth 字段被忽略。
+5. **统一认证未实现 / TLS 已覆盖**：TLS 由 S6 的 `broker_security_tls` 覆盖；`CONNECT` 的 auth 字段被忽略，统一认证仍未实现（`docs/security.md` §12）。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 

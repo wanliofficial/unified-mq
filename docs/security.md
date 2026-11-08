@@ -129,7 +129,7 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 | 编码失败 | `encode_structured` / `encode_binary` 先 `validate/1`，非法事件不产出字节 | `broker_event_SUITE` |
 | 策略未知 | 返回 `{error, {invalid_policy, P}}`，不静默降级 | `broker_event_SUITE` |
 
-**未实现（不冒充）**：Schema Registry 内容校验、未知扩展属性的「拒绝还是保留」按租户可配——当前是「保留 + 上限」。这两项列入 §9。
+**未实现（不冒充）**：Schema Registry 内容校验、未知扩展属性的「拒绝还是保留」按租户可配——当前是「保留 + 上限」。这两项列入 §12。
 
 ---
 
