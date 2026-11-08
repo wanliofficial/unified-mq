@@ -43,7 +43,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([subscribe/3, join/5, unsubscribe/2, leave/2,
-         ack/4, claim/4, release/4,
+         ack/4, claim/4, release/4, retry/4,
          inflight/2, attach/3, detach/2, dispatch/2]).
 -export([subscriptions/1, cursor/2, session/1, role/2]).
 
@@ -151,6 +151,13 @@ claim(SubRef, PartitionId, Max, Consumer) ->
 -spec release(sub_ref(), partition_id(), [offset()], binary()) -> ok.
 release(SubRef, PartitionId, Offsets, Consumer) ->
     broker_subscription_worker:release(SubRef, PartitionId, Offsets, Consumer).
+
+%% @doc One delivery attempt timed out (ADR-015 §15.1, S2-E E-1). The connection
+%% reports; the worker owns the backoff clock, the attempt budget and the
+%% dead-letter decision, because that state must outlive the connection.
+-spec retry(sub_ref(), partition_id(), offset(), binary()) -> ok.
+retry(SubRef, PartitionId, Offset, Consumer) ->
+    broker_subscription_worker:retry(SubRef, PartitionId, Offset, Consumer).
 
 %% @doc Persist the conn_fsm's opaque session blob (packet_id allocator +
 %% in-flight set, §5.3 tier 3). This layer never inspects it -- that is R7's

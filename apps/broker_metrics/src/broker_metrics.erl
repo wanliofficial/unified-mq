@@ -322,4 +322,12 @@ key_specs() ->
      {shared_ack_unowned, counter},
      {shared_window_full, counter},
      {shared_claim_rollbacks, counter},
-     {failover_promotions, counter}].
+     {failover_promotions, counter},
+     %% S2-E (ADR-015 §15.2/§15.3/§15.4): dead-letter appends (and the ones that
+     %% failed and must be retried), plus messages skipped because `expires_at'
+     %% had passed. `redelivery_total' and `dlq_size' already existed; the
+     %% former counts every retry the worker scheduled, the latter the copies
+     %% currently retained (S2-E only grows it -- S2-F decrements on GC).
+     {dlq_appends, counter},
+     {dlq_append_failed, counter},
+     {ttl_expired_total, counter}].

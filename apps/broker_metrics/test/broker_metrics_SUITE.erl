@@ -38,7 +38,8 @@ all() ->
          cloudevents_validate_failed, retain_updates, retain_clears,
          retain_overflow, retain_store_errors, will_published,
          qos2_state_overflow, shared_claims, shared_ack_unowned,
-         shared_window_full, shared_claim_rollbacks, failover_promotions]).
+         shared_window_full, shared_claim_rollbacks, failover_promotions,
+         dlq_appends, dlq_append_failed, ttl_expired_total]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.

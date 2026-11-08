@@ -19,5 +19,9 @@
            %% the backend capability at CONNECT (E2). `released' + `received'
            %% per session are capped; over the cap is a deliberate disconnect.
            {mqtt_max_qos, 2},
-           {max_qos2_state_per_session, 100}]}
+           {max_qos2_state_per_session, 100},
+           %% S2-E (ADR-015 §15.1/§15.4): the ack-timeout failure signal and the
+           %% default publish-time TTL (0 = no expiry).
+           {ack_timeout_ms, 30000},
+           {message_ttl_ms, 0}]}
 ]}.

@@ -12,5 +12,12 @@
            %% ADR-019 §19.1: the per-{SubRef, Partition} bound on
            %% `acked ∪ assigned'. A full window refuses further claims instead of
            %% evicting a live assignment.
-           {shared_state_max, 4096}]}
+           {shared_state_max, 4096},
+           %% S2-E (ADR-015 §15.2/§15.3): retry backoff, attempt budget and the
+           %% dead-letter destination template.
+           {retry_tick_ms, 1000},
+           {retry_base_ms, 1000},
+           {retry_max_delay_ms, 60000},
+           {max_attempts, 10},
+           {dlq_name_pattern, <<"$dlq/{tenant}/{original}">>}]}
 ]}.

@@ -58,6 +58,15 @@ DLQ 是"不丢数据"的兜底，但 DLQ 自身 append 失败（磁盘满、stor
 - 记 `dlq_append_failed` 计数与错误日志；
 - 达到上限的重试条目保持原状，等待下次重试，**不静默丢弃**。
 
+### 15.6 实现注记（S2-E，2026-11-08）
+
+下面四项是本 ADR 留给实现的空白，由 S2-E 冻结并实现；**不改变 §15.1~§15.5 的对外契约**。理由与代价见 [S2-E 执行计划](../design/s2-e-redelivery-dlq-ttl-execution-plan.md) §2。
+
+1. **失败信号 = ack 超时**（`ack_timeout_ms`，默认 30 s）。检测在连接进程（它已有每条在途消息的 `sent_at`），**决策与计时仍在 worker**：连接只在超时时发一次 `retry/5`，worker 记 `attempts`/`next_at`，到点再唤醒执行者。MQTT 3.1.1 没有 nack；没有超时定义，§15.2 的退避就没有起点。
+2. **重试状态放在 cursor 行的 `retries` 字段**（随 `.cursors` 的窗口落盘），不新建文件。一份 `{SubRef, Partition}` 的真相已经在 cursor 行里；另起文件会造出两份可以互相矛盾的「这条消息怎么样了」。崩溃后 `attempts` 可能回退，表现为**多重试几次**（方向安全）。
+3. **TTL 过滤在读者侧执行**，不改 `broker_queue:read_from/3`（ADR-011 冻结了它的连续记录契约）。§15.4 两个过滤点的可观测契约——不投递、cursor 前进、committed 不卡——由读者侧一次检查同时满足。
+4. **DLQ 副本固定 `fsync`**，`expires_at = undefined`，`created_at` 为入队时间，`message_id` 重新生成（原值进 `x-original-message-id`）。死信是「不丢数据」的兜底，不能比原件更弱；继承原 `expires_at` 会让过期消息进 DLQ 后立刻不可消费。副本按 §15.3 计入 `dlq_size`（S2-E 只增，段删除在 S2-F 才发生）。
+
 ## 后果（Consequences）
 
 - **+** 重试计划比连接活得久，连接风暴/断连不会丢重试进度。

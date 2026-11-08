@@ -207,12 +207,12 @@
 - **不在 S2-D**：`$share` 线上语法（S2.5）、消费权重、位图的位级表示（S2-I 压测后再定）。
 - **测试**：三种类型的投递归属、claim 并发不相交、`low` 在乱序 ack/空洞/成员退出三场景的正确性、Shared 组内不重复、failover 接管、`.subs` v2 与 v1 迁移演练（含中途失败）、Router 回填（boot step 2+3）、T14 R9。**结果（2026-11-08）**：`broker_subscription_SUITE` 44/44、`mqtt_conn_SUITE` 55/55、全量 `rebar3 ct` 349/349、T14 R9 双档 PASS、`dialyzer` 干净；明细见执行计划 §8。
 
-### 4.5 S2-E 重投递 / DLQ / TTL
+### 4.5 S2-E 重投递 / DLQ / TTL（✅ 已实现 2026-11-08）
 
-- **重投递**：`broker_redelivery` 表 `{SubRef, Partition, Offset} -> #{attempts, first_at, next_at, reason}`；定时器由 `broker_subscription_worker` 持有（单进程，避免每连接一个）；退避 `base * 2^n` 上限可配；超限进 DLQ。
-- **DLQ（O2 已定案）**：destination 命名**按租户可配**（`broker_dlq.name_pattern`，默认 `$dlq/{tenant}/{original}`），走普通 append；原始消息保留并包装 `headers`（`x-original-destination`/`x-failure-reason`/`x-attempts`/`x-tenant`）；**DLQ 保留期独立配置**（`broker_dlq.retention`，不与源 destination 共享）。
-- **TTL**：`expires_at` 生效；`read_from` 跳过过期（并推进 cursor），retention 清除过期段内消息。
-- **测试**：退避时序（假时钟）、超限转 DLQ、DLQ 可订阅、**同一租户两名消费者各自的 DLQ 命名与保留期互不影响**、TTL 到期不投递、过期不影响 committed。
+- **重投递**：状态**不建独立表**，放在 cursor 行的 `retries` 字段（`#{Offset => #{attempts, first_at, next_at, reason}}`，随 `.cursors` 窗口落盘）；定时器与决策都在 `broker_subscription_worker`（单进程），连接只负责检测 ack 超时并上报。退避 `base * 2^(n-1)`、上限 `retry_max_delay_ms`；`max_attempts` 次失败后转 DLQ。实现见 [S2-E 执行计划](s2-e-redelivery-dlq-ttl-execution-plan.md) §2 / ADR-015 §15.6。
+- **DLQ**：普通 destination，命名模板 `broker_subscription.dlq_name_pattern`（默认 `$dlq/{tenant}/{original}`，变量 `{tenant}{original}{qos}{kind}`，含 `+`/`#`/未知变量 ⇒ **启动失败**）；副本固定 `fsync`、`expires_at=undefined`、新 `message_id`，原值进 `x-original-destination`/`x-original-message-id`/`x-failure-reason`/`x-attempts`/`x-tenant`。写失败保留 cursor（`dlq_append_failed`）。**独立保留期**（O2）落在 S2-F 的段级 GC，S2-E 只提供 `dlq_size` 计数。
+- **TTL**：`expires_at` 在读者侧（`mqtt_conn_fsm`）过滤：不投递但推进 cursor 与 committed；不改 `broker_queue:read_from/3` 的连续记录契约（ADR-011 冻结）。
+- **测试**：退避时序（假时钟）、超限转 DLQ、DLQ 可订阅、坏模板拒绝启动、DLQ 写失败保 cursor、重启保进度、ack 超时 `DUP=1` 重投、TTL 到期不投递且 committed 前进（360/360 中的 11 例，映射见执行计划 §8.2）。
 
 ### 4.6 S2-F retention 与慢消费者守卫
 

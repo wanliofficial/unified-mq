@@ -87,6 +87,9 @@ all() ->
      a_qos0_subscription_receives_stored_traffic_at_qos0,
      offline_messages_are_caught_up_in_offset_order,
      an_unacked_message_is_resent_with_dup_and_the_same_packet_id,
+     %% S2-E (ADR-015): ack-timeout redelivery and TTL expiry.
+     a_timed_out_delivery_is_redelivered_with_dup_and_the_same_packet_id,
+     an_expired_message_is_skipped_and_the_cursor_advances,
      takeover_closes_the_old_connection_and_keeps_the_session,
      a_clean_session_connection_tears_the_previous_session_down,
      the_memory_backend_serves_the_full_e12_posture,
@@ -144,6 +147,16 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_proto_mqtt, max_keepalive_ms, 60000),
     ok = application:set_env(broker_proto_mqtt, mqtt_max_qos, 2),
     ok = application:set_env(broker_proto_mqtt, max_qos2_state_per_session, 100),
+    %% S2-E knobs (ADR-015): every case starts from the production defaults, and
+    %% a case that needs another posture re-sets them before boot/0.
+    ok = application:set_env(broker_proto_mqtt, ack_timeout_ms, 30000),
+    ok = application:set_env(broker_proto_mqtt, message_ttl_ms, 0),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 1000),
+    ok = application:set_env(broker_subscription, retry_base_ms, 1000),
+    ok = application:set_env(broker_subscription, retry_max_delay_ms, 60000),
+    ok = application:set_env(broker_subscription, max_attempts, 10),
+    ok = application:set_env(broker_subscription, dlq_name_pattern,
+                             <<"$dlq/{tenant}/{original}">>),
     ok = case_env(Case),
     {ok, _Started} = application:ensure_all_started(broker_storage),
     [{data_dir, DataDir} | Config].
@@ -170,6 +183,16 @@ case_env(publish_over_the_effective_max_closes_without_an_ack) ->
     application:set_env(broker_proto_mqtt, mqtt_max_qos, 0);
 case_env(the_memory_backend_serves_the_full_e12_posture) ->
     application:set_env(broker_storage, backend, broker_storage_memory);
+case_env(a_timed_out_delivery_is_redelivered_with_dup_and_the_same_packet_id) ->
+    %% Fast clock: the timeout is the failure signal, so its two halves (the
+    %% conn's detector, the worker's backoff + retry tick) must be small enough
+    %% that the case is about the protocol, not about sleeping.
+    ok = application:set_env(broker_proto_mqtt, ack_timeout_ms, 100),
+    ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 50),
+    ok = application:set_env(broker_subscription, retry_base_ms, 50);
+case_env(an_expired_message_is_skipped_and_the_cursor_advances) ->
+    ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100);
 case_env(_) ->
     ok.
 
@@ -1098,6 +1121,60 @@ an_unacked_message_is_resent_with_dup_and_the_same_packet_id(_Config) ->
     {ok, normal} = mqtt_close(Publisher),
     ok.
 
+%% E-10 (ADR-015 §15.1/§15.2): MQTT has no nack, so "the peer did not finish this
+%% delivery" is only observable as elapsed time. The connection detects the
+%% timeout and reports it; the worker schedules the backoff; the redelivery
+%% reuses the SAME packet id with DUP=1 (R7) on the SAME socket. Nothing here is
+%% a reconnect -- that path (R7 via the inflight blob) is a different case.
+a_timed_out_delivery_is_redelivered_with_dup_and_the_same_packet_id(_Config) ->
+    ok = boot(),
+    ok = broker_metrics:reset(),
+    {Publisher, _} = open(<<"pub">>),
+    {Subscriber, _} = open(#{client_id => <<"c1">>, clean => false}),
+    1 = sub(Subscriber, 1, <<"d/#">>, 1),
+    {ok, SubRef} = subscribed(<<"c1">>, <<"d/#">>, 1),
+    P = route_partition(<<"d/a">>),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    #puback{} = pub(Publisher, 1, <<"d/a">>, <<"once">>, 1),
+    {Pub, _} = recv_publish(csock(Subscriber)),
+    #publish{qos = 1, dup = 0, packet_id = Pid} = Pub,
+    %% No PUBACK: the connection's own clock is the only failure signal, and the
+    %% redelivery must arrive without any client-side help.
+    {Resent, _} = recv_publish(csock(Subscriber)),
+    #publish{qos = 1, dup = 1, packet_id = Pid, payload = <<"once">>} = Resent,
+    %% The retry moved the worker's schedule at least once, and the eventual ack
+    %% still closes the delivery: one cursor advance for the one message.
+    #{redelivery_total := Redelivered} = broker_metrics:snapshot(),
+    true = Redelivered >= 1,
+    ok = mqtt_puback(Subscriber, Pid),
+    wait_cursor_after(SubRef, P, Anchor),
+    {ok, normal} = mqtt_close(Subscriber),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+%% E-11 (ADR-015 §15.4): an expired record is not delivered, but it must still
+%% leave every cursor -- otherwise the committed watermark pins on a message
+%% nobody will ever read, and S2-F retention can never reclaim the segment.
+an_expired_message_is_skipped_and_the_cursor_advances(_Config) ->
+    ok = boot(),
+    ok = broker_metrics:reset(),
+    {Subscriber, _} = open(#{client_id => <<"c1">>, clean => false}),
+    1 = sub(Subscriber, 1, <<"ttl/#">>, 1),
+    {ok, SubRef} = subscribed(<<"c1">>, <<"ttl/#">>, 1),
+    P = route_partition(<<"ttl/a">>),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    {ok, Offset} = offline_publish_expired(<<"ttl/a">>, <<"stale">>),
+    %% The reader filters (E-3), so nothing reaches the wire ...
+    true = mqtt_silence(csock(Subscriber), 400),
+    %% ... but the cursor still moves past it, and so does the committed
+    %% watermark once the cursor tick has folded it in (K6).
+    wait_cursor_after(SubRef, P, Anchor),
+    wait_committed_at_least(P, Offset),
+    #{ttl_expired_total := Expired} = broker_metrics:snapshot(),
+    true = Expired >= 1,
+    {ok, normal} = mqtt_close(Subscriber),
+    ok.
+
 takeover_closes_the_old_connection_and_keeps_the_session(_Config) ->
     ok = boot(),
     {Old, _} = open(#{client_id => <<"c1">>, clean => false}),
@@ -1444,6 +1521,39 @@ offline_publish(Topic, Payload) ->
                           expires_at = undefined, event = undefined},
     {ok, Offset} = broker_queue:append(P, Msg, fsync),
     {Topic, Offset}.
+
+%% Same shape as `offline_publish/2', but the record is already past its
+%% `expires_at' -- which is what makes the reader-side TTL filter observable
+%% without sleeping on a wall clock.
+offline_publish_expired(Topic, Payload) ->
+    P = route_partition(Topic),
+    Now = erlang:system_time(millisecond),
+    Msg = #broker_message{message_id = crypto:strong_rand_bytes(16),
+                          tenant_id = <<"t1">>, destination = Topic,
+                          partition_id = P, payload = Payload,
+                          payload_encoding = raw, headers = #{},
+                          proto_meta = #{qos => 1},
+                          persistence = durable, reliability = fsync,
+                          created_at = Now, expires_at = Now - 1000,
+                          event = undefined},
+    {ok, Offset} = broker_queue:append(P, Msg, fsync),
+    {ok, Offset}.
+
+%% The committed watermark only moves on the subscription worker's cursor tick
+%% (K6), so a TTL case waits for the fold rather than assuming it is immediate.
+wait_committed_at_least(Partition, Offset) ->
+    wait_committed_at_least(Partition, Offset, 3000).
+
+wait_committed_at_least(Partition, Offset, Budget) ->
+    case broker_queue:watermarks(Partition) of
+        {ok, Committed, _High} when Committed >= Offset ->
+            ok;
+        _ when Budget > 50 ->
+            timer:sleep(25),
+            wait_committed_at_least(Partition, Offset, Budget - 25);
+        Other ->
+            exit({committed_stuck, Partition, Offset, Other})
+    end.
 
 expect_closed(Client) ->
     case mqtt_recv_or(Client, 3000, nothing) of

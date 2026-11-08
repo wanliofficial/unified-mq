@@ -66,6 +66,7 @@
              pending_rev = #{},            %% {Partition, Offset} => Pid
              sent = #{},                   %% Pid => true, SENT BY THIS CONNECTION
              sent_at = #{},                %% Pid => monotonic us, for ack_latency_us
+             retry_reported = #{},         %% Pid => true, timeout already told to the worker
              will = undefined,             %% #{topic, payload, qos, retain} | undefined
              counted = false,              %% this conn's row in connections_current
              inflight_dirty = false}).
@@ -161,6 +162,14 @@ event({broker_deliver, _ClientId, _MaxQoS, _Refs, {_P, _O, _Msg}}, StateName, D)
     %% a wake for a durable position; the tuple's Msg is not read -- the pull
     %% loop is the only reader (J6/K9).
     wake(StateName, D);
+event({broker_redeliver, shared, _SubRef, _P, _O}, StateName, D) ->
+    %% The worker released a shared offset back to the pool; the claim that
+    %% follows decides who reads it, so this member only needs to run a round.
+    wake(StateName, D);
+event({broker_redeliver, _Kind, SubRef, P, O}, connected, D) ->
+    redeliver(SubRef, P, O, D);
+event({broker_redeliver, _Kind, _SubRef, _P, _O}, StateName, D) ->
+    {state, StateName, D};
 event({mqtt_takeover, NewPid}, _StateName, D) ->
     %% §4.3: we are the old connection. Close WITHOUT writing the blob -- the
     %% new conn owns the session now, and a stale blob behind it would
@@ -451,7 +460,7 @@ clean_session_teardown(D) ->
     _ = (catch broker_subscription:inflight(D#st.client_id, undefined)),
     D#st{pending = #{}, pending_qos = #{}, released = #{}, received = #{},
          retained_queue = [], pending_rev = #{}, sent = #{}, sent_at = #{},
-         next_pid = 1, inflight_dirty = false}.
+         retry_reported = #{}, next_pid = 1, inflight_dirty = false}.
 
 %% The blob is `vsn 2' (ADR-018 §18.3 R3) and a `vsn 1' blob from S1 is read
 %% as "pending, all QoS 1, no release state" -- semantically identical to S1's
@@ -652,6 +661,7 @@ reliability_of(0) -> os_buffer;
 reliability_of(_) -> fsync.
 
 build_message(Topic, Payload, QoS, WirePid, Partition, Retain, D) ->
+    Created = erlang:system_time(millisecond),
     #broker_message{
       message_id = crypto:strong_rand_bytes(16),
       tenant_id = D#st.tenant_id,
@@ -663,9 +673,149 @@ build_message(Topic, Payload, QoS, WirePid, Partition, Retain, D) ->
       proto_meta = #{qos => QoS, dup => 0, retain => Retain, packet_id => WirePid},
       persistence = case QoS of 0 -> transient; _ -> durable end,
       reliability = reliability_of(QoS),
-      created_at = erlang:system_time(millisecond),
-      expires_at = undefined,
+      created_at = Created,
+      expires_at = expiry(Created, D),
       event = undefined}.
+
+%% TTL (ADR-015 §15.4): `expires_at' is the absolute ms deadline the publisher
+%% path computed from `message_ttl_ms'. `undefined' never expires -- that is the
+%% S1/S2-A default and the E-12 assertion.
+expired(#broker_message{expires_at = undefined}) ->
+    false;
+expired(#broker_message{expires_at = At}) when is_integer(At) ->
+    At =< erlang:system_time(millisecond).
+
+expiry(Created, D) ->
+    case opt(message_ttl_ms, 0, D) of
+        TTL when is_integer(TTL), TTL > 0 -> Created + TTL;
+        _ -> undefined
+    end.
+
+%%%_* Ack timeout -> worker retry (S2-E E-1) ----------------------------------
+
+%% MQTT 3.1.1 has no nack, so "the peer did not finish this delivery" is only
+%% observable as elapsed time. The connection detects it -- it already holds
+%% `sent_at' for every wire attempt -- and reports it once per attempt; the
+%% worker owns the backoff clock and the attempt budget (ADR-015 §15.1).
+report_ack_timeouts(D) ->
+    TimeoutUs = opt(ack_timeout_ms, 30000, D) * 1000,
+    Now = erlang:monotonic_time(microsecond),
+    maps:fold(
+      fun(Pid, SentAt, DAcc) ->
+              case is_integer(SentAt) andalso Now - SentAt >= TimeoutUs
+                  andalso not maps:is_key(Pid, DAcc#st.retry_reported) of
+                  true -> report_timeout(Pid, DAcc);
+                  false -> DAcc
+              end
+      end, D, D#st.sent_at).
+
+report_timeout(Pid, D) ->
+    case maps:get(Pid, D#st.pending, undefined) of
+        {Refs, {P, O}} when is_integer(P), is_integer(O) ->
+            ClientId = D#st.client_id,
+            lists:foreach(fun(Ref) ->
+                                  _ = (catch broker_subscription:retry(Ref, P, O,
+                                                                      ClientId))
+                          end, Refs),
+            case all_shared(Refs) of
+                true ->
+                    %% A shared offset is re-claimed, never resent: the worker
+                    %% released it back to the pool, so this in-flight entry is
+                    %% stale. Dropping it makes the next claim a fresh delivery
+                    %% (new packet id) instead of a silent duplicate.
+                    drop_local(Pid, {P, O}, D);
+                false ->
+                    D#st{retry_reported = (D#st.retry_reported)#{Pid => true}}
+            end;
+        _ ->
+            D
+    end.
+
+all_shared([]) ->
+    false;
+all_shared(Refs) ->
+    lists:all(fun(Ref) -> element(1, Ref) =:= shared end, Refs).
+
+drop_local(Pid, Pos, D) ->
+    D#st{pending = maps:remove(Pid, D#st.pending),
+         pending_qos = maps:remove(Pid, D#st.pending_qos),
+         released = maps:remove(Pid, D#st.released),
+         pending_rev = remove_rev(D#st.pending_rev, Pos, Pid),
+         sent = maps:remove(Pid, D#st.sent),
+         sent_at = maps:remove(Pid, D#st.sent_at),
+         retry_reported = maps:remove(Pid, D#st.retry_reported),
+         inflight_dirty = true}.
+
+%% A redelivery wake from the worker. The offset is still the sub's read
+%% position (the cursor only moves on ack), so the same packet id is reused with
+%% DUP=1 (R7). Several subscriptions can name the same {P, O}; the first wake
+%% refreshes `sent_at', which makes the others no-ops -- one timeout must not
+%% become N duplicates.
+redeliver(SubRef, P, O, D) ->
+    case broker_subscription:role(SubRef, D#st.client_id) of
+        active ->
+            case maps:get({P, O}, D#st.pending_rev, undefined) of
+                Pid when is_integer(Pid) ->
+                    redeliver_pid(Pid, P, O, D);
+                undefined ->
+                    %% Nothing in flight here: the ordinary round re-reads from
+                    %% the cursor (which is still at O).
+                    wake(connected, D)
+            end;
+        _ ->
+            {state, connected, D}
+    end.
+
+redeliver_pid(Pid, P, O, D) ->
+    case overdue(Pid, D) of
+        false ->
+            %% Another subscription's wake (or a poll tick) already resent it.
+            {state, connected, D};
+        true ->
+            case maps:is_key(Pid, D#st.released) of
+                true ->
+                    {D1, _} = resend(Pid, P, O, undefined, D),
+                    {state, connected, clear_reported(Pid, D1)};
+                false ->
+                    case read_one(P, O) of
+                        {ok, Msg} ->
+                            case expired(Msg) of
+                                true -> expire_local(Pid, P, O, D);
+                                false ->
+                                    {D1, _} = resend(Pid, P, O, Msg, D),
+                                    {state, connected, clear_reported(Pid, D1)}
+                            end;
+                        error ->
+                            {state, connected, D}
+                    end
+            end
+    end.
+
+overdue(Pid, D) ->
+    TimeoutUs = opt(ack_timeout_ms, 30000, D) * 1000,
+    Now = erlang:monotonic_time(microsecond),
+    case maps:get(Pid, D#st.sent_at, undefined) of
+        undefined -> true;
+        SentAt -> Now - SentAt >= TimeoutUs
+    end.
+
+clear_reported(Pid, D) ->
+    D#st{retry_reported = maps:remove(Pid, D#st.retry_reported)}.
+
+read_one(P, O) ->
+    case (catch broker_queue:read_from(P, O, 1)) of
+        {ok, [{O, Msg}], _Next} -> {ok, Msg};
+        _ -> error
+    end.
+
+%% The message expired while it sat in flight: the retry is over, the cursor
+%% moves, and no further wake will name this offset.
+expire_local(Pid, P, O, D) ->
+    {Refs, Pos} = maps:get(Pid, D#st.pending),
+    D1 = release_pid(Pid, Pos, D),
+    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D1#st.client_id) end, Refs),
+    broker_metrics:inc(ttl_expired_total),
+    after_release(D1).
 
 %%%_* SUBSCRIBE / UNSUBSCRIBE -------------------------------------------------
 
@@ -895,6 +1045,7 @@ release_pid(Pid, Pos, D) ->
          pending_rev = remove_rev(D#st.pending_rev, Pos, Pid),
          sent = maps:remove(Pid, D#st.sent),
          sent_at = maps:remove(Pid, D#st.sent_at),
+         retry_reported = maps:remove(Pid, D#st.retry_reported),
          inflight_dirty = true}.
 
 %% Window-only release (retained replay) followed by the rest of the backlog.
@@ -951,7 +1102,8 @@ arm_poll(_StateName, D) ->
 
 pull_round(D0) ->
     try
-        D = D0#st{round_no = D0#st.round_no + 1},
+        D0a = report_ack_timeouts(D0),
+        D = D0a#st{round_no = D0a#st.round_no + 1},
         Subs = broker_subscription:subscriptions(D#st.client_id),
         %% One partition per round, rotated by the round number: a deep backlog
         %% on P0 cannot starve P3 (plan §pull loop step 4).
@@ -1191,6 +1343,22 @@ read_page(P, From, Limit, _D) ->
 %%%_* One stored message, every subscribing filter (pull path) ----------------
 
 handle_stored(P, O, Msg, Rows, D) ->
+    case expired(Msg) of
+        true ->
+            %% ADR-015 §15.4 (S2-E E-3): an expired message is not delivered, but
+            %% it must still leave every cursor, or the committed watermark pins
+            %% on it forever. The reader filters because `read_from/3' is frozen
+            %% (ADR-011) to return the log's contiguous records.
+            broker_metrics:inc(ttl_expired_total),
+            lists:foreach(fun(#{ref := Ref}) ->
+                                  ack_skip(Ref, P, O, D#st.client_id)
+                          end, Rows),
+            {D, progress};
+        false ->
+            handle_stored1(P, O, Msg, Rows, D)
+    end.
+
+handle_stored1(P, O, Msg, Rows, D) ->
     Topic = Msg#broker_message.destination,
     {Hits, Others} =
         lists:foldl(
@@ -1238,6 +1406,16 @@ handle_stored(P, O, Msg, Rows, D) ->
 %%     acked, or `low' pins on traffic this consumer was never going to see;
 %%   * one ref, not a set: the claim was made for exactly this subscription.
 handle_claimed(P, O, Msg, Ref, Filter, SubQoS, D) ->
+    case expired(Msg) of
+        true ->
+            broker_metrics:inc(ttl_expired_total),
+            ack_skip(Ref, P, O, D#st.client_id),
+            {D, progress};
+        false ->
+            handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D)
+    end.
+
+handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D) ->
     Topic = Msg#broker_message.destination,
     case mqtt_filter:matches(Topic, Filter) of
         false ->

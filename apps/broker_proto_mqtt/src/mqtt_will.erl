@@ -79,6 +79,7 @@ broker_retain_put(Msg, 1, Mode) ->
     end.
 
 build(Topic, Payload, QoS, Retain, Partition, Tenant) ->
+    Created = erlang:system_time(millisecond),
     #broker_message{
       message_id = crypto:strong_rand_bytes(16),
       tenant_id = Tenant,
@@ -90,9 +91,18 @@ build(Topic, Payload, QoS, Retain, Partition, Tenant) ->
       proto_meta = #{qos => QoS, dup => 0, retain => Retain, will => true},
       persistence = case QoS of 0 -> transient; _ -> durable end,
       reliability = reliability_of(QoS),
-      created_at = erlang:system_time(millisecond),
-      expires_at = undefined,
+      created_at = Created,
+      expires_at = expiry(Created),
       event = undefined}.
+
+%% Same deadline rule as a live publish (`mqtt_conn_fsm:build_message/7'): a
+%% Will is an ordinary message once it is published, so it carries the same TTL
+%% (S2-E E-5).
+expiry(Created) ->
+    case application:get_env(broker_proto_mqtt, message_ttl_ms, 0) of
+        TTL when is_integer(TTL), TTL > 0 -> Created + TTL;
+        _ -> undefined
+    end.
 
 reliability_of(0) -> os_buffer;
 reliability_of(_) -> fsync.

@@ -73,7 +73,18 @@
     %% ADR-019 §19.1: per-{SubRef, Partition} bound on `acked ∪ assigned'.
     %% A full window refuses more claims (counted, bounded) rather than
     %% evicting an assignment somebody is still holding.
-    {shared_state_max, 4096}
+    {shared_state_max, 4096},
+    %% S2-E (ADR-015): retry and dead-letter policy. `attempts' counts failed
+    %% deliveries; reaching `max_attempts' dead-letters the message and advances
+    %% the cursor, so a poison message cannot pin a partition.
+    {retry_tick_ms, 1000},
+    {retry_base_ms, 1000},
+    {retry_max_delay_ms, 60000},
+    {max_attempts, 10},
+    %% Variables: {tenant} {original} {qos} {kind}. A `+'/'#' or an unknown
+    %% variable fails the application at boot (a typo must not wait for the
+    %% first dead letter to surface).
+    {dlq_name_pattern, <<"$dlq/{tenant}/{original}">>}
   ]},
 
   {broker_security, [
@@ -116,7 +127,14 @@
     {max_keepalive_ms, 60000},
     %% ADR-018 §18.4: per-session cap on `released' + `received'. Over the cap
     %% the connection is closed (a silent drop of QoS 2 state would lie).
-    {max_qos2_state_per_session, 100}
+    {max_qos2_state_per_session, 100},
+    %% S2-E (ADR-015 §15.1): how long a delivery may stay unacknowledged before
+    %% the connection reports a failure. It must exceed a normal ack latency
+    %% (the risk in the execution plan §7). 0 disables the detector.
+    {ack_timeout_ms, 30000},
+    %% S2-E (ADR-015 §15.4): default per-message TTL stamped into `expires_at'
+    %% at publish time. 0/undefined means no expiry (S1 semantics).
+    {message_ttl_ms, 0}
   ]},
 
   {broker_retain, [

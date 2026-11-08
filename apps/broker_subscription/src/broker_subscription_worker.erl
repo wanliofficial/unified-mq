@@ -47,7 +47,8 @@
 
 -export([start_link/0,
          subscribe/3, join/5, unsubscribe/2, leave/2,
-         ack/4, claim/4, release/4, inflight/2, attach/3, detach/2]).
+         ack/4, claim/4, release/4, retry/4,
+         inflight/2, attach/3, detach/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -89,6 +90,14 @@ claim(SubRef, PartitionId, Max, Consumer) ->
 release(SubRef, PartitionId, Offsets, Consumer) ->
     gen_server:call(?MODULE, {release, SubRef, PartitionId, Offsets, Consumer}).
 
+%% S2-E (ADR-015 §15.1): one delivery attempt failed (ack timeout). The
+%% connection only reports; the backoff clock, attempt budget and dead-letter
+%% decision live in this worker, because that state must outlive the connection.
+-spec retry({exclusive | shared | failover, binary(), binary()},
+            partition_id(), offset(), binary()) -> ok.
+retry(SubRef, PartitionId, Offset, Consumer) ->
+    gen_server:call(?MODULE, {retry, SubRef, PartitionId, Offset, Consumer}).
+
 inflight(ClientId, Term) ->
     gen_server:call(?MODULE, {inflight, ClientId, Term}).
 
@@ -101,6 +110,14 @@ detach(ClientId, Pid) ->
 %%%_* gen_server -----------------------------------------------------------
 
 init([]) ->
+    %% A malformed dead-letter template is a configuration error, and the moment
+    %% to say so is boot -- not the first message that needed a DLQ (S2-E E-6).
+    case broker_dlq:validate_pattern(dlq_pattern()) of
+        ok -> init_tables();
+        {error, Reason} -> {stop, {invalid_dlq_pattern, Reason}}
+    end.
+
+init_tables() ->
     create_tables(),
     Partitions = broker_queue:partition_ids(),
     State = #{partitions => Partitions,
@@ -108,6 +125,10 @@ init([]) ->
               cursor_interval => application:get_env(broker_subscription, cursor_flush_interval_ms, 100),
               inflight_interval => application:get_env(broker_subscription, inflight_flush_interval_ms, 100),
               shared_state_max => application:get_env(broker_subscription, shared_state_max, 4096),
+              retry_interval => application:get_env(broker_subscription, retry_tick_ms, 1000),
+              retry_base => application:get_env(broker_subscription, retry_base_ms, 1000),
+              retry_max => application:get_env(broker_subscription, retry_max_delay_ms, 60000),
+              max_attempts => application:get_env(broker_subscription, max_attempts, 10),
               last_committed => #{},
               cursor_dirty => #{},
               inflight_dirty => #{},
@@ -115,13 +136,18 @@ init([]) ->
     case boot(Partitions) of
         {ok, LastCommitted} ->
             State1 = State#{last_committed := LastCommitted},
-            {ok, rearm(inflight_tick, rearm(cursor_tick, State1))};
+            {ok, rearm(retry_tick,
+                       rearm(inflight_tick, rearm(cursor_tick, State1)))};
         {error, Reason} ->
             %% `{stop, Reason}' from init fails start_link, which fails the
             %% application: nobody can serve a subscription set that only partly
             %% loaded.
             {stop, {subscription_boot_failed, Reason}}
     end.
+
+dlq_pattern() ->
+    application:get_env(broker_subscription, dlq_name_pattern,
+                        <<"$dlq/{tenant}/{original}">>).
 
 handle_call({subscribe, ClientId, Filter, QoS}, _From, State) ->
     SubRef = {exclusive, ClientId, Filter},
@@ -264,7 +290,9 @@ handle_call({claim, SubRef = {_Kind, _, _}, PartitionId, Max, Consumer}, _From, 
             #{shared_state_max := Limit} = State,
             case broker_queue:watermarks(PartitionId) of
                 {ok, _Committed, High} ->
-                    case broker_cursor:claim(Row, Max, High, Consumer, Limit) of
+                    Blocked = broker_cursor:blocked(Row, now_ms(), High),
+                    case broker_cursor:claim(Row, Max, High, Consumer, Limit,
+                                             Blocked) of
                         {ok, [], _Row1} ->
                             %% The tail: not an error, and not a claim either.
                             {reply, {ok, []}, State};
@@ -300,6 +328,10 @@ handle_call({release, SubRef = {_Kind, _, _}, PartitionId, Offsets, Consumer}, _
             %% return, and the caller is retiring this ref anyway.
             {reply, ok, State}
     end;
+
+handle_call({retry, SubRef = {_Kind, _, _}, PartitionId, Offset, Consumer}, _From,
+            State) ->
+    {reply, ok, retry_delivery(SubRef, PartitionId, Offset, Consumer, State)};
 
 handle_call({inflight, ClientId, Term}, _From, State) ->
     true = ets:insert(?INFLIGHT, {ClientId, Term}),
@@ -361,6 +393,9 @@ handle_info(cursor_tick, State) ->
     State2 = compute_committed(State1),
     _ = sample_gauges(State2),
     {noreply, rearm(cursor_tick, State2)};
+
+handle_info(retry_tick, State) ->
+    {noreply, rearm(retry_tick, sweep_retries(State))};
 
 handle_info(inflight_tick, State) ->
     {noreply, rearm(inflight_tick, flush_all_dirty_inflight(State))};
@@ -755,6 +790,213 @@ sample_gauges(#{partitions := Partitions}) ->
     broker_metrics:gauge(cursor_lag, Lag1),
     ok.
 
+%%%_* Retry scheduling and dead letters (S2-E, ADR-015) -----------------------
+
+%% The failure signal is an ack timeout reported by the connection (E-1). What
+%% happens next is decided here so it survives the connection:
+%%
+%%   * `attempts' counts *failures*; reaching `max_attempts' dead-letters the
+%%     message, advances the cursor and frees the window (§15.2);
+%%   * otherwise the offset is scheduled at `base * 2^(n-1)' (capped) and the
+%%     retry tick wakes whoever can redeliver it then.
+%%
+%% `owns/3' drops a report from a consumer that no longer holds the offset: that
+%% is a rebalance racing a timeout, not a retry.
+retry_delivery(SubRef, PartitionId, Offset, Consumer, State) ->
+    case ets:lookup(?CURSORS, {SubRef, PartitionId}) of
+        [] ->
+            State;
+        [{_, Row}] ->
+            case owns(Row, Offset, Consumer) of
+                false ->
+                    State;
+                true ->
+                    Now = now_ms(),
+                    Attempts = broker_cursor:attempts(Row, Offset) + 1,
+                    case Attempts >= maps:get(max_attempts, State) of
+                        true ->
+                            dead_letter(SubRef, PartitionId, Offset, Attempts,
+                                        Row, State);
+                        false ->
+                            NextAt = Now + backoff(Attempts, State),
+                            Row1 = schedule_retry(Row, Offset, NextAt, Now,
+                                                  ack_timeout),
+                            store_row(SubRef, PartitionId, Row1, State)
+                    end
+            end
+    end.
+
+owns(#{kind := shared, assigned := Assigned}, Offset, Consumer) ->
+    maps:get(Offset, Assigned, undefined) =:= Consumer;
+owns(_Row, _Offset, _Consumer) ->
+    true.
+
+%% A shared offset that just timed out goes back to the pool *after* its
+%% backoff: `release_offset/2' drops the assignment, `retry/5' parks the offset
+%% in `retries', and `claim/6' will skip it until `next_at' (E-5). A plain row
+%% keeps its scalar cursor and its retry entry; nothing is reassigned.
+schedule_retry(#{kind := shared} = Row, Offset, NextAt, Now, Reason) ->
+    broker_cursor:retry(broker_cursor:release_offset(Row, Offset), Offset,
+                        NextAt, Now, Reason);
+schedule_retry(Row, Offset, NextAt, Now, Reason) ->
+    broker_cursor:retry(Row, Offset, NextAt, Now, Reason).
+
+backoff(Attempts, State) ->
+    broker_cursor:backoff(Attempts, maps:get(retry_base, State),
+                          maps:get(retry_max, State)).
+
+%% The retry tick is the only scheduler. Each row with retry state is examined
+%% against its partition's watermark (an offset the log does not have yet cannot
+%% be redelivered):
+%%
+%%   * a due offset is paused (`next_at = infinity') and its executor woken --
+%%     `infinity' means "handed to a connection, waiting for its next timeout",
+%%     which is why one wake produces at most one retry;
+%%   * a `dlq_append_failed' entry tries the dead-letter append again, keeping
+%%     the cursor where it is (§15.5).
+sweep_retries(State) ->
+    Now = now_ms(),
+    lists:foldl(
+      fun({{SubRef, P}, Row}, Acc) ->
+              case map_size(broker_cursor:retries(Row)) of
+                  0 ->
+                      Acc;
+                  _ ->
+                      case broker_queue:watermarks(P) of
+                          {ok, _Committed, High} ->
+                              lists:foldl(
+                                fun(O, SAcc) ->
+                                        sweep_one(SubRef, P, O, High, Now, SAcc)
+                                end, Acc, broker_cursor:due(Row, Now, High));
+                          {error, _Reason} ->
+                              Acc
+                      end
+              end
+      end, State, ets:tab2list(?CURSORS)).
+
+sweep_one(SubRef, P, O, _High, _Now, State) ->
+    %% Re-read: an ack (which clears the entry) may have landed between the
+    %% snapshot `sweep_retries/1' took and this offset's turn.
+    case ets:lookup(?CURSORS, {SubRef, P}) of
+        [] ->
+            State;
+        [{_, Row}] ->
+            case maps:get(O, broker_cursor:retries(Row), undefined) of
+                undefined ->
+                    State;
+                #{reason := dlq_append_failed, attempts := Attempts} ->
+                    dead_letter(SubRef, P, O, Attempts, Row, State);
+                #{next_at := At} when is_integer(At) ->
+                    Row1 = broker_cursor:pause(Row, [O]),
+                    State1 = store_row(SubRef, P, Row1, State),
+                    wake_executor(SubRef, P, O, State1),
+                    broker_metrics:inc(redelivery_total),
+                    State1;
+                _ ->
+                    State
+            end
+    end.
+
+dead_letter(SubRef, P, O, Attempts, Row, State) ->
+    Kind = element(1, SubRef),
+    QoS = entity_qos(SubRef),
+    case broker_dlq:dead_letter(P, O, #{qos => QoS, kind => Kind,
+                                        attempts => Attempts}) of
+        ok ->
+            finish_dead_letter(SubRef, P, O, Row, State);
+        {error, already_dead_letter} ->
+            %% The original is already a dead letter (it timed out on a `$dlq'
+            %% subscription). Nesting `$dlq/.../$dlq/...' adds no information, so
+            %% the cursor advances and the existing copy stays the evidence.
+            log_info("dead letter timed out again; advancing", [SubRef, P, O]),
+            finish_dead_letter(SubRef, P, O, Row, State);
+        {error, Reason} ->
+            %% §15.5: a failed dead-letter append must not consume the cursor.
+            %% Park it and retry the append on the next tick.
+            log_warning("dead letter append failed ~p for ~p ~p/~p",
+                        [Reason, SubRef, P, O]),
+            Now = now_ms(),
+            Row1 = schedule_retry(Row, O, Now + maps:get(retry_base, State), Now,
+                                  dlq_append_failed),
+            store_row(SubRef, P, Row1, State)
+    end.
+
+%% The broker consumed the offset: plain rows advance their scalar cursor,
+%% shared rows settle the assignment even though no consumer acked it.
+finish_dead_letter(SubRef, P, O, Row, State) ->
+    Row1 = case maps:get(kind, Row) of
+               shared -> broker_cursor:settle(Row, O);
+               _ -> broker_cursor:advance_plain(Row, O)
+           end,
+    State1 = store_row(SubRef, P, Row1, State),
+    absorb_advance(SubRef, delta(Row, Row1), State1).
+
+%% Who can redeliver this offset now:
+%%   * exclusive -- the client that owns the SubRef;
+%%   * failover  -- the currently active member (a standby must not pull, §19.4);
+%%   * shared    -- *every* attached member: the wake is a hint, a later claim
+%%                  decides who actually reads it (ADR-019 §19.4).
+wake_executor(SubRef = {shared, _Key, _Filter}, P, O, _State) ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [{_, #{consumers := Consumers}}] ->
+            lists:foreach(fun(C) -> wake_client(C, {broker_redeliver, shared,
+                                                    SubRef, P, O}) end, Consumers);
+        [] ->
+            ok
+    end;
+wake_executor(SubRef = {Kind, _Key, _Filter}, P, O, _State) when Kind =:= exclusive ->
+    wake_client(element(2, SubRef), {broker_redeliver, Kind, SubRef, P, O});
+wake_executor(SubRef = {failover, _Key, _Filter}, P, O, State) ->
+    case owner_of(SubRef, State) of
+        undefined -> ok;
+        ClientId -> wake_client(ClientId, {broker_redeliver, failover, SubRef, P, O})
+    end.
+
+owner_of(SubRef, State) ->
+    case maps:get(SubRef, maps:get(active_of, State, #{}), undefined) of
+        undefined ->
+            case ets:lookup(?ENTITIES, SubRef) of
+                [{_, #{consumers := Consumers}}] -> first_attached(Consumers);
+                [] -> undefined
+            end;
+        ClientId ->
+            ClientId
+    end.
+
+wake_client(undefined, _Msg) ->
+    ok;
+wake_client(ClientId, Msg) ->
+    case ets:lookup(?ATTACHMENTS, ClientId) of
+        [{_, #{pid := Pid}}] -> Pid ! Msg, ok;
+        [] -> ok
+    end.
+
+entity_qos(SubRef) ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [{_, #{qos := QoS}}] -> QoS;
+        [] -> 1
+    end.
+
+store_row(SubRef, P, Row, State) ->
+    true = ets:insert(?CURSORS, {{SubRef, P}, Row}),
+    mark_cursor_dirty(SubRef, State).
+
+%% Retry state lives in the cursor row, so it reaches `.cursors' through the
+%% same flush window as the cursor itself (E-2). A crash may therefore lose the
+%% last window of attempts, which only means *more* retries -- the safe
+%% direction (ADR-015 §15.6).
+mark_cursor_dirty(SubRef, State) ->
+    #{cursor_dirty := Dirty} = State,
+    State#{cursor_dirty := Dirty#{SubRef => maps:get(SubRef, Dirty, 0)}}.
+
+now_ms() ->
+    %% System time, not monotonic: `next_at' is persisted and must still mean
+    %% something after a VM restart.
+    erlang:system_time(millisecond).
+
+log_info(Fmt, Args) -> logger:log(info, "broker_subscription: " ++ Fmt, Args).
+log_warning(Fmt, Args) -> logger:log(warning, "broker_subscription: " ++ Fmt, Args).
+
 %%%_* failover active election ------------------------------------------------
 
 %% The consumer list is the order; the active is the first member with a live
@@ -922,6 +1164,9 @@ create_protected_table(Name) ->
 
 rearm(cursor_tick, State = #{cursor_interval := Ms}) when Ms > 0 ->
     _ = erlang:send_after(Ms, self(), cursor_tick),
+    State;
+rearm(retry_tick, State = #{retry_interval := Ms}) when Ms > 0 ->
+    _ = erlang:send_after(Ms, self(), retry_tick),
     State;
 rearm(inflight_tick, State = #{inflight_interval := Ms}) when Ms > 0 ->
     _ = erlang:send_after(Ms, self(), inflight_tick),

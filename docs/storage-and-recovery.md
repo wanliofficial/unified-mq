@@ -276,15 +276,23 @@ recover(P, Dir):
 - 写入序列：**临时文件 → `file:sync` → `rename` 覆盖**。rename 在 ext4/xfs 上原子，读者只会看到完整旧文件或完整新文件；**不做目录级 fsync**（掉电语义见 §11）。
 - 解码：`.subs`/`.cursors` 用 `[safe]`（body 只有 binary/integer/atom）；`.inflight` **不用** `[safe]`（含 `mqtt_conn_fsm` 的原子，M11）。
 - `list_subscriptions/0` 只枚举 `*.subs`：集合是权威；没有对应 `.subs` 的 `.cursors` 是孤儿，boot 时删除（`prune_orphan_cursors/0`）。
-- **`assigned` 不落盘**（ADR-019 §19.3）：它是活的分配，崩溃后必须全部重投。落盘的只有 `low`（plain 行是 `offset`）与 `acked`。
+- **`assigned` 不落盘**（ADR-019 §19.3）：它是活的分配，崩溃后必须全部重投。落盘的是 `low`（plain 行是 `offset`）、`acked`，以及 S2-E 的重试状态 `retries`。
 
 `.cursors` 的两种行（`broker_cursor`）：
 
 ```
-plain（exclusive/failover）：#{kind, offset := offset(), pending := [offset()]}
+plain（exclusive/failover）：#{kind, offset := offset(), pending := [offset()],
+                               retries := #{offset() => retry()}}
 shared                      ：#{kind, low := offset(), acked := #{offset() => true},
-                               assigned := #{offset() => ClientId}}
+                               assigned := #{offset() => ClientId},   % 不落盘
+                               retries := #{offset() => retry()}}
+
+retry() :: #{attempts := pos_integer(), first_at := integer(),
+             next_at := integer(), reason := ack_timeout | dlq_append_failed}
 ```
+
+- **`retries` 落盘（S2-E / ADR-015 §15.6）**：退避进度不能只活在内存里，否则重启会把 `max_attempts` 的预算清零。崩溃回退窗口内 `attempts` 可能回退，表现是**多重试几次**（方向安全，不会少投）；`restore/1` 保留 `retries`、清 `assigned`，`persist/1` 原样保留。
+- **`next_at` 的两种取值**：整数 = 退避到期时刻（epoch ms）；`infinity` = 已下发给连接、等下一次 ack 超时。成员死亡/`release` 会把 `infinity` 解冻回 `0`（立即可重投），`attempts` 不丢。
 
 `.inflight` 的 Body（ADR-018 §18.3 R3）：
 
@@ -362,6 +370,18 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 - 上限拒绝（`max_retained` / `max_retained_bytes` / `max_payload_bytes`）发生在**写盘之前**：树不变、仍向在线订阅者转发、publisher 仍拿到正常 ack，计数 `retain_overflow` 加一。**拒绝是有界的显式行为，不是丢消息**。
 - retain 树与 `.inflight`/`.cursors` 之间没有跨文件一致性要求：树只在 PUBLISH 时变，会话文件只在投递/ack 时变，两者可以各自回退到上一个完整版本，最坏结果是"重复补发一条 retained 消息"。
 
+### 9.6 DLQ 与 TTL 的存储事实（S2-E）
+
+| 项 | 事实 |
+|---|---|
+| DLQ 位置 | 普通 WAL destination（默认 `$dlq/{tenant}/{original}`），由 `broker_router_hash` 定分区；不是独立目录/独立 app |
+| 写入等级 | 固定 `fsync`（死信不能比原件更弱）；`expires_at = undefined`（否则过期消息进 DLQ 后立刻不可消费） |
+| 原值 | `x-original-destination` / `x-original-message-id` / `x-failure-reason` / `x-attempts` / `x-tenant`；`message_id` 重新生成 |
+| 嵌套 | 已在 DLQ 的消息再次失败不再嵌套死信（`already_dead_letter`），只推进 cursor |
+| 失败 | `append` 失败时 cursor 不越过原件，`dlq_append_failed` +1；下一轮重试仍从原件再试 |
+| TTL | `expires_at` 由 `build_message/7` 从 `message_ttl_ms` 填入；读者跳过过期记录并推进 cursor/committed，不改 `read_from/3` 契约 |
+| 恢复 | 不需要新文件：`retries` 在 `.cursors` 里；DLQ 副本就是普通 WAL 记录，按常规恢复 |
+
 ---
 
 ## 10. 恢复矩阵（Gate S1 硬项）
@@ -401,7 +421,7 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 | `fsync` append | 返回即已 `file:sync`；`kill -9` 不丢 |
 | `os_buffer` append | 返回即已写入页缓存；`kill -9` 不丢，掉电可能丢 |
 | 订阅集合 | 每次变化 fsync + 原子 rename；`kill -9` 后完整 |
-| cursor / in-flight | 有界回退（窗口见 §9.2）；方向只偏低 |
+| cursor / in-flight | 有界回退（窗口见 §9.2）；方向只偏低；`retries` 随 cursor 窗口回退（多试几次，不会少试） |
 | 恢复 | 撕裂尾截断；损坏/跨版本/缺段拒绝启动；水位只夹低 |
 | 分区创建 | 只由带外动作产生；boot 不静默创建 |
 
@@ -410,6 +430,8 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 - **掉电（power loss）**：`kill -9` 不覆盖 `os_buffer` 窗口，也没有目录级 fsync（`rename` 后的目录项可能丢）。S0.3 已注明，S2 用 dm-flakey / VM 硬复位补。
 - **不重复**：默认档 cursor/in-flight 有回退窗口，重复是契约内行为；只有零回退档能逼近"零重复"。
 - **retention / 空间回收**：段与 `meta.log` 都只增不减；`truncate_before` 只是逻辑边界。
+- **TTL 不删数据**：`expires_at` 只在读者侧过滤（S2-E）；过期记录仍占段空间，直到 S2-F 的段级 GC 回收。
+- **DLQ 条数**：`dlq_size` 是 gauge，S2-E 只增不减（段删除在 S2-F 才发生），因此它是「累计死信量」的上界，不是「当前可消费条数」。
 - **跨版本写**：旧代码遇到更高 Vsn 拒绝启动（这是有意的安全行为，不是兼容承诺）。
 - **多写者并发**：每分区单写者是硬前提；绕过 `wal_writer` 直接写段文件会破坏 offset 稠密性。
 

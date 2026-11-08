@@ -80,7 +80,17 @@ all() ->
      orphan_cursors_files_are_removed_at_boot,
      %% ADR-019 §19.2 (plan §2.5): dispatch recipients by kind.
      a_qos0_publish_reaches_exactly_one_shared_member,
-     a_durable_wake_reaches_every_shared_member].
+     a_durable_wake_reaches_every_shared_member,
+     %% S2-E (ADR-015): retry algebra, backoff, DLQ and TTL-adjacent rules.
+     retry_algebra_schedules_and_ack_clears,
+     backoff_sequence_is_exponential_and_capped,
+     shared_retry_waits_for_the_backoff_before_reclaim,
+     max_attempts_dead_letters_and_advances,
+     a_dead_letter_is_an_ordinary_subscribable_destination,
+     dlq_template_validation_and_rendering,
+     a_bad_dlq_template_refuses_boot,
+     a_failed_dead_letter_keeps_the_cursor,
+     retry_progress_survives_a_restart].
 
 %%%_* Fixtures ------------------------------------------------------------
 
@@ -110,6 +120,14 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_max_regress, 64),
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 100),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 100),
+    %% S2-E knobs: every case starts from the production defaults, and a case
+    %% that needs another posture re-sets them before boot/0 (same J10 rule).
+    ok = application:set_env(broker_subscription, retry_tick_ms, 1000),
+    ok = application:set_env(broker_subscription, retry_base_ms, 1000),
+    ok = application:set_env(broker_subscription, retry_max_delay_ms, 60000),
+    ok = application:set_env(broker_subscription, max_attempts, 10),
+    ok = application:set_env(broker_subscription, dlq_name_pattern,
+                             <<"$dlq/{tenant}/{original}">>),
     {ok, _Started} = application:ensure_all_started(broker_storage),
     [{data_dir, DataDir} | Config].
 
@@ -973,6 +991,178 @@ a_durable_wake_reaches_every_shared_member(_Config) ->
     [<<"c1">>, <<"c2">>] = lists:sort(Got),
     ok.
 
+%%%_* S2-E: retry, DLQ and TTL (ADR-015) -------------------------------------
+
+%% E-1: the retry row is pure algebra. `attempts' counts failures, `due/3' and
+%% `blocked/3' partition the retry map by `next_at', and an ack ends the story.
+retry_algebra_schedules_and_ack_clears(_Config) ->
+    R0 = broker_cursor:new_shared(1),
+    {ok, [1], R1} = broker_cursor:claim(R0, 1, 100, <<"a">>, 4096),
+    R2 = broker_cursor:retry(broker_cursor:release_offset(R1, 1), 1, 1000, 10,
+                             ack_timeout),
+    1 = broker_cursor:attempts(R2, 1),
+    %% Still in backoff: not due, and a claim must skip it.
+    [] = broker_cursor:due(R2, 500, 100),
+    #{1 := true} = broker_cursor:blocked(R2, 500, 100),
+    {ok, [], _} = broker_cursor:claim(R2, 1, 2, <<"b">>, 4096,
+                                      broker_cursor:blocked(R2, 500, 100)),
+    %% Due once the clock reaches next_at.
+    [1] = broker_cursor:due(R2, 1000, 100),
+    #{} = broker_cursor:blocked(R2, 1000, 100),
+    R3 = broker_cursor:retry(R2, 1, 2000, 1000, ack_timeout),
+    2 = broker_cursor:attempts(R3, 1),
+    %% Paused (handed to a connection) is neither due nor blocked.
+    R4 = broker_cursor:pause(R3, [1]),
+    [] = broker_cursor:due(R4, 5000, 100),
+    #{} = broker_cursor:blocked(R4, 5000, 100),
+    %% Releasing the holder unpauses it immediately.
+    R5 = broker_cursor:release_offset(R4#{assigned := #{1 => <<"c">>}}, 1),
+    [1] = broker_cursor:due(R5, 5000, 100),
+    %% An ack clears the retry entry.
+    R6 = R5#{assigned := #{1 => <<"a">>}},
+    {ok, R7} = broker_cursor:ack_shared(R6, 1, <<"a">>),
+    0 = broker_cursor:attempts(R7, 1),
+    ok.
+
+%% E-3: §15.2's curve, asserted with no clock.
+backoff_sequence_is_exponential_and_capped(_Config) ->
+    [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000] =
+        [broker_cursor:backoff(N, 1000, 60000) || N <- lists:seq(1, 8)],
+    %% A huge attempt count must not overflow the shift.
+    60000 = broker_cursor:backoff(1000000, 1000, 60000),
+    ok.
+
+%% E-2/E-5: a timed-out shared offset is released, parked for its backoff and
+%% counted in the window while it waits.
+shared_retry_waits_for_the_backoff_before_reclaim(_Config) ->
+    ok = application:set_env(broker_subscription, retry_base_ms, 400),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 3600000),
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    {ok, Offset} = append(0, <<"s/a">>),
+    {ok, [Offset]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    %% Within the backoff the offset is nobody's to claim ...
+    {ok, []} = broker_subscription:claim(SubRef, 0, 100, <<"c2">>),
+    timer:sleep(500),
+    %% ... and once it elapses the survivor gets it, with the attempt count kept
+    %% (a later timeout is attempt 2, not 1).
+    {ok, [Offset]} = broker_subscription:claim(SubRef, 0, 100, <<"c2">>),
+    ok.
+
+%% E-4/E-5: `max_attempts' failures dead-letter the message, advance the cursor
+%% (so the partition is not pinned) and append a normal, fsynced, TTL-free copy.
+max_attempts_dead_letters_and_advances(_Config) ->
+    ok = application:set_env(broker_subscription, max_attempts, 2),
+    ok = application:set_env(broker_subscription, retry_base_ms, 60000),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 3600000),
+    ok = boot(),
+    ok = broker_metrics:reset(),
+    {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"s/#">>, 1),
+    {ok, Offset} = append(0, <<"s/a">>),
+    %% Failure 1: schedule a retry, cursor stays.
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    {ok, 1} = broker_subscription:cursor(SubRef, 0),
+    #{dlq_appends := 0} = broker_metrics:snapshot(),
+    %% Failure 2 reaches the budget: dead letter + advance.
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    {ok, 2} = broker_subscription:cursor(SubRef, 0),
+    Dest = <<"$dlq/t0/s/a">>,
+    Copy = find_message(dlq_partition(Dest), Dest),
+    <<"p">> = Copy#broker_message.payload,
+    undefined = Copy#broker_message.expires_at,
+    fsync = Copy#broker_message.reliability,
+    durable = Copy#broker_message.persistence,
+    #{<<"x-original-message-id">> := <<"m">>,
+      <<"x-original-destination">> := <<"s/a">>,
+      <<"x-attempts">> := <<"2">>,
+      <<"x-tenant">> := <<"t0">>,
+      <<"x-failure-reason">> := <<"max_attempts">>} = Copy#broker_message.headers,
+    true = byte_size(Copy#broker_message.message_id) =:= 16,
+    #{dlq_appends := 1, dlq_size := 1} = broker_metrics:snapshot(),
+    ok.
+
+%% E-7: the DLQ is a destination, not a subsystem: an ordinary `$dlq/#' filter
+%% indexes it in the Router exactly like any other topic.
+a_dead_letter_is_an_ordinary_subscribable_destination(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:subscribe(<<"audit">>, <<"$dlq/#">>, 1),
+    Ref = {exclusive, <<"audit">>, <<"$dlq/#">>},
+    SubRef = Ref,
+    true = lists:member(Ref, route_refs(<<"$dlq/t0/orders/new">>)),
+    false = lists:member(Ref, route_refs(<<"orders/new">>)),
+    ok.
+
+%% E-6: template validation is boot-time, and `name/2' is literal substitution.
+dlq_template_validation_and_rendering(_Config) ->
+    Default = <<"$dlq/{tenant}/{original}">>,
+    ok = broker_dlq:validate_pattern(Default),
+    ok = broker_dlq:validate_pattern(<<"dead/{kind}/{tenant}/{original}/{qos}">>),
+    {error, wildcard_in_pattern} = broker_dlq:validate_pattern(<<"$dlq/+/x">>),
+    {error, wildcard_in_pattern} = broker_dlq:validate_pattern(<<"$dlq/#">>),
+    {error, {unknown_variable, <<"nope">>}} =
+        broker_dlq:validate_pattern(<<"$dlq/{nope}/x">>),
+    {error, unterminated_variable} = broker_dlq:validate_pattern(<<"$dlq/{tenant">>),
+    Bindings = #{tenant => <<"t0">>, original => <<"orders/new">>,
+                 qos => 1, kind => shared},
+    <<"$dlq/t0/orders/new">> = broker_dlq:name(Default, Bindings),
+    <<"dead/shared/t0/orders/new/1">> =
+        broker_dlq:name(<<"dead/{kind}/{tenant}/{original}/{qos}">>, Bindings),
+    ok.
+
+%% E-6's boot half: a template that could never be published is refused at
+%% start, not on the first dead letter.
+a_bad_dlq_template_refuses_boot(_Config) ->
+    ok = application:set_env(broker_subscription, dlq_name_pattern,
+                             <<"$dlq/+/x">>),
+    [ok = broker_queue:create_partition(P) || P <- broker_queue:partition_ids()],
+    {error, {broker_subscription,
+             {{shutdown, {failed_to_start_child, broker_subscription_worker,
+                          {invalid_dlq_pattern, wildcard_in_pattern}}},
+              {broker_subscription_app, start, [normal, []]}}}} =
+        application:ensure_all_started(broker_subscription),
+    undefined = whereis(broker_subscription_worker),
+    ok.
+
+%% E-8: a dead-letter append that fails must not consume the cursor (§15.5).
+%% The original here is an offset the log does not have, which is the honest way
+%% to make the copy impossible without breaking the partition.
+a_failed_dead_letter_keeps_the_cursor(_Config) ->
+    ok = application:set_env(broker_subscription, max_attempts, 1),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 3600000),
+    ok = boot(),
+    ok = broker_metrics:reset(),
+    {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"s/#">>, 1),
+    ok = broker_subscription:retry(SubRef, 0, 0, <<"c1">>),
+    {ok, 1} = broker_subscription:cursor(SubRef, 0),
+    #{dlq_append_failed := Failed} = broker_metrics:snapshot(),
+    true = Failed >= 1,
+    #{dlq_appends := 0} = broker_metrics:snapshot(),
+    ok.
+
+%% E-9: retries are in the cursor row, so a restart keeps the attempt budget.
+%% If the retry state were connection-local, the second failure below would be
+%% attempt 1 again and the message would not be dead-lettered.
+retry_progress_survives_a_restart(_Config) ->
+    ok = application:set_env(broker_subscription, max_attempts, 2),
+    ok = application:set_env(broker_subscription, retry_base_ms, 60000),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 3600000),
+    ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 20),
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"s/#">>, 1),
+    {ok, Offset} = append(0, <<"s/a">>),
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    {ok, 1} = broker_subscription:cursor(SubRef, 0),
+    %% Let the cursor tick put the `retries' map on disk.
+    timer:sleep(150),
+    ok = bounce_subscription_app(),
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    {ok, 2} = broker_subscription:cursor(SubRef, 0),
+    Dest = <<"$dlq/t0/s/a">>,
+    _Copy = find_message(dlq_partition(Dest), Dest),
+    ok.
+
 %%%_* Helpers -------------------------------------------------------------------
 
 append(Partition, Dest) ->
@@ -988,6 +1178,27 @@ msg(Dest) ->
                     headers = #{}, proto_meta = #{},
                     persistence = durable, reliability = fsync,
                     created_at = erlang:system_time(millisecond)}.
+
+%% The DLQ destination is routed by the same oracle a publish uses (ADR-010).
+dlq_partition(Dest) ->
+    {ok, Env} = broker_router:env(),
+    {ok, [{P, _Refs} | _]} = broker_router_hash:route(Dest, #{}, Env),
+    P.
+
+find_message(P, Dest) ->
+    find_message(P, Dest, 0).
+
+find_message(P, Dest, From) ->
+    case broker_queue:read_from(P, From, 100) of
+        {ok, Page, Next} when is_list(Page), Page =/= [] ->
+            case [M || {_O, M} <- Page, M#broker_message.destination =:= Dest] of
+                [M | _] -> M;
+                [] when Next > From -> find_message(P, Dest, Next);
+                _ -> exit({no_message_on_destination, P, Dest})
+            end;
+        _ ->
+            exit({no_message_on_destination, P, Dest})
+    end.
 
 route_refs(Dest) ->
     {ok, Env} = broker_router:env(),
