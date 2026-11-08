@@ -30,25 +30,29 @@ S1 是一个**单节点、无复制**的 MQTT 3.1.1 broker 垂直切片，只实
 
 ## 2. 应用划分
 
-### 2.1 9 个应用（S1 的 8 个 + S2-A 的 `broker_metrics`）
+### 2.1 11 个应用（S1 的 8 个 + S2-A 的 `broker_metrics` + S4 的 `broker_meta`/`broker_cluster`）
 
 ```
 apps/
 ├── broker_core/          仅 include/broker_message.hrl 与公共类型；无模块、无进程、无 supervisor
 ├── broker_metrics/       S2-A：counters/atomics 指标 + snapshot/0 + 周期单行日志（无热路径进程）
+├── broker_meta/          S4：Mnesia 控制面 11 表、版本/对账、outbox、用户哈希与 ACL（不含消息正文）
+├── broker_cluster/       S4：ra Metadata Raft Group、归属缓存、Epoch Fencing、复制与 quorum
 ├── broker_storage/       broker_storage behavior + 内存/WAL 两实现 + WAL 内部七个模块
 ├── broker_router/        broker_router behavior + broker_router_hash 实现（内存索引）
 ├── broker_queue/         分区层：存储句柄生命周期、append/read 编排、{new_messages} 扇出
 ├── broker_subscription/  订阅、per-sub cursor、投递唤醒、三层会话持久化
-├── broker_event/         CloudEvents 策略接口（S1：`policy/0` + 恒等 `apply_policy/1,2` + 保留 `#cloud_event{}` 接口位）
+├── broker_event/         CloudEvents codec/binding/五档策略/去重（S3）
 ├── broker_security/      username/password 认证与 allow-all ACL 桩（纯函数）
-└── broker_proto_mqtt/    MQTT 3.1.1 编解码 + 连接 FSM + ranch listener
+└── broker_proto_mqtt/    MQTT 3.1.1/5 编解码 + 连接 FSM + ranch listener
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
 |---|---|---|---|---|
 | `broker_core` | kernel, stdlib | 无 | `broker_message.hrl` 的 `#broker_message{}`、`partition_id()`、`sync_mode()` | 无（纯类型） |
 | `broker_metrics` | kernel, stdlib, sasl | `broker_metrics_server`（仅 `report_interval_ms > 0`；指标本身不在进程里） | `inc/1,2`、`observe/2`、`gauge/2`、`gauge_add/2`、`snapshot/0`、`p99/1`、`keys/0` | `counters`/`atomics` 数组 + `persistent_term` 的 `Key → {Kind,Ref,Idx}` 索引（无 ETS） |
+| `broker_meta` | kernel, stdlib, sasl, mnesia, crypto, broker_core | 无（调用方同步访问 Mnesia） | `ensure_schema/0`、11 张表的 CRUD、`bump/1`、`reconcile/0`、`enqueue/2`、`user/1`、`acl/4` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用 |
+| `broker_cluster` | kernel, stdlib, sasl, ra, broker_core, broker_meta, broker_metrics, broker_queue | `broker_cluster_meta_ctl`（ra server `{broker_cluster_meta, Node}`）、`broker_cluster_cache`、`broker_cluster_rep` | `assign/4`、`migrate/4`、`finish_migration/2`、`owner/1`、`epoch/1`、`authorize_append/2`、`replicate/2`、`reliable/0` | 本地 ETS 归属/epoch 缓存；ra 日志与快照；`persistent_term` 队列钩子 |
 | `broker_storage` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
 | `broker_queue` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router | `broker_queue_store` + 每分区 `broker_queue_partition` | `append/3`、`read_from/3`、`watermarks/1`、`capability/1`、`subscribe/2`、`create_partition/1` | 分区句柄注册表、每分区订阅者集合 |
@@ -79,6 +83,8 @@ broker_storage ←── broker_queue ←── broker_subscription ←── br
 broker_router  ←── broker_queue ──┘            ↑
 broker_security ───────────────────────────────┘
 broker_event ──────────────────────────────────┘（发布路径调用；默认 pass_through 恒等）
+broker_meta    ←── broker_cluster             （控制面单向依赖；broker_cluster 不反向依赖协议层）
+broker_cluster ──→ broker_queue（仅通过 persistent_term 钩子，未注册时 no-op）
 ```
 
 依赖只允许**向下**：协议层可以调内核，内核任何一层都不得反向引用 `broker_proto_mqtt`；`broker_core` 不依赖任何兄弟应用。`xref` 是这条约束的机械检查（当前只剩预期的 unused-export 告警）。

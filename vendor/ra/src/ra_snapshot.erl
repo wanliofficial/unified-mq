@@ -1,0 +1,1162 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2017-2025 Broadcom. All Rights Reserved. The term Broadcom refers to Broadcom Inc. and/or its subsidiaries.
+%%
+-module(ra_snapshot).
+
+-include("ra.hrl").
+
+-include_lib("stdlib/include/assert.hrl").
+-type file_err() :: ra_lib:file_err().
+
+%% alias
+-type meta() :: snapshot_meta().
+
+-export([
+         recover/1,
+         recover_recovery_checkpoint/1,
+         read_meta/2,
+         begin_read/2,
+         read_chunk/3,
+         delete/2,
+
+         init/7,
+         init/8,
+         init/9,
+         init_ets/0,
+         current/1,
+         pending/1,
+         accepting/1,
+         directory/2,
+         last_index_for/1,
+
+         begin_snapshot/5,
+         promote_checkpoint/2,
+         complete_snapshot/5,
+
+         begin_accept/2,
+         accept_chunk/3,
+         complete_accept/4,
+         abort_accept/1,
+
+         context/2,
+
+         handle_error/3,
+         current_snapshot_dir/1,
+
+         latest_checkpoint/1,
+         recovery_checkpoint/1,
+         highest_idx/1,
+
+         take_older_checkpoints/2,
+         take_extra_checkpoints/1,
+
+         make_snapshot_dir/3,
+         write_indexes/2,
+         indexes/1,
+
+         write_recovery_checkpoint/4,
+         delete_recovery_checkpoint/1,
+
+         snapshot_size/1
+        ]).
+
+-type effect() :: {monitor, process, snapshot_writer, pid()} |
+                  {bg_work, fun(), fun()}.
+
+-type kind() :: snapshot | checkpoint | recovery_checkpoint.
+
+-type checkpoint() :: ra_idxterm().
+-type recovery_checkpoint() :: ra_idxterm().
+
+-export_type([
+              meta/0,
+              file_err/0,
+              effect/0,
+              chunk_flag/0,
+              kind/0,
+              checkpoint/0,
+              recovery_checkpoint/0
+             ]).
+
+-record(accept, {%% the next expected chunk
+                 next = 1 :: non_neg_integer(),
+                 state :: term(),
+                 machine_version :: non_neg_integer(),
+                 idxterm :: ra_idxterm()}).
+
+-record(?MODULE,
+        {uid :: ra_uid(),
+         counter :: undefined | counters:counters_ref(),
+         module :: module(),
+         %% Per-system pool of gen_batch_server workers that serialize and
+         %% batch fsync calls across all Ra servers in the system.
+         sync_server :: undefined | ra_log_sync:pool_ref(),
+         %% typically <data_dir>/snapshots
+         %% snapshot subdirs are store below
+         %% this as <data_dir>/snapshots/Term_Index
+         snapshot_directory :: file:filename_all(),
+         %% <data_dir>/checkpoints
+         %% like snapshots, these are also stored in subdirs
+         %% as <data_dir>/checkpoints/Term_Index
+         checkpoint_directory :: file:filename_all(),
+         %% <data_dir>/recovery_checkpoint
+         %% recovery checkpoints are written synchronously during shutdown
+         %% to speed up recovery. Only one exists at a time.
+         %% undefined when recovery checkpoints are not configured
+         recovery_checkpoint_directory :: option(file:filename_all()),
+         pending :: option({ra_idxterm(), kind()}),
+         accepting :: option(#accept{}),
+         current :: option(ra_idxterm()),
+         checkpoints = [] :: list(checkpoint()),
+         max_checkpoints :: pos_integer(),
+         %% recovery checkpoint - written during shutdown, used to speed up recovery
+         recovery_checkpoint :: option(recovery_checkpoint()),
+         machine :: option(ra_machine:machine()),
+         snapshot_size = undefined :: non_neg_integer() | undefined}).
+
+-define(ETSTBL, ra_log_snapshot_state).
+
+%% Indexes file format constants
+-define(IDX_MAGIC, "RASI").  %% RA Snapshot Indexes
+-define(IDX_VERSION, 1).
+
+-opaque state() :: #?MODULE{}.
+
+-export_type([state/0]).
+
+-optional_callbacks([context/0,
+                     get_size/1]).
+
+%% Side effect function
+%% Turn the current state into immutable reference.
+-callback prepare(Index :: ra_index(),
+                  State :: term()) ->
+    Ref :: term().
+
+%% Saves snapshot from external state to disk.
+%% Runs in a separate process.
+%% External storage should be available to read
+%% `Sync' suggests whether the file should be synchronized with `fsync(1)'.
+-callback write(Location :: file:filename_all(),
+                Meta :: meta(),
+                Ref :: term(),
+                Sync :: boolean()) ->
+    ok |
+    {ok, Bytes :: non_neg_integer()} |
+    {error, file_err() | term()}.
+
+%% Synchronizes the snapshot to disk.
+-callback sync(Location :: file:filename_all()) ->
+    ok |
+    {error, file_err() | term()}.
+
+
+%% Read the snapshot metadata and initialise a read state used in read_chunk/1
+%% The read state should contain all the information required to read a chunk
+%% The Context is the map returned by the context/0 callback
+%% This can be used to inform the sender of receive capabilities.
+-callback begin_read(Location :: file:filename_all(), Context :: map()) ->
+    {ok, Meta :: meta(), ReadState :: term()}
+    | {error, term()}.
+
+%% Read a chunk of data from the snapshot using the read state
+%% Returns a binary chunk of data and a continuation state
+-callback read_chunk(ReadState,
+                     ChunkSizeBytes :: non_neg_integer(),
+                     Location :: file:filename_all()) ->
+    {ok, Chunk :: term(), {next, ReadState} | last} | {error, term()}.
+
+%% begin a stateful snapshot acceptance process
+-callback begin_accept(SnapDir :: file:filename_all(),
+                       Meta :: meta()) ->
+    {ok, AcceptState :: term()} | {error, term()}.
+
+%% accept a chunk of data
+-callback accept_chunk(Chunk :: term(),
+                       AcceptState :: term()) ->
+    {ok, AcceptState :: term()} | {error, term()}.
+
+%% accept the last chunk of data
+-callback complete_accept(Chunk :: term(),
+                          AcceptState :: term()) ->
+    ok |
+    {ok, Bytes :: non_neg_integer()} |
+    {error, term()}.
+
+%% Side-effect function
+%% Recover machine state from file
+-callback recover(Location :: file:filename_all()) ->
+    {ok, Meta :: meta(), State :: term()} | {error, term()}.
+
+%% validate the integrity of the snapshot
+-callback validate(Location :: file:filename_all()) ->
+    ok | {error, term()}.
+
+%% Only read meta data from snapshot
+-callback read_meta(Location :: file:filename_all()) ->
+    {ok, meta()} |
+    {error, invalid_format |
+            {invalid_version, integer()} |
+            checksum_error |
+            file_err() |
+            term()}.
+
+-callback context() -> map().
+
+-callback get_size(Location :: file:filename_all()) ->
+    {ok, SnapshotSize :: non_neg_integer() | undefined} |
+    {error, file_err() | term()}.
+
+-spec init(ra_uid(), module(),
+           file:filename_all(), file:filename_all(),
+           option(ra_machine:machine()),
+           undefined | counters:counters_ref(),
+           pos_integer()) ->
+    state().
+init(UId, Module, SnapshotsDir, CheckpointDir,
+     Machine, Counter, MaxCheckpoints) ->
+    init(UId, Module, SnapshotsDir, CheckpointDir,
+         undefined, Machine, Counter, MaxCheckpoints).
+
+-spec init(ra_uid(), module(),
+           file:filename_all(), file:filename_all(),
+           option(file:filename_all()),
+           option(ra_machine:machine()),
+           undefined | counters:counters_ref(),
+           pos_integer()) ->
+    state().
+init(UId, Module, SnapshotsDir, CheckpointDir,
+     RecoveryCheckpointDir, Machine,
+     Counter, MaxCheckpoints) ->
+    init(UId, Module, SnapshotsDir, CheckpointDir,
+         RecoveryCheckpointDir, undefined, Machine,
+         Counter, MaxCheckpoints).
+
+-spec init(ra_uid(), module(),
+           file:filename_all(), file:filename_all(),
+           option(file:filename_all()),
+           undefined | ra_log_sync:pool_ref(),
+           option(ra_machine:machine()),
+           undefined | counters:counters_ref(),
+           pos_integer()) ->
+    state().
+init(UId, Module, SnapshotsDir, CheckpointDir,
+     RecoveryCheckpointDir, SyncServer, Machine,
+     Counter, MaxCheckpoints) ->
+    State = #?MODULE{uid = UId,
+                     counter = Counter,
+                     module = Module,
+                     machine = Machine,
+                     sync_server = SyncServer,
+                     snapshot_directory = SnapshotsDir,
+                     checkpoint_directory = CheckpointDir,
+                     recovery_checkpoint_directory = RecoveryCheckpointDir,
+                     max_checkpoints = MaxCheckpoints},
+    State1 = find_snapshots(State),
+    State2 = find_checkpoints(State1),
+    find_recovery_checkpoint(State2).
+
+find_snapshots(#?MODULE{uid = UId,
+                        module = Module,
+                        machine = Machine,
+                        snapshot_directory = SnapshotsDir} = State) ->
+    true = ra_lib:is_dir(SnapshotsDir),
+    {ok, Snaps0} = prim_file:list_dir(SnapshotsDir),
+    Snaps = lists:reverse(lists:sort(Snaps0)),
+    %% /snapshots/term_index/
+    case pick_first_valid(UId, Module, SnapshotsDir, Snaps) of
+        undefined ->
+            ok = delete_snapshots(SnapshotsDir, Snaps),
+            %% initialise snapshots table even if no snapshots have been taken
+            %% this ensure these is an entry when the WAL queries it
+            ok = ra_log_snapshot_state:insert(?ETSTBL, UId, -1, 0, []),
+            State;
+        Current0 ->
+            Current = filename:join(SnapshotsDir, Current0),
+            {ok, #{index := Idx,
+                   term := Term}} = Module:read_meta(Current),
+            SnapshotSize = try
+                               case Module:get_size(Current) of
+                                   {ok, Size} when is_integer(Size) ->
+                                       Size;
+                                   {error, _} ->
+                                       undefined
+                               end
+                           catch
+                               error:undef ->
+                                   undefined
+                           end,
+            Indexes = case indexes(Current) of
+                          {ok, Idxs} ->
+                              Idxs;
+                          {error, Err} ->
+                              recover_indexes(
+                                UId, Module, Machine,
+                                Current, Err)
+                      end,
+            SmallestLiveIdx = case ra_seq:first(Indexes) of
+                                  undefined ->
+                                      Idx+1;
+                                  First ->
+                                      First
+                              end,
+            ok = ra_log_snapshot_state:insert(?ETSTBL, UId, Idx, SmallestLiveIdx,
+                                              Indexes),
+
+            ok = delete_snapshots(SnapshotsDir, lists:delete(Current0, Snaps)),
+            %% delete old snapshots if any
+            State#?MODULE{current = {Idx, Term},
+                          snapshot_size = SnapshotSize}
+    end.
+
+recover_indexes(UId, Module, Machine, SnapDir, Err) ->
+    ?WARN("ra_snapshot: ~ts: indexes file corrupt "
+          "(~w), recovering from snapshot",
+          [UId, Err]),
+    case Module:recover(SnapDir) of
+        {ok, #{machine_version := MacVer}, MacState} ->
+            MacMod = ra_machine:which_module(
+                       Machine, MacVer),
+            Idxs = ra_machine:live_indexes(
+                     MacMod, MacState),
+            ok = write_indexes(SnapDir, Idxs),
+            ?INFO("ra_snapshot: ~ts: indexes file recovered "
+                  "~b live indexes recovered from snapshot",
+                  [UId, ra_seq:length(Idxs)]),
+            Idxs;
+        {error, RecoverErr} ->
+            ?WARN("ra_snapshot: ~ts: failed to "
+                  "recover snapshot for index "
+                  "rebuild: ~w",
+                  [UId, RecoverErr]),
+            []
+    end.
+
+delete_snapshots(Dir, Snaps) ->
+    Old = [filename:join(Dir, O) || O <- Snaps],
+    lists:foreach(fun ra_lib:recursive_delete/1, Old),
+    ok.
+
+pick_first_valid(_, _, _, []) ->
+    undefined;
+pick_first_valid(UId, Mod, Dir, [S | Rem]) ->
+    case Mod:validate(filename:join(Dir, S)) of
+        ok -> S;
+        Err ->
+            ?INFO("ra_snapshot: ~ts: skipping ~s as did not validate. Err: ~w",
+                  [UId, S, Err]),
+            pick_first_valid(UId, Mod, Dir, Rem)
+    end.
+
+find_checkpoints(#?MODULE{current = Current,
+                          checkpoint_directory = CheckpointDir} = State) ->
+    case ra_lib:is_dir(CheckpointDir) of
+        false ->
+            State;
+        true ->
+            CurrentIdx = case Current of
+                             undefined ->
+                                 -1;
+                             {I, _} ->
+                                 I
+                         end,
+            {ok, CPFiles0} = prim_file:list_dir(CheckpointDir),
+            %% Reverse-sort the files so that the most recent checkpoints
+            %% come first.
+            CPFiles = lists:reverse(lists:sort(CPFiles0)),
+            find_checkpoints(CPFiles, State, CurrentIdx, [])
+    end.
+
+find_checkpoints([], State, _CurrentIdx, Checkpoints) ->
+    %% Reverse so that the most recent checkpoints come first.
+    State#?MODULE{checkpoints = lists:reverse(Checkpoints)};
+find_checkpoints([File | Files],
+                 #?MODULE{uid = UId,
+                          module = Module,
+                          checkpoint_directory = CheckpointDir} = State,
+                 CurrentIdx, []) ->
+    %% When we haven't yet found a valid checkpoint (`Checkpoints =:= []`),
+    %% fully validate the file with the `ra_snapshot:validate/1` callback to
+    %% ensure that we can recover from the latest checkpoint.
+    CP = filename:join(CheckpointDir, File),
+    case Module:validate(CP) of
+        ok ->
+            {ok, #{index := Idx, term := Term}} = Module:read_meta(CP),
+            case Idx > CurrentIdx of
+                true ->
+                    find_checkpoints(Files, State, CurrentIdx, [{Idx, Term}]);
+                false ->
+                    %% If the first valid checkpoint is older than the snapshot
+                    %% index then all checkpoints in `Files` are older as well.
+                    %% Delete all checkpoints and bail.
+                    delete_stale_checkpoints(
+                      UId, CheckpointDir, [File | Files]),
+                    State
+            end;
+        Err ->
+            ?INFO("ra_snapshot: ~ts: removing checkpoint ~s as it did not "
+                  "validate. Err: ~w",
+                  [UId, CP, Err]),
+            _ = ra_lib:recursive_delete(CP),
+            find_checkpoints(Files, State, CurrentIdx, [])
+    end;
+find_checkpoints([File | Files],
+                 #?MODULE{uid = UId,
+                          module = Module,
+                          checkpoint_directory = CheckpointDir} = State,
+                 CurrentIdx, Checkpoints) ->
+    %% If a valid checkpoint has already been found it is assumed all older
+    %% checkpoints are also valid. Scanning all can introduce a lot of
+    %% additional I/O during recovery.
+    CP = filename:join(CheckpointDir, File),
+    case Module:read_meta(CP) of
+        {ok, #{index := Idx, term := Term}} ->
+            case Idx > CurrentIdx of
+                true ->
+                    find_checkpoints(
+                      Files, State, CurrentIdx, [{Idx, Term} | Checkpoints]);
+                false ->
+                    %% If this checkpoint is older than the current snapshot
+                    %% then all later `Files` will be as well. Delete them and
+                    %% finish searching.
+                    delete_stale_checkpoints(
+                      UId, CheckpointDir, [File | Files]),
+                    find_checkpoints([], State, CurrentIdx, Checkpoints)
+            end;
+        Err ->
+            ?INFO("ra_snapshot: ~ts: removing checkpoint ~s as metadata could "
+                  "not be read. Err: ~w",
+                  [UId, CP, Err]),
+            _ = ra_lib:recursive_delete(CP),
+            find_checkpoints(Files, State, CurrentIdx, Checkpoints)
+    end.
+
+delete_stale_checkpoints(UId, CheckpointDir, Files) ->
+    [begin
+         CP = filename:join(CheckpointDir, File),
+         ?INFO("ra_snapshot: ~ts: removing checkpoint ~s as it was older than "
+               "the current snapshot.", [UId, CP]),
+         _ = ra_lib:recursive_delete(CP)
+     end || File <- Files],
+    ok.
+
+%% Find and validate recovery checkpoint if present
+find_recovery_checkpoint(#?MODULE{recovery_checkpoint_directory = undefined} = State) ->
+    State;
+find_recovery_checkpoint(#?MODULE{uid = UId,
+                                  module = Module,
+                                  recovery_checkpoint_directory = RecoveryDir} = State) ->
+    case ra_lib:is_dir(RecoveryDir) of
+        false ->
+            State;
+        true ->
+            {ok, Files0} = prim_file:list_dir(RecoveryDir),
+            %% Reverse-sort to get most recent first
+            Files = lists:reverse(lists:sort(Files0)),
+            case Files of
+                [] ->
+                    State;
+                [Latest | OldFiles] ->
+                    RecoveryPath = filename:join(RecoveryDir, Latest),
+                    case Module:validate(RecoveryPath) of
+                        ok ->
+                            {ok, #{index := Idx, term := Term}} = Module:read_meta(RecoveryPath),
+                            %% Delete any older recovery checkpoints
+                            _ = [ra_lib:recursive_delete(filename:join(RecoveryDir, F))
+                                 || F <- OldFiles],
+                            State#?MODULE{recovery_checkpoint = {Idx, Term}};
+                        Err ->
+                            ?INFO("ra_snapshot: ~ts: removing recovery checkpoint ~s "
+                                  "as it did not validate. Err: ~w",
+                                  [UId, RecoveryPath, Err]),
+                            _ = ra_lib:recursive_delete(RecoveryPath),
+                            %% Try next one if any
+                            find_recovery_checkpoint(State)
+                    end
+            end
+    end.
+
+-spec init_ets() -> ok.
+init_ets() ->
+    TableFlags = [set,
+                  named_table,
+                  {read_concurrency, true},
+                  {write_concurrency, true},
+                  public],
+    _ = ets:new(?ETSTBL, TableFlags),
+    ok.
+
+-spec current(state()) -> option(ra_idxterm()).
+current(#?MODULE{current = Current}) -> Current.
+
+-spec latest_checkpoint(state()) -> option(checkpoint()).
+latest_checkpoint(#?MODULE{checkpoints = [Current | _]}) -> Current;
+latest_checkpoint(#?MODULE{checkpoints = _}) -> undefined.
+
+-spec recovery_checkpoint(state()) -> option(recovery_checkpoint()).
+recovery_checkpoint(#?MODULE{recovery_checkpoint = RC}) -> RC.
+
+%% Returns the highest index among snapshot, checkpoint, and recovery checkpoint
+-spec highest_idx(state()) -> ra_index().
+highest_idx(#?MODULE{current = Current,
+                     checkpoints = Checkpoints,
+                     recovery_checkpoint = RecoveryCheckpoint}) ->
+    SnapIdx = case Current of
+                  undefined -> -1;
+                  {I, _} -> I
+              end,
+    CPIdx = case Checkpoints of
+                [] -> -1;
+                [{I2, _} | _] -> I2
+            end,
+    RCIdx = case RecoveryCheckpoint of
+                undefined -> -1;
+                {I3, _} -> I3
+            end,
+    max(SnapIdx, max(CPIdx, RCIdx)).
+
+-spec pending(state()) -> option({ra_idxterm(), kind()}).
+pending(#?MODULE{pending = Pending}) ->
+    Pending.
+
+-spec accepting(state()) -> option(ra_idxterm()).
+accepting(#?MODULE{accepting = undefined}) ->
+    undefined;
+accepting(#?MODULE{accepting = #accept{idxterm = Accepting}}) ->
+    Accepting.
+
+-spec directory(state(), kind()) -> option(file:filename_all()).
+directory(#?MODULE{snapshot_directory = Dir}, snapshot) -> Dir;
+directory(#?MODULE{checkpoint_directory = Dir}, checkpoint) -> Dir;
+directory(#?MODULE{recovery_checkpoint_directory = Dir}, recovery_checkpoint) -> Dir.
+
+-spec snapshot_size(state()) -> non_neg_integer() | undefined.
+snapshot_size(#?MODULE{snapshot_size = SnapshotSize}) ->
+    SnapshotSize.
+
+-spec last_index_for(ra_uid()) -> option(ra_index()).
+last_index_for(UId) ->
+    case ra_log_snapshot_state:snapshot(?ETSTBL, UId) of
+        Index when Index >= 0 ->
+            Index;
+        _ ->
+            undefined
+    end.
+
+-spec begin_snapshot(meta(), MacModule :: module(),
+                     MacState :: term(), kind(), state()) ->
+    {state(), [effect()]}.
+begin_snapshot(#{index := Idx,
+                 term := Term} = Meta,
+               MacMod, MacState, SnapKind,
+               #?MODULE{module = Mod,
+                        counter = Counter,
+                        sync_server = SyncServer,
+                        snapshot_directory = SnapshotDir,
+                        checkpoint_directory = CheckpointDir} = State) ->
+    {CounterIdx, Dir} =
+        case SnapKind of
+            snapshot ->
+                {?C_RA_LOG_SNAPSHOT_BYTES_WRITTEN, SnapshotDir};
+            checkpoint ->
+                {?C_RA_LOG_CHECKPOINT_BYTES_WRITTEN, CheckpointDir}
+        end,
+    %% create directory for this snapshot
+    %% This needs to be called in the current process to "lock" potentially
+    %% mutable machine state
+    Ref = Mod:prepare(Meta, MacState),
+    PostPrepareEqualsMacState = Ref == MacState,
+    LiveIndexes0 = case PostPrepareEqualsMacState of
+                       false ->
+                           ra_machine:live_indexes(MacMod, MacState);
+                       true ->
+                           []
+                   end,
+    %% write the snapshot in a separate process
+    Self = self(),
+    IdxTerm = {Idx, Term},
+    BgWorkFun = fun () ->
+                        SnapDir = make_snapshot_dir(Dir, Idx, Term),
+                        StartTime = erlang:monotonic_time(),
+                        ok = ra_lib:make_dir(SnapDir),
+                        %% Write without fsync. For snapshots, the sync is
+                        %% batched through the per-system ra_log_sync process
+                        %% to avoid N parallel fsyncs saturating the disk.
+                        SnapshotSize = case Mod:write(SnapDir, Meta, Ref, false) of
+                                           ok ->
+                                               undefined;
+                                           {ok, BytesWritten} ->
+                                               counters_add(Counter, CounterIdx,
+                                                            BytesWritten),
+                                               BytesWritten
+                                       end,
+
+                        %% if the Ref returned by ra_snapshot:prepare/2 is
+                        %% the same as the mac state then indexes can be
+                        %% calculated here
+                        LiveIndexes =
+                            case PostPrepareEqualsMacState of
+                                true ->
+                                    case ra_machine:live_indexes(MacMod, Ref) of
+                                        [] ->
+                                            [];
+                                        LI ->
+                                            ok = write_indexes(SnapDir, LI),
+                                            LI
+                                    end;
+                                false ->
+                                    LiveIndexes0
+                            end,
+
+                        %% Snapshots must be fsync'd. Checkpoints skip fsync
+                        %% and are synced later when promoted to snapshots.
+                        ok = maybe_sync(SnapKind, SyncServer,
+                                        Mod, SnapDir),
+
+                        EndTime = erlang:monotonic_time(),
+                        Duration = erlang:convert_time_unit(EndTime - StartTime,
+                                                            native, millisecond),
+                        Self ! {ra_log_event,
+                                {snapshot_written, IdxTerm,
+                                 LiveIndexes, SnapKind, SnapshotSize, Duration}},
+                        ok
+                end,
+
+    %% record snapshot in progress
+    %% emit an effect that monitors the current snapshot attempt
+    {State#?MODULE{pending = {{Idx, Term}, SnapKind}},
+     [{bg_work, BgWorkFun, err_fun(IdxTerm, SnapKind)}]}.
+
+-spec promote_checkpoint(Idx :: ra_index(), State0 :: state()) ->
+    {boolean(), State :: state(), Effects :: [effect()]}.
+promote_checkpoint(PromotionIdx,
+                   #?MODULE{module = Mod,
+                            sync_server = SyncServer,
+                            snapshot_directory = SnapDir,
+                            checkpoint_directory = CheckpointDir,
+                            checkpoints = Checkpoints0,
+                            %% TODO: We currently re-use the previous snapshot
+                            %% size. Should we recompute the size based on the
+                            %% promoted checkpoint?
+                            snapshot_size = SnapshotSize} = State0) ->
+    %% Find the checkpoint with the highest index smaller than or equal to the
+    %% given `Idx' and rename the checkpoint directory to the snapshot
+    %% directory.
+    case find_promotable_checkpoint(PromotionIdx, Checkpoints0, []) of
+        {Checkpoints, {Idx, Term}} ->
+            Checkpoint = make_snapshot_dir(CheckpointDir, Idx, Term),
+            Snapshot = make_snapshot_dir(SnapDir, Idx, Term),
+            Self = self(),
+            Fun = fun() ->
+                          StartTime = erlang:monotonic_time(),
+                          ok = maybe_sync(snapshot, SyncServer,
+                                          Mod, Checkpoint),
+                          ok = ra_file:rename(Checkpoint, Snapshot),
+                          _ = ra_lib:sync_dir(CheckpointDir),
+                          _ = ra_lib:sync_dir(SnapDir),
+                          Indexes = case indexes(Snapshot) of
+                                        {ok, Idxs} ->
+                                            Idxs;
+                                        _ ->
+                                            []
+                                    end,
+                          EndTime = erlang:monotonic_time(),
+                          Duration = erlang:convert_time_unit(EndTime - StartTime,
+                                                              native, millisecond),
+                          Self ! {ra_log_event,
+                                  {snapshot_written, {Idx, Term},
+                                   Indexes, snapshot, SnapshotSize, Duration}}
+                  end,
+
+            State = State0#?MODULE{pending = {{Idx, Term}, snapshot},
+                                   checkpoints = Checkpoints},
+            {true, State, [{bg_work, Fun, err_fun({Idx, Term}, snapshot)}]};
+        undefined ->
+            {false, State0, []}
+    end.
+
+%% Find the first checkpoint smaller than or equal to the promotion index and
+%% remove it from the checkpoint list.
+-spec find_promotable_checkpoint(PromotionIdx, Checkpoints, Acc) -> Result
+    when
+      PromotionIdx :: ra_index(),
+      Checkpoints :: [ra_idxterm()],
+      Acc :: [ra_idxterm()],
+      Result :: option({[ra_idxterm()], ra_idxterm()}).
+find_promotable_checkpoint(Idx, [{CPIdx, _} = CP | Rest], Acc)
+  when CPIdx =< Idx ->
+    %% Checkpoints are sorted by index descending so the first checkpoint
+    %% with an index smaller than or equal to the promotion index is the proper
+    %% checkpoint to promote.
+    {lists:reverse(Rest, Acc), CP};
+find_promotable_checkpoint(Idx, [CP | Rest], Acc) ->
+    find_promotable_checkpoint(Idx, Rest, [CP | Acc]);
+find_promotable_checkpoint(_Idx, [], _Acc) ->
+    undefined.
+
+-spec complete_snapshot(ra_idxterm(), kind(), ra_seq:state(), non_neg_integer(), state()) ->
+    state().
+complete_snapshot(_IdxTerm, snapshot, _LiveIndexes, _SnapshotSize,
+                  #?MODULE{pending = undefined} = State) ->
+    %% if pending=undefined it means and snapshot installation with a higher
+    %% index was accepted concurrently
+    State;
+complete_snapshot({Idx, _} = IdxTerm, snapshot, LiveIndexes, SnapshotSize,
+                  #?MODULE{uid = UId,
+                           recovery_checkpoint = RecoveryCheckpoint} = State0) ->
+    SmallestIdx = case ra_seq:first(LiveIndexes) of
+                      undefined ->
+                          Idx + 1;
+                      I ->
+                          I
+                  end,
+    %% live indexes
+    ok = ra_log_snapshot_state:insert(?ETSTBL, UId, Idx, SmallestIdx,
+                                      LiveIndexes),
+    %% Delete recovery checkpoint if snapshot overtakes it
+    State = case RecoveryCheckpoint of
+                {RCIdx, _} when Idx >= RCIdx ->
+                    delete_recovery_checkpoint(State0);
+                _ ->
+                    State0
+            end,
+    State#?MODULE{pending = undefined,
+                  current = IdxTerm,
+                  snapshot_size = SnapshotSize};
+complete_snapshot(IdxTerm, checkpoint, _LiveIndexes, _SnapshotSize,
+                  #?MODULE{pending = Pending,
+                           checkpoints = Checkpoints0} = State) ->
+    %% Only clear pending if it still points at this checkpoint.
+    %% A concurrent promote_checkpoint may have overwritten pending
+    %% with a snapshot entry that must not be discarded.
+    NewPending = case Pending of
+                     {IdxTerm, checkpoint} -> undefined;
+                     _ -> Pending
+                 end,
+    State#?MODULE{pending = NewPending,
+                  checkpoints = [IdxTerm | Checkpoints0]}.
+
+-spec begin_accept(meta(), state()) ->
+    {ok, state()}.
+begin_accept(#{index := Idx,
+               machine_version := SnapMacVer,
+               term := Term} = Meta,
+             #?MODULE{module = Mod,
+                      snapshot_directory = Dir} = State) ->
+    SnapDir = make_snapshot_dir(Dir, Idx, Term),
+    ok = ra_lib:make_dir(SnapDir),
+    {ok, AcceptState} = Mod:begin_accept(SnapDir, Meta),
+    {ok, State#?MODULE{accepting = #accept{idxterm = {Idx, Term},
+                                           machine_version = SnapMacVer,
+                                           state = AcceptState}}}.
+
+-spec complete_accept(Chunk :: term(), Num :: non_neg_integer(),
+                      Machine :: ra_machine:machine(), state()) ->
+    {state(), MacState :: term(), ra_seq:state(), [effect()]}.
+complete_accept(Chunk, Num, Machine,
+                #?MODULE{uid = UId,
+                         module = Mod,
+                         snapshot_directory = Dir,
+                         current = Current,
+                         pending = Pending,
+                         accepting = #accept{next = Num,
+                                             idxterm = {Idx, Term} = IdxTerm,
+                                             state = AccState}} = State0) ->
+    %% last chunk
+    SnapshotSize = case Mod:complete_accept(Chunk, AccState) of
+                       ok ->
+                           undefined;
+                       {ok, Bytes} ->
+                           Bytes
+                   end,
+    %% run validate here?
+    %% delete the current snapshot if any
+    Dels = case Pending of
+               undefined ->
+                   [Current];
+               {PendIdxTerm, _} ->
+                   [Current, PendIdxTerm]
+           end,
+    Eff = {bg_work,
+           fun() -> [delete(Dir, Del) || Del <- Dels] end,
+           fun (_) -> ok end},
+    State = State0#?MODULE{accepting = undefined,
+                           %% reset any pending snapshot writes
+                           pending = undefined,
+                           current = IdxTerm,
+                           snapshot_size = SnapshotSize},
+    %% recover should always succeed here since we just accepted a snapshot
+    {SnapMacVer, MacState} =
+        case recover(State) of
+            {ok, #{machine_version := SMV}, MS} ->
+                {SMV, MS};
+            {error, Reason} ->
+                error({snapshot_recovery_failed, Reason})
+        end,
+    SnapMacMod  = ra_machine:which_module(Machine, SnapMacVer),
+    LiveIndexes = ra_machine:live_indexes(SnapMacMod, MacState),
+    SnapDir = make_snapshot_dir(Dir, Idx, Term),
+    ok = write_indexes(SnapDir, LiveIndexes),
+    %% delete accepting marker file
+    AcceptMarker = filename:join(SnapDir, <<"accepting">>),
+    _ = prim_file:delete(AcceptMarker),
+    _ = ra_lib:sync_dir(SnapDir),
+    %% assert accepting marker is no longer there
+    ?assertNot(filelib:is_file(AcceptMarker)),
+    SmallestIdx = case ra_seq:first(LiveIndexes) of
+                      undefined ->
+                          Idx + 1;
+                      I ->
+                          I
+                  end,
+    ok = ra_log_snapshot_state:insert(?ETSTBL, UId, Idx, SmallestIdx,
+                                      LiveIndexes),
+    {State, MacState, LiveIndexes, [Eff]}.
+
+-spec accept_chunk(Chunk :: term(), Num :: non_neg_integer(), state()) ->
+    state().
+accept_chunk(Chunk, Num, #?MODULE{module = Mod,
+                                  accepting =
+                                  #accept{state = AccState0,
+                                          next = Num} = Accept} = State) ->
+    {ok, AccState} = Mod:accept_chunk(Chunk, AccState0),
+    State#?MODULE{accepting = Accept#accept{state = AccState,
+                                            next = Num + 1}};
+accept_chunk(_Chunk, Num,
+             #?MODULE{accepting = #accept{next = Next}} = State)
+  when Next > Num ->
+    %% this must be a resend - we can just ignore it
+    State.
+
+-spec abort_accept(state()) -> state().
+abort_accept(#?MODULE{accepting = undefined} = State) ->
+    State;
+abort_accept(#?MODULE{accepting = #accept{idxterm = {Idx, Term}},
+                      snapshot_directory = Dir} = State) ->
+    ok = delete(Dir, {Idx, Term}),
+    State#?MODULE{accepting = undefined}.
+
+%% get the snapshot capabilities context of a remote node
+-spec context(state(), node()) -> map().
+context(#?MODULE{module = Mod}, Node) ->
+    try erpc:call(Node, Mod, ?FUNCTION_NAME, []) of
+        Result ->
+            Result
+    catch
+        error:{exception, undef, _} ->
+            #{}
+    end.
+
+
+
+-spec handle_error({ra:index(), ra_term()}, Error :: term(), state()) ->
+    state().
+handle_error(IDX_TERM = IdxTerm, _Error,
+            #?MODULE{snapshot_directory = SnapshotDir,
+                     checkpoint_directory = CheckpointDir,
+                     pending = {IDX_TERM, SnapKind}} = State) ->
+    %% delete the pending snapshot/checkpoint directory
+    Dir = case SnapKind of
+              snapshot -> SnapshotDir;
+              checkpoint -> CheckpointDir
+          end,
+    ok = delete(Dir, IdxTerm),
+    State#?MODULE{pending = undefined};
+handle_error(_IdxTerm, _Error, #?MODULE{} = State) ->
+    %% ignore if not referring to the current pending, if any
+    State.
+
+delete(_, undefined) ->
+    ok;
+delete(Dir, {Idx, Term}) ->
+    SnapDir = make_snapshot_dir(Dir, Idx, Term),
+    ok = ra_lib:recursive_delete(SnapDir),
+    ok.
+
+-spec begin_read(State :: state(), Context :: map()) ->
+    {ok, Meta :: meta(), ReadState} |
+    {error, term()} when ReadState :: term().
+begin_read(#?MODULE{module = Mod,
+                    snapshot_directory = Dir,
+                    current = {Idx, Term}},
+          Context) when is_map(Context) ->
+    Location = make_snapshot_dir(Dir, Idx, Term),
+    Mod:begin_read(Location, Context).
+
+
+-spec read_chunk(ReadState, ChunkSizeBytes :: non_neg_integer(),
+                 State :: state()) ->
+    {ok, Data :: term(), {next, ReadState} | last}  |
+    {error, term()} when ReadState :: term().
+read_chunk(ReadState, ChunkSizeBytes, #?MODULE{module = Mod,
+                                               snapshot_directory = Dir,
+                                               current = {Idx, Term}}) ->
+    %% TODO: do we need to generate location for every chunk?
+    Location = make_snapshot_dir(Dir, Idx, Term),
+    Mod:read_chunk(ReadState, ChunkSizeBytes, Location).
+
+%% Recovers from the latest checkpoint or snapshot, if available.
+%% Note: This does NOT consider recovery checkpoints - those are handled
+%% separately in ra_server:recover/1 to skip log replay.
+-spec recover(state()) ->
+    {ok, Meta :: meta(), State :: term()} |
+    {error, no_current_snapshot} |
+    {error, term()}.
+recover(#?MODULE{current = undefined, checkpoints = []}) ->
+    {error, no_current_snapshot};
+recover(#?MODULE{module = Mod,
+                 current = Snapshot,
+                 snapshot_directory = SnapDir,
+                 checkpoints = Checkpoints,
+                 checkpoint_directory = CheckpointDir}) ->
+    %% Recover from snapshot or checkpoint, whichever has the highest index.
+    SnapIdx = case Snapshot of
+                  undefined -> -1;
+                  {SI, _} -> SI
+              end,
+    CPIdx = case Checkpoints of
+                [] -> -1;
+                [{CI, _} | _] -> CI
+            end,
+    %% At least one of Snapshot or Checkpoints must be non-empty
+    %% (guaranteed by the first clause matching {undefined, []})
+    Dir = if
+              CPIdx > SnapIdx ->
+                  [{_, CPTerm} | _] = Checkpoints,
+                  make_snapshot_dir(CheckpointDir, CPIdx, CPTerm);
+              Snapshot =/= undefined ->
+                  {Idx, Term} = Snapshot,
+                  make_snapshot_dir(SnapDir, Idx, Term);
+              Checkpoints =/= [] ->
+                  [{Idx, Term} | _] = Checkpoints,
+                  make_snapshot_dir(CheckpointDir, Idx, Term)
+          end,
+    Mod:recover(Dir).
+
+%% @doc Recover from the recovery checkpoint if it exists.
+%% This is used by ra_server:recover/1 to skip log replay when a recovery
+%% checkpoint with a higher index than the snapshot exists.
+-spec recover_recovery_checkpoint(state()) ->
+    {ok, Meta :: meta(), State :: term()} |
+    {error, no_recovery_checkpoint} |
+    {error, term()}.
+recover_recovery_checkpoint(#?MODULE{recovery_checkpoint = undefined}) ->
+    {error, no_recovery_checkpoint};
+recover_recovery_checkpoint(#?MODULE{module = Mod,
+                                     recovery_checkpoint = {Idx, Term},
+                                     recovery_checkpoint_directory = Dir}) ->
+    SnapDir = make_snapshot_dir(Dir, Idx, Term),
+    Mod:recover(SnapDir).
+
+-spec read_meta(Module :: module(), Location :: file:filename_all()) ->
+    {ok, meta()} |
+    {error, invalid_format |
+            {invalid_version, integer()} |
+            checksum_error |
+            file_err() |
+            term()}.
+read_meta(Module, Location) ->
+    Module:read_meta(Location).
+
+-spec current_snapshot_dir(state()) ->
+    option(file:filename_all()).
+current_snapshot_dir(#?MODULE{snapshot_directory = Dir,
+                              current = {Idx, Term}}) ->
+    make_snapshot_dir(Dir, Idx, Term);
+current_snapshot_dir(_) ->
+    undefined.
+
+-spec take_older_checkpoints(ra_index(), state()) ->
+    {state(), [checkpoint()]}.
+take_older_checkpoints(Idx, #?MODULE{checkpoints = Checkpoints0} = State0) ->
+    {Checkpoints, Outdated} = lists:splitwith(fun ({CPIdx, _Term}) ->
+                                                      CPIdx > Idx
+                                              end, Checkpoints0),
+    {State0#?MODULE{checkpoints = Checkpoints}, Outdated}.
+
+-spec take_extra_checkpoints(state()) ->
+    {state(), [checkpoint()]}.
+take_extra_checkpoints(State0) ->
+    take_extra_checkpoints(State0, []).
+
+
+take_extra_checkpoints(#?MODULE{checkpoints = Checkpoints0,
+                                max_checkpoints = MaxCheckpoints} = State0,
+                      Checks) ->
+    Len = erlang:length(Checkpoints0),
+    case Len > MaxCheckpoints of
+        true ->
+            %% when the number of checkpoints grow we increase the difference
+            %% between checkpoints in order to keep the total count kept on disk
+            %% down but keep some upper limit (~500k) to avoid huge differences
+            Mult = min(8, Len div MaxCheckpoints),
+            case find_checkpoint_to_delete(Mult, lists:reverse(Checkpoints0)) of
+                undefined ->
+                    {State0, Checks};
+                {_, _} = Check ->
+                    Checkpoints = lists:delete(Check, Checkpoints0),
+                    {State0#?MODULE{checkpoints = Checkpoints},
+                    [Check | Checks]}
+            end;
+        false ->
+            {State0, Checks}
+    end.
+
+%% @doc
+%% Indexes file format:
+%% "RASI"           (4 bytes - magic)
+%% Version          (1 byte - unsigned)
+%% CRC32            (4 bytes - unsigned 32-bit integer)
+%% Data             (binary - term_to_binary of indexes)
+%% @end
+-spec write_indexes(file:filename_all(), ra_seq:state()) ->
+    ok | {error, ra_lib:file_err()}.
+write_indexes(Dir, Indexes) ->
+    File = filename:join(Dir, <<"indexes">>),
+    Data = term_to_binary(Indexes),
+    Crc = erlang:crc32(Data),
+    %% Skip fsync here. The indexes file  recoverable from the
+    %% snapshot data if lost.
+    ra_lib:write_file(File, [<<?IDX_MAGIC,
+                               ?IDX_VERSION:8/unsigned,
+                               Crc:32/unsigned>>,
+                             Data], false).
+
+-spec indexes(file:filename_all()) ->
+    {ok, ra_seq:state()} |
+    {error, invalid_format |
+            {invalid_version, integer()} |
+            checksum_error |
+            file:posix()}.
+indexes(Dir) ->
+    File = filename:join(Dir, <<"indexes">>),
+    case prim_file:read_file(File) of
+        {ok, <<?IDX_MAGIC, ?IDX_VERSION:8/unsigned, Crc:32/unsigned, Data/binary>>} ->
+            case erlang:crc32(Data) of
+                Crc ->
+                    {ok, binary_to_term(Data)};
+                _ ->
+                    {error, checksum_error}
+            end;
+        {ok, <<?IDX_MAGIC, Version:8/unsigned, _Crc:32/unsigned, _Data/binary>>} ->
+            {error, {invalid_version, Version}};
+        {ok, Bin} ->
+            %% Backward compatibility: old format without header
+            %% Try to parse as plain term_to_binary data
+            try
+                {ok, binary_to_term(Bin)}
+            catch
+                _:_ ->
+                    {error, invalid_format}
+            end;
+        {error, enoent} ->
+            %% no indexes
+            {ok, []};
+        Err ->
+            Err
+    end.
+
+
+%% Utility
+
+-define(MAX_DIFF, 65_536).
+
+find_checkpoint_to_delete(Mult,
+                          [{FstIdx, _},
+                           {_, _} = Pot,
+                           {ThrdIdx, _} | _] = Checks) ->
+    case ThrdIdx - FstIdx < (?MAX_DIFF * Mult) of
+        true ->
+            Pot;
+        false ->
+            find_checkpoint_to_delete(Mult, tl(Checks))
+    end;
+find_checkpoint_to_delete(_, _) ->
+    undefined.
+
+make_snapshot_dir(Dir, Index, Term) ->
+    I = ra_lib:zpad_hex(Index),
+    T = ra_lib:zpad_hex(Term),
+    filename:join(Dir, <<T/binary, "_", I/binary>>).
+
+counters_add(undefined, _, _) ->
+    ok;
+counters_add(Counter, Ix, Incr) ->
+    counters:add(Counter, Ix, Incr).
+
+err_fun(IdxTerm, Kind) ->
+    Self = self(),
+    fun (Error) ->
+            Self ! {ra_log_event,
+                    {snapshot_error, IdxTerm, Kind, Error}}
+    end.
+
+maybe_sync(checkpoint, _SyncServer, _Mod, _Dir) ->
+    ok;
+maybe_sync(snapshot, undefined, Mod, Dir) ->
+    ok = Mod:sync(Dir),
+    _ = ra_lib:sync_dir(Dir),
+    _ = ra_lib:sync_dir(filename:dirname(Dir)),
+    ok;
+maybe_sync(snapshot, SyncServer, Mod, Dir) ->
+    ok = ra_log_sync:sync(
+           SyncServer,
+           fun() ->
+                   ok = Mod:sync(Dir),
+                   _ = ra_lib:sync_dir(Dir),
+                   _ = ra_lib:sync_dir(
+                         filename:dirname(Dir)),
+                   ok
+           end).
+
+%% Recovery checkpoint functions
+
+%% @doc Write a recovery checkpoint synchronously during shutdown.
+%% Recovery checkpoints store the machine state to skip log replay on restart.
+%% They don't include live indexes - those are recovered from the last snapshot/checkpoint.
+-spec write_recovery_checkpoint(meta(), term(), module(), state()) ->
+    {ok, state()} | {error, term()}.
+write_recovery_checkpoint(#{index := Idx, term := Term} = Meta, MacState,
+                          SnapModule,
+                          #?MODULE{recovery_checkpoint_directory = RecoveryDir,
+                                   recovery_checkpoint = OldRC} = State) ->
+    SnapDir = make_snapshot_dir(RecoveryDir, Idx, Term),
+    ok = ra_lib:make_dir(SnapDir),
+    %% Write snapshot data without fsync (Sync=false) since this is during
+    %% ordered shutdown
+    case SnapModule:write(SnapDir, Meta, MacState, false) of
+        Res when Res =:= ok orelse element(1, Res) =:= ok ->
+            %% Delete old recovery checkpoint(s) after successful write
+            case OldRC of
+                undefined ->
+                    ok;
+                {OldIdx, OldTerm} ->
+                    OldDir = make_snapshot_dir(RecoveryDir, OldIdx, OldTerm),
+                    _ = ra_lib:recursive_delete(OldDir),
+                    ok
+            end,
+            {ok, State#?MODULE{recovery_checkpoint = {Idx, Term}}};
+        {error, _} = Err ->
+            _ = ra_lib:recursive_delete(SnapDir),
+            Err
+    end.
+
+%% @doc Delete the current recovery checkpoint.
+-spec delete_recovery_checkpoint(state()) -> state().
+delete_recovery_checkpoint(#?MODULE{recovery_checkpoint = undefined} = State) ->
+    State;
+delete_recovery_checkpoint(#?MODULE{recovery_checkpoint = {Idx, Term},
+                                    recovery_checkpoint_directory = RecoveryDir} = State) ->
+    Dir = make_snapshot_dir(RecoveryDir, Idx, Term),
+    _ = ra_lib:recursive_delete(Dir),
+    State#?MODULE{recovery_checkpoint = undefined}.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+
+
+-endif.

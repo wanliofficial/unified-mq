@@ -24,7 +24,8 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([partition_ids/0, create_partition/1, storage_config/0]).
--export([append/3, read_from/3, advance_committed/2, capability/1, watermarks/1]).
+-export([append/3, append_replica/3, reliability/0, read_from/3,
+         advance_committed/2, capability/1, watermarks/1]).
 -export([subscribe/2, unsubscribe/2]).
 %% ADR-014 §14.5: operator/test view of what retention could not delete.
 -export([retention_status/0]).
@@ -104,14 +105,71 @@ retention_status() ->
 %% succeeds. Retrying here instead would be wrong: an append that reached the
 %% writer already consumed an offset, and a silent retry would put the same
 %% message in the log twice without the publisher ever knowing.
+%% S4 (ADR-021 §D3/§D5): two optional `persistent_term' hooks keep this module
+%% free of a compile-time dependency on `broker_cluster'. With neither hook
+%% installed -- a single node, or a cluster app that is not running -- every
+%% path below is byte-for-byte the S1~S3 behaviour, which is what lets the whole
+%% existing suite run unchanged.
+%%
+%%   * `append_guard' runs first. Its answer is final: a `{fenced, _}' means the
+%%     write is refused before an offset is consumed.
+%%   * `replicated_commit' is only accepted when a replicator is installed. The
+%%     local append is still a single `fsync' (the WAL has no notion of a
+%%     consensus commit); replication is the extra step that turns "my disk has
+%%     it" into "a majority has it". Without a replicator the mode stays
+%%     unsupported, exactly as ADR-011 froze it.
 -spec append(partition_id(), #broker_message{}, sync_mode()) ->
     {ok, offset()} | {error, term()}.
 append(PartitionId, Msg, Mode) ->
+    case append_guard(PartitionId, Msg, Mode) of
+        ok -> append_checked(PartitionId, Msg, Mode);
+        {error, _Reason} = Error -> Error
+    end.
+
+%% @doc Follower-side append (ADR-021 §D5). No guard -- only the owner decides
+%% whether a write may happen -- and no local notification, because a replica
+%% serves no readers until ownership moves to it.
+-spec append_replica(partition_id(), #broker_message{}, sync_mode()) ->
+    {ok, offset()} | {error, term()}.
+append_replica(PartitionId, Msg, Mode) ->
+    do_append(PartitionId, Msg, Mode, false).
+
+append_checked(PartitionId, Msg, replicated_commit) ->
+    case replicator() of
+        undefined ->
+            %% No cluster app: keep the frozen S1~S3 answer.
+            do_append(PartitionId, Msg, replicated_commit, true);
+        Replicate ->
+            case do_append(PartitionId, Msg, fsync, false) of
+                {ok, Offset} ->
+                    case Replicate(PartitionId, Msg) of
+                        ok ->
+                            notify_range(PartitionId, Offset),
+                            {ok, Offset};
+                        {error, _Reason} = Error ->
+                            %% The local record stays (it is already fsynced);
+                            %% the caller must NOT ack the publisher.
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end
+    end;
+append_checked(PartitionId, Msg, Mode) ->
+    do_append(PartitionId, Msg, Mode, true).
+
+do_append(PartitionId, Msg, Mode, Notify) ->
     with_partition(PartitionId,
                    fun(#{backend := Backend, handle := Hd, worker := Worker}) ->
                            try Backend:append(Hd, [Msg], Mode) of
                                {ok, [Offset]} ->
-                                   notify(Worker, {appended, PartitionId, Offset, Offset}),
+                                   case Notify of
+                                       true ->
+                                           notify(Worker, {appended, PartitionId,
+                                                           Offset, Offset});
+                                       false ->
+                                           ok
+                                   end,
                                    {ok, Offset};
                                {ok, Offsets} ->
                                    {error, {unexpected_offsets, Offsets}};
@@ -122,6 +180,26 @@ append(PartitionId, Msg, Mode) ->
                                    {error, stale(PartitionId, Worker, Class, Reason)}
                            end
                    end).
+
+append_guard(PartitionId, Msg, Mode) ->
+    case persistent_term:get({?MODULE, append_guard}, undefined) of
+        undefined -> ok;
+        Guard when is_function(Guard, 3) -> Guard(PartitionId, Msg, Mode)
+    end.
+
+replicator() ->
+    case persistent_term:get({?MODULE, replicator}, undefined) of
+        undefined -> undefined;
+        Replicate when is_function(Replicate, 2) -> Replicate
+    end.
+
+notify_range(PartitionId, Offset) ->
+    case broker_queue_store:lookup(PartitionId) of
+        {ok, #{worker := Worker}} ->
+            notify(Worker, {appended, PartitionId, Offset, Offset});
+        {error, _Reason} ->
+            ok
+    end.
 
 -spec read_from(partition_id(), offset(), pos_integer()) ->
     {ok, [{offset(), #broker_message{}}], offset()} | {error, term()}.
@@ -153,6 +231,19 @@ advance_committed(PartitionId, Offset) ->
 %% Both S1 backends answer this from a constant, so a stale handle still gives
 %% the right capability -- which is what §5.1(a) wants, since conn_fsm caches it
 %% once at startup rather than per publish.
+%% @doc The mode the connection layer should use for durable publishes
+%% (ADR-021 §D5). `replicated_commit' is answered only when the cluster app has
+%% actually installed a replicator: advertising a mode the data path would then
+%% refuse is worse than staying on `fsync'.
+-spec reliability() -> sync_mode().
+reliability() ->
+    case {application:get_env(broker_queue, reliability, fsync), replicator()} of
+        {replicated_commit, Replicate} when is_function(Replicate, 2) ->
+            replicated_commit;
+        _ ->
+            fsync
+    end.
+
 -spec capability(partition_id()) -> [sync_mode()] | {error, term()}.
 capability(PartitionId) ->
     with_partition(PartitionId,

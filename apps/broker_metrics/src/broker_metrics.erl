@@ -351,4 +351,12 @@ key_specs() ->
      {mqtt_publish_dropped_oversize, counter},
      {wal_pending_append, gauge},
      {backpressure_pauses, counter},
-     {backpressure_disconnects, counter}].
+     {backpressure_disconnects, counter},
+     %% S4 (ADR-021 §D3~§D5): ownership changes committed by the Metadata Raft
+     %% group, appends refused by epoch fencing, replication attempts that
+     %% failed to reach a majority, and metadata writes rejected because the
+     %% group had no quorum.
+     {cluster_owner_changes, counter},
+     {cluster_fencing_rejected, counter},
+     {cluster_replication_failed, counter},
+     {cluster_no_quorum, counter}].

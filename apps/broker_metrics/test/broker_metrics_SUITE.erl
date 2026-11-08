@@ -43,10 +43,18 @@ all() ->
          dlq_appends, dlq_append_failed, ttl_expired_total,
          conn_mailbox_len, conn_inflight,
          mqtt_packet_too_large, mqtt_publish_dropped_oversize,
-         wal_pending_append, backpressure_pauses, backpressure_disconnects]).
+         wal_pending_append, backpressure_pauses, backpressure_disconnects,
+         cluster_owner_changes, cluster_fencing_rejected,
+         cluster_replication_failed, cluster_no_quorum]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.
+    %% Another suite may have started broker_metrics with the default interval
+    %% already (the report server would then be alive), so stop it first and
+    %% reload before setting env -- `set_env' before `load' is overwritten by
+    %% the .app file's defaults.
+    _ = application:stop(broker_metrics),
+    _ = application:load(broker_metrics),
     Saved = application:get_env(broker_metrics, report_interval_ms, undefined),
     ok = application:set_env(broker_metrics, report_interval_ms, 0),
     {ok, _} = application:ensure_all_started(broker_metrics),

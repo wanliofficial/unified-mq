@@ -620,11 +620,12 @@ handle_publish1(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
         [{Partition, Refs} | _] = Routed,
         Msg0 = build_message(Topic, Payload, QoS, WirePid, Partition, Retain,
                              Props, D),
+        MsgA = annotate_epoch(Msg0),
         %% S3 (ADR-020): the policy seam runs before any storage work. A
         %% rejection never reaches the log; an accepted event carries its
         %% decoded view in `event'. The default `pass_through' is the identity,
         %% so 3.1.1 bytes and S2 metadata are unchanged.
-        case broker_event:apply_policy(Msg0) of
+        case broker_event:apply_policy(MsgA) of
             {ok, Msg} ->
                 case broker_event:duplicate(Msg) of
                     false ->
@@ -639,7 +640,7 @@ handle_publish1(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
             {error, EventReason} ->
                 %% Reject: no ACK for the record. The optional isolation copy
                 %% is best-effort evidence, never a promotion to accepted.
-                _ = broker_event:quarantine(Msg0, EventReason),
+                _ = broker_event:quarantine(MsgA, EventReason),
                 reject_event(QoS, WirePid, EventReason, D)
         end
     catch
@@ -792,7 +793,10 @@ remember_received(Pid, #st{received = R} = D) ->
     end.
 
 reliability_of(0) -> os_buffer;
-reliability_of(_) -> fsync.
+reliability_of(_) ->
+    %% ADR-021 §D5: `replicated_commit' is only advertised when the cluster app
+    %% installed a replicator; otherwise this is the frozen S1~S3 `fsync'.
+    broker_queue:reliability().
 
 build_message(Topic, Payload, QoS, WirePid, Partition, Retain, Props, D) ->
     Created = erlang:system_time(millisecond),
@@ -812,6 +816,25 @@ build_message(Topic, Payload, QoS, WirePid, Partition, Retain, Props, D) ->
       created_at = Created,
       expires_at = expiry(Created, Props, D),
       event = undefined}.
+
+%% ADR-021 §D3: carry the epoch the publisher saw into `proto_meta' so the
+%% queue's fencing guard can reject a write stamped by an owner that has since
+%% been replaced. This is a `persistent_term' lookup, not a call into
+%% `broker_cluster': a single node without the cluster app pays nothing and
+%% keeps the exact S1~S3 metadata shape.
+annotate_epoch(Msg) ->
+    case persistent_term:get({broker_cluster, epoch}, undefined) of
+        EpochOf when is_function(EpochOf, 1) ->
+            case EpochOf(Msg#broker_message.partition_id) of
+                {ok, Epoch} ->
+                    Meta = Msg#broker_message.proto_meta,
+                    Msg#broker_message{proto_meta = Meta#{cluster_epoch => Epoch}};
+                _ ->
+                    Msg
+            end;
+        _ ->
+            Msg
+    end.
 
 %% S2.5 (ADR-017 §17.2): MQTT 5 PUBLISH properties land in `proto_meta', never
 %% in `headers'. Only keys that were actually on the wire are added, so a 3.1.1

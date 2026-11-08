@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v0.7（S3 CloudEvents 1.0 标准化层）
-- **最近一次追加**：2026-11-08，§4.3「S3 追加」——CloudEvents 1.0 JSON codec、五档策略、MQTT Structured/Binary Binding、显式损失清单、去重窗口与拒绝/隔离路径。§4/§4.1/§4.2 原文保留为当时事实
+- **文档版本**：v0.8（S4 集群与一致性：ACK 等级、复制与 Fencing）
+- **最近一次追加**：2026-11-08，§4.4「S4 追加」——`replicated_commit` 的多数派 ACK、Fencing、失去多数派时的协议表现。§4/§4.1/§4.2/§4.3 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -225,6 +225,47 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | codec / 策略 / binding（`broker_event_SUITE`） | 31 例：必需属性缺失、类型错误、非法版本/时间/base64、`data`/`data_base64` 互斥、扩展保留与上限、Structured/Binary 正反向、3.1.1 损失清单、跨协议往返、事件 ID 与 Broker ID 分离、策略解析、去重开/关/过期、隔离副本、ACL 不信任事件属性 |
 | 连接（`mqtt_conn_SUITE`） | 2 例：v5 `required` 拒绝回 `0x83` 且连接继续可用；3.1.1 拒绝关闭且不发 ACK |
 | 全量 | `rebar3 ct` **422/422**；`dialyzer` 0 warnings；`xref` 76 条均为预期 unused-export（S3 新增 13 条公开 API/测试入口） |
+
+---
+
+### 4.4 S4 追加（2026-11-08）：复制等级、Fencing 与失去多数派
+
+> 决策见 [ADR-021](adr/021-cluster-control-plane-raft-and-fencing.md)；执行计划与证据见 [`design/s4-cluster-execution-plan.md`](design/s4-cluster-execution-plan.md) §5。**MQTT 线上字节不变**；S4 只改变「什么时候可以 ACK」。
+
+**三档 ACK 与故障边界**
+
+| 等级 | ACK 时机 | 崩溃/分区边界 | 何时可用 |
+|---|---|---|---|
+| `os_buffer` | 写入 OS 缓冲即 ACK | broker 进程崩溃不丢（页缓存仍在），**主机掉电可能丢** | 始终 |
+| `fsync` | 本地 WAL fsync 返回后 ACK | 单机掉电不丢；**网络分区下不保证 split-brain 安全** | 始终 |
+| `replicated_commit` | 本地 fsync + 复制到 `replicas`，收到 `quorum = (N div 2) + 1` 个成功（含本地）后 ACK | 少数派副本被隔离时不 ACK；旧 Owner 失去 quorum 时写入被拒 | 仅当 `broker_queue` 已注册复制钩子（`broker_cluster` 启动） |
+
+- `replicated_commit` 失败返回 `{error, {replication_failed, Acks, Needed}}`；本地已 fsync 的副本保留（不回滚），但**调用方不得 ACK 发布者**。
+- 默认单副本时 `quorum = 1`，语义等价本地 `fsync`；因此默认单节点行为与 S1~S3 完全一致。
+- 未启动 `broker_cluster` 时，队列对 `replicated_commit` 仍返回 `{error, {unsupported_sync_mode, replicated_commit}}`，不做静默降级。
+
+**Fencing**
+
+- 归属变化（assign/migrate/finish）必须携带更大 epoch；状态机拒绝不递增的写入。
+- 数据面守卫 `broker_cluster:authorize_append(Partition, Epoch)`：epoch 不匹配或本地不是 owner 时返回 `{error, {fenced, #{partition, expected_epoch, actual_epoch}}}`，队列拒绝 append，发布者拿不到 ACK。
+- 分区隔离的旧 Owner 无法更新缓存，但它也拿不到复制 quorum，因此 `replicated_commit` 写入会失败；`fsync` 单节点档不承诺跨分区一致（文档明写，见 ADR-021 §后果）。
+
+**失去多数派**
+
+- 元数据写（assign/migrate/finish/remove）超时（`quorum_timeout_ms`，默认 5000）返回 `{error, no_quorum}`。
+- 配置 `{on_quorum_loss, reject | os_buffer_only}`：`reject`（默认）拒绝 `replicated_commit` append；`os_buffer_only` 仅允许 QoS0 的 `os_buffer` 继续。
+- 连接层不静默降级：MQTT 5 回 `0x83`，MQTT 3.1.1 断开连接。
+
+**指标**：`cluster_owner_changes`、`cluster_fenced_rejects`、`cluster_replication_failed`、`cluster_no_quorum`。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| 控制面（`broker_meta_SUITE`） | 10 例：11 表、用户哈希、ACL、partition/node、版本、outbox |
+| 单节点集群语义（`broker_cluster_SUITE`） | 11 例：assign/epoch、Fencing、迁移两阶段、no-quorum、quorum 前后 ACK、副本不足不 ACK |
+| 分布式（`broker_cluster_dist_SUITE`） | 4 例：3 节点组形成/复制、Leader 故障切换、失去多数派、迁移后旧 Owner Fencing |
+| 全量 | `rebar3 ct` **447/447**；`dialyzer` 0 warnings；`xref` 121 条均为预期 unused-export |
 
 ---
 

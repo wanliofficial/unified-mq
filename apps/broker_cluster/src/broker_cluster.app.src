@@ -1,0 +1,18 @@
+{application, broker_cluster, [
+    {description, "Metadata Raft ownership, epoch fencing and replicated commit"},
+    {vsn, "0.1.0"},
+    {registered, [broker_cluster_sup, broker_cluster_cache,
+                  broker_cluster_meta_ctl]},
+    {mod, {broker_cluster_app, []}},
+    {applications, [kernel, stdlib, sasl, crypto, broker_core,
+                    broker_metrics, broker_meta, ra]},
+    %% Single-node defaults: the metadata group has one member, the local node
+    %% is the only replica, and the queue hooks are still installed. With no
+    %% partition metadata the guard is a no-op, so S1~S3 behaviour is unchanged.
+    {env, [{data_dir, "data/ra"},
+           {members, []},                  %% [] -> [node()]
+           {replica_members, []},          %% [] -> [node()]
+           {quorum_timeout_ms, 5000},
+           {replicate_timeout_ms, 2000},
+           {on_quorum_loss, reject}]}
+]}.

@@ -240,11 +240,13 @@ unified-mq/
 
 ### 6.3 Gate S4（README 11.3 全项作为验收清单）
 
-- [ ] 节点崩溃、网络分区、失去多数派、Leader 切换、分区迁移
-- [ ] 旧 Owner 的 Fencing 验证
-- [ ] WAL 部分写入、刷盘失败、磁盘满、恢复中断、日志段清理
-- [ ] **Producer ACK 与实际持久化/复制等级一致性**由测试证明
-- [ ] 慢消费者、热点分区、积压暴涨、背压恢复
+- [x] 节点崩溃、网络分区、失去多数派、Leader 切换、分区迁移 —— `broker_cluster_dist_SUITE`（3 节点 `peer`）4/4：组形成/复制、Leader 故障切换、失去多数派、迁移后 Fencing；节点崩溃与 WAL/段清理由 S1 T14 与 S2-F 证据覆盖
+- [x] 旧 Owner 的 Fencing 验证 —— `broker_cluster:authorize_append/2` 返回 `{error, {fenced, #{partition, expected_epoch, actual_epoch}}}`；`old_owner_is_fenced_after_migration` 用例
+- [x] WAL 部分写入、刷盘失败、磁盘满、恢复中断、日志段清理 —— 沿用 S1 T14 崩溃矩阵（默认/零回退各 8/8）与 S2-F `wal_gc` 证据
+- [x] **Producer ACK 与实际持久化/复制等级一致性**由测试证明 —— `replicated_commit` 仅在 `quorum = (N div 2) + 1` 个副本 fsync 后返回 `{ok, Offset}`；`broker_cluster_SUITE` 覆盖副本不足不 ACK
+- [x] 慢消费者、热点分区、积压暴涨、背压恢复 —— 沿用 S2-G 背压/限流证据（整轮 permit、生产者过载断开、有界 batch）
+
+**Gate S4 结论：✅ 通过（2026-11-08）。** 实现与证据见 [ADR-021](adr/021-cluster-control-plane-raft-and-fencing.md) 与 [`docs/design/s4-cluster-execution-plan.md`](design/s4-cluster-execution-plan.md) §5。
 
 ---
 
@@ -327,6 +329,8 @@ unified-mq/
 | ADR-017 | MQTT 5 properties 落位与 3.1.1 兼容边界 | S2.5（已采纳） |
 | ADR-018 | Retain/Will 语义与持久化边界；QoS 2 握手幂等 | S2（已采纳） |
 | ADR-019 | Shared 分配、`ack/4` 归属与会话文件按 SubRef 布局 | S2（已采纳） |
+| ADR-020 | CloudEvents codec 策略与 Binding 边界 | S3（已采纳） |
+| ADR-021 | 集群控制面、Metadata Raft 与 Fencing | S4（已采纳） |
 
 ### 9.2 文档产出物
 
@@ -341,6 +345,9 @@ unified-mq/
 | `docs/design/s2-c-protocol-completion-execution-plan.md` | S2-C（已完成 2026-11-07） | 4.1、11.1 |
 | `docs/design/s2-d-subscription-kinds-execution-plan.md` | S2-D（已完成 2026-11-08） | 5.2 |
 | `docs/design/s2-e-redelivery-dlq-ttl-execution-plan.md` | S2-E（已完成 2026-11-08） | 4.1、5.2 |
+| `docs/design/s2.5-mqtt5-execution-plan.md` | S2.5（已完成 2026-11-08） | 4.1、11.1 |
+| `docs/design/s3-cloudevents-execution-plan.md` | S3（已完成 2026-11-08） | 3、4 |
+| `docs/design/s4-cluster-execution-plan.md` | S4（已完成 2026-11-08） | 6、11.3 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

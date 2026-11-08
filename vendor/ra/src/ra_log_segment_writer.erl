@@ -1,0 +1,630 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2017-2025 Broadcom. All Rights Reserved. The term Broadcom refers to Broadcom Inc. and/or its subsidiaries.
+%%
+%% @hidden
+-module(ra_log_segment_writer).
+-behaviour(gen_server).
+
+-export([start_link/1,
+         accept_mem_tables/3,
+         my_segments/2,
+         await/1,
+         overview/1
+        ]).
+
+-export([init/1,
+         handle_call/3,
+         handle_cast/2,
+         handle_info/2,
+         terminate/2,
+         code_change/3
+         ]).
+
+-record(state, {data_dir :: file:filename(),
+                system :: atom(),
+                counter :: counters:counters_ref(),
+                %% Caches the current (highest numbered) segment file per uid
+                %% so that the common flush does not have to list the server
+                %% directory, which is O(number of segment files).
+                %%
+                %% This has to be an ETS table rather than a field: the flush
+                %% runs in processes spawned by ra_lib:partition_parallel/3
+                %% over a closure that captures #state{}, so anything held
+                %% here is deep copied into every worker. It also has to be
+                %% public, as those workers both read and update it.
+                seg_cache :: ets:tid(),
+                segment_conf = #{} :: ra_log_segment:ra_log_segment_options()}).
+
+-include("ra.hrl").
+
+-define(AWAIT_TIMEOUT, 60000).
+-define(SEGMENT_WRITER_RECOVERY_TIMEOUT, 30000).
+-define(STALE_SEGMENT_THRESHOLD, 1024). %% 1KB
+
+-define(C_MEM_TABLES, 1).
+-define(C_SEGMENTS, 2).
+-define(C_ENTRIES, 3).
+-define(C_BYTES_WRITTEN, 4).
+
+-define(COUNTER_FIELDS,
+        [{mem_tables, ?C_MEM_TABLES, counter,
+          "Number of in-memory tables handled"},
+         {segments, ?C_SEGMENTS, counter,
+          "Number of segments written"},
+         {entries, ?C_ENTRIES, counter,
+          "Number of entries written"},
+         {bytes_written, ?C_BYTES_WRITTEN, counter,
+          "Number of bytes written"}
+        ]).
+
+
+%%% ra_log_segment_writer
+%%% receives a set of closed mem_tables from the wal
+%%% flushes entries to segment files for each ra server
+%%% notifies ra servers of new/updated segments
+
+
+%%%===================================================================
+%%% API functions
+%%%===================================================================
+
+start_link(#{name := Name} = Config) ->
+    gen_server:start_link({local, Name}, ?MODULE, [Config], []).
+
+-spec accept_mem_tables(atom() | pid(),
+                        #{ra_uid() => [{ets:tid(), ra_seq:state()}]},
+                        file:filename_all()) -> ok.
+accept_mem_tables(_SegmentWriter, Tables, undefined)
+  when map_size(Tables) == 0 ->
+    ok;
+accept_mem_tables(SegmentWriter, UIdTidRanges, WalFile)
+  when is_map(UIdTidRanges) ->
+    gen_server:cast(SegmentWriter, {mem_tables, UIdTidRanges, WalFile}).
+
+-spec my_segments(atom() | pid(), ra_uid()) -> [file:filename()].
+my_segments(SegWriter, Who) ->
+    maybe_wait_for_segment_writer(SegWriter, ?SEGMENT_WRITER_RECOVERY_TIMEOUT),
+    gen_server:call(SegWriter, {my_segments, Who}, infinity).
+
+-spec overview(atom() | pid()) -> #{}.
+overview(SegWriter) ->
+    gen_server:call(SegWriter, overview).
+
+await(SegWriter)  ->
+    IsAlive = fun IsAlive(undefined) -> false;
+                  IsAlive(P) when is_pid(P) ->
+                      is_process_alive(P);
+                  IsAlive(A) when is_atom(A) ->
+                      IsAlive(whereis(A))
+              end,
+    case IsAlive(SegWriter) of
+        true ->
+            gen_server:call(SegWriter, await, ?AWAIT_TIMEOUT);
+        false ->
+            % if it is down it isn't processing anything
+            ok
+    end.
+
+-define(UPGRADE_MARKER, "segment_name_upgrade_marker").
+
+%%%==================================================================
+%%% gen_server callbacks
+%%%===================================================================
+
+init([#{data_dir := DataDir,
+        name := SegWriterName,
+        system := System} = Conf]) ->
+    process_flag(trap_exit, true),
+    CRef = ra_counters:new(SegWriterName, ?COUNTER_FIELDS,
+                           #{ra_system => System,
+                             module => ?MODULE}),
+    SegmentConf = maps:get(segment_conf, Conf, #{}),
+    maybe_upgrade_segment_file_names(System, DataDir),
+    Cache = ets:new(ra_log_segment_writer_cache,
+                    [set, public, {read_concurrency, true}]),
+    {ok, #state{system = System,
+                data_dir = DataDir,
+                counter = CRef,
+                seg_cache = Cache,
+                segment_conf = SegmentConf}}.
+
+handle_call(await, _From, State) ->
+    {reply, ok, State};
+handle_call({my_segments, Who}, _From, State) ->
+    SegFiles = segments_for(Who, State),
+    {reply, SegFiles, State};
+handle_call(overview, _From, State) ->
+    {reply, get_overview(State), State}.
+
+segments_for(UId, #state{data_dir = DataDir}) ->
+    Dir = filename:join(DataDir, ra_lib:to_list(UId)),
+    segment_files(Dir).
+
+handle_cast({mem_tables, UIdTidRanges, WalFile},
+            #state{system = System,
+                   seg_cache = Cache} = State) ->
+    T1 = erlang:monotonic_time(),
+    ok = counters:add(State#state.counter, ?C_MEM_TABLES, map_size(UIdTidRanges)),
+    #{names := Names} = ra_system:fetch(System),
+    %5 leave a bit of room for other scheduling
+    Degree = max(1, erlang:system_info(schedulers) - 2),
+    %% TODO: refactor to make better use of time where each uid has an
+    %% uneven amount of work to do.
+    RangesList = maps:fold(
+                   fun (UId, TidRanges, Acc) ->
+                           case ra_directory:is_registered_uid(Names, UId) of
+                               true ->
+                                   [{UId, TidRanges} | Acc];
+                               false ->
+                                   %% delete all tids as the uid is not
+                                   %% registered
+                                   ?DEBUG("segment_writer in '~ts': deleting memtable "
+                                          "for ~ts as not a registered uid",
+                                          [System, UId]),
+                                   _ = ets:delete(Cache, UId),
+                                   ok = ra_log_ets:delete_mem_tables(Names, UId),
+                                   Acc
+                           end
+                   end, [], UIdTidRanges),
+
+    _ = [begin
+             {ok, _, Failures} =
+                ra_lib:partition_parallel(
+                    fun (TidRange) ->
+                            ok = flush_mem_table_ranges(TidRange, State),
+                            true
+                    end, Tabs, infinity),
+             case Failures of
+                 [] ->
+                     %% this is what we expect
+                     ok;
+                 _ ->
+                     ?ERROR("segment_writer: ~b failures encountered during segment"
+                            " flush. Errors: ~P", [length(Failures), Failures, 32]),
+                     exit({segment_writer_segment_write_failure, Failures})
+             end
+         end || Tabs <- ra_lib:lists_chunk(Degree, RangesList)],
+    %% delete wal file once done
+    ok = prim_file:delete(WalFile),
+    T2 = erlang:monotonic_time(),
+    Diff = erlang:convert_time_unit(T2 - T1, native, millisecond),
+    ?DEBUG("segment_writer in '~w': completed flush of ~b writers from wal file "
+           "~s in ~bms",
+          [System, length(RangesList), WalFile, Diff]),
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+get_overview(#state{data_dir = Dir,
+                    segment_conf = Conf}) ->
+    #{data_dir => Dir,
+      segment_conf => Conf}.
+
+flush_mem_table_ranges({ServerUId, TidSeqs0},
+                       #state{system = System} = State) ->
+    %% Get the smallest index that should be written to segments.
+    %% This is the minimum of (snapshot_index + 1) and the first live index.
+    %% Get the sparse sequence of live indexes that must be preserved
+    %% beyond the snapshot boundary for compaction.
+    {_, SnapIdx, SmallestIdx, LiveIndexes} = snapshot_state(ServerUId),
+    %% TidSeqs arrive here sorted new -> old.
+
+    %% Truncate and limit all seqs to create a non-overlapping list of
+    %% tid ranges to flush to disk. With sparse log compaction (v3),
+    %% these ranges may include non-contiguous live indexes.
+    TidSeqs = lists:foldl(
+                fun ({T, Seq0}, []) ->
+                        case ra_seq:floor(SmallestIdx, Seq0) of
+                            [] ->
+                                [];
+                            Seq when LiveIndexes == []->
+                                [{T, Seq}];
+                            Seq ->
+                                L = ra_seq:in_range(ra_seq:range(Seq),
+                                                    LiveIndexes),
+                                [{T, ra_seq:add(ra_seq:floor(SnapIdx + 1, Seq), L)}]
+                        end;
+                    ({T, Seq0}, [{_T, PrevSeq} | _] = Acc) ->
+                        Start = ra_seq:first(PrevSeq),
+                        Seq1 = ra_seq:floor(SmallestIdx, Seq0),
+                        case ra_seq:limit(Start, Seq1) of
+                            [] ->
+                                Acc;
+                            Seq when LiveIndexes == [] ->
+                                [{T, Seq} | Acc];
+                            Seq ->
+                                L = ra_seq:in_range(ra_seq:range(Seq),
+                                                    LiveIndexes),
+                                [{T, ra_seq:add(ra_seq:floor(SnapIdx + 1, Seq), L)}
+                                | Acc]
+                        end
+                end, [], TidSeqs0),
+
+    SegRefs0 = lists:append(
+                 lists:reverse(
+                   %% segrefs are returned in appended order so new -> old
+                   %% so we need to reverse them so that the final appended list
+                   %% of segrefs is in the old -> new order
+                   [flush_mem_table_range(ServerUId, TidSeq, State)
+                    || TidSeq <- TidSeqs])),
+
+    %% compact cases where a segment was appended in a subsequent call to
+    %% flush_mem_table_range
+    %% the list of segrefs is returned in new -> old order which is the same
+    %% order they are kept by the ra_log
+    SegRefs = lists:reverse(
+                lists:foldl(
+                  fun ({FILE, _}, [{FILE, _} | _] = Acc) ->
+                          Acc;
+                      (Seg, Acc) ->
+                          [Seg | Acc]
+                  end, [], SegRefs0)),
+
+    ok = send_segments(System, ServerUId, TidSeqs0, SegRefs),
+    ok.
+
+flush_mem_table_range(ServerUId, {Tid, Seq},
+                      #state{data_dir = DataDir,
+                             system = System,
+                             seg_cache = Cache,
+                             segment_conf = SegConf} = State) ->
+    Dir = filename:join(DataDir, binary_to_list(ServerUId)),
+    case open_file(Dir, ServerUId, SegConf, Cache) of
+        enoent ->
+            ?DEBUG("segment_writer: skipping segment as directory ~ts does "
+                   "not exist", [Dir]),
+            %% Directory gone (server deleted), clean up the memtable
+            _ = ets:delete(Cache, ServerUId),
+            #{names := Names} = ra_system:fetch(System),
+            ok = ra_log_ets:delete_mem_tables(Names, ServerUId),
+            [];
+        {Segment0, Created0} ->
+            {Segment1, Created1} = maybe_open_new_segment(ServerUId, Segment0,
+                                                          SegConf),
+            case append_to_segment(ServerUId, Tid, Seq, Segment1, State) of
+                undefined ->
+                    %% Directory disappeared during write - close segment handle
+                    _ = ra_log_segment:close(Segment1),
+                    _ = ets:delete(Cache, ServerUId),
+                    ?WARN("segment_writer: skipping segments for ~w as "
+                          "directory ~ts disappeared whilst writing",
+                          [ServerUId, Dir]),
+                    [];
+                {Segment, Closed0} ->
+                    %% Notify the ra server of new segment refs.
+                    %% Each segref contains the filename and index range.
+                    %% Filter out any undefined segrefs (empty segments).
+                    ClosedSegRefs = [ra_log_segment:segref(S)
+                                     || S <- Closed0,
+                                        %% ensure we don't send undefined seg refs
+                                        is_tuple(ra_log_segment:segref(S))],
+                    SegRefs = case ra_log_segment:segref(Segment) of
+                                  undefined ->
+                                      ClosedSegRefs;
+                                  SRef ->
+                                      [SRef | ClosedSegRefs]
+                              end,
+
+                    %% remember where to resume appending next time
+                    true = ets:insert(Cache,
+                                      {ServerUId,
+                                       ra_log_segment:filename(Segment)}),
+                    ok = ra_log_segment:close(Segment),
+                    %% the directory only needs syncing if a file appeared in
+                    %% it, an append to an existing segment does not change
+                    %% the directory entry
+                    case Created0 orelse
+                         Created1 orelse
+                         Closed0 =/= [] of
+                        true ->
+                            _ = ra_lib:sync_dir(Dir),
+                            ok;
+                        false ->
+                            ok
+                    end,
+                    SegRefs
+            end
+    end.
+
+start_index(ServerUId, StartIdx0) ->
+    max(smallest_live_idx(ServerUId), StartIdx0).
+
+smallest_live_idx(ServerUId) ->
+    ra_log_snapshot_state:smallest(ra_log_snapshot_state, ServerUId).
+
+snapshot_state(ServerUId) ->
+    case ra_log_snapshot_state:read(ra_log_snapshot_state, ServerUId) of
+        undefined ->
+            {ServerUId, -1, 0, []};
+        Res ->
+            Res
+    end.
+
+%% @doc Sends segment update notification to the Ra server.
+%% If the server is not running, cleans up the memtable entries
+%% using ra_mt:delete/1 which supports sparse ra_seq deletion.
+send_segments(System, ServerUId, TidRanges, SegRefs) ->
+    case ra_directory:pid_of(System, ServerUId) of
+        undefined ->
+            ?DEBUG("ra_log_segment_writer: unable to send "
+                   "ra_log_event to: "
+                   "~ts. Reason: ~s",
+                   [ServerUId, "No Pid"]),
+            %% Delete from the memtable on the non-running server's behalf.
+            %% ra_mt:delete/1 supports {indexes, Tid, Seq} format for
+            %% sparse sequence deletion.
+            _ = [?CATCH(ra_mt:delete({indexes, Tid, Seq}))
+                 || {Tid, Seq} <- TidRanges],
+            ok;
+        Pid ->
+            Pid ! {ra_log_event, {segments, TidRanges, SegRefs}},
+            ok
+    end.
+
+append_to_segment(UId, Tid, Seq0, Seg, State) ->
+    FirstIdx = case ra_seq:first(Seq0) of
+                   undefined ->
+                       0;
+                   Fst ->
+                       Fst
+               end,
+    StartIdx = start_index(UId, FirstIdx),
+    %% Floor the sequence to start at StartIdx, then create an iterator.
+    %% TODO: Combine into ra_seq:iterator_from(StartIdx, Seq0) to avoid
+    %% intermediate allocation.
+    Seq = ra_seq:floor(StartIdx, Seq0),
+    SeqIter = ra_seq:iterator(Seq),
+    append_to_segment(UId, Tid, ra_seq:next(SeqIter), Seg, [], State).
+
+append_to_segment(_, _, end_of_seq, Seg, Closed, _State) ->
+    {Seg, Closed};
+append_to_segment(UId, Tid, {Idx, SeqIter} = Cur, Seg0, Closed, State) ->
+    try ets:lookup(Tid, Idx) of
+        [] ->
+            StartIdx = start_index(UId, Idx),
+            case Idx < StartIdx of
+                true ->
+                    %% a snapshot must have been completed after we last checked
+                    %% the start idx, continue flush from new start index.
+                    append_to_segment(UId, Tid, next_ra_seq(StartIdx, SeqIter), Seg0,
+                                      Closed, State);
+                false ->
+                    %% oh dear, an expected index was not found in the mem table.
+                    ?WARN("segment_writer: missing index ~b in mem table for uid ~s"
+                          "start index ~b checking to see if UId has been unregistered",
+                          [Idx, UId, StartIdx]),
+                    case ra_directory:is_registered_uid(State#state.system, UId) of
+                        true ->
+                            ?ERROR("segment_writer: uid ~ts is registered, exiting...",
+                                   [UId]),
+                            exit({missing_index, UId, Idx});
+                        false ->
+                            ?INFO("segment_writer: uid ~ts was not registered, skipping",
+                                  [UId]),
+                            undefined
+                    end
+            end;
+        [{Idx, Term, Data0}] ->
+            Data = term_to_iovec(Data0),
+            DataSize = iolist_size(Data),
+            case ra_log_segment:append(Seg0, Idx, Term, {DataSize, Data}) of
+                {ok, Seg} ->
+                    ok = counters:add(State#state.counter, ?C_ENTRIES, 1),
+                    %% this isn't completely accurate as firstly the segment may not
+                    %% have written it to disk and it doesn't include data written to
+                    %% the segment index but is probably good enough to get comparative
+                    %% data rates for different Ra components
+                    ok = counters:add(State#state.counter, ?C_BYTES_WRITTEN, DataSize),
+                    append_to_segment(UId, Tid, ra_seq:next(SeqIter), Seg, Closed, State);
+                {error, full} ->
+                    % close and open a new segment
+                    case open_successor_segment(Seg0, State#state.segment_conf) of
+                        enoent ->
+                            %% a successor cannot be opened - this is most likely due
+                            %% to the directory having been deleted.
+                            undefined;
+                        Seg ->
+                            ok = counters:add(State#state.counter, ?C_SEGMENTS, 1),
+                            %% re-evaluate snapshot state for the server in case
+                            %% a snapshot has completed during segment flush
+                            StartIdx = start_index(UId, Idx),
+                            Next = case StartIdx == Idx of
+                                       true ->
+                                           Cur;
+                                       false ->
+                                           next_ra_seq(StartIdx, SeqIter)
+                                   end,
+                            append_to_segment(UId, Tid, Next,
+                                              Seg, [Seg0 | Closed], State)
+                    end;
+                {error, Posix} ->
+                    FileName = ra_log_segment:filename(Seg0),
+                    exit({segment_writer_append_error, FileName, Posix})
+            end
+    catch _:badarg ->
+              ?INFO("segment_writer: uid ~s ets table deleted", [UId]),
+              %% ets table has been deleted.
+              %% this could be due to two reasons
+              %% 1. the ra server has been deleted.
+              %% 2. an old mem table has been deleted due to snapshotting
+              %% but the member is still active
+              %% skipping this table
+              undefined
+
+    end.
+
+find_segment_files(Dir) ->
+    lists:reverse(segment_files(Dir)).
+
+segment_files(Dir) ->
+    case prim_file:list_dir(Dir) of
+        {ok, Files0} ->
+            Files = [filename:join(Dir, F)
+                     || F <- Files0, filename:extension(F) =:= ".segment"],
+            lists:sort(Files);
+        {error, enoent} ->
+            []
+    end.
+
+-spec maybe_open_new_segment(ra_uid(), ra_log_segment:state(),
+                             ra_log_segment:ra_log_segment_options()) ->
+    {ra_log_segment:state(), Created :: boolean()}.
+maybe_open_new_segment(ServerUId, Seg, SegConf) ->
+    case ra_log_segment:range(Seg) of
+        {_First, Last} ->
+            case Last < smallest_live_idx(ServerUId) andalso
+                 ra_log_segment:data_size(Seg) > ?STALE_SEGMENT_THRESHOLD of
+                true ->
+                    case open_successor_segment(Seg, SegConf) of
+                        enoent ->
+                            {Seg, false};
+                        NewSeg ->
+                            {NewSeg, true}
+                    end;
+                false ->
+                    {Seg, false}
+            end;
+        _ ->
+            {Seg, false}
+    end.
+
+open_successor_segment(CurSeg, SegConf) ->
+    Fn0 = ra_log_segment:filename(CurSeg),
+    Fn = ra_lib:zpad_filename_incr(Fn0),
+    ok = ra_log_segment:close(CurSeg),
+    case ra_log_segment:open(Fn, SegConf) of
+        {error, enoent} ->
+            %% the directory has been deleted whilst segments were being
+            %% written
+            enoent;
+        {ok, Seg} ->
+            Seg
+    end.
+
+-spec open_file(file:filename_all(), ra_uid(),
+                ra_log_segment:ra_log_segment_options(), ets:tid()) ->
+    {ra_log_segment:state(), Created :: boolean()} | enoent.
+open_file(Dir, ServerUId, SegConf, Cache) ->
+    case ets:lookup(Cache, ServerUId) of
+        [{_, File}] ->
+            %% Trust the cached filename but require it to still exist. If it
+            %% has gone we must fall back to a scan: creating a fresh file
+            %% under a name that already had entries would leave two segments
+            %% claiming overlapping ranges.
+            case ra_log_segment:open(File, SegConf#{mode => append,
+                                                    must_exist => true}) of
+                {ok, Segment} ->
+                    {Segment, false};
+                {error, enoent} ->
+                    open_file(Dir, SegConf);
+                Err ->
+                    open_file_err(Dir, File, SegConf, Err)
+            end;
+        [] ->
+            open_file(Dir, SegConf)
+    end.
+
+open_file(Dir, SegConf) ->
+    {File, Created} = case find_segment_files(Dir) of
+                          [] ->
+                              F = ra_lib:zpad_filename("", "segment", 1),
+                              {filename:join(Dir, F), true};
+                          [F | _] ->
+                              {F, false}
+                      end,
+    %% There is a chance we'll get here without the target directory
+    %% existing which could happen after server deletion
+    case ra_log_segment:open(File, SegConf#{mode => append}) of
+        {ok, Segment} ->
+            {Segment, Created};
+        Err ->
+            open_file_err(Dir, File, SegConf, Err)
+    end.
+
+open_file_err(Dir, File, SegConf, Err) ->
+    case Err of
+        {error, missing_segment_header} ->
+            %% A file was created but the segment header had not been
+            %% synced. In this case it is typically safe to just delete
+            %% and retry.
+            ?WARN("segment_writer: missing header in segment file ~ts "
+                  "deleting file and retrying recovery", [File]),
+            _ = prim_file:delete(File),
+            _ = ra_lib:sync_dir(Dir),
+            open_file(Dir, SegConf);
+        {error, enoent} ->
+            ?DEBUG("segment_writer: failed to open segment file ~ts "
+                  "error: enoent", [File]),
+            enoent;
+        _ ->
+            %% Any other error should be considered a hard error or else
+            %% we'd risk data loss
+            ?WARN("segment_writer: failed to open segment file ~ts "
+                  "error: ~W. Exiting", [File, Err, 10]),
+            exit(Err)
+    end.
+
+maybe_wait_for_segment_writer(_SegWriter, TimeRemaining)
+  when TimeRemaining < 0 ->
+    error(segment_writer_not_available);
+maybe_wait_for_segment_writer(SegWriter, TimeRemaining)
+  when is_atom(SegWriter) ->
+    case whereis(SegWriter) of
+        undefined ->
+            %% segment writer isn't available yet, sleep a bit
+            timer:sleep(10),
+            maybe_wait_for_segment_writer(SegWriter, TimeRemaining - 10);
+        _ ->
+            ok
+    end;
+maybe_wait_for_segment_writer(_SegWriter, _TimeRemaining) ->
+    ok.
+
+maybe_upgrade_segment_file_names(System, DataDir) ->
+    Marker = filename:join(DataDir, ?UPGRADE_MARKER),
+    case ra_lib:is_file(Marker) of
+        false ->
+            ?INFO("segment_writer: upgrading segment file names to "
+                  "new format in dirctory ~ts",
+                  [DataDir]),
+            _ = [begin
+                     Dir = filename:join(DataDir, UId),
+                     case prim_file:list_dir(Dir) of
+                         {ok, Files} ->
+                             [ra_lib:zpad_upgrade(Dir, F, ".segment")
+                              || F <- Files, filename:extension(F) =:= ".segment"];
+                         {error, enoent} ->
+                             ok
+                     end
+                 end || {_, UId} <- ra_directory:list_registered(System)],
+
+            ok = ra_lib:write_file(Marker, <<>>);
+        true ->
+            ok
+    end.
+
+next_ra_seq(Idx, Iter0) ->
+    case ra_seq:next(Iter0) of
+        end_of_seq ->
+            end_of_seq;
+        {I, _} = Next
+          when I >= Idx ->
+            Next;
+        {_, Iter} ->
+            next_ra_seq(Idx, Iter)
+    end.

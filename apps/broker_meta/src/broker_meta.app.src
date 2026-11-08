@@ -1,0 +1,15 @@
+{application, broker_meta, [
+    {description, "Mnesia control plane: tenants, ACL, metadata, config version and outbox"},
+    {vsn, "0.1.0"},
+    {registered, [broker_meta_sup, broker_meta_config, broker_meta_outbox]},
+    {mod, {broker_meta_app, []}},
+    {applications, [kernel, stdlib, sasl, mnesia]},
+    %% Every knob is explicit: the boundary ADR-002 froze is "control plane
+    %% only", and the table storage is the one setting that differs between
+    %% tests (ram_copies) and a release (disc_copies).
+    {env, [{table_storage, ram_copies},
+           {nodes, []},                    %% [] -> [node()]
+           {reconcile_ms, 5000},
+           {outbox_interval_ms, 1000},
+           {outbox_publisher, none}]}
+]}.
