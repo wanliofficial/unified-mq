@@ -305,6 +305,10 @@ key_specs() ->
      {retention_blocked_by_committed, counter},
      {cloudevents_validate_ok, counter},
      {cloudevents_validate_failed, counter},
+     %% S3 (ADR-020 §D7/§D8): duplicate events dropped inside a configured
+     %% window, and rejected events written to an isolation destination.
+     {cloudevents_duplicates, counter},
+     {cloudevents_quarantined, counter},
      %% S2-C (ADR-018 §18.5): retained state, Will publication and QoS 2
      %% state-cap violations. Same rule as every other key -- a closed atom
      %% set, no labels, no per-topic suffixes.

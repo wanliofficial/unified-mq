@@ -1,8 +1,17 @@
 {application, broker_event, [
-    {description, "CloudEvents layer: pass_through stub in S1, real codec in S3"},
-    {vsn, "0.1.0"},
-    {registered, []},
+    {description, "CloudEvents 1.0 codec, policy switch, MQTT binding, dedup window"},
+    {vsn, "0.2.0"},
+    {registered, [broker_event_sup, broker_event_dedup]},
     {mod, {broker_event_app, []}},
-    {applications, [kernel, stdlib, sasl, broker_core]},
-    {env, []}
+    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics,
+                    broker_router, broker_queue]},
+    %% ADR-020: the default is the S1/S2 identity. Policies can be overridden
+    %% per tenant + destination in `policies'.
+    %% Deduplication is opt-in and scoped per tenant + destination.
+    %% `quarantine' is the optional isolation copy for rejected events.
+    {env, [{policy, pass_through},
+           {policies, []},
+           {dedup, []},
+           {dedup_max_entries, 100000},
+           {quarantine, []}]}
 ]}.

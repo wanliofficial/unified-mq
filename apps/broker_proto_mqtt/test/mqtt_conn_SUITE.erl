@@ -69,6 +69,8 @@ all() ->
      puback_is_not_blocked_by_the_subscription_worker,
      reserved_qos_bits_close_without_an_ack,
      publish_over_the_effective_max_closes_without_an_ack,
+     event_policy_rejection_is_a_v5_reason_code,
+     event_policy_rejection_closes_311_without_ack,
      qos2_inbound_four_steps_delivers_once,
      qos2_inbound_dup_publish_is_not_redelivered,
      unknown_pubrel_gets_pubcomp,
@@ -122,6 +124,7 @@ init_per_suite(Config) ->
     _ = application:load(broker_queue),
     _ = application:load(broker_subscription),
     _ = application:load(broker_security),
+    _ = application:load(broker_event),
     _ = application:load(broker_proto_mqtt),
     Config.
 
@@ -166,6 +169,12 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, max_attempts, 10),
     ok = application:set_env(broker_subscription, dlq_name_pattern,
                              <<"$dlq/{tenant}/{original}">>),
+    %% S3 (ADR-020): CloudEvents is opt-in; every case starts from the identity
+    %% policy, and only the two event cases move it.
+    ok = application:set_env(broker_event, policy, pass_through),
+    ok = application:set_env(broker_event, policies, []),
+    ok = application:set_env(broker_event, dedup, []),
+    ok = application:set_env(broker_event, quarantine, []),
     ok = case_env(Case),
     {ok, _Started} = application:ensure_all_started(broker_storage),
     [{data_dir, DataDir} | Config].
@@ -1133,6 +1142,39 @@ publish_over_the_effective_max_closes_without_an_ack(_Config) ->
     {ok, normal} = expect_down(Monitor, cpid(Conn)),
     %% The refused subscription is not quietly downgraded into a live one.
     [] = broker_subscription:subscriptions(<<"c1">>),
+    ok.
+
+%% S3 (ADR-020 §D8): a v5 peer can be told "not accepted" in the ack itself.
+event_policy_rejection_is_a_v5_reason_code(_Config) ->
+    ok = application:set_env(broker_event, policies,
+                             [{<<"*">>, <<"events/#">>, required}]),
+    ok = boot(),
+    {Conn, _} = mqtt_open_v5(#{client_id => <<"v5evt">>, props => #{}}),
+    mqtt_publish_v5(Conn, 1, <<"events/bad">>, <<"not-an-event">>, 1, #{}),
+    #puback{packet_id = 1, reason_code = 16#83} =
+        mqtt_recv_v5(csock(Conn)),
+    %% The connection stays usable; the refusal is not a protocol death.
+    #ping{kind = resp} = mqtt_ping(Conn),
+    Valid = <<"{\"specversion\":\"1.0\",\"id\":\"e1\","
+              "\"source\":\"/s3\",\"type\":\"demo\","
+              "\"data\":\"ok\"}">>,
+    mqtt_publish_v5(Conn, 2, <<"events/good">>, Valid, 1, #{}),
+    %% Accepted: 0x10 means "stored, no matching subscriber" (ADR-017), not a
+    %% refusal -- the prefix of the reason byte is what matters here.
+    #puback{packet_id = 2, reason_code = 16#10} = mqtt_recv_v5(csock(Conn)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% 3.1.1 cannot express the refusal: close without an ack, publisher retries.
+event_policy_rejection_closes_311_without_ack(_Config) ->
+    ok = application:set_env(broker_event, policies,
+                             [{<<"*">>, <<"events/#">>, required}]),
+    ok = boot(),
+    {Conn, _} = open(<<"c311evt">>),
+    Monitor = mqtt_monitor(Conn),
+    ok = mqtt_publish(Conn, 1, <<"events/bad">>, <<"not-an-event">>, 1),
+    ok = expect_closed(csock(Conn)),
+    {ok, normal} = expect_down(Monitor, cpid(Conn)),
     ok.
 
 %%%_* Delivery levels and the merge (§4.8, H7) --------------------------------

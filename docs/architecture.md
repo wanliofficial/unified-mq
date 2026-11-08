@@ -53,15 +53,21 @@ apps/
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
 | `broker_queue` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router | `broker_queue_store` + 每分区 `broker_queue_partition` | `append/3`、`read_from/3`、`watermarks/1`、`capability/1`、`subscribe/2`、`create_partition/1` | 分区句柄注册表、每分区订阅者集合 |
 | `broker_subscription` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_queue | `broker_subscription_worker` | `subscribe/3`、`unsubscribe/2`、`ack/3`、`inflight/2`、`attach/3`、`detach/2`、`dispatch/2`、`cursor/2`、`subscriptions/1`、`session/1` | 四张 ETS（实体/游标/连接绑定/in-flight）+ `data/sessions/*` 三件套 |
-| `broker_event` | kernel, stdlib, sasl, broker_core | 空 supervisor | `policy/0`、`apply_policy/1,2`（纯函数读 env；S1 恒等透传）、`#cloud_event{}` 接口位 | 无（配置即状态；S1 数据路径无调用） |
+| `broker_event` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_router, broker_queue | `broker_event_dedup`（去重窗口 gen_server + ETS） | `policy/0`、`policy_for/1`、`apply_policy/1,2`、`dedup_window/1`、`duplicate/1`、`quarantine/2`、`broker_event_codec`（CE 1.0 JSON / Binary）、`broker_event_binding`（MQTT Binding + 损失报告） | 去重 ETS（`{Tenant,Destination,source,id} → 过期时刻`，默认关闭） |
 | `broker_security` | kernel, stdlib, sasl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
 | `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 其余 6 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener` | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器） |
 
-### 2.2 `broker_event` 的真实状态（避免误读）
+### 2.2 `broker_event` 的真实状态（S3 已实现）
 
-T11 之后 `broker_event` 有一个**纯函数**模块：`policy/0` 读 `broker_event.policy`（3 参 `get_env`），`apply_policy/1,2` 对 `pass_through` / `disabled` 返回**逐项相同**的消息（payload 字节、`headers`、`event`、`proto_meta` 全不动），对 `validate_if_present` / `required` / `normalize` 返回 `{error, {policy_not_implemented, P, s3}}` —— **响亮失败，不静默降级**。`include/cloud_event.hrl` 保留 README §3.1 的 `#cloud_event{}` 作为 S3 codec 的接口位（它与 ADR-009 的 `event :: undefined | map()` 如何对接是 S3 的判决点，头文件里已注明）。
+S3（ADR-020）把 T11 的恒等桩补成完整的 CloudEvents 1.0 层：
 
-**S1 数据路径仍然不经过它**：`mqtt_conn_fsm:build_message/5` 直接把 `event` 填 `undefined`，所以 `apply_policy/1` 目前在运行时无调用者（`xref` 的 3 条 unused-export 即此）。这不是遗漏，而是 OQ-5 的选择：MQTT 3.1.1 没有 PUBLISH properties，`content-type` 不在 S1 线路上；要"看见" CloudEvents 只能嗅探 payload 字节，而 ADR-004 禁止强制 CloudEvents、S0.5 也把逐事件解析测成 CPU 成本中心（0 扩展 ~53 µs，1024 扩展 8 ms）。
+- `broker_event_codec`：Structured JSON 与 Binary `ce-*` 双向编解码、核心/可选/扩展属性校验、`data`/`data_base64` 互斥。
+- `broker_event_binding`：MQTT 消息检测（v5 `user_properties` → Binary；`content-type`/payload → Structured）、`decode/1`、`to_mqtt/3` 与 `#{mode, target, version, losses, preserved}` 转换报告。
+- `broker_event`：五档策略按租户 + 目的地首个匹配；`apply_policy/1,2` 默认 `pass_through`，对普通消息恒等；`required`/`normalize` 对非事件返回 `{error, {event_invalid, event_required}}`；`normalize` 只写 `event`，**不改 payload 字节**。
+- `broker_event_dedup`：受监督的有界去重窗口，默认关闭；键 `{Tenant, Destination, source, id}`，进程重启即清空（不承诺跨重启）。
+- `quarantine/2`：可选的隔离副本，把原始消息以 `fsync` 追加到可配置 destination，拒绝本身不受隔离成败影响。
+
+**数据路径**：`mqtt_conn_fsm:handle_publish1/7` 在路由之后、存储之前调用 `broker_event:apply_policy/1`；拒绝不 ACK（v5 QoS1 PUBACK `0x83`、QoS2 PUBREC `0x83`，3.1.1 关闭连接），去重命中只 ACK 不二次存储。默认策略是 `pass_through`，因此 MQTT 3.1.1 出站字节与 S2 行为完全不变；CloudEvents 是按租户/目的地显式开启的能力，不是全局强制（ADR-004）。
 
 ### 2.3 依赖方向
 
@@ -72,7 +78,7 @@ broker_metrics ←── broker_storage / broker_queue / broker_subscription / b
 broker_storage ←── broker_queue ←── broker_subscription ←── broker_proto_mqtt
 broker_router  ←── broker_queue ──┘            ↑
 broker_security ───────────────────────────────┘
-broker_event ──────────────────────────────────┘（纯函数接口，数据路径无调用）
+broker_event ──────────────────────────────────┘（发布路径调用；默认 pass_through 恒等）
 ```
 
 依赖只允许**向下**：协议层可以调内核，内核任何一层都不得反向引用 `broker_proto_mqtt`；`broker_core` 不依赖任何兄弟应用。`xref` 是这条约束的机械检查（当前只剩预期的 unused-export 告警）。

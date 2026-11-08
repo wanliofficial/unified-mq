@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v0.6（S2.5 MQTT 5 子集实现）
-- **最近一次追加**：2026-11-08，§4.2「S2.5 追加」——MQTT 5.0 CONNECT/PUBLISH/SUBSCRIBE properties、v5 reason codes、session expiry、`$share` 语法；MQTT 行拆为 3.1.1 / 5.0 两行。§4/§4.1 原文保留为 S1/S2-C 当时事实
+- **文档版本**：v0.7（S3 CloudEvents 1.0 标准化层）
+- **最近一次追加**：2026-11-08，§4.3「S3 追加」——CloudEvents 1.0 JSON codec、五档策略、MQTT Structured/Binary Binding、显式损失清单、去重窗口与拒绝/隔离路径。§4/§4.1/§4.2 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -170,6 +170,61 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 帧（`mqtt_frame_SUITE`） | 31 例，含 v5 CONNECT/PUBLISH 属性往返、未知 property 拒绝、level 5 接受、3.1.1 字节不变 |
 | 连接（`mqtt_conn_SUITE`） | v5 CONNACK 形状、级别 6 的 `0x84`、properties 送达订阅端、PUBACK `0x10`、`$share` 单成员投递、`receive_maximum=1` 窗口 |
 | 全量 | `rebar3 ct` **397/397**；`dialyzer` 0 warnings；`xref` 无新增未使用导出 |
+
+---
+
+### 4.3 S3 追加（2026-11-08）：CloudEvents 1.0 标准化层
+
+> 范围与冻结决策见 [ADR-020](adr/020-cloudevents-codec-policy-binding.md)；执行计划与交付记录见 [`design/s3-cloudevents-execution-plan.md`](design/s3-cloudevents-execution-plan.md)。默认策略仍是 `pass_through`，**MQTT 3.1.1 线上字节不变**；本节只描述启用后新增的能力与限制。
+
+**规范范围**
+
+- 只实现 **CloudEvents 1.0 JSON Format**；Avro / Protobuf 不在 S3。`specversion` 只接受 `"1.0"`，其他值按 `unsupported_specversion` 拒绝。
+- 运行时事件视图是 `#broker_message.event` 的 `map()`（ADR-009 的槽位不变）；`#cloud_event{}` 记录仅保留为 README §3.1 接口说明。
+- 校验项：必需属性 `specversion/id/source/type` 非空且为 UTF-8；可选属性类型；`time` 为 RFC3339；`data` 与 `data_base64` 互斥；`data_base64` 合法 base64；扩展名 `[a-z0-9]{1,20}`、值限 string/boolean/integer/float、单事件 ≤ 32 个。
+
+**检测与策略（按租户 + 目的地，首个匹配）**
+
+| 策略 | 不是 CloudEvents | 是但非法 |
+|---|---|---|
+| `disabled` / `pass_through` | 恒等，不解析 | 恒等，不解析 |
+| `validate_if_present` | 恒等 | 拒绝，`{error, {event_invalid, Why}}` |
+| `required` | 拒绝，`{error, {event_invalid, event_required}}` | 拒绝 |
+| `normalize` | 拒绝 | 合法则写 `event`；payload 字节不改写 |
+
+检测顺序：MQTT 5 `user_properties` 含 `ce-specversion` → Binary Mode；`content_type = application/cloudevents+json` 或 payload 是含 `specversion` 的 JSON 对象 → Structured Mode；否则不是 CloudEvents。
+
+**MQTT Binding 与转换损失（README §4.1：不得静默丢弃）**
+
+| 方向 | MQTT 3.1.1 | MQTT 5.0 |
+|---|---|---|
+| Structured（事件 JSON） | 支持（payload 自描述；无 `content-type` 元数据） | 支持，并写 `content_type = application/cloudevents+json` |
+| Binary（`ce-*` 上下文 + 原始 data） | **不可表达**：返回损失报告，列出全部 `ce-*` 属性（含必需四项），data 字节仍传输 | 支持：上下文写 `user_properties` 的 `ce-*`，`datacontenttype` 映射到 `content_type` |
+
+`broker_event_binding:to_mqtt/3` 返回 `#{mode, target := mqtt, version, losses, preserved}`；`losses` 非空即表示该次转换非无损，调用方必须能拿到它。已知非无损项：
+
+1. **3.1.1 的 Binary Mode**：所有事件属性都进 `losses`（协议没有元数据通道）。
+2. **Structured → Binary 的 `data`**：JSON term 被重新序列化为字节，字节等价但不是原 JSON 语法（例如空白与键序）；报告记 `data`。
+3. **非字符串扩展值**：integer/boolean/float 在 Binary Mode 变成文本（`3` → `"3"`）；报告记 `ce-<name>`。
+4. **`data_base64`**：Binary Mode 输出解码后的原始字节，报告记 `data_base64`。
+5. **协议侧标识**：offset、Pulsar Message ID、MQTT Packet Identifier 只进 `proto_meta`，**永不覆盖** `event.id`（ADR-005）。
+
+**去重与拒绝**
+
+- 去重默认**关闭**；`{dedup, [{Tenant, Destination, WindowMs}]}` 首个匹配，键 `{Tenant, Destination, source, id}`，窗口过期后同一事件视为新事件。命中时只 ACK、不产生第二次存储；QoS2 仍完成四步握手。窗口是进程内有界表，**不承诺跨重启去重**。
+- 转换失败**不 ACK**：MQTT 5 QoS1 回 PUBACK `0x83`、QoS2 回 PUBREC `0x83`（连接保持可用）；MQTT 3.1.1 无拒绝帧，关闭连接让 QoS1/2 发布者重试（Will 仍按异常断连发布）。
+- 可选隔离副本：`{quarantine, [{Tenant, Destination, TargetPattern}]}` 命中时把**原始消息**以 `fsync` 追加到目标 destination（默认模板 `$invalid/{tenant}/{destination}`），头部写拒绝原因与原目的地；隔离失败不改变拒绝结果。
+- ACL 只用认证主体：策略解析与授权都不读取 `event.source` / `type` / 扩展属性，伪造事件属性不能改变租户或授权结果。
+
+**指标**：`cloudevents_validate_ok`、`cloudevents_validate_failed`、`cloudevents_duplicates`、`cloudevents_quarantined`。
+
+**证据**
+
+| 层 | 用例 |
+|---|---|
+| codec / 策略 / binding（`broker_event_SUITE`） | 31 例：必需属性缺失、类型错误、非法版本/时间/base64、`data`/`data_base64` 互斥、扩展保留与上限、Structured/Binary 正反向、3.1.1 损失清单、跨协议往返、事件 ID 与 Broker ID 分离、策略解析、去重开/关/过期、隔离副本、ACL 不信任事件属性 |
+| 连接（`mqtt_conn_SUITE`） | 2 例：v5 `required` 拒绝回 `0x83` 且连接继续可用；3.1.1 拒绝关闭且不发 ACK |
+| 全量 | `rebar3 ct` **422/422**；`dialyzer` 0 warnings；`xref` 76 条均为预期 unused-export（S3 新增 13 条公开 API/测试入口） |
 
 ---
 

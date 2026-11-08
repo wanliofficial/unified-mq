@@ -109,12 +109,18 @@
   ]},
 
   {broker_event, [
-    %% S1 implements the two arms that need no parsing (pass_through /
-    %% disabled). validate_if_present / required / normalize are accepted by
-    %% the type but rejected at the call site -- failing loudly beats shipping
-    %% unvalidated events behind a validated-looking config (design §11.2
-    %% OQ-5, ADR-004).
-    {policy, pass_through}
+    %% ADR-020: the default remains the S1/S2 identity -- enabling CloudEvents
+    %% is a per-tenant + destination decision, never a global surprise.
+    {policy, pass_through},
+    %% Ordered first-match list: {Tenant, Destination, Policy}. `<<"*">>' is
+    %% the wildcard; Destination accepts MQTT `+` / `#'.
+    {policies, []},
+    %% Opt-in dedup windows: {Tenant, Destination, WindowMs}, key source+id.
+    {dedup, []},
+    {dedup_max_entries, 100000},
+    %% Opt-in isolation copies for rejected events:
+    %% {Tenant, Destination, <<"$invalid/{tenant}/{destination}">>}.
+    {quarantine, []}
   ]},
 
   {broker_proto_mqtt, [

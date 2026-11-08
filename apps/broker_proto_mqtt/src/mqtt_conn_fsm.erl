@@ -618,13 +618,65 @@ handle_publish1(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
         %% and the surrounding try reports it as ours, not as a silently invented
         %% partition 0.
         [{Partition, Refs} | _] = Routed,
-        Msg = build_message(Topic, Payload, QoS, WirePid, Partition, Retain,
-                            Props, D),
-        store_and_ack(Msg, QoS, Partition, Refs, WirePid, Retain, D)
+        Msg0 = build_message(Topic, Payload, QoS, WirePid, Partition, Retain,
+                             Props, D),
+        %% S3 (ADR-020): the policy seam runs before any storage work. A
+        %% rejection never reaches the log; an accepted event carries its
+        %% decoded view in `event'. The default `pass_through' is the identity,
+        %% so 3.1.1 bytes and S2 metadata are unchanged.
+        case broker_event:apply_policy(Msg0) of
+            {ok, Msg} ->
+                case broker_event:duplicate(Msg) of
+                    false ->
+                        store_and_ack(Msg, QoS, Partition, Refs, WirePid,
+                                      Retain, D);
+                    true ->
+                        %% Duplicate inside a configured window: ACK the
+                        %% publisher (it did its job) but do not store a second
+                        %% copy. QoS2 still completes the handshake.
+                        duplicate_publish(Msg, QoS, WirePid, D)
+                end;
+            {error, EventReason} ->
+                %% Reject: no ACK for the record. The optional isolation copy
+                %% is best-effort evidence, never a promotion to accepted.
+                _ = broker_event:quarantine(Msg0, EventReason),
+                reject_event(QoS, WirePid, EventReason, D)
+        end
     catch
-        Class:Reason:Stack ->
-            log(warning, "publish path failed ~p:~p ~p", [Class, Reason, Stack]),
-            {stop, {publish_failed, Reason}, D}
+        Class:CatchReason:Stack ->
+            log(warning, "publish path failed ~p:~p ~p",
+                [Class, CatchReason, Stack]),
+            {stop, {publish_failed, CatchReason}, D}
+    end.
+
+%% A duplicate event was already stored: acknowledge without a second append.
+duplicate_publish(_Msg, 0, _WirePid, D) ->
+    {state, connected, D};
+duplicate_publish(_Msg, 1, WirePid, D) ->
+    {state, connected, send_frame(enc(#puback{packet_id = WirePid}, D), D)};
+duplicate_publish(_Msg, 2, WirePid, D) ->
+    %% PUBREC starts the release phase; the following PUBREL hits the existing
+    %% "unknown pubrel gets PUBCOMP" path, so the client sees a clean handshake.
+    {state, connected, send_frame(enc(#pubrec{packet_id = WirePid}, D), D)}.
+
+%% MQTT 5 can say "not accepted" in the ack itself; 3.1.1 cannot, so the only
+%% honest signal is to close without acking (the QoS1/2 publisher retries).
+reject_event(QoS, WirePid, Reason, D) ->
+    log(warning, "publish rejected by event policy: ~p (qos=~p)",
+        [Reason, QoS]),
+    case {vsn(D), QoS} of
+        {5, 1} ->
+            {state, connected,
+             send_frame(enc(#puback{packet_id = WirePid,
+                                    reason_code = 16#83}, D), D)};
+        {5, 2} ->
+            {state, connected,
+             send_frame(enc(#pubrec{packet_id = WirePid,
+                                    reason_code = 16#83}, D), D)};
+        _ ->
+            %% 3.1.1 has no refusal frame. Closing is the only honest signal:
+            %% the QoS1/2 publisher retries, and a Will (if any) still fires.
+            {stop, normal, D}
     end.
 
 store_and_ack(Msg, 0, _Partition, Refs, _WirePid, Retain, D) ->
