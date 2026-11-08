@@ -72,6 +72,20 @@ S1 的 `truncate/2` 是**逻辑**边界：它让 `read_from` 把 `BeforeOffset` 
 - **TTL**（ADR-015）负责"消息级"过期：个别消息 `expires_at` 到期后不可投递，但所在段可能因其他未过期消息而保留。
 - 两者不互相替代；TTL 到期消息在 retention 时随段一起消失。
 
+### 14.7 实现注记（S2-F，2026-11-08）
+
+> 实现计划与交付记录见 [`docs/design/s2-f-retention-execution-plan.md`](../design/s2-f-retention-execution-plan.md)。以下只记录 §14.1~§14.6 未定死、由实现固化的选择；对外契约未变。
+
+1. **删除资格只读 `wal_writer` 的 `committed`**（F-1）。`committed` 已由 `broker_subscription_worker` 按 K6 推进为 `min(live cursor) - 1`，慢消费者自然钉住它；存储层**不反向调用订阅层**。§14.1 的条件 2 因此由条件 1 的取值来源保证，不再单独查询。
+2. **`meta.log` 升 vsn 2**：body 为 `{2, Committed, TruncateBefore, Retired}`，`Retired` 是已 retired 段的起始 offset 列表（升序去重）。v1 body `{1, Committed, TruncateBefore}` 读作 `retired = []`（S1 从未删段，这是唯一不虚构删除的读法）。
+3. **物理删除在 `wal_writer:truncate/2` 内完成**，顺序严格为：列出目录 → 选出可删整段 → 写 `retired + truncate_before` 并 fsync → `unlink` → `wal_index:prune_below/2`。只删非活跃整段，`truncate_before` 仍可落在保留段中间。`truncate/2` 是 GC 的唯一入口，behavior 的 8 个回调未变。
+4. **执行者是一个全局 `wal_gc` 进程**，挂在 `broker_storage_wal_sup` 下，默认每 60 s 扫描 `data_dir/wal/*`；每个分区的实际删除仍在各自的 `wal_writer` 内串行。纯决策（`plan/3`）与文件扫描（`scan/1`）分离，测试不启动进程也能断言。
+5. **`max_age_ms` 用段文件的 mtime**，而不是逐条解析记录的 `created_at`：GC 不应做写路径级别的工作，且段轮转后 mtime 只增不减。时钟回拨只会让段"看起来更年轻"（少删），方向安全。这是对 §14.2/§14.6 用词的实现期收窄。
+6. **删除上限 `committed + 1`**；非法边界仍由 `truncate/2` 拒绝并计 `retention_blocked_by_committed`。策略有删除意图但无合法段时，计 `retention_blocked_by_slow_consumer` 并让 `retention_status/0` 报 `slow_consumer`。
+7. **恢复规则**（补充 §14.4）：retired 且文件仍在 → 补删并记 warning；retired 且已不在 → 正常；未 retired 但缺失 → `segment_gap` 拒绝启动；retired 列表含最后一个（活跃）段 → `retired_active_segment` 拒绝启动；replay 的 `expect` 从第一个现存段的起始 offset 开始；首个现存段起点 `> truncate_before` 视为 gap。
+8. **`retention_status/0`** 每分区返回 `{PartitionId, OldestSegment, DeletableBytes, BlockedReason}`，`BlockedReason :: none | slow_consumer | no_writer`；memory 后端返回 `[]`。
+9. **实现偏差**：执行计划 §2 写的"新增 `encode/4`"最终落成 `encode/3`（`Committed, TruncateBefore, Retired`），`write/3` 保留并转发 `write/4`；`encode/2`/`write/3` 仅是兼容入口，生产路径已使用 `write/4`。`xref` 由 53 条基线增至 **61** 条，新增 8 条均为预期 unused-export：`wal_gc` 的 5 个入口（`start_link/0` 只被 supervisor 规格引用，其余供测试/运维）、`wal_meta:encode/3`+`write/3`（内部/测试用）、`broker_queue:retention_status/0`（运维与测试入口）。
+
 ## 后果（Consequences）
 
 - **+** 磁盘有界，且删除条件可机械核对（两个不等式 + 活跃段排除）。

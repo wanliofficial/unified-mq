@@ -22,19 +22,23 @@
 %% is an S2 item.
 -module(wal_meta).
 
--export([filename/0, path/1, encode/2,
-         open_append/1, write/3, close/1, read/1]).
+-export([filename/0, path/1, encode/2, encode/3,
+         open_append/1, write/3, write/4, close/1, read/1]).
 
 -define(FILENAME, "meta.log").
 %% 'M'. The segment magic is 'U'; wal_meta_SUITE pins both directions.
 -define(MAGIC, 16#4D).
--define(VSN, 1).
+%% v1: `{1, Committed, TruncateBefore}'. v2 (S2-F / ADR-014 §14.4) adds the
+%% retired segment list. Old entries stay readable; a newer file still refuses
+%% to load (§11.5), which is the whole point of versioning the body separately.
+-define(VSN, 2).
 %% Magic:8 + Vsn:8 + CRC32:32 + Len:32 = 80 bits.
 -define(HEADER_SIZE, 10).
 -define(CHUNK_BYTES, 1 bsl 16).
 
 -type watermarks() :: #{committed := non_neg_integer(),
-                        truncate_before := non_neg_integer()}.
+                        truncate_before := non_neg_integer(),
+                        retired := [non_neg_integer()]}.
 -type tail() :: clean | {torn, truncated} | {corrupt, term()}.
 
 -export_type([watermarks/0, tail/0]).
@@ -45,9 +49,16 @@ filename() -> ?FILENAME.
 -spec path(file:filename_all()) -> file:filename_all().
 path(Dir) -> filename:join(Dir, ?FILENAME).
 
+%% `encode/2' keeps the S1 signature and writes the S2-F shape with an empty
+%% retired list, so a caller that has nothing to retire never has to know about
+%% the fourth field.
 -spec encode(non_neg_integer(), non_neg_integer()) -> binary().
 encode(Committed, TruncateBefore) ->
-    Body = term_to_binary({?VSN, Committed, TruncateBefore}),
+    encode(Committed, TruncateBefore, []).
+
+-spec encode(non_neg_integer(), non_neg_integer(), [non_neg_integer()]) -> binary().
+encode(Committed, TruncateBefore, Retired) ->
+    Body = term_to_binary({?VSN, Committed, TruncateBefore, Retired}),
     <<?MAGIC:8, ?VSN:8, (erlang:crc32(Body)):32, (byte_size(Body)):32, Body/binary>>.
 
 -spec open_append(file:filename_all()) -> {ok, file:io_device()} | {error, term()}.
@@ -73,7 +84,12 @@ open_append(Dir) ->
 %% message.
 -spec write(file:io_device(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 write(Fd, Committed, TruncateBefore) ->
-    case file:write(Fd, encode(Committed, TruncateBefore)) of
+    write(Fd, Committed, TruncateBefore, []).
+
+-spec write(file:io_device(), non_neg_integer(), non_neg_integer(),
+            [non_neg_integer()]) -> ok | {error, term()}.
+write(Fd, Committed, TruncateBefore, Retired) ->
+    case file:write(Fd, encode(Committed, TruncateBefore, Retired)) of
         ok -> file:sync(Fd);
         {error, Reason} -> {error, Reason}
     end.
@@ -105,7 +121,7 @@ read(Dir) ->
 %% Offsets start at 1 (design §7.1): `committed = 0' means nothing was ever
 %% acknowledged and `truncate_before = 1' means nothing has been discarded.
 -spec initial() -> watermarks().
-initial() -> #{committed => 0, truncate_before => 1}.
+initial() -> #{committed => 0, truncate_before => 1, retired => []}.
 
 scan(Fd, State, Buf) ->
     case decode_entry(Buf) of
@@ -139,8 +155,23 @@ decode_entry(_Incomplete) ->
 
 decode_body(?VSN, Body, Size) ->
     try binary_to_term(Body, [safe]) of
-        {?VSN, Committed, TruncateBefore} ->
-            {ok, #{committed => Committed, truncate_before => TruncateBefore}, Size};
+        {?VSN, Committed, TruncateBefore, Retired} ->
+            {ok, #{committed => Committed, truncate_before => TruncateBefore,
+                   retired => Retired}, Size};
+        Other ->
+            {error, {bad_body, Other}}
+    catch
+        _:Reason ->
+            {error, {bad_body, Reason}}
+    end;
+%% v1 (S1) had no retired list: everything written before S2-F is still on
+%% disk and therefore nothing was ever retired. Reading it as `[]' is the only
+%% answer that does not invent a deletion.
+decode_body(1, Body, Size) ->
+    try binary_to_term(Body, [safe]) of
+        {1, Committed, TruncateBefore} ->
+            {ok, #{committed => Committed, truncate_before => TruncateBefore,
+                   retired => []}, Size};
         Other ->
             {error, {bad_body, Other}}
     catch

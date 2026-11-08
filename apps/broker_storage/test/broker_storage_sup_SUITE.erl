@@ -22,12 +22,15 @@ each_backend_boots_the_process_its_create_needs(_Config) ->
 
 assert_wal_sup() ->
     %% create/2 adds partitions here, so the supervisor has to exist before any
-    %% handle can be made. It starts empty: boot step 1 recovers partitions and
-    %% never creates them (ADR-011 §11.2, H8).
+    %% handle can be made. It starts with exactly the retention driver (S2-F /
+    %% ADR-014) and no partition: boot step 1 recovers partitions and never
+    %% creates them (ADR-011 §11.2, H8).
     [{broker_storage_wal_sup, Pid, supervisor, [broker_storage_wal_sup]}] =
         supervisor:which_children(broker_storage_sup),
     true = is_process_alive(Pid),
-    [] = supervisor:which_children(broker_storage_wal_sup),
+    [{wal_gc, GcPid, worker, [wal_gc]}] =
+        supervisor:which_children(broker_storage_wal_sup),
+    true = is_process_alive(GcPid),
     ok.
 
 assert_memory_store() ->

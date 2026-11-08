@@ -20,7 +20,9 @@ all() ->
      the_last_entry_wins,
      watermarks_survive_a_reopen_without_truncating,
      a_torn_last_entry_is_skipped_and_reported,
-     a_corrupt_last_entry_is_skipped_and_reported].
+     a_corrupt_last_entry_is_skipped_and_reported,
+     write_then_read_roundtrips_retired_segments,
+     a_v1_entry_reads_with_no_retired_segments].
 
 %% CT hands every testcase in a suite the SAME priv_dir, so each case needs its
 %% own subdirectory or it reads the previous case's watermarks.
@@ -95,6 +97,31 @@ watermarks_survive_a_reopen_without_truncating(Config) ->
     ok = wal_meta:write(Fd2, 20, 11),
     ok = wal_meta:close(Fd2),
     {ok, #{committed := 20, truncate_before := 11}, clean} = wal_meta:read(Dir),
+    ok.
+
+%% S2-F / ADR-014 §14.4: the log carries which segments are already retired.
+%% A roundtrip must preserve the list exactly, including duplicates from a
+%% caller that appended the same start twice (the writer de-duplicates).
+write_then_read_roundtrips_retired_segments(Config) ->
+    Dir = priv(Config),
+    {ok, Fd} = wal_meta:open_append(Dir),
+    ok = wal_meta:write(Fd, 300, 257, [1, 129, 257]),
+    ok = wal_meta:close(Fd),
+    {ok, #{committed := 300, truncate_before := 257,
+           retired := [1, 129, 257]}, clean} = wal_meta:read(Dir),
+    ok.
+
+%% S1 entries are still readable after the version bump: nothing was ever
+%% retired before S2-F, so `[]' is the only honest answer.
+a_v1_entry_reads_with_no_retired_segments(Config) ->
+    Dir = priv(Config),
+    Body = term_to_binary({1, 42, 7}),
+    %% 'M', the meta magic pinned in magic_is_not_the_segment_magic.
+    V1 = <<16#4D:8, 1:8, (erlang:crc32(Body)):32,
+           (byte_size(Body)):32, Body/binary>>,
+    ok = file:write_file(wal_meta:path(Dir), V1),
+    {ok, #{committed := 42, truncate_before := 7, retired := []}, clean} =
+        wal_meta:read(Dir),
     ok.
 
 %% The crash shape: half an entry on disk. The previous watermark is what

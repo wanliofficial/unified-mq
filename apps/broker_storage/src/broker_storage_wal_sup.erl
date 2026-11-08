@@ -39,5 +39,17 @@ start_partition(PartitionId, Dir, WalConfig) ->
 %% Intensity 4 in 30 s: one restart per partition survives a kill -9 or an OOM,
 %% while a crash loop exhausts it and takes the application down. A partition
 %% that cannot be recovered must stop the node, not serve an empty log.
+%%
+%% `wal_gc' is the one static child: there is a single collector for the node,
+%% and it scans whatever partition directories exist rather than being created
+%% per partition (ADR-014 §14.3 leaves the shape to S2-F; one process per
+%% partition would double the supervision tree for no gain, because the actual
+%% deletion is serialized inside each partition's writer anyway).
 init([]) ->
-    {ok, {#{strategy => one_for_one, intensity => 4, period => 30}, []}}.
+    {ok, {#{strategy => one_for_one, intensity => 4, period => 30},
+          [#{id => wal_gc,
+             start => {wal_gc, start_link, []},
+             restart => permanent,
+             shutdown => 5000,
+             type => worker,
+             modules => [wal_gc]}]}}.

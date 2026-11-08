@@ -43,6 +43,9 @@ all() ->
      a_committed_watermark_above_the_durable_high_is_clamped,
      a_truncate_boundary_above_the_committed_offset_is_clamped,
      a_torn_meta_tail_keeps_the_last_readable_watermarks,
+     retired_segments_are_ignored_and_removed,
+     retiring_the_active_segment_refuses_to_start,
+     a_missing_segment_is_still_corruption,
      foreign_files_are_reported_but_do_not_block_recovery].
 
 init_per_testcase(Case, Config) ->
@@ -263,6 +266,47 @@ a_torn_meta_tail_keeps_the_last_readable_watermarks(Config) ->
       warnings := [{meta_tail, {torn, truncated}}]} = St,
     ok.
 
+%% A segment may be retired while its file is still on disk: the crash landed
+%% between the meta fsync and the unlink (ADR-014 §14.4). Recovery must finish
+%% the deletion and never replay the file.
+retired_segments_are_ignored_and_removed(Config) ->
+    Dir = priv(Config),
+    ok = wal_recovery:create(Dir),
+    _ = write_records(Dir, 1, [<<"a">>, <<"b">>]),
+    _ = write_records(Dir, 3, [<<"c">>, <<"d">>]),
+    ok = write_meta(Dir, 4, 3, [1]),
+    {ok, St} = wal_recovery:recover(1, Dir, #{}),
+    #{high := 5, committed := 4, truncate_before := 3, retired := [1]} = St,
+    false = filelib:is_file(wal_segment:path(Dir, 1)),
+    true = filelib:is_file(wal_segment:path(Dir, 3)),
+    true = lists:member({retired_segment_removed, wal_segment:path(Dir, 1)},
+                        maps:get(warnings, St)),
+    ok.
+
+%% The active segment is the last one and is never a retention candidate.
+%% Seeing it in `retired' means somebody deleted the file the writer appends to;
+%% that must stop the boot rather than serve a truncated log.
+retiring_the_active_segment_refuses_to_start(Config) ->
+    Dir = priv(Config),
+    ok = wal_recovery:create(Dir),
+    _ = write_records(Dir, 1, [<<"a">>]),
+    ok = write_meta(Dir, 1, 1, [1]),
+    {error, {retired_active_segment, _Path}} = wal_recovery:recover(1, Dir, #{}),
+    ok.
+
+%% A missing file that is not retired is a hole, not a retention decision. If
+%% recovery silently skipped it, every offset after it would be renumbered.
+a_missing_segment_is_still_corruption(Config) ->
+    Dir = priv(Config),
+    ok = wal_recovery:create(Dir),
+    _ = write_records(Dir, 1, [<<"a">>, <<"b">>]),
+    _ = write_records(Dir, 3, [<<"c">>, <<"d">>]),
+    _ = write_records(Dir, 5, [<<"e">>]),
+    ok = file:delete(wal_segment:path(Dir, 3)),
+    ok = write_meta(Dir, 0, 1, []),
+    {error, {segment_gap, 3, 5}} = wal_recovery:recover(1, Dir, #{}),
+    ok.
+
 foreign_files_are_reported_but_do_not_block_recovery(Config) ->
     Dir = priv(Config),
     ok = wal_recovery:create(Dir),
@@ -303,8 +347,11 @@ append_all(Fd, [Bin | Rest]) ->
     append_all(Fd, Rest).
 
 write_meta(Dir, Committed, TruncateBefore) ->
+    write_meta(Dir, Committed, TruncateBefore, []).
+
+write_meta(Dir, Committed, TruncateBefore, Retired) ->
     {ok, Fd} = wal_meta:open_append(Dir),
-    ok = wal_meta:write(Fd, Committed, TruncateBefore),
+    ok = wal_meta:write(Fd, Committed, TruncateBefore, Retired),
     wal_meta:close(Fd).
 
 %% Rewrite the version byte of a valid record and re-cover it with a correct

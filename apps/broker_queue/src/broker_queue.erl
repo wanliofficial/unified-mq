@@ -26,6 +26,8 @@
 -export([partition_ids/0, create_partition/1, storage_config/0]).
 -export([append/3, read_from/3, advance_committed/2, capability/1, watermarks/1]).
 -export([subscribe/2, unsubscribe/2]).
+%% ADR-014 §14.5: operator/test view of what retention could not delete.
+-export([retention_status/0]).
 
 -export_type([entry/0]).
 
@@ -81,6 +83,19 @@ storage_config() ->
 
 backend() ->
     application:get_env(broker_storage, backend, broker_storage_wal).
+
+%% @doc What retention is holding back, per partition (ADR-014 §14.5). The
+%% `wal' backend delegates to `wal_gc:status/0'; a memory backend has no
+%% segments and answers `[]'. Read-only and deliberately out of the data path.
+-spec retention_status() -> [{partition_id(), offset() | undefined,
+                              non_neg_integer(), atom()}].
+retention_status() ->
+    case backend() of
+        broker_storage_wal ->
+            try wal_gc:status() catch _:_ -> [] end;
+        _ ->
+            []
+    end.
 
 %%%_* Data path -----------------------------------------------------------
 

@@ -51,9 +51,11 @@ backend_setup(Case, Config) ->
 %% case's create/2 fail with already_present instead of doing its job.
 backend_cleanup(_Config) ->
     lists:foreach(
-      fun({Id, _Child, _Type, _Modules}) ->
+      fun({{wal_writer, _} = Id, _Child, _Type, _Modules}) ->
               _ = supervisor:terminate_child(broker_storage_wal_sup, Id),
-              ok = supervisor:delete_child(broker_storage_wal_sup, Id)
+              ok = supervisor:delete_child(broker_storage_wal_sup, Id);
+         (_) ->
+              ok
       end,
       supervisor:which_children(broker_storage_wal_sup)).
 
@@ -70,7 +72,9 @@ backend_cases() ->
      create_refuses_a_volatile_data_dir,
      a_crashed_writer_is_restarted_and_the_log_survives,
      mixed_sync_modes_concurrently_yield_dense_offsets_and_readable_records,
-     read_from_spans_a_segment_rotation].
+     read_from_spans_a_segment_rotation,
+     retention_deletes_only_whole_segments_below_committed,
+     a_pinned_committed_offset_deletes_nothing].
 
 %%%_* Backend cases -------------------------------------------------------
 
@@ -219,6 +223,57 @@ read_from_spans_a_segment_rotation(Config) ->
     %% back into the last segment.
     {ok, Tail, 8} = ?BACKEND:read_from(Hd, 3, 100),
     [3, 4, 5, 6, 7] = [Offset || {Offset, _Msg} <- Tail],
+    ok.
+
+%% ADR-014 §14.1/§14.4: a truncate boundary only becomes a physical delete for
+%% whole segments whose last offset is below `committed + 1'. The active
+%% segment and the segment the boundary points into stay.
+retention_deletes_only_whole_segments_below_committed(Config) ->
+    Small = #{data_dir => ?config(data_dir, Config),
+              wal => #{require_durable_fs => false, segment_max_records => 3}},
+    {ok, Hd} = ?BACKEND:create(1, Small),
+    {ok, [1, 2, 3, 4, 5, 6, 7, 8, 9]} =
+        ?BACKEND:append(Hd, [msg(1, payload(1, N)) || N <- lists:seq(1, 9)],
+                        os_buffer),
+    Dir = partition_dir(1, Config),
+    [{1, _}, {4, _}, {7, _}] = segments(Dir),
+    %% Everything through offset 6 is acked, so the boundary may move to 7.
+    ok = ?BACKEND:advance_committed(Hd, 6),
+    ok = ?BACKEND:truncate(Hd, 7),
+    false = filelib:is_file(wal_segment:path(Dir, 1)),
+    false = filelib:is_file(wal_segment:path(Dir, 4)),
+    true = filelib:is_file(wal_segment:path(Dir, 7)),
+    %% The frozen read contract: below the boundary clamps up, never errors.
+    {ok, Page, 10} = ?BACKEND:read_from(Hd, 1, 100),
+    [7, 8, 9] = [Offset || {Offset, _Msg} <- Page],
+    %% Recovery sees the same partition: retired list, boundary, and no hole.
+    {ok, Recovered} = wal_recovery:recover(1, Dir, #{}),
+    #{high := 10, committed := 6, truncate_before := 7, retired := [1, 4]} =
+        Recovered,
+    ok.
+
+%% The hard ADR-014 rule: a slow consumer pins `committed`, so the GC must not
+%% delete anything -- and the refusal is counted, not silently swallowed.
+a_pinned_committed_offset_deletes_nothing(Config) ->
+    Small = #{data_dir => ?config(data_dir, Config),
+              wal => #{require_durable_fs => false, segment_max_records => 3}},
+    {ok, Hd} = ?BACKEND:create(2, Small),
+    _ = ?BACKEND:append(Hd, [msg(2, payload(2, N)) || N <- lists:seq(1, 6)],
+                        os_buffer),
+    Dir = partition_dir(2, Config),
+    [{1, _}, {4, _}] = segments(Dir),
+    Before = maps:get(retention_blocked_by_committed, broker_metrics:snapshot()),
+    %% Nothing acked: any boundary above 1 is past `committed + 1'.
+    {error, {invalid_truncate, _, _}} = ?BACKEND:truncate(Hd, 4),
+    After = maps:get(retention_blocked_by_committed, broker_metrics:snapshot()),
+    After = Before + 1,
+    true = filelib:is_file(wal_segment:path(Dir, 1)),
+    true = filelib:is_file(wal_segment:path(Dir, 4)),
+    %% A legal no-op boundary deletes nothing either: offset 1 is not a whole
+    %% segment below the boundary.
+    ok = ?BACKEND:truncate(Hd, 1),
+    true = filelib:is_file(wal_segment:path(Dir, 1)),
+    true = filelib:is_file(wal_segment:path(Dir, 4)),
     ok.
 
 %%%_* Suite helpers -------------------------------------------------------

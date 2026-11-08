@@ -4,5 +4,7 @@
     {registered, []},
     {mod, {broker_storage_app, []}},
     {applications, [kernel, stdlib, sasl, broker_core, broker_metrics]},
-    {env, []}
+    {env, [{retention, #{max_bytes => 0,
+                         max_age_ms => 0,
+                         check_interval_ms => 60000}}]}
 ]}.

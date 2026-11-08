@@ -18,7 +18,8 @@ all() ->
      locate_finds_an_exact_anchor,
      locate_falls_back_to_the_greatest_anchor_below,
      locate_below_the_first_anchor_is_not_found,
-     locate_never_returns_an_anchor_from_an_earlier_segment].
+     locate_never_returns_an_anchor_from_an_earlier_segment,
+     prune_below_removes_only_older_anchors].
 
 %%%_* Tests --------------------------------------------------------------
 
@@ -84,6 +85,21 @@ locate_never_returns_an_anchor_from_an_earlier_segment(_Config) ->
     {ok, 500, "seg-b", 0} = wal_index:locate(Tid, 600),
     {ok, 756, "seg-b", 4321} = wal_index:locate(Tid, 999),
     {ok, 256, "seg-a", 900} = wal_index:locate(Tid, 499),
+    ok.
+
+prune_below_removes_only_older_anchors(_Config) ->
+    Tid = wal_index:new(),
+    true = wal_index:add_anchor(Tid, 1, "seg-a", 0),
+    true = wal_index:add_anchor(Tid, 100, "seg-a", 400),
+    true = wal_index:add_anchor(Tid, 200, "seg-b", 0),
+    true = wal_index:add_anchor(Tid, 300, "seg-b", 800),
+    2 = wal_index:prune_below(Tid, 200),
+    not_found = wal_index:locate(Tid, 1),
+    not_found = wal_index:locate(Tid, 150),
+    {ok, 200, "seg-b", 0} = wal_index:locate(Tid, 200),
+    {ok, 300, "seg-b", 800} = wal_index:locate(Tid, 999),
+    %% The meta row is not an anchor and must survive pruning.
+    {true, 1} = wal_index:state(Tid),
     ok.
 
 %%%_* Helpers ------------------------------------------------------------

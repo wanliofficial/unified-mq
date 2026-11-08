@@ -42,7 +42,7 @@
 
 -export([start_link/3, stop/1, capability/0]).
 -export([append/3, advance_committed/2, truncate/2, close/1, open/1,
-         state/1, stats/1]).
+         state/1, stats/1, retention_info/1]).
 -export([check_filesystem/2]).
 %% Exported for wal_writer_SUITE: the guard is only testable if the mount table
 %% is an argument rather than a file the test has to fake on the host.
@@ -88,6 +88,7 @@
              high            :: offset(),
              committed       :: offset(),
              truncate_before :: offset(),
+             retired         :: [offset()],
              pending         :: [#req{}],
              min_deadline    :: wal_group_committer:deadline(),
              timer           :: reference() | undefined,
@@ -163,6 +164,14 @@ open(Pid) ->
 state(Pid) ->
     gen_server:call(Pid, state).
 
+%% @doc Watermarks plus the directory facts the GC needs. Kept out of `state/1'
+%% because it is a retention concern, not a storage-contract answer: the type of
+%% the active segment and the retired list are implementation details of the WAL
+%% backend (ADR-014 §14.3).
+-spec retention_info(pid()) -> map().
+retention_info(Pid) ->
+    gen_server:call(Pid, retention_info).
+
 %% `syncs' and `batches' are not vanity counters: they are the only way to
 %% observe that a batch of fsync callers paid for one sync, which the return
 %% value of append/3 cannot show.
@@ -227,13 +236,11 @@ handle_call({truncate, Before}, _From,
             #st{committed = Committed, truncate_before = Trunc, id = Id} = State) ->
     case Before >= Trunc andalso Before =< Committed + 1 of
         true ->
-            true = wal_index:set_trunc(State#st.index, Before),
-            State1 = State#st{truncate_before = Before},
-            case persist_watermarks(State1) of
-                ok -> {reply, ok, State1};
-                {error, Reason} -> {stop, Reason, {error, Reason}, State}
-            end;
+            truncate_and_delete(Before, State);
         false ->
+            %% A caller asking to cross `committed' is trying to discard unacked
+            %% data. Count it, do not do it (ADR-014 §14.1/§14.5).
+            broker_metrics:inc(retention_blocked_by_committed),
             {reply, {error, {invalid_truncate, Id, {Trunc, Committed, Before}}}, State}
     end;
 
@@ -260,7 +267,16 @@ handle_call(state, _From, #st{} = State) ->
     {reply, state_map(State), State};
 
 handle_call(stats, _From, #st{stats = Stats} = State) ->
-    {reply, Stats, State}.
+    {reply, Stats, State};
+
+handle_call(retention_info, _From, #st{} = State) ->
+    {reply, #{id => State#st.id,
+              dir => State#st.dir,
+              committed => State#st.committed,
+              truncate_before => State#st.truncate_before,
+              high => State#st.high,
+              active_segment => State#st.seg#seg.path,
+              retired => State#st.retired}, State}.
 
 handle_cast(Msg, State) ->
     {stop, {unexpected_cast, Msg}, State}.
@@ -298,7 +314,8 @@ start_up(PartitionId, Dir, Config, FsWarnings) ->
 
 open_partition(PartitionId, Dir, Config, Recovered, FsWarnings) ->
     #{index := Index, high := High, committed := Committed,
-      truncate_before := Trunc, current := Current, warnings := Warnings} = Recovered,
+      truncate_before := Trunc, current := Current, warnings := Warnings,
+      retired := Retired} = Recovered,
     #{path := Path, start_offset := StartOffset, records := Records,
       end_pos := EndPos} = Current,
     case wal_segment:open_append(Path) of
@@ -327,6 +344,7 @@ open_partition(PartitionId, Dir, Config, Recovered, FsWarnings) ->
                              high = High,
                              committed = Committed,
                              truncate_before = Trunc,
+                             retired = Retired,
                              pending = [],
                              min_deadline = infinity,
                              timer = undefined,
@@ -506,8 +524,99 @@ sync_fd_measured(Fd) ->
 %% have cost the opposite. S1 does not compact this file (design §7.3 makes the
 %% same trade for segments); that is retention work in S2.
 persist_watermarks(#st{meta_fd = MetaFd, committed = Committed,
-                       truncate_before = Trunc}) ->
-    wal_meta:write(MetaFd, Committed, Trunc).
+                       truncate_before = Trunc, retired = Retired}) ->
+    wal_meta:write(MetaFd, Committed, Trunc, Retired).
+
+%%%_* Retention ----------------------------------------------------------
+
+%% ADR-014 §14.4's order is load-bearing:
+%%
+%%   1. write `retired' + the new boundary to `meta.log' and fsync,
+%%   2. unlink the files,
+%%   3. prune the anchors that pointed into them.
+%%
+%% A crash between 1 and 2 leaves retired files behind: recovery deletes them
+%% (they are already declared dead). A crash between 2 and 3 leaves anchors into
+%% a missing file, which the next boot's full replay replaces anyway. Doing 3
+%% before 1 would make a concurrent reader seek into a deleted file.
+%%
+%% Only whole segments can go, and never the active one: `truncate_before' may
+%% point into the middle of a retained segment, which is the logical boundary
+%% ADR-011 §11.6 already froze.
+truncate_and_delete(Before, #st{dir = Dir, seg = #seg{path = ActivePath}} = State) ->
+    case deletable_segments(Dir, Before, ActivePath) of
+        {ok, Sized, Deletable} ->
+            NewRetired = lists:usort(State#st.retired ++ [S || {S, _, _, _} <- Deletable]),
+            State1 = State#st{truncate_before = Before, retired = NewRetired},
+            case persist_watermarks(State1) of
+                ok ->
+                    _ = unlink_segments(Deletable),
+                    FirstRetained = first_retained(Sized, Deletable,
+                                                   State1#st.seg#seg.start_offset),
+                    _ = wal_index:prune_below(State1#st.index, FirstRetained),
+                    true = wal_index:set_trunc(State1#st.index, Before),
+                    {reply, ok, State1};
+                {error, Reason} ->
+                    {stop, Reason, {error, Reason}, State}
+            end;
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end.
+
+%% Returns `{Sized, Deletable}': every segment with its size, and the prefix of
+%% whole segments whose last offset is `< Before'. The active segment is
+%% excluded twice (by path and by `infinity' next-start) because deleting it
+%% would pull the log out from under the writer that is still appending.
+deletable_segments(Dir, Before, ActivePath) ->
+    case wal_segment:list(Dir) of
+        {ok, #{segments := Segments}} ->
+            Sized = [{Start, Path, filelib:file_size(Path)}
+                     || {Start, Path} <- Segments],
+            Pairs = lists:zip(Sized, tl(Sized) ++ [none]),
+            Deletable = [{Start, Next, Path, Size}
+                         || {{Start, Path, Size}, NextSeg} <- Pairs,
+                            Next <- [next_start(NextSeg)],
+                            Path =/= ActivePath,
+                            Next =/= infinity,
+                            Next =< Before],
+            {ok, Sized, Deletable};
+        {error, Reason} ->
+            {error, {list_failed, Dir, Reason}}
+    end.
+
+next_start(none) -> infinity;
+next_start({Start, _Path, _Size}) -> Start.
+
+%% The first segment we keep. Deleting is a prefix operation, so the first
+%% non-deleted one is where `read_from' may anchor after this call. The list is
+%% never empty: the active segment is excluded from deletion, so it survives.
+first_retained([{_Start, _, _} | _] = Sized, Deletable, _ActiveStart) ->
+    Deleted = [S || {S, _, _, _} <- Deletable],
+    Kept = [S || {S, _, _} <- Sized, not lists:member(S, Deleted)],
+    hd(Kept).
+
+unlink_segments(Deletable) ->
+    {Bytes, Count} = lists:foldl(fun({_Start, _Next, Path, Size}, {B, C}) ->
+                                         case file:delete(Path) of
+                                             ok -> {B + Size, C + 1};
+                                             {error, Reason} ->
+                                                 %% The meta entry already says
+                                                 %% retired, so the next
+                                                 %% recovery will try again. A
+                                                 %% warning beats stopping a
+                                                 %% partition over one stuck file.
+                                                 logger:warning(
+                                                   "retention: could not delete ~ts: ~p",
+                                                   [Path, Reason]),
+                                                 {B, C}
+                                         end
+                                 end, {0, 0}, Deletable),
+    case Count of
+        0 -> ok;
+        _ -> broker_metrics:inc(retention_deleted_segments, Count),
+             broker_metrics:inc(retention_deleted_bytes, Bytes)
+    end,
+    {Bytes, Count}.
 
 %%%_* Timers -------------------------------------------------------------
 
@@ -596,6 +705,7 @@ state_map(#st{} = State) ->
       high => State#st.high,
       committed => State#st.committed,
       truncate_before => State#st.truncate_before,
+      retired => State#st.retired,
       closed => State#st.closed,
       warnings => State#st.warnings}.
 

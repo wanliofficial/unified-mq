@@ -101,9 +101,11 @@ cleanup_writers() ->
             ok;
         _Sup ->
             lists:foreach(
-              fun({Id, _Child, _Type, _Modules}) ->
+              fun({{wal_writer, _} = Id, _Child, _Type, _Modules}) ->
                       _ = supervisor:terminate_child(broker_storage_wal_sup, Id),
-                      ok = supervisor:delete_child(broker_storage_wal_sup, Id)
+                      ok = supervisor:delete_child(broker_storage_wal_sup, Id);
+                 (_) ->
+                      ok
               end,
               supervisor:which_children(broker_storage_wal_sup))
     end.

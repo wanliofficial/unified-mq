@@ -44,6 +44,7 @@
                    high := non_neg_integer(),
                    committed := non_neg_integer(),
                    truncate_before := non_neg_integer(),
+                   retired := [non_neg_integer()],
                    segments := [{non_neg_integer(), file:filename_all()}],
                    current := current(),
                    warnings := [term()]}.
@@ -112,31 +113,96 @@ recover(PartitionId, Dir, Opts) ->
 %%%_* Internal -----------------------------------------------------------
 
 assemble(Dir, Segments, Unexpected, Watermarks, MetaTail, PartitionId, Interval) ->
-    case replay(Segments, PartitionId, Interval) of
-        {ok, #{high := High, anchors := Anchors, warnings := ReplayWarnings,
-               current := Current}} ->
-            {Committed, Trunc, ClampWarnings} = clamp(Watermarks, High),
-            Index = publish(Anchors, Trunc),
-            {ok, #{dir => Dir,
-                   index => Index,
-                   high => High,
-                   committed => Committed,
-                   truncate_before => Trunc,
-                   segments => Segments,
-                   current => Current,
-                   warnings => ReplayWarnings ++ ClampWarnings
-                               ++ meta_warnings(MetaTail)
-                               ++ unexpected_warnings(Unexpected)}};
+    #{retired := Retired} = Watermarks,
+    case split_retired(Segments, Retired) of
         {error, Reason} ->
-            {error, Reason}
+            {error, Reason};
+        {Kept, RemovedWarnings} ->
+            case Kept of
+                [] ->
+                    %% Every segment was retired; the active one can never be,
+                    %% so this directory cannot be a live partition.
+                    {error, {all_segments_retired, Dir}};
+                [{First, _} | _] ->
+                    case replay(Kept, PartitionId, Interval, First) of
+                        {ok, #{high := High, anchors := Anchors,
+                               warnings := ReplayWarnings, current := Current}} ->
+                            {Committed, Trunc, ClampWarnings} = clamp(Watermarks, High),
+                            case first_segment_below_truncate(First, Trunc, Committed) of
+                                ok ->
+                                    Index = publish(Anchors, Trunc),
+                                    {ok, #{dir => Dir,
+                                           index => Index,
+                                           high => High,
+                                           committed => Committed,
+                                           truncate_before => Trunc,
+                                           retired => Retired,
+                                           segments => Kept,
+                                           current => Current,
+                                           warnings => ReplayWarnings ++ ClampWarnings
+                                                       ++ RemovedWarnings
+                                                       ++ meta_warnings(MetaTail)
+                                                       ++ unexpected_warnings(Unexpected)}};
+                                {error, Reason} ->
+                                    {error, Reason}
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
+                    end
+            end
     end.
 
-replay(Segments, PartitionId, Interval) ->
+%% ADR-014 §14.4: a segment named in `retired' is already dead, whether or not
+%% the unlink happened before the crash. Re-deleting it here is the recovery
+%% half of "write meta first, unlink second"; the file is never replayed.
+%%
+%% The active segment is the last one. Retiring it would mean the writer had
+%% deleted the file it is still appending to, which no sequence in
+%% `wal_writer:truncate/2' can produce -- so it is corruption, not a crash.
+split_retired(Segments, Retired) ->
+    case lists:last(Segments) of
+        {ActiveStart, ActivePath} ->
+            case lists:member(ActiveStart, Retired) of
+                true ->
+                    {error, {retired_active_segment, ActivePath}};
+                false ->
+                    {Kept, Warnings} =
+                        lists:foldl(
+                          fun({Start, Path}, {Acc, Warn}) ->
+                                  case lists:member(Start, Retired) of
+                                      false ->
+                                          {[{Start, Path} | Acc], Warn};
+                                      true ->
+                                          case file:delete(Path) of
+                                              ok ->
+                                                  {Acc, [{retired_segment_removed,
+                                                          Path} | Warn]};
+                                              {error, enoent} -> {Acc, Warn};
+                                              {error, Reason} ->
+                                                  {Acc, [{retired_segment_removal_failed,
+                                                          Path, Reason} | Warn]}
+                                          end
+                                  end
+                          end, {[], []}, Segments),
+                    {lists:reverse(Kept), lists:reverse(Warnings)}
+            end
+    end.
+
+%% A first surviving segment above the logical boundary means the offsets
+%% between the boundary and that segment were never retired and are gone: a
+%% hole, not a retention decision. The normal invariant is
+%% `first_start =< truncate_before'.
+first_segment_below_truncate(First, Trunc, _Committed) when First =< Trunc ->
+    ok;
+first_segment_below_truncate(First, Trunc, Committed) ->
+    {error, {segment_below_truncate_missing, Trunc, First, Committed}}.
+
+replay([{First, _} | _] = Segments, PartitionId, Interval, First) ->
     Scan0 = #{partition_id => PartitionId,
               interval => Interval,
               last_path => element(2, lists:last(Segments)),
-              expect => ?FIRST_OFFSET,
-              high => ?FIRST_OFFSET,
+              expect => First,
+              high => First,
               anchors => [],
               warnings => [],
               current => undefined},

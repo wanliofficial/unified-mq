@@ -214,12 +214,14 @@
 - **TTL**：`expires_at` 在读者侧（`mqtt_conn_fsm`）过滤：不投递但推进 cursor 与 committed；不改 `broker_queue:read_from/3` 的连续记录契约（ADR-011 冻结）。
 - **测试**：退避时序（假时钟）、超限转 DLQ、DLQ 可订阅、坏模板拒绝启动、DLQ 写失败保 cursor、重启保进度、ack 超时 `DUP=1` 重投、TTL 到期不投递且 committed 前进（360/360 中的 11 例，映射见执行计划 §8.2）。
 
-### 4.6 S2-F retention 与慢消费者守卫
+### 4.6 S2-F retention 与慢消费者守卫（✅ 已实现 2026-11-08）
 
-- **段 GC**：`wal_gc`（`broker_storage_wal_sup` 下新 worker 或挂到每分区 writer？建议独立进程按分区扫描，避免阻塞写路径）；删除条件见 D3。
-- **配置**：`retention.max_bytes`、`retention.max_age_ms`、`retention.check_interval_ms`；`truncate_before` 语义不变。
-- **守卫**：慢消费者钉住时 `broker_metrics` 计数 + 告警日志，不删；提供 `broker_queue:retention_status/0`。
-- **测试**：段删除边界（不删有未消费数据的段）、删除后 `read_from` 从 `truncate_before` 起、恢复不误读已删段、慢消费者场景不 OOM。
+- **段 GC**：独立 `wal_gc` worker 挂在 `broker_storage_wal_sup` 下（全局一个，默认 60 s 扫描 `data_dir/wal/*`）；实际删除在 `wal_writer:truncate/2` 内串行完成，写路径形状不变。纯决策 `plan/3` 与目录扫描 `scan/1` 分离，测试无需启动进程。
+- **删除边界**：只删「非活跃整段且段内最大 offset `<= committed`」的段；`committed` 来自 `broker_subscription_worker` 的 K6 水位（`min(live cursor) - 1`），慢消费者自然钉住删除，存储层不反查订阅层。
+- **配置**：`retention.max_bytes` / `retention.max_age_ms` / `retention.check_interval_ms`；0 = 不限；两者同时配置时取交集。`max_age_ms` 用段文件 mtime（见 ADR-014 §14.7 第 5 条）。
+- **`meta.log` v2**：body 为 `{2, Committed, TruncateBefore, Retired}`；v1 读作 `retired = []`。删除顺序固定为「写 meta + fsync → unlink → 清锚点」，恢复按 retired 列表补删/拒绝。
+- **守卫**：慢消费者钉住时只计数不删；`broker_queue:retention_status/0` 返回 `{PartitionId, OldestSegment, DeletableBytes, BlockedReason}`，`BlockedReason ∈ none | slow_consumer | no_writer`。
+- **测试**：`wal_meta_SUITE` v2/v1、`wal_index_SUITE` prune、`wal_recovery_SUITE` retired 三场景、`broker_storage_wal_SUITE` 整段删除/慢消费者零删除、`wal_gc_SUITE` 8 例纯策略 + status；全量 `rebar3 ct` **376/376**、`dialyzer` 干净、`xref` 61（基线 53 的 8 条新增均记录在 ADR-014 §14.7）。
 
 ### 4.7 S2-G 背压与限流
 
@@ -251,7 +253,7 @@
 | M0 决策冻结 | D1~D9 结案；ADR-012~017 起草并评审 | 每份 ADR 状态=已采纳；本文升 v0.2+（**已完成**：2026-11-07 六份 ADR 全部签认，本文 v0.3） |
 | M1 观测与证明 | S2-A + S2-B | `os_buffer` 双轨报告可复跑（CI 替身 + dm-flakey）；metrics snapshot 稳定 |
 | M2 协议补齐 | S2-C（QoS2 / Retain / Will） | ✅ **已完成（2026-11-07）**：帧级 27 例 + 连接级 20 例 + retain 17 例；T14 R8 默认档/零回退档双档 PASS；T15 新增 5 例、全套 10/10 PASS。**MQTT 5 已移出本里程碑到 S2.5** |
-| M3 结构改造 | S2-D → S2-E → S2-F | ✅ **S2-D 已完成（2026-11-08）**：三种订阅类型（worker 原子 claim + 最小连续前缀 + §19.5 读验证）、`.subs` v1→v2 迁移、T14 R9 双档全绿；S2-E（DLQ/TTL）与 S2-F（retention）未开始 |
+| M3 结构改造 | S2-D → S2-E → S2-F | ✅ **S2-D 已完成（2026-11-08）**：三种订阅类型（worker 原子 claim + 最小连续前缀 + §19.5 读验证）、`.subs` v1→v2 迁移、T14 R9 双档全绿；✅ **S2-E 已完成（2026-11-08）**：cursor 行内重试 + 指数退避 + DLQ + TTL；✅ **S2-F 已完成（2026-11-08）**：`meta.log` v2 retired、`wal_gc` 整段回收、慢消费者钉住零删除、376/376 |
 | M4 收口 | S2-G + S2-I + Gate S2 报告 | Gate 四项证据齐备，全量回归零 FAILED |
 | （S2.5） | MQTT 5 子集 | 独立跟踪，不阻塞 Gate S2 |
 

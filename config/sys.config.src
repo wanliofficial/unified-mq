@@ -46,7 +46,15 @@
             max_batch_size => 256,
             batch_delay_ms => #{os_buffer => 0, fsync => 1},
             index_anchor_interval => 256,
-            segment_max_records => 100000}}
+            segment_max_records => 100000}},
+    %% S2-F / ADR-014 §14.2: whole-segment retention. `max_bytes' and
+    %% `max_age_ms' are independent limits; when both are set a segment is
+    %% deleted only if BOTH agree (the stricter reading). 0 means "no limit".
+    %% Deletion can never cross `committed' (min live cursor - 1), so a slow
+    %% consumer pins the disk instead of losing data.
+    {retention, #{max_bytes => 0,
+                  max_age_ms => 0,
+                  check_interval_ms => 60000}}
   ]},
 
   {broker_router, [

@@ -79,13 +79,14 @@ Body 是一个**独立于 `#broker_message{}` 的元组**（磁盘协议 ≠ 内
 ### 3.2 水位记录（`wal_meta`）
 
 ```
-Magic=0x4D, Vsn=0x01, CRC32, Len, term_to_binary({1, Committed, TruncateBefore})
+Magic=0x4D, Vsn=0x02, CRC32, Len, term_to_binary({2, Committed, TruncateBefore, Retired})
 ```
 
 - 追加写 + **每次 `file:sync`**。文件只增不减，S1 不压缩；最后一条可读记录就是当前水位。
+- `Retired` 是已物理删除（或已决定删除、尚未 unlink）的段起始 offset 列表（升序去重，S2-F）。v1 body `{1, Committed, TruncateBefore}` 仍可读，解释为 `retired = []`。
 - 尾部撕裂/损坏**不是错误**：`read/1` 返回 `{ok, LastGood, {torn|{corrupt,_}}}`，恢复采用最后一条完整记录并记一条 warning。
 - Magic 与段记录不同（`0x4D` vs `0x55`）：把两种文件指错会**响亮失败**，而不是读出一个看似合理的水位。
-- 初始值：`committed = 0`（没有任何确认）、`truncate_before = 1`（没有丢弃任何记录）。
+- 初始值：`committed = 0`（没有任何确认）、`truncate_before = 1`（没有丢弃任何记录）、`retired = []`。
 
 ---
 
@@ -104,7 +105,7 @@ segment-<StartOffset:20 位零填充>.log
 - 阈值：`segment_max_records`（默认 100 000 条）。
 - 轮转发生在 `wal_writer` 内部，**允许发生在一个批次的中间**：先对旧段 `sync`（若该批欠一次 fsync），关旧段，以 `Offset` 为新 `StartOffset` 开新段。
 - 新段的第一条记录必然成为锚点（`(Offset - Start) rem Interval =:= 0` 在 `Offset = Start` 时天然成立），所以跨段续读只需一次 `wal_index:locate/2`。
-- 段永不删除；`truncate/2` 只移动**逻辑**读取边界。
+- S2-F 起，整段可以被物理删除（条件见 §4.5）；`truncate/2` 仍先移动**逻辑**边界，只有边界覆盖的整段才 unlink。
 
 ### 4.3 稀疏索引（`wal_index`）
 
@@ -122,10 +123,19 @@ segment-<StartOffset:20 位零填充>.log
 
 ### 4.4 `read_from/3` 的语义
 
-- `From = max(请求 offset, truncate_before)`；逻辑边界以下直接跳过（记录还在盘上）。
+- `From = max(请求 offset, truncate_before)`；逻辑边界以下直接跳过。边界以下的段可能已被物理删除（S2-F），因此不能再假设"记录还在盘上"。
 - 返回 `{ok, [{Offset, Msg}], NextOffset}`；`NextOffset = 最后一条的 offset + 1`；空页时等于请求值。
 - 遇到**完整但不可读**的记录返回 `{error, {corrupt_record, Path, Reason}}`，**不**把损坏当成"日志到此为止"——否则订阅者会永远等一个真实存在的 offset。
 - 关闭的分区返回 `{error, {closed, Id}}`，不与"已追平"混淆。
+
+### 4.5 段回收（`wal_gc` + `wal_writer:truncate/2`，S2-F）
+
+- **执行者**：`broker_storage_wal_sup` 下的静态 `wal_gc` worker，每 `retention.check_interval_ms`（默认 60 s）扫描 `data_dir/wal/<partition>`；实际删除在对应 `wal_writer` 进程内串行完成，写路径形状不变。
+- **资格**：段内最大 offset `<= committed`，且该段不是当前活跃写段。`committed` 由订阅层按 K6 推进为 `min(live cursor) - 1`，所以慢消费者会钉住删除；存储层不反向查询订阅层。
+- **策略**：`max_bytes`（超阈值时从最老段删到阈值以下）、`max_age_ms`（段文件 mtime 早于阈值）；0 = 不限；两者同时配置时取交集。没有可删段时只计 `retention_blocked_by_slow_consumer` / `retention_blocked_by_committed`，不删。
+- **顺序**：写 `meta.log`（`retired` + 新 `truncate_before`）并 fsync → unlink 段文件 → `wal_index:prune_below/2` 清锚点。任一中间崩溃由恢复收敛（§7）。
+- **指标**：`retention_deleted_bytes` / `retention_deleted_segments`；`broker_queue:retention_status/0` 返回每分区 `{PartitionId, OldestSegment, DeletableBytes, BlockedReason}`，`BlockedReason ∈ none | slow_consumer | no_writer`。
+- **`read_from` 不变**：删除后 `From < truncate_before` 仍 clamp 到 `truncate_before`，不新增错误码。
 
 ---
 
@@ -183,13 +193,13 @@ caller:  收到 {ok, Offsets} 后才发 PUBACK
 |---|---|---|---|
 | `high` | 下一条 append 的位置；最后一条持久记录 + 1 | `wal_writer` | 由段文件本身推导 |
 | `committed` | 全局"最后已确认"的连续前缀 | 存储（由订阅层驱动） | `meta.log` |
-| `truncate_before` | 逻辑不可读边界；S1 不删文件 | 存储 | `meta.log` |
+| `truncate_before` | 逻辑不可读边界；S2-F 起也是整段删除的下界 | 存储 | `meta.log` |
 | per-sub `cursor` | "下一条要读" | `broker_subscription` | `sessions/*.cursors` |
 
 ### 6.1 守卫
 
 - `advance_committed/2`：仅接受 `Committed =< Offset =< High - 1`，否则 `{error,{invalid_committed_offset,...}}`。
-- `truncate/2`：仅接受 `Trunc =< Before =< Committed + 1`，否则 `{error,{invalid_truncate,...}}`。
+- `truncate/2`：仅接受 `Trunc =< Before =< Committed + 1`，否则 `{error,{invalid_truncate,...}}` 并计 `retention_blocked_by_committed`。合法边界会物理删除所有「非活跃且最后 offset `< Before`」的整段（S2-F）。
 - 两条都先更新内存、再 `meta.log` 追加 + fsync；fsync 失败则 writer 停止（水位不能"只在内存里成立"）。
 
 ### 6.2 订阅层的聚合与次序（K6）
@@ -217,9 +227,15 @@ recover(P, Dir):
       → 段按文件名排序；非段文件记入 unexpected
  2. wal_meta:read(Dir)
       → not_found → {error, {missing_meta, Dir}}          （create 没写完，不能假装什么都没确认）
-      → {ok, Watermarks, MetaTail}
+      → {ok, Watermarks, MetaTail}                        （Watermarks 含 retired 列表）
+ 2b. 处理 retired 段（S2-F，ADR-014 §14.4）：
+       retired 且文件仍在 → 补删 + warning {retired_segment_removed, Path}
+       retired 且文件已不在 → 正常，忽略
+       retired 列表含最后一个（活跃）段 → {error, {retired_active_segment, Path}}，拒绝启动
+       未 retired 但文件缺失 → 仍是 {segment_gap, ...}，不当成已删
  3. 逐段 replay（顺序，不允许跳段）：
-      起始 offset 必须等于 expect（否则 {segment_gap, Expect, Actual}）
+      起始 offset 必须等于 expect（第一个现存段的起点，而不是硬编码 1；
+      若首段起点 > truncate_before 则 {segment_below_truncate_missing, ...}）
       fold 每条记录：校验 magic/vsn/CRC → 解码 → 记锚点（每 interval 条 + 每段首条）
  4. 处理最后一段的尾部（见 7.2）
  5. clamp 水位：committed ≤ high-1；truncate_before ≤ committed+1
@@ -238,6 +254,10 @@ recover(P, Dir):
 | `{corrupt, {unsupported_vsn, V}}` | 来自更新版本 | `{error, {unsupported_vsn, Path, V}}`，保留现场 |
 | 其它 `{corrupt, _}`（CRC/解码头错） | 字节在但内容错 | `{error, {corrupt_record, Path, Reason}}`，不截断（截断会毁掉唯一证据和其后的记录） |
 | 段起始 offset 不连续 | 段被删/错名 | `{error, {segment_gap, Expect, Actual}}` |
+| 段在 `retired` 里且文件仍在 | 崩溃在 meta fsync 与 unlink 之间 | 补删文件，warning `{retired_segment_removed, Path}`；不 replay |
+| 段在 `retired` 里且文件已不在 | 删除已完成 | 正常，忽略 |
+| `retired` 含最后一个（活跃）段 | 违反"活跃段永不删" | `{error, {retired_active_segment, Path}}`，拒绝启动 |
+| 首个现存段起点 `> truncate_before` | 边界以下出现未声明的空洞 | `{error, {segment_below_truncate_missing, ...}}` |
 | 目录/段缺失 | 分区未创建或挂载错 | `{error, {not_found, P}}` → application 启动失败 |
 | `meta.log` 缺失 | create 未完成 | `{error, {missing_meta, Dir}}` |
 | `meta.log` 尾撕裂/损坏 | 水位更新被打断 | 用最后一条完整记录 + warning |
@@ -422,14 +442,15 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 | `os_buffer` append | 返回即已写入页缓存；`kill -9` 不丢，掉电可能丢 |
 | 订阅集合 | 每次变化 fsync + 原子 rename；`kill -9` 后完整 |
 | cursor / in-flight | 有界回退（窗口见 §9.2）；方向只偏低；`retries` 随 cursor 窗口回退（多试几次，不会少试） |
-| 恢复 | 撕裂尾截断；损坏/跨版本/缺段拒绝启动；水位只夹低 |
+| 恢复 | 撕裂尾截断；损坏/跨版本/缺段拒绝启动；水位只夹低；retired 段补删不 replay |
 | 分区创建 | 只由带外动作产生；boot 不静默创建 |
+| 段回收（S2-F） | 只删非活跃整段且最大 offset `<= committed`；写 meta 先于 unlink；慢消费者钉住时零删除 |
 
 ### 11.2 明确不保证
 
 - **掉电（power loss）**：`kill -9` 不覆盖 `os_buffer` 窗口，也没有目录级 fsync（`rename` 后的目录项可能丢）。S0.3 已注明，S2 用 dm-flakey / VM 硬复位补。
 - **不重复**：默认档 cursor/in-flight 有回退窗口，重复是契约内行为；只有零回退档能逼近"零重复"。
-- **retention / 空间回收**：段与 `meta.log` 都只增不减；`truncate_before` 只是逻辑边界。
+- **retention / 空间回收**：S2-F 起整段可删，但边界只到 `committed`；`meta.log` 自身仍只增不减（不压缩）。被慢消费者钉住的段不会被回收。
 - **TTL 不删数据**：`expires_at` 只在读者侧过滤（S2-E）；过期记录仍占段空间，直到 S2-F 的段级 GC 回收。
 - **DLQ 条数**：`dlq_size` 是 gauge，S2-E 只增不减（段删除在 S2-F 才发生），因此它是「累计死信量」的上界，不是「当前可消费条数」。
 - **跨版本写**：旧代码遇到更高 Vsn 拒绝启动（这是有意的安全行为，不是兼容承诺）。
@@ -502,7 +523,7 @@ Gate「WAL 与内存实现可互换」的机械检查：`apps/broker_storage/tes
 
 | 方向 | 会改什么 | 必须保持 |
 |---|---|---|
-| retention / compaction | 段删除、`meta.log` 压缩、`truncate_before` 真正回收空间 | 记录头格式；水位只低不高 |
+| retention / compaction | ✅ S2-F 已实现段删除（`wal_gc` + `meta.log` v2 retired）；`meta.log` 压缩仍待做 | 记录头格式；水位只低不高 |
 | 掉电验证 | dm-flakey / VM 硬复位；补目录 fsync | `fsync` 档的 ACK 时机 |
 | Mnesia 控制面 | `.subs`/`.cursors`/`.inflight` 迁入 `subscription_meta`/`cursor_meta`/`session_meta` | `broker_subscription` 对外 API |
 | 复制（S3/S4） | 新后端实现 `replicated_commit`；提交点变为共识返回 | 同一 behavior；ACK 与 capability 一一对应 |

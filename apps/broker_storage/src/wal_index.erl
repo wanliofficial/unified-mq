@@ -18,7 +18,8 @@
 %% which wal_writer_SUITE pins.
 -module(wal_index).
 
--export([new/0, state/1, set_open/2, set_trunc/2, add_anchor/4, locate/2]).
+-export([new/0, state/1, set_open/2, set_trunc/2, add_anchor/4, locate/2,
+         prune_below/2]).
 
 -define(META_KEY, {meta}).
 
@@ -48,6 +49,14 @@ set_trunc(Tid, TruncateBefore) ->
 -spec add_anchor(ets:tid(), non_neg_integer(), file:filename_all(), non_neg_integer()) -> true.
 add_anchor(Tid, Offset, SegPath, FilePos) ->
     ets:insert(Tid, {{anchor, Offset}, SegPath, FilePos}).
+
+%% Drop every anchor strictly below `Below'. Called by `wal_writer:truncate/2'
+%% after the retired segments are unlinked: an anchor that still points into a
+%% deleted file would send `read_from' into a descriptor that no longer exists.
+-spec prune_below(ets:tid(), non_neg_integer()) -> non_neg_integer().
+prune_below(Tid, Below) ->
+    ets:select_delete(Tid,
+                      [{{{anchor, '$1'}, '_', '_'}, [{'<', '$1', Below}], [true]}]).
 
 %% `not_found' means the offset lies below the first anchor, i.e. before the
 %% partition's own start; there is nothing to seek to and the caller serves an
