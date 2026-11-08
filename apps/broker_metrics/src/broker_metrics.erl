@@ -313,4 +313,13 @@ key_specs() ->
      {retain_overflow, counter},
      {retain_store_errors, counter},
      {will_published, counter},
-     {qos2_state_overflow, counter}].
+     {qos2_state_overflow, counter},
+     %% S2-D (ADR-019 §19.1/§19.2): shared-page claims, acks that named an
+     %% offset the consumer does not hold, refusals when a partition's
+     %% `acked ∪ assigned' window is full, and failover actives promoted by a
+     %% death. Same closed-set rule as every other key.
+     {shared_claims, counter},
+     {shared_ack_unowned, counter},
+     {shared_window_full, counter},
+     {shared_claim_rollbacks, counter},
+     {failover_promotions, counter}].

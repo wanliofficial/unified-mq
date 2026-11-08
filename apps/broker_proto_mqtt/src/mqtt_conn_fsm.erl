@@ -437,9 +437,14 @@ attach_session(ClientId, Clean, D) ->
     D#st{attached = true, persist = not Clean}.
 
 clean_session_teardown(D) ->
+    %% ADR-019 §19.2: an exclusive subscription is *removed*, a group membership
+    %% is only *left* -- the group outlives any one consumer, and the last one to
+    %% leave deletes the SubRef itself.
     lists:foreach(
-      fun(#{sub_ref := {_, Filter}}) ->
-              _ = broker_subscription:unsubscribe(D#st.client_id, Filter)
+      fun(#{kind := exclusive, filter := Filter}) ->
+              _ = broker_subscription:unsubscribe(D#st.client_id, Filter);
+         (#{sub_ref := Ref}) ->
+              _ = broker_subscription:leave(Ref, D#st.client_id)
       end, broker_subscription:subscriptions(D#st.client_id)),
     %% Clearing the blob here is what makes the boot residue (an empty `.subs'
     %% with no `.inflight') harmless, and is the §4.2 "start from zero".
@@ -816,7 +821,7 @@ handle_puback(Pid, #st{pending = Pending} = D) ->
                     {state, connected, D};
                 1 ->
                     D1 = release_pid(Pid, Pos, D),
-                    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O) end, Refs),
+                    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end, Refs),
                     after_release(D1)
             end
     end.
@@ -871,7 +876,7 @@ handle_pubcomp(Pid, #st{pending = Pending} = D) ->
             finish_ack(Pid, D);
         {{ok, {Refs, {P, O} = Pos}}, true} ->
             D1 = release_pid(Pid, Pos, D),
-            lists:foreach(fun(Ref) -> ack_skip(Ref, P, O) end, Refs),
+            lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end, Refs),
             after_release(D1);
         _ ->
             %% R2: unknown, or a PUBCOMP for an entry that never entered the
@@ -975,7 +980,7 @@ pull_round(D0) ->
 %% in P0 is still a delivery when P1 is looked at (and when the round stops early
 %% on a verdict that is not `idle').
 pull_sweep([P | Rest], Subs, D) ->
-    {Verdict, D1} = pull_partition(P, subs_for(P, Subs), D),
+    {Verdict, D1} = pull_partition(P, subs_for(P, Subs, D#st.client_id), D),
     case Verdict of
         idle -> pull_sweep(Rest, Subs, D1);
         Other -> {Other, D1}
@@ -987,27 +992,56 @@ rotate(Ps, N) ->
     Start = N rem max(1, length(Ps)),
     lists:nthtail(Start, Ps) ++ lists:sublist(Ps, Start).
 
-%% The subscription rows this conn serves, with the one field the pull loop
-%% needs per partition: that sub's cursor. `subscriptions/1' is re-read every
-%% round (it is a protected ETS read), which is also how a UNSUBSCRIBE that raced
-%% us gets digested.
-subs_for(P, Subs) ->
+%% The subscription rows this conn serves in P, with the two things the pull loop
+%% needs: that sub's read position and its kind. `subscriptions/1' is re-read
+%% every round (it is a protected ETS read), which is also how an UNSUBSCRIBE that
+%% raced us gets digested.
+%%
+%% A failover member that is not the active one is dropped here, before any read:
+%% a standby must not pull, must not claim and must not ack (ADR-019 §19.4). Its
+%% connection stays up only so that the next election finds it attached.
+subs_for(P, Subs, ClientId) ->
     lists:filtermap(
-      fun(#{sub_ref := Ref, filter := Filter, qos := QoS, cursors := Cursors}) ->
+      fun(#{sub_ref := Ref, kind := Kind, filter := Filter, qos := QoS,
+            cursors := Cursors}) ->
               case lists:keyfind(P, 1, Cursors) of
-                  {P, Offset} -> {true, {Ref, Filter, QoS, Offset}};
-                  false -> false
+                  {P, Offset} ->
+                      case serving(Kind, Ref, ClientId) of
+                          true -> {true, #{ref => Ref, kind => Kind,
+                                           filter => Filter, qos => QoS,
+                                           cursor => Offset}};
+                          false -> false
+                      end;
+                  false ->
+                      false
               end
       end, Subs).
 
+serving(failover, Ref, ClientId) ->
+    broker_subscription:role(Ref, ClientId) =:= active;
+serving(_Kind, _Ref, _ClientId) ->
+    true.
+
+%% One partition per round, split by kind: the plain rows share one read position
+%% (their min) and the shared rows own disjoint claimed pages. Two loops, because
+%% the question they answer is different -- "where does this subscriber read from"
+%% versus "which offsets did the group hand me".
 pull_partition(_P, [], D) ->
     idle_verdict(D);
 pull_partition(P, Rows, D) ->
+    {Plain, Shared} = lists:partition(fun(#{kind := K}) -> K =/= shared end, Rows),
+    {V1, D1} = pull_plain(P, Plain, D),
+    {V2, D2} = pull_shared(P, Shared, D1),
+    {unrank(max(rank(V1), rank(V2))), D2}.
+
+pull_plain(_P, [], D) ->
+    idle_verdict(D);
+pull_plain(P, Rows, D) ->
     %% The cursor is the only read position (J6), and the union of this client's
     %% cursors in P is exactly `min' of them: everything above it has been asked
     %% for by somebody. Per-message relevance is decided by each row's own
     %% cursor, not by this start.
-    Start = lists:min([Offset || {_Ref, _Filter, _QoS, Offset} <- Rows]),
+    Start = lists:min([Cursor || #{cursor := Cursor} <- Rows]),
     case read_page(P, Start, D) of
         {ok, [], _Next} ->
             idle_verdict(D);
@@ -1022,6 +1056,108 @@ pull_partition(P, Rows, D) ->
             log(warning, "read_from(~p, ~p) failed ~p", [P, Start, Reason]),
             idle_verdict(D)
     end.
+
+%% ADR-019 §19.1: a shared member does not read from the cursor -- it claims a
+%% page and reads exactly those offsets. Claiming is a worker call because two
+%% members must never be handed the same offset; the read itself stays here in
+%% the caller's process, like every other read on the pull path.
+pull_shared(_P, [], D) ->
+    idle_verdict(D);
+pull_shared(P, Rows, D) ->
+    lists:foldl(
+      fun(#{ref := Ref, filter := Filter, qos := QoS}, {VAcc, DAcc}) ->
+              {V, DAcc2} = claim_and_pull(P, Ref, Filter, QoS, DAcc),
+              {unrank(max(rank(VAcc), rank(V))), DAcc2}
+      end, {idle, D}, Rows).
+
+claim_and_pull(P, Ref, Filter, SubQoS, D) ->
+    ClientId = D#st.client_id,
+    case (catch broker_subscription:claim(Ref, P, opt(pull_page_limit, 32, D),
+                                          ClientId)) of
+        {ok, []} ->
+            %% The tail: the group has nothing unassigned. Not an error.
+            {idle, D};
+        {ok, Offsets} ->
+            deliver_claimed(P, Ref, Filter, SubQoS, Offsets, D);
+        {error, overflow} ->
+            %% shared_state_max. The worker already counted it; back off until
+            %% an ack frees the window (bounded rejection, ADR-019 §19.1).
+            log(info, "shared window full on ~p ~p", [Ref, P]),
+            {stalled, D};
+        {error, Reason} ->
+            log(warning, "claim ~p ~p failed ~p", [Ref, P, Reason]),
+            {idle, D};
+        Other ->
+            log(warning, "claim ~p ~p crashed ~p", [Ref, P, Other]),
+            {idle, D}
+    end.
+
+deliver_claimed(P, Ref, Filter, SubQoS, Offsets, D) ->
+    Page = read_claimed(P, Offsets, D),
+    %% ADR-019 §19.5: the storage high watermark is a *reservation*, so a claim
+    %% can name an offset whose append has not been flushed yet -- and an offset
+    %% we never read can never be acked, which would leave `low' pinned forever.
+    %% Anything the page did not actually contain goes back to the pool here and
+    %% is re-issued by a later claim (the append's wake is what brings the next
+    %% round). This is not a retry timer: the message was never delivered, so
+    %% there is nothing to count.
+    Read = [O || {O, _Msg} <- Page],
+    Missing = Offsets -- Read,
+    case Missing of
+        [] -> ok;
+        _ ->
+            broker_metrics:inc(shared_claim_rollbacks),
+            _ = (catch broker_subscription:release(Ref, P, Missing, D#st.client_id))
+    end,
+    {Rank, D1} =
+        lists:foldl(
+          fun({Offset, Msg}, {RAcc, DAcc}) ->
+                  {DAcc2, V} = handle_claimed(P, Offset, Msg, Ref, Filter, SubQoS, DAcc),
+                  {max(RAcc, rank(V)), DAcc2}
+          end, {0, D}, Page),
+    case {Page, Missing} of
+        %% Nothing was readable this round and the whole page went back: stall
+        %% the round instead of claiming every partition again. A wake or the
+        %% poll tick brings the next attempt.
+        {[], [_ | _]} -> {stalled, D1};
+        _ -> {unrank(Rank), D1}
+    end.
+
+%% The claimed offsets are ascending and may be non-contiguous (holes are offsets
+%% another member holds or ones already acked out of order), so they are read as
+%% one page per contiguous run -- a wide hole between two claims must not turn
+%% into one giant read.
+read_claimed(P, Offsets, D) ->
+    lists:flatmap(fun(Run) -> read_run(P, Run, D) end, contiguous_runs(Offsets)).
+
+read_run(P, [First | _] = Run, D) ->
+    case read_page(P, First, length(Run), D) of
+        {ok, Page, _Next} -> Page;
+        {error, Reason} ->
+            %% The claimed offsets stay assigned to this member until the
+            %% connection dies (that is what releases them, §19.2), so a failed
+            %% read costs a stalled group, never a dropped message or a `low'
+            %% that jumps over one.
+            log(warning, "read_from(~p, ~p) failed ~p", [P, First, Reason]),
+            []
+    end;
+read_run(_P, [], _D) ->
+    [].
+
+contiguous_runs([]) ->
+    [];
+contiguous_runs([O | Rest]) ->
+    contiguous_runs(Rest, O, O, []).
+
+contiguous_runs([O | Rest], RunStart, Prev, Acc) when O =:= Prev + 1 ->
+    contiguous_runs(Rest, RunStart, O, Acc);
+contiguous_runs([O | Rest], RunStart, Prev, Acc) ->
+    contiguous_runs(Rest, O, O, [run(RunStart, Prev) | Acc]);
+contiguous_runs([], RunStart, Prev, Acc) ->
+    lists:reverse([run(RunStart, Prev) | Acc]).
+
+run(First, Last) ->
+    lists:seq(First, Last).
 
 idle_verdict(D) -> {idle, D}.
 
@@ -1038,7 +1174,9 @@ unrank(1) -> stalled;
 unrank(2) -> progress.
 
 read_page(P, From, D) ->
-    Limit = opt(pull_page_limit, 32, D),
+    read_page(P, From, opt(pull_page_limit, 32, D), D).
+
+read_page(P, From, Limit, _D) ->
     case (catch broker_queue:read_from(P, From, Limit)) of
         {ok, Page, Next} when is_list(Page) -> {ok, Page, Next};
         {error, {stale_handle, _, _, _, _}} ->
@@ -1056,7 +1194,8 @@ handle_stored(P, O, Msg, Rows, D) ->
     Topic = Msg#broker_message.destination,
     {Hits, Others} =
         lists:foldl(
-          fun({Ref, Filter, QoS, Cursor}, {H, Ot}) when Cursor =< O ->
+          fun(#{ref := Ref, filter := Filter, qos := QoS, cursor := Cursor}, {H, Ot})
+                when Cursor =< O ->
                   case mqtt_filter:matches(Topic, Filter) of
                       true -> {[{Ref, QoS} | H], Ot};
                       false -> {H, [Ref | Ot]}
@@ -1071,7 +1210,7 @@ handle_stored(P, O, Msg, Rows, D) ->
             %% read-and-skip: non-matching traffic still has to advance every
             %% cursor in P, or the committed watermark pins at the first
             %% unrelated message forever (K6).
-            lists:foreach(fun(Ref) -> ack_skip(Ref, P, O) end, Others),
+            lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end, Others),
             {D, progress};
         _ ->
             Refs = [Ref || {Ref, _Q} <- Hits],
@@ -1082,7 +1221,7 @@ handle_stored(P, O, Msg, Rows, D) ->
             SubMax = lists:max([Q || {_Ref, Q} <- Hits]),
             case min(SubMax, qos_of(Msg)) of
                 0 ->
-                    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O) end,
+                    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end,
                                   Others ++ Refs),
                     note_delivery(Msg),
                     {send_frame(publish_bin(0, 0, Msg, undefined), D), progress};
@@ -1091,12 +1230,36 @@ handle_stored(P, O, Msg, Rows, D) ->
             end
     end.
 
+%% One offset this member CLAIMED on a shared subscription (ADR-019 §19.1). Two
+%% differences from the plain path:
+%%
+%%   * the offset is already ours, so the only ack question is *when*, never
+%%     *whether* -- a claimed offset that does not match the filter must still be
+%%     acked, or `low' pins on traffic this consumer was never going to see;
+%%   * one ref, not a set: the claim was made for exactly this subscription.
+handle_claimed(P, O, Msg, Ref, Filter, SubQoS, D) ->
+    Topic = Msg#broker_message.destination,
+    case mqtt_filter:matches(Topic, Filter) of
+        false ->
+            ack_skip(Ref, P, O, D#st.client_id),
+            {D, progress};
+        true ->
+            case min(SubQoS, qos_of(Msg)) of
+                0 ->
+                    ack_skip(Ref, P, O, D#st.client_id),
+                    note_delivery(Msg),
+                    {send_frame(publish_bin(0, 0, Msg, undefined), D), progress};
+                DeliverQoS ->
+                    deliver(P, O, Msg, DeliverQoS, [Ref], [], D)
+            end
+    end.
+
 %% One delivery at the level this client granted. The three cases differ only in
 %% what the peer owes back: nothing (QoS 0), PUBACK (QoS 1), or
 %% PUBREC->PUBCOMP (QoS 2).
 deliver(P, O, Msg, DeliverQoS, Refs, Others, D) ->
     Pos = {P, O},
-    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O) end, Others),
+    lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end, Others),
     case maps:get(Pos, D#st.pending_rev, undefined) of
         Pid when is_integer(Pid) ->
             %% Already in flight for this {Partition, Offset}: either restored
@@ -1201,10 +1364,11 @@ publish_bin(QoS, Dup, RetainFlag, Msg, Pid) ->
                                packet_id = Pid,
                                payload = Msg#broker_message.payload}).
 
-%% ack/3 refuses unknown/dead subscriptions idempotently, so this is safe after
-%% an UNSUBSCRIBE raced us (the cursor row is gone with the entity).
-ack_skip(Ref, P, O) ->
-    _ = (catch broker_subscription:ack(Ref, P, O)),
+%% `ack/4' refuses unknown/dead subscriptions idempotently, and answers `ok' for
+%% an ack whose consumer does not hold the offset (ADR-019 §19.2), so this is safe
+%% after an UNSUBSCRIBE or a rebalance raced us.
+ack_skip(Ref, P, O, Consumer) ->
+    _ = (catch broker_subscription:ack(Ref, P, O, Consumer)),
     ok.
 
 %%%_* In-flight snapshot (R7 blob) ---------------------------------------------

@@ -69,7 +69,11 @@
     %% the near-zero-regress tier, which pays a per-ack fsync.
     {cursor_max_regress, 64},
     {cursor_flush_interval_ms, 100},
-    {inflight_flush_interval_ms, 100}
+    {inflight_flush_interval_ms, 100},
+    %% ADR-019 §19.1: per-{SubRef, Partition} bound on `acked ∪ assigned'.
+    %% A full window refuses more claims (counted, bounded) rather than
+    %% evicting an assignment somebody is still holding.
+    {shared_state_max, 4096}
   ]},
 
   {broker_security, [

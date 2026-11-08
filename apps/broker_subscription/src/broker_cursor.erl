@@ -23,7 +23,7 @@
 
 -export([new_plain/2, new_shared/1,
          advance_plain/2, ack_shared/3, grow/2,
-         claim/5, release/2,
+         claim/5, release/2, rollback/3,
          next_read/1, committed/1,
          persist/1, restore/1]).
 
@@ -172,6 +172,24 @@ grow(#{kind := shared, acked := Acked} = Row, Offset) ->
 -spec release(row(), consumer()) -> row().
 release(#{assigned := Assigned} = Row, Consumer) ->
     Row#{assigned := maps:filter(fun(_Offset, C) -> C =/= Consumer end, Assigned)}.
+
+%% @doc Return a *set* of offsets to the pool, but only the ones still held by
+%% `Consumer' (ADR-019 §19.5). This is the claim-side correction: the storage
+%% `High' watermark is a reservation, so a claim can name an offset whose record
+%% has not been flushed yet; the caller reads the page, finds the offset absent
+%% and hands it back here instead of leaving a lease nobody will ever ack.
+%%
+%% Acking wins every race: an offset that moved into `acked' in the meantime is
+%% simply not in `assigned' any more, so the fold leaves it where it is.
+-spec rollback(row(), [offset()], consumer()) -> row().
+rollback(#{assigned := Assigned} = Row, Offsets, Consumer) ->
+    Row#{assigned := lists:foldl(
+                       fun(Offset, Acc) ->
+                               case maps:get(Offset, Acc, undefined) of
+                                   Consumer -> maps:remove(Offset, Acc);
+                                   _ -> Acc
+                               end
+                       end, Assigned, Offsets)}.
 
 %%%_* Persistence ------------------------------------------------------------
 

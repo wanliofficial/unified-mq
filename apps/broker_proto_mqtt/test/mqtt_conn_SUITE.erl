@@ -89,7 +89,15 @@ all() ->
      an_unacked_message_is_resent_with_dup_and_the_same_packet_id,
      takeover_closes_the_old_connection_and_keeps_the_session,
      a_clean_session_connection_tears_the_previous_session_down,
-     the_memory_backend_serves_the_full_e12_posture].
+     the_memory_backend_serves_the_full_e12_posture,
+     %% ADR-019: Shared/Failover have no MQTT 3.1.1 wire syntax (§13.4 puts
+     %% `$share/...' in S2.5), so the group is created through the internal API
+     %% and the *conn* is the consumer under test: claim, read, ack, redeliver.
+     a_shared_group_delivers_each_message_exactly_once,
+     a_dead_shared_member_hands_its_page_to_the_survivor,
+     a_standby_failover_member_receives_nothing,
+     failover_promotes_the_next_member_when_the_active_disconnects,
+     a_qos0_publish_reaches_exactly_one_shared_member_over_the_wire].
 
 %%%_* Fixtures ----------------------------------------------------------------
 
@@ -841,7 +849,7 @@ inflight_blob_is_v2_and_skips_retained_entries(_Config) ->
     #{vsn := 2, pending := Pending, qos := Qos, received := Received} = Blob,
     %% One positional entry: the delivery owed a PUBACK. Its offset is the
     %% stored message's own, so only the partition is pinned here.
-    [{OutPid, {[{<<"c1">>, <<"b/#">>}], {Part, Off}}}] = Pending,
+    [{OutPid, {[{exclusive, <<"c1">>, <<"b/#">>}], {Part, Off}}}] = Pending,
     ?assertEqual(route_partition(<<"b/a">>), Part),
     ?assert(is_integer(Off)),
     ?assertEqual(#{OutPid => 1}, Qos),
@@ -1169,8 +1177,156 @@ the_memory_backend_serves_the_full_e12_posture(_Config) ->
     {ok, normal} = mqtt_close(Conn2),
     ok.
 
-%%%_* Helpers -----------------------------------------------------------------
+%%%_* ADR-019: Shared / Failover over the wire --------------------------------
+%%
+%% MQTT 3.1.1 has no syntax for a group (the `$share/...' spelling is §13.4's
+%% S2.5 work), so the group is created through the internal API and the conn is
+%% the consumer under test: claim, read, ack, redeliver. What these cases pin is
+%% the end-to-end invariant the wire can see -- "one message, one member", the
+%% standby's silence, and promotion after a death -- not the bookkeeping (that
+%% is `broker_subscription_SUITE''s job).
+%%
+%% The group is always joined *after* the connections are up: a clean-session
+%% CONNECT deliberately leaves every group the client was in (§4.2), so joining
+%% first would be wiped by the very next `clean_session_teardown/1'.
 
+a_shared_group_delivers_each_message_exactly_once(_Config) ->
+    ok = boot(),
+    {C1, _} = open(<<"c1">>),
+    {C2, _} = open(<<"c2">>),
+    {ok, SubRef} = join_group(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = join_group(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    {Publisher, _} = open(<<"pub">>),
+    P = route_partition(<<"s/x">>),
+    Payloads = [<<"1">>, <<"2">>, <<"3">>, <<"4">>],
+    [#puback{} = pub(Publisher, N, <<"s/x">>, Payload, 1)
+     || {N, Payload} <- lists:zip([1, 2, 3, 4], Payloads)],
+    %% Each offset is claimed by exactly one member (§19.1), so the union of the
+    %% two sockets must be the four payloads -- once each, never twice. Which
+    %% member won which page is a race and is not asserted.
+    Delivered = collect_publishes([C1, C2], 4),
+    Payloads = lists:sort([Pub#publish.payload || {_Conn, Pub} <- Delivered]),
+    true = lists:all(fun({_Conn, Pub1}) -> Pub1#publish.qos =:= 1 end, Delivered),
+    [ok = mqtt_puback(Conn, Pid) || {Conn, #publish{packet_id = Pid}} <- Delivered],
+    %% `low' is the contiguous prefix nobody holds any more: with every offset
+    %% acked it lands exactly on the stored high watermark.
+    wait_cursor_at(SubRef, P, high_watermark(P)),
+    {ok, normal} = mqtt_close(C1),
+    {ok, normal} = mqtt_close(C2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+a_dead_shared_member_hands_its_page_to_the_survivor(_Config) ->
+    ok = boot(),
+    %% `clean = false' on purpose: the session has to survive the transport
+    %% death, or the teardown would delete the group's last member and with it
+    %% the cursor the redelivery is about.
+    {C1, _} = open(#{client_id => <<"c1">>, clean => false}),
+    {ok, SubRef} = join_group(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {Publisher, _} = open(<<"pub">>),
+    P = route_partition(<<"s/x">>),
+    Payloads = [<<"1">>, <<"2">>, <<"3">>, <<"4">>],
+    [#puback{} = pub(Publisher, N, <<"s/x">>, Payload, 1)
+     || {N, Payload} <- lists:zip([1, 2, 3, 4], Payloads)],
+    %% One member, so it takes the whole page -- and never PUBACKs it.
+    Delivered = collect_publishes([C1], 4),
+    Payloads = lists:sort([Pub#publish.payload || {_, Pub} <- Delivered]),
+    {ok, normal} = mqtt_close(C1),
+    %% The claim was a lease on a live attachment: the DOWN hands every
+    %% un-acked offset back to the pool (§19.2), which is why S2-D needs no
+    %% retry timer. A consumer arriving afterwards reads the same offsets.
+    {C2, _} = open(<<"c2">>),
+    {ok, SubRef} = join_group(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    Redelivered = collect_publishes([C2], 4),
+    Payloads = lists:sort([Pub#publish.payload || {_, Pub} <- Redelivered]),
+    [ok = mqtt_puback(Conn, Pid) || {Conn, #publish{packet_id = Pid}} <- Redelivered],
+    wait_cursor_at(SubRef, P, high_watermark(P)),
+    {ok, normal} = mqtt_close(C2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+a_standby_failover_member_receives_nothing(_Config) ->
+    ok = boot(),
+    {C1, _} = open(<<"c1">>),
+    {C2, _} = open(<<"c2">>),
+    {ok, SubRef} = join_group(failover, <<"g">>, <<"c1">>, <<"f/#">>, 1),
+    {ok, SubRef} = join_group(failover, <<"g">>, <<"c2">>, <<"f/#">>, 1),
+    %% The member order is the election (§19.4): first joined, first active.
+    active = broker_subscription:role(SubRef, <<"c1">>),
+    standby = broker_subscription:role(SubRef, <<"c2">>),
+    {Publisher, _} = open(<<"pub">>),
+    P = route_partition(<<"f/x">>),
+    Payloads = [<<"1">>, <<"2">>, <<"3">>],
+    [#puback{} = pub(Publisher, N, <<"f/x">>, Payload, 1)
+     || {N, Payload} <- lists:zip([1, 2, 3], Payloads)],
+    Delivered = collect_publishes([C1], 3),
+    Payloads = lists:sort([Pub#publish.payload || {_, Pub} <- Delivered]),
+    %% The standby is not merely skipped at delivery time -- it never gets a
+    %% wake, never claims and never reads (subs_for/3 drops it before the read).
+    true = mqtt_silence(csock(C2), 500),
+    [ok = mqtt_puback(Conn, Pid) || {Conn, #publish{packet_id = Pid}} <- Delivered],
+    wait_cursor_at(SubRef, P, high_watermark(P)),
+    {ok, normal} = mqtt_close(C1),
+    {ok, normal} = mqtt_close(C2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+failover_promotes_the_next_member_when_the_active_disconnects(_Config) ->
+    ok = boot(),
+    {C1, _} = open(<<"c1">>),
+    {C2, _} = open(<<"c2">>),
+    {ok, SubRef} = join_group(failover, <<"g">>, <<"c1">>, <<"f/#">>, 1),
+    {ok, SubRef} = join_group(failover, <<"g">>, <<"c2">>, <<"f/#">>, 1),
+    {Publisher, _} = open(<<"pub">>),
+    P = route_partition(<<"f/x">>),
+    [#puback{} = pub(Publisher, N, <<"f/x">>, <<"1">>, 1) || N <- [1, 2]],
+    First = collect_publishes([C1], 2),
+    [ok = mqtt_puback(Conn, Pid) || {Conn, #publish{packet_id = Pid}} <- First],
+    %% The active leaves. Its cursor is a plain scalar, so the successor picks
+    %% up exactly where the acked prefix ended -- no message is replayed and
+    %% none is skipped.
+    {ok, normal} = mqtt_close(C1),
+    ok = wait_role(SubRef, <<"c2">>, active),
+    [#puback{} = pub(Publisher, N, <<"f/x">>, P2, 1)
+     || {N, P2} <- [{3, <<"3">>}, {4, <<"4">>}]],
+    Second = collect_publishes([C2], 2),
+    [<<"3">>, <<"4">>] = lists:sort([Pub#publish.payload || {_, Pub} <- Second]),
+    [ok = mqtt_puback(Conn, Pid) || {Conn, #publish{packet_id = Pid}} <- Second],
+    wait_cursor_at(SubRef, P, high_watermark(P)),
+    {ok, normal} = mqtt_close(C2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+a_qos0_publish_reaches_exactly_one_shared_member_over_the_wire(_Config) ->
+    ok = boot(),
+    {C1, _} = open(<<"c1">>),
+    {C2, _} = open(<<"c2">>),
+    {ok, SubRef} = join_group(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = join_group(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    P = route_partition(<<"s/x">>),
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    {Publisher, _} = open(<<"pub">>),
+    %% A QoS0 publish never enters the log, so there is no offset to claim: the
+    %% push IS the delivery, and pushing to every member would deliver N copies
+    %% (§2.5). Exactly one member is picked.
+    ok = mqtt_publish(Publisher, undefined, <<"s/x">>, <<"fast">>, 0),
+    [{Winner, Pub}] = collect_publishes([C1, C2], 1, 4000),
+    #publish{qos = 0, packet_id = undefined, payload = <<"fast">>} = Pub,
+    Other = case Winner =:= C1 of
+                true -> csock(C2);
+                false -> csock(C1)
+            end,
+    %% ...and the other member sees nothing at all: one copy on the wire, not N.
+    true = mqtt_silence(Other, 300),
+    %% Nothing was stored, so no cursor moved: a QoS0 message is not backlog.
+    {ok, Anchor} = broker_subscription:cursor(SubRef, P),
+    [ok = assert_empty_page(Part) || Part <- broker_queue:partition_ids()],
+    {ok, normal} = mqtt_close(C1),
+    {ok, normal} = mqtt_close(C2),
+    {ok, normal} = mqtt_close(Publisher),
+    ok.
+
+%%%_* Helpers -----------------------------------------------------------------
 %% open/1 asserts the grant: a case that expects a refusal calls mqtt_open/1 and
 %% matches the CONNACK code itself.
 open(ClientId) when is_binary(ClientId) ->
@@ -1300,4 +1456,85 @@ expect_down(Monitor, Pid) ->
     receive
         {'DOWN', Monitor, process, Pid, Reason} -> {ok, Reason}
     after 5000 -> exit({mqtt_no_down, Pid})
+    end.
+
+%%%_* Group (Shared / Failover) helpers ---------------------------------------
+%%
+%% The group has to be created through the internal API because MQTT 3.1.1 has no
+%% `$share' syntax yet (§13.4 defers it to S2.5). Joining is a worker call, so a
+%% conn that was given the same client_id is the consumer these cases drive.
+
+join_group(Kind, Group, ClientId, Filter, QoS) ->
+    broker_subscription:join(Kind, Group, ClientId, Filter, QoS).
+
+%% Collect exactly N PUBLISH frames from a group of subscriber sockets. No
+%% socket is entrusted with more than it sends: each poll asks every socket in
+%% turn for one frame and the answer is appended with the socket it came from,
+%% which is what lets a case assert "the whole group saw each message once"
+%% without predicting the claim race.
+collect_publishes(Conns, N) ->
+    collect_publishes(Conns, N, 4000).
+
+collect_publishes(_Conns, N, _Budget) when N =< 0 ->
+    [];collect_publishes(Conns, N, Budget) ->
+    case poll_one(Conns, min(Budget, 200)) of
+        none when Budget > 0 ->
+            collect_publishes(Conns, N, Budget - 200);
+        none ->
+            exit({missing_publishes, N, Conns});
+        {Conn, #publish{} = Pub} ->
+            [{Conn, Pub} | collect_publishes(Conns, N - 1, Budget)];
+        {_Conn, _Other} ->
+            %% A ping response or a stray ack is not the frame under test; the
+            %% group sockets only ever see publishes, but skipping instead of
+            %% dying keeps a future frame type from turning this into a flake.
+            collect_publishes(Conns, N, Budget)
+    end.
+
+poll_one([], _Timeout) ->
+    none;
+poll_one([Conn | Rest], Timeout) ->
+    case mqtt_recv_or(csock(Conn), Timeout, nothing) of
+        nothing -> poll_one(Rest, Timeout);
+        {error, closed} -> exit({group_socket_closed, Conn});
+        Frame -> {Conn, Frame}
+    end.
+
+%% The shared row's `low' lands on the partition's high watermark once every
+%% offset of the page has been acked (High = Last + 1, so `next_read' = High).
+wait_cursor_at(SubRef, Partition, Target) ->
+    wait_cursor_at(SubRef, Partition, Target, 3000).
+
+wait_cursor_at(SubRef, Partition, Target, Budget) ->
+    case broker_subscription:cursor(SubRef, Partition) of
+        {ok, Target} ->
+            ok;
+        Other when Budget > 50 ->
+            _ = Other,
+            timer:sleep(25),
+            wait_cursor_at(SubRef, Partition, Target, Budget - 25);
+        Other ->
+            exit({cursor_never_reached, SubRef, Partition, Target, Other})
+    end.
+
+high_watermark(Partition) ->
+    {ok, _Committed, High} = broker_queue:watermarks(Partition),
+    High.
+
+%% The facade's `role/2' answers from the attachment table (pid liveness), so it
+%% flips the instant the old conn is gone; the worker's promotion counter is one
+%% DOWN message behind. Polling the role is therefore polling the fact the wire
+%% cares about -- who serves the next message.
+wait_role(SubRef, ClientId, Role) ->
+    wait_role(SubRef, ClientId, Role, 3000).
+
+wait_role(SubRef, ClientId, Role, Budget) ->
+    case broker_subscription:role(SubRef, ClientId) of
+        Role ->
+            ok;
+        _ when Budget > 50 ->
+            timer:sleep(25),
+            wait_role(SubRef, ClientId, Role, Budget - 25);
+        Other ->
+            exit({role_never_became, SubRef, ClientId, Role, Other})
     end.

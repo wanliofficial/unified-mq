@@ -2,27 +2,43 @@
 %% and the batched flush tiers of §5.3.
 %%
 %% The shape mirrors what J4 froze for `broker_queue_store' and 【F3】 froze for
-%% the Router index: four `protected' ETS tables owned by this one process --
+%% the Router index: five `protected' ETS tables owned by this one process --
 %% every other process reads them lock-free (that is `cursor/2', `subscriptions/1',
-%% `dispatch/2' in the facade), and only state *changes* are gen_server calls
-%% here. A consumer's cursor read must not serialize behind a flush tick that is
-%% fsyncing somebody else's file.
+%% `dispatch/2', `role/2' in the facade), and only state *changes* are gen_server
+%% calls here. A consumer's cursor read must not serialize behind a flush tick
+%% that is fsyncing somebody else's file.
 %%
-%% What the calls actually decide, in order:
+%% ADR-019 changed three things about this process:
+%%
+%%  * **A subscription is a SubRef, not a client.** `?ENTITIES' is keyed by
+%%    `{Kind, Key, Filter}'; a Shared/Failover group is *one* entity with an
+%%    ordered `consumers' list, and `?MEMBERS' is the second index
+%%    (`{ClientId, SubRef}') that answers "what does this connection consume".
+%%    Two indexes, one truth: the entity owns the list, `?MEMBERS' only points.
+%%  * **A shared offset is allocated here, serially** (`claim/4'). That is the
+%%    whole decision of §19.1: the cursor is shared, so "who reads what" cannot
+%%    be answered by each connection reading from `min(cursor)' -- they would all
+%%    read the same message. The row's `assigned' map is the answer, and it lives
+%%    only in memory (§19.3).
+%%  * **An ack names its consumer** (`ack/4'), so a member cannot advance a
+%%    position it does not hold (§19.2). A mismatch is `ok' plus a counter, never
+%%    a protocol error: the acker is a conn_fsm whose view may lag a rebalance.
+%%
+%% What the calls decide, in order:
 %%
 %%  * `init/1' is boot steps 2+3 and all-or-nothing, the same stance T6 froze
 %%    for partition recovery: a corrupt `.subs', an unreadable watermark or a
 %%    Router that refuses the backfill stops the application loudly, because a
 %%    half-loaded session set serves `not_found' for subscriptions that exist on
 %%    disk (ADR-011 §11.2's silent-empty lie, one layer up).
-%%  * subscribe (K2/K5): register in the Router **first** (a rejection fails
+%%  * subscribe/join (K2/K5): register in the Router **first** (a rejection fails
 %%    while nothing was written anywhere), then fsync `.subs' carrying the init
-%%    cursors, then insert the in-memory rows. A crash between the last two
-%%    loses nothing: the disk copy is what boot reloads.
-%%  * the flush tick (K6): dirty clients' `.cursors' reach the disk *before*
-%%    `advance_committed' is called with min(cursor) - 1. Reversing the order
-%%    would let a crash rewind a cursor below the committed watermark, and S2's
-%%    truncation would then delete messages the subscriber never acknowledged.
+%%    cursors and the consumer list, then insert the in-memory rows. A crash
+%%    between the last two loses nothing: the disk copy is what boot reloads.
+%%  * the flush tick (K6): dirty subscriptions' `.cursors' reach the disk
+%%    *before* `advance_committed' is called with min(cursor) - 1. Reversing the
+%%    order would let a crash rewind a cursor below the committed watermark, and
+%%    S2's truncation would then delete messages the subscriber never acked.
 -module(broker_subscription_worker).
 
 -behaviour(gen_server).
@@ -30,11 +46,13 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([start_link/0,
-         subscribe/3, unsubscribe/2, ack/3, inflight/2, attach/3, detach/2]).
+         subscribe/3, join/5, unsubscribe/2, leave/2,
+         ack/4, claim/4, release/4, inflight/2, attach/3, detach/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(ENTITIES, broker_subscription_entities).
+-define(MEMBERS, broker_subscription_members).
 -define(CURSORS, broker_subscription_cursors).
 -define(ATTACHMENTS, broker_subscription_attachments).
 -define(INFLIGHT, broker_subscription_inflight).
@@ -47,11 +65,29 @@ start_link() ->
 subscribe(ClientId, Filter, QoS) ->
     gen_server:call(?MODULE, {subscribe, ClientId, Filter, QoS}).
 
+join(Kind, Group, ClientId, Filter, QoS) ->
+    gen_server:call(?MODULE, {join, Kind, Group, ClientId, Filter, QoS}).
+
 unsubscribe(ClientId, Filter) ->
     gen_server:call(?MODULE, {unsubscribe, ClientId, Filter}).
 
-ack(SubRef, PartitionId, Offset) ->
-    gen_server:call(?MODULE, {ack, SubRef, PartitionId, Offset}).
+leave(SubRef, ClientId) ->
+    gen_server:call(?MODULE, {leave, SubRef, ClientId}).
+
+ack(SubRef, PartitionId, Offset, Consumer) ->
+    gen_server:call(?MODULE, {ack, SubRef, PartitionId, Offset, Consumer}).
+
+claim(SubRef, PartitionId, Max, Consumer) ->
+    gen_server:call(?MODULE, {claim, SubRef, PartitionId, Max, Consumer}).
+
+%% ADR-019 §19.5: the caller read back the page and some claimed offsets were not
+%% readable yet (the storage `High' watermark is a reservation, not a read
+%% bound). Hand exactly those back to the pool so the next claim can re-issue
+%% them once the append has landed.
+-spec release({exclusive | shared | failover, binary(), binary()},
+              partition_id(), [offset()], binary()) -> ok.
+release(SubRef, PartitionId, Offsets, Consumer) ->
+    gen_server:call(?MODULE, {release, SubRef, PartitionId, Offsets, Consumer}).
 
 inflight(ClientId, Term) ->
     gen_server:call(?MODULE, {inflight, ClientId, Term}).
@@ -71,9 +107,11 @@ init([]) ->
               max_regress => application:get_env(broker_subscription, cursor_max_regress, 64),
               cursor_interval => application:get_env(broker_subscription, cursor_flush_interval_ms, 100),
               inflight_interval => application:get_env(broker_subscription, inflight_flush_interval_ms, 100),
+              shared_state_max => application:get_env(broker_subscription, shared_state_max, 4096),
               last_committed => #{},
               cursor_dirty => #{},
-              inflight_dirty => #{}},
+              inflight_dirty => #{},
+              active_of => #{}},
     case boot(Partitions) of
         {ok, LastCommitted} ->
             State1 = State#{last_committed := LastCommitted},
@@ -86,7 +124,7 @@ init([]) ->
     end.
 
 handle_call({subscribe, ClientId, Filter, QoS}, _From, State) ->
-    SubRef = {ClientId, Filter},
+    SubRef = {exclusive, ClientId, Filter},
     case ets:lookup(?ENTITIES, SubRef) of
         [_] ->
             %% Re-subscribe (MQTT replaces the QoS of a live filter): the
@@ -95,48 +133,173 @@ handle_call({subscribe, ClientId, Filter, QoS}, _From, State) ->
             %% unregister/register window for zero effect (K2). The cursor is
             %% deliberately *not* re-anchored: a re-subscribe continues from
             %% where the subscription left off.
-            reply_resubscribe(ClientId, SubRef, QoS, State);
+            reply_resubscribe(SubRef, QoS, State);
         [] ->
-            reply_new_subscribe(ClientId, Filter, QoS, State)
+            reply_new_subscribe(SubRef, #{kind => exclusive, key => ClientId,
+                                          filter => Filter, qos => QoS,
+                                          consumers => [ClientId]},
+                                State)
     end;
 
-handle_call({unsubscribe, ClientId, Filter}, _From, State) ->
-    SubRef = {ClientId, Filter},
+handle_call({join, Kind, Group, ClientId, Filter, QoS}, _From, State)
+  when Kind =:= shared; Kind =:= failover ->
+    SubRef = {Kind, Group, Filter},
     case ets:lookup(?ENTITIES, SubRef) of
+        [{_, #{consumers := Consumers, qos := OldQoS} = Info}] ->
+            case lists:member(ClientId, Consumers) of
+                true ->
+                    %% Already a member: a re-SUBSCRIBE may only change the QoS,
+                    %% and it must not move the consumer's place in the order
+                    %% (that order is the failover active election, ADR-019 §19.4).
+                    Info1 = Info#{qos => QoS},
+                    case persist_entity(SubRef, Info1) of
+                        ok -> {reply, {ok, SubRef}, State};
+                        {error, Reason} ->
+                            {reply, {error, {persist_subs, Reason}}, State}
+                    end;
+                false ->
+                    _ = OldQoS,
+                    %% Appended at the tail: a joining member never displaces the
+                    %% active one, and a reconnecting one is appended rather than
+                    %% restored to its old slot -- membership order is "who joined
+                    %% first among the current members", which is the only rule
+                    %% that survives an arbitrary death order.
+                    Info1 = Info#{consumers => Consumers ++ [ClientId],
+                                  qos => QoS},
+                    case persist_entity(SubRef, Info1) of
+                        ok ->
+                            true = ets:insert(?ENTITIES, {SubRef, Info1}),
+                            true = ets:insert(?MEMBERS, {{ClientId, SubRef}}),
+                            {reply, {ok, SubRef},
+                             refresh_active(SubRef, State)};
+                        {error, Reason} ->
+                            {reply, {error, {persist_subs, Reason}}, State}
+                    end
+            end;
         [] ->
-            {reply, ok, State};
-        [_] ->
-            %% Disk first, then Router, then memory: a crash between persist
-            %% and unregister leaves a Router orphan the dispatch path skips
-            %% (K8), whereas unregistering a still-persisted subscription
-            %% first would silently stop delivering a sub that reboot brings
-            %% back. A failed persist changes nothing anywhere.
-            Body = [Entry || Entry = {F, _QoS, _Init} <- subs_body(ClientId), F =/= Filter],
-            case broker_subscription_files:write_subs(ClientId, Body) of
-                ok ->
-                    _ = broker_router:unregister(SubRef),
-                    remove_local(SubRef),
-                    {reply, ok, State};
+            case broker_router:register(Filter, SubRef, #{qos => QoS}) of
+                Result when Result =:= ok;
+                            Result =:= {error, {already_registered, SubRef}} ->
+                    Info = #{kind => Kind, key => Group, filter => Filter,
+                             qos => QoS, consumers => [ClientId]},
+                    reply_new_subscribe2(SubRef, Info, State);
                 {error, Reason} ->
-                    {reply, {error, {persist_subs, Reason}}, State}
+                    {reply, {error, {router_register, Reason}}, State}
             end
     end;
 
-handle_call({ack, SubRef = {ClientId, _Filter}, PartitionId, Offset}, _From, State) ->
+handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS}, _From, State) ->
+    {reply, {error, wrong_kind}, State};
+
+handle_call({unsubscribe, ClientId, Filter}, _From, State) ->
+    remove_subscription({exclusive, ClientId, Filter}, State);
+
+handle_call({leave, SubRef, ClientId}, _From, State) ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [] ->
+            {reply, ok, State};
+        [{_, #{kind := exclusive}}] ->
+            %% `leave/2' is for group memberships; an exclusive subscription has
+            %% exactly one consumer and UNSUBSCRIBE is its removal path.
+            {reply, ok, State};
+        [{_, #{consumers := Consumers} = Info}] ->
+            case lists:member(ClientId, Consumers) of
+                false ->
+                    {reply, ok, State};
+                true ->
+                    Rest = lists:delete(ClientId, Consumers),
+                    State1 = maybe_release(SubRef, ClientId, State),
+                    case Rest of
+                        [] ->
+                            %% Last member left: the entity, its cursors, its
+                            %% Router entry and its files all go (ADR-019 §19.2).
+                            _ = broker_router:unregister(SubRef),
+                            ok = broker_subscription_files:delete_subscription(SubRef),
+                            remove_local(SubRef),
+                            true = ets:delete(?MEMBERS, {ClientId, SubRef}),
+                            {reply, ok, drop_dirty(SubRef, State1)};
+                        [NewActive | _] ->
+                            Info1 = Info#{consumers => Rest},
+                            case persist_entity(SubRef, Info1) of
+                                ok ->
+                                    true = ets:insert(?ENTITIES, {SubRef, Info1}),
+                                    true = ets:delete(?MEMBERS, {ClientId, SubRef}),
+                                    _ = NewActive,
+                                    {reply, ok, refresh_active(SubRef, State1)};
+                                {error, Reason} ->
+                                    {reply, {error, {persist_subs, Reason}}, State1}
+                            end
+                    end
+            end
+    end;
+
+handle_call({ack, SubRef, PartitionId, Offset, Consumer}, _From, State) ->
     State1 = case ets:lookup(?CURSORS, {SubRef, PartitionId}) of
                  [] ->
                      %% Unknown sub or unknown partition: idempotent ok. The
-                     %% acker is a conn_fsm whose view may lag a UNSUBSCRIBE by
+                     %% acker is a conn_fsm whose view may lag an UNSUBSCRIBE by
                      %% one message; failing it would turn a race into a
                      %% protocol error.
                      State;
                  [{_, Row}] ->
-                     New = advance_row(Row, Offset),
-                     Delta = maps:get(offset, New) - maps:get(offset, Row),
-                     true = ets:insert(?CURSORS, {{SubRef, PartitionId}, New}),
-                     absorb_advance(ClientId, Delta, State)
+                     case ack_row(Row, Offset, Consumer) of
+                         unowned ->
+                             broker_metrics:inc(shared_ack_unowned),
+                             State;
+                         {ok, Row1} ->
+                             true = ets:insert(?CURSORS,
+                                               {{SubRef, PartitionId}, Row1}),
+                             absorb_advance(SubRef, delta(Row, Row1), State)
+                     end
              end,
     {reply, ok, State1};
+
+handle_call({claim, SubRef = {_Kind, _, _}, PartitionId, Max, Consumer}, _From, State) ->
+    case ets:lookup(?CURSORS, {SubRef, PartitionId}) of
+        [] ->
+            {reply, {error, {no_cursor_for_partition, SubRef, PartitionId}}, State};
+        [{_, #{kind := Kind}}] when Kind =/= shared ->
+            {reply, {error, wrong_kind}, State};
+        [{_, Row}] ->
+            #{shared_state_max := Limit} = State,
+            case broker_queue:watermarks(PartitionId) of
+                {ok, _Committed, High} ->
+                    case broker_cursor:claim(Row, Max, High, Consumer, Limit) of
+                        {ok, [], _Row1} ->
+                            %% The tail: not an error, and not a claim either.
+                            {reply, {ok, []}, State};
+                        {ok, Offsets, Row1} ->
+                            true = ets:insert(?CURSORS,
+                                              {{SubRef, PartitionId}, Row1}),
+                            broker_metrics:inc(shared_claims),
+                            {reply, {ok, Offsets}, State};
+                        {error, overflow} ->
+                            broker_metrics:inc(shared_window_full),
+                            {reply, {error, overflow}, State}
+                    end;
+                {error, Reason} ->
+                    %% The pull loop degrades to `idle' this round and retries on
+                    %% the poll tick; a watermark read must not crash a
+                    %% connection (§19.1).
+                    {reply, {error, {watermark, PartitionId, Reason}}, State}
+            end
+    end;
+
+handle_call({release, SubRef = {_Kind, _, _}, PartitionId, Offsets, Consumer}, _From, State) ->
+    case ets:lookup(?CURSORS, {SubRef, PartitionId}) of
+        [{_, #{kind := shared} = Row}] ->
+            %% Ownership-checked per offset inside the cursor module, so a
+            %% rollback cannot resurrect an offset that was acked in the
+            %% meantime (§19.5).
+            true = ets:insert(?CURSORS,
+                              {{SubRef, PartitionId},
+                               broker_cursor:rollback(Row, Offsets, Consumer)}),
+            {reply, ok, State};
+        _ ->
+            %% The row is gone (subscription left) or not shared: nothing to
+            %% return, and the caller is retiring this ref anyway.
+            {reply, ok, State}
+    end;
 
 handle_call({inflight, ClientId, Term}, _From, State) ->
     true = ets:insert(?INFLIGHT, {ClientId, Term}),
@@ -162,7 +325,7 @@ handle_call({attach, ClientId, Pid, Persist}, _From, State) ->
                       {ClientId, #{pid => Pid,
                                    ref => erlang:monitor(process, Pid),
                                    persist => Persist}}),
-    {reply, {ok, Prev}, State};
+    {reply, {ok, Prev}, refresh_all_active(subs_of(ClientId), State)};
 
 handle_call({detach, ClientId, Pid}, _From, State) ->
     {ok, State1} = do_detach(ClientId, Pid, State),
@@ -221,14 +384,30 @@ terminate(_Reason, State) ->
 %%%_* Boot: steps 2 + 3 ------------------------------------------------------
 
 boot(Partitions) ->
-    case {live_watermarks(Partitions), broker_subscription_files:list_sessions()} of
-        {{ok, Watermarks}, {ok, Sessions}} ->
+    %% ADR-019 §19.4: migration first, then the orphan sweep, then the load. A
+    %% directory that is half v1 is refused rather than served with a smaller
+    %% subscription set.
+    case broker_subscription_files:migrate_v1() of
+        ok ->
+            ok = broker_subscription_files:prune_orphan_cursors(),
+            boot_subscriptions(Partitions);
+        {error, Reason} ->
+            %% Same wrapper the load path uses: a corrupt session file is one
+            %% refusal whatever stage noticed it.
+            {error, {session_scan, Reason}}
+    end.
+
+boot_subscriptions(Partitions) ->
+    case {live_watermarks(Partitions), broker_subscription_files:list_subscriptions()} of
+        {{ok, Watermarks}, {ok, Subs}} ->
             LastCommitted = maps:from_list([{P, C} || {P, {C, _High}} <- Watermarks]),
             WM = maps:from_list([{P, High} || {P, {_C, High}} <- Watermarks]),
-            case load_entities(Sessions, Partitions, WM, []) of
+            case load_entities(Subs, Partitions, WM, []) of
                 {ok, Refs} ->
                     case backfill(Refs) of
-                        ok -> {ok, LastCommitted};
+                        ok ->
+                            load_all_inflight(),
+                            {ok, LastCommitted};
                         {error, Reason} -> {error, Reason}
                     end;
                 {error, Reason} ->
@@ -251,74 +430,83 @@ live_watermarks([P | Rest], Acc) ->
 live_watermarks([], Acc) ->
     {ok, lists:reverse(Acc)}.
 
-%% Step 2: entities + cursors from disk. The rule per (SubRef, PartitionId):
-%% `.cursors' if it carries the key, else the init anchor embedded in `.subs'
-%% (K5) -- never `Committed', never 0, never a fresh High for a partition the
-%% subscription already had (that would rewind past acks or skip past
-%% un-acknowledged backlog). A partition missing from *both* files is one that
-%% did not exist when the subscription was made; it anchors at the live tail,
-%% which is what subscribing to it today would do.
-load_entities([{ClientId, Entries} | Rest], Partitions, WM, Refs) ->
-    case load_client(ClientId, Entries, Partitions, WM) of
-        {ok, ClientRefs} -> load_entities(Rest, Partitions, WM, Refs ++ ClientRefs);
-        {error, Reason} -> {error, {ClientId, Reason}}
+%% Step 2: entities + members + cursors from disk. The rule per (SubRef,
+%% PartitionId): `.cursors' if it carries the key, else the init anchor embedded
+%% in `.subs' (K5) -- never `Committed', never 0, never a fresh High for a
+%% partition the subscription already had (that would rewind past acks or skip
+%% past un-acknowledged backlog). A partition missing from *both* files is one
+%% that did not exist when the subscription was made; it anchors at the live
+%% tail, which is what subscribing to it today would do.
+load_entities([{SubRef, Body} | Rest], Partitions, WM, Refs) ->
+    case load_subscription(SubRef, Body, Partitions, WM) of
+        {ok, Ref} -> load_entities(Rest, Partitions, WM, Refs ++ [Ref]);
+        {error, Reason} -> {error, {SubRef, Reason}}
     end;
 load_entities([], _Partitions, _WM, Refs) ->
     {ok, Refs}.
 
-load_client(ClientId, Entries, Partitions, WM) ->
-    case {broker_subscription_files:read_cursors(ClientId),
-          broker_subscription_files:read_inflight(ClientId)} of
-        {{ok, Flushed0}, {ok, Inflight}} ->
-            Flushed = cursors_map(ClientId, Flushed0),
+load_subscription(SubRef, Body, Partitions, WM) ->
+    case broker_subscription_files:read_cursors(SubRef) of
+        {ok, Flushed0} ->
             try
-                Refs =
-                    lists:map(fun({Filter, QoS, InitCursors}) ->
-                                SubRef = {ClientId, Filter},
-                                Init = maps:from_list(InitCursors),
-                                true = ets:insert(?ENTITIES,
-                                                  {SubRef, #{client_id => ClientId,
-                                                             filter => Filter,
-                                                             qos => QoS,
-                                                             init_cursors => InitCursors}}),
-                                lists:foreach(
-                                  fun(P) ->
-                                      Offset = cursor_at(SubRef, P, Flushed, Init, WM),
-                                      true = ets:insert(?CURSORS,
-                                                        {{SubRef, P}, #{offset => Offset,
-                                                                        pending => []}})
-                                  end, Partitions),
-                                {SubRef, Filter}
-                              end, Entries),
-                _ = case Inflight of
-                        none -> ok;
-                        Term -> true = ets:insert(?INFLIGHT, {ClientId, Term})
-                    end,
-                {ok, Refs}
+                #{kind := Kind, filter := Filter, consumers := Consumers,
+                  init_cursors := InitCursors} = Body,
+                true = ets:insert(?ENTITIES, {SubRef, Body}),
+                lists:foreach(fun(C) -> true = ets:insert(?MEMBERS, {{C, SubRef}}) end,
+                              Consumers),
+                Init = maps:from_list(InitCursors),
+                Flushed = flushed_rows(SubRef, Flushed0),
+                lists:foreach(
+                  fun(P) ->
+                      Row = restored_row(Kind, P, Flushed, Init, WM),
+                      true = ets:insert(?CURSORS, {{SubRef, P}, Row})
+                  end, Partitions),
+                {ok, {SubRef, Filter}}
             catch
                 Class:Reason -> {error, {load_failed, Class, Reason}}
             end;
-        {{error, Reason}, _} ->
-            {error, {cursors_file, Reason}};
-        {_, {error, Reason}} ->
-            {error, {inflight_file, Reason}}
+        {error, Reason} ->
+            {error, {cursors_file, Reason}}
     end.
 
-cursors_map(_ClientId, none) ->
+flushed_rows(_SubRef, none) ->
     #{};
-cursors_map(ClientId, Body) ->
-    maps:from_list([{{{ClientId, Filter}, P}, Offset}
-                    || {Filter, Rows} <- Body, {P, Offset} <- Rows]).
+flushed_rows(SubRef, #{rows := Rows}) when is_map(Rows) ->
+    maps:from_list([{P, Row} || {P, Row} <- maps:to_list(Rows),
+                                is_map(Row), maps:get(kind, Row) =:= element(1, SubRef)]).
 
-cursor_at(SubRef, P, Flushed, Init, WM) ->
+restored_row(Kind, P, Flushed, Init, WM) ->
     case Flushed of
-        #{{SubRef, P} := Offset} -> Offset;
+        #{P := Row} ->
+            %% `assigned' never reached the disk (§19.3), so a shared row comes
+            %% back with its claim list empty: everything un-acked is owed again.
+            broker_cursor:restore(Row);
         _ ->
-            case Init of
-                #{P := Offset} -> Offset;
-                _ -> maps:get(P, WM, 0)
-            end
+            %% `.cursors' has no row for this partition: fall back to the init
+            %% anchor inside `.subs' (K5), then to the live tail.
+            Offset = case Init of
+                         #{P := I} -> I;
+                         _ -> maps:get(P, WM, 0)
+                     end,
+            new_row(Kind, Offset)
     end.
+
+new_row(shared, Offset) -> broker_cursor:new_shared(Offset);
+new_row(Kind, Offset) -> broker_cursor:new_plain(Kind, Offset).
+
+%% In-flight blobs are client-keyed and independent of the subscription scan
+%% (§19.3), so they load once per client after the entities are in place.
+load_all_inflight() ->
+    lists:foreach(
+      fun(ClientId) ->
+              case broker_subscription_files:read_inflight(ClientId) of
+                  {ok, none} -> ok;
+                  {ok, Term} -> true = ets:insert(?INFLIGHT, {ClientId, Term})
+              end
+      end, all_clients()).
+
+all_clients() ->
+    lists:usort([C || {{C, _SubRef}} <- ets:tab2list(?MEMBERS)]).
 
 %% Step 3: backfill the Router index. `already_registered' is ok (K8): the
 %% crash window that orphans a Router entry ends with exactly this file on disk
@@ -333,52 +521,48 @@ backfill([{SubRef, Filter} | Rest]) ->
 backfill([]) ->
     ok.
 
-%%%_* subscribe / unsubscribe -----------------------------------------------
+%%%_* subscribe / join -------------------------------------------------------
 
-reply_resubscribe(ClientId, SubRef, QoS, State) ->
+reply_resubscribe(SubRef = {_Kind, _Key, _Filter}, QoS, State) ->
     [{SubRef, Info}] = ets:lookup(?ENTITIES, SubRef),
-    true = ets:insert(?ENTITIES, {SubRef, Info#{qos => QoS}}),
-    case broker_subscription_files:write_subs(ClientId, subs_body(ClientId)) of
+    Info1 = Info#{qos => QoS},
+    case persist_entity(SubRef, Info1) of
         ok ->
+            true = ets:insert(?ENTITIES, {SubRef, Info1}),
             {reply, {ok, SubRef}, State};
         {error, Reason} ->
-            true = ets:insert(?ENTITIES, {SubRef, Info}),
             {reply, {error, {persist_subs, Reason}}, State}
     end.
 
-reply_new_subscribe(ClientId, Filter, QoS, State) ->
-    #{partitions := Partitions} = State,
-    SubRef = {ClientId, Filter},
-    %% Fail fast in the Router: a refused register (invalid filter, store
-    %% down) ends here with nothing written anywhere, which is the only
-    %% rollback that needs no code. `already_registered' means a K8 orphan
-    %% of this very {ClientId, Filter} is still indexed -- adopt it.
-    case broker_router:register(Filter, SubRef, #{qos => QoS}) of
+reply_new_subscribe(SubRef, Info, State) ->
+    #{filter := Filter} = Info,
+    case broker_router:register(Filter, SubRef, #{qos => maps:get(qos, Info)}) of
         Result when Result =:= ok;
                     Result =:= {error, {already_registered, SubRef}} ->
-            anchor_and_persist(ClientId, Filter, QoS, SubRef, Partitions, State);
+            reply_new_subscribe2(SubRef, Info, State);
         {error, Reason} ->
             {reply, {error, {router_register, Reason}}, State}
     end.
 
-anchor_and_persist(ClientId, Filter, QoS, SubRef, Partitions, State) ->
+reply_new_subscribe2(SubRef, Info, State) ->
+    #{partitions := Partitions} = State,
     case tail_offsets(Partitions, []) of
         {ok, InitCursors} ->
-            Body = subs_body(ClientId) ++ [{Filter, QoS, InitCursors}],
-            case broker_subscription_files:write_subs(ClientId, Body) of
+            Full = Info#{init_cursors => InitCursors,
+                         created_at => erlang:system_time(millisecond)},
+            case persist_entity(SubRef, Full) of
                 ok ->
-                    true = ets:insert(?ENTITIES,
-                                      {SubRef, #{client_id => ClientId,
-                                                 filter => Filter,
-                                                 qos => QoS,
-                                                 init_cursors => InitCursors}}),
+                    true = ets:insert(?ENTITIES, {SubRef, Full}),
+                    lists:foreach(
+                      fun(C) -> true = ets:insert(?MEMBERS, {{C, SubRef}}) end,
+                      maps:get(consumers, Full)),
+                    Kind = maps:get(kind, Full),
                     lists:foreach(
                       fun({P, Offset}) ->
-                              true = ets:insert(?CURSORS,
-                                                {{SubRef, P}, #{offset => Offset,
-                                                                pending => []}})
+                          true = ets:insert(?CURSORS,
+                                            {{SubRef, P}, new_row(Kind, Offset)})
                       end, InitCursors),
-                    {reply, {ok, SubRef}, State};
+                    {reply, {ok, SubRef}, refresh_active(SubRef, State)};
                 {error, Reason} ->
                     %% Roll the Router back so a rejected subscribe leaves no
                     %% trace anywhere: the K8 orphan tolerance exists for
@@ -399,54 +583,82 @@ tail_offsets([P | Rest], Acc) ->
 tail_offsets([], Acc) ->
     {ok, lists:reverse(Acc)}.
 
-subs_body(ClientId) ->
-    [{Filter, QoS, InitCursors}
-     || {_SubRef, #{filter := Filter, qos := QoS, init_cursors := InitCursors}}
-            <- entities_of(ClientId)].
+persist_entity(SubRef, #{kind := Kind, key := Key, filter := Filter, qos := QoS,
+                         consumers := Consumers, init_cursors := Init} = Info) ->
+    broker_subscription_files:write_subs(
+      SubRef, #{kind => Kind, key => Key, filter => Filter, qos => QoS,
+                consumers => Consumers, init_cursors => Init,
+                created_at => maps:get(created_at, Info, 0)}).
 
-entities_of(ClientId) ->
-    ets:match_object(?ENTITIES, {{ClientId, '_'}, '_'}).
+%%%_* unsubscribe / leave ---------------------------------------------------
+
+remove_subscription(SubRef = {_Kind, _Key, _Filter}, State) ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [] ->
+            {reply, ok, State};
+        [{_, #{consumers := Consumers}}] ->
+            %% Disk first, then Router, then memory: a crash between persist
+            %% and unregister leaves a Router orphan the dispatch path skips
+            %% (K8), whereas unregistering a still-persisted subscription first
+            %% would silently stop delivering a sub that reboot brings back. A
+            %% failed persist changes nothing anywhere.
+            ok = broker_subscription_files:delete_subscription(SubRef),
+            _ = broker_router:unregister(SubRef),
+            remove_local(SubRef),
+            lists:foreach(fun(C) -> true = ets:delete(?MEMBERS, {C, SubRef}) end,
+                          Consumers),
+            {reply, ok, drop_dirty(SubRef, State)}
+    end.
+
+%% A member's claimed-but-unacked offsets go back to the pool. Only shared rows
+%% have assignments; the plain rows of a departed exclusive subscriber keep
+%% their scalar cursor, which is the session that will resume.
+maybe_release(SubRef, ClientId, State) ->
+    lists:foreach(
+      fun({{S, P}, Row}) when S =:= SubRef ->
+              case maps:get(kind, Row, undefined) of
+                  shared -> true = ets:insert(?CURSORS, {{S, P}, broker_cursor:release(Row, ClientId)});
+                  _ -> ok
+              end;
+         (_) ->
+              ok
+      end, ets:match_object(?CURSORS, {{SubRef, '_'}, '_'})),
+    State.
 
 %%%_* ack / cursor aggregation ------------------------------------------------
 
-%% Contiguous-prefix advance: an ack at the cursor moves it and cascades over
-%% the buffered set; an ack beyond it buffers; an ack behind it is a duplicate
-%% and changes nothing (MQTT acks can arrive out of order via different
-%% packet_ids resolving in different orders).
-advance_row(Row, Offset) ->
-    Current = maps:get(offset, Row),
-    Pending = maps:get(pending, Row),
-    if
-        Offset < Current -> Row;
-        Offset =:= Current -> cascade(Current + 1, Pending, Row);
-        true -> Row#{pending => lists:usort([Offset | Pending])}
-    end.
+ack_row(#{kind := shared} = Row, Offset, Consumer) ->
+    broker_cursor:ack_shared(Row, Offset, Consumer);
+ack_row(Row, Offset, _Consumer) ->
+    {ok, broker_cursor:advance_plain(Row, Offset)}.
 
-cascade(Next, [Next | Rest], Row) ->
-    cascade(Next + 1, Rest, Row);
-cascade(Next, Pending, Row) ->
-    Row#{offset => Next, pending => Pending}.
+delta(Row, Row1) ->
+    broker_cursor:next_read(Row1) - broker_cursor:next_read(Row).
 
-absorb_advance(_ClientId, 0, State) ->
+absorb_advance(_SubRef, 0, State) ->
     State;
-absorb_advance(ClientId, Delta, State) ->
+absorb_advance(_SubRef, Delta, State) when Delta < 0 ->
+    _ = Delta,
+    State;
+absorb_advance(SubRef, Delta, State) ->
     #{cursor_dirty := Dirty, max_regress := MaxRegress, cursor_interval := Interval} = State,
-    Count = maps:get(ClientId, Dirty, 0) + Delta,
-    State1 = State#{cursor_dirty := Dirty#{ClientId => Count}},
+    Count = maps:get(SubRef, Dirty, 0) + Delta,
+    State1 = State#{cursor_dirty := Dirty#{SubRef => Count}},
     if
         %% The two §5.3 knobs meet here: the interval arms a timer, the count
-        %% bounds how far a busy client can run ahead of its file. An interval
-        %% of 0 selects the near-zero-regress tier: every advance flushes.
-        Interval =:= 0, Count > 0 -> flush_client_cursors(ClientId, compute_committed(State1));
-        Count >= MaxRegress -> flush_client_cursors(ClientId, compute_committed(State1));
+        %% bounds how far a busy subscription can run ahead of its file. An
+        %% interval of 0 selects the near-zero-regress tier: every advance
+        %% flushes.
+        Interval =:= 0, Count > 0 -> flush_sub_cursors(SubRef, compute_committed(State1));
+        Count >= MaxRegress -> flush_sub_cursors(SubRef, compute_committed(State1));
         true -> State1
     end.
 
-flush_client_cursors(ClientId, State) ->
+flush_sub_cursors(SubRef, State) ->
     #{cursor_dirty := Dirty} = State,
-    case broker_subscription_files:write_cursors(ClientId, cursors_body(ClientId)) of
+    case broker_subscription_files:write_cursors(SubRef, cursors_body(SubRef)) of
         ok ->
-            State#{cursor_dirty := maps:remove(ClientId, Dirty)};
+            State#{cursor_dirty := maps:remove(SubRef, Dirty)};
         {error, _Reason} ->
             %% The in-memory cursor is still correct to read (a restart is the
             %% only consumer of the file); the tick retries. The regress bound
@@ -455,18 +667,16 @@ flush_client_cursors(ClientId, State) ->
             State
     end.
 
-cursors_body(ClientId) ->
-    lists:map(
-      fun({SubRef, #{filter := Filter}}) ->
-              {Filter, [{P, maps:get(offset, Row)}
-                        || {{_SubRef, P}, Row} <- ets:match_object(?CURSORS,
-                                                                   {{SubRef, '_'}, '_'})]}
-      end,
-      entities_of(ClientId)).
+cursors_body(SubRef) ->
+    [{_, #{kind := Kind}}] = ets:lookup(?ENTITIES, SubRef),
+    #{kind => Kind,
+      rows => maps:from_list(
+                [{P, broker_cursor:persist(Row)}
+                 || {{_SubRef, P}, Row} <- ets:match_object(?CURSORS, {{SubRef, '_'}, '_'})])}.
 
 flush_all_dirty_cursors(State) ->
     #{cursor_dirty := Dirty} = State,
-    lists:foldl(fun(ClientId, Acc) -> flush_client_cursors(ClientId, Acc) end,
+    lists:foldl(fun(SubRef, Acc) -> flush_sub_cursors(SubRef, Acc) end,
                 State, maps:keys(Dirty)).
 
 %% K6: committed = min(live cursors) - 1, and only for partitions that have at
@@ -476,9 +686,10 @@ flush_all_dirty_cursors(State) ->
 %% must run after the cursor files: see the module doc.
 compute_committed(State) ->
     #{last_committed := Last, partitions := Partitions} = State,
-    Mins = ets:foldr(fun({{_SubRef, P}, #{offset := Offset}}, Acc) ->
-                             maps:update_with(P, fun(Min) -> erlang:min(Min, Offset) end,
-                                              Offset, Acc)
+    Mins = ets:foldr(fun({{_SubRef, P}, Row}, Acc) ->
+                             Next = broker_cursor:next_read(Row),
+                             maps:update_with(P, fun(Min) -> erlang:min(Min, Next) end,
+                                              Next, Acc)
                      end, #{}, ?CURSORS),
     NewLast =
         lists:foldl(
@@ -507,7 +718,7 @@ compute_committed(State) ->
 
 %% ADR-016's backlog gauges, refreshed on the cursor tick (100 ms by default):
 %%
-%%   * subscription_backlog = sum over cursor rows of (High - cursor): messages
+%%   * subscription_backlog = sum over cursor rows of (High - next_read): messages
 %%     a subscription has not read yet.
 %%   * cursor_lag = sum over partitions of (High - Committed): the window not
 %%     yet acknowledged by *every* subscriber, i.e. what retention may not
@@ -526,9 +737,10 @@ sample_gauges(#{partitions := Partitions}) ->
                           WM =/= undefined]),
     {Backlog, Lag} =
         lists:foldl(
-          fun({{_SubRef, P}, #{offset := O}}, {B, L}) ->
+          fun({{_SubRef, P}, Row}, {B, L}) ->
                   case maps:get(P, Marks, undefined) of
-                      {ok, _Committed, High} -> {B + max(0, High - O), L};
+                      {ok, _Committed, High} ->
+                          {B + max(0, High - broker_cursor:next_read(Row)), L};
                       undefined -> {B, L}
                   end
           end, {0, 0}, ets:tab2list(?CURSORS)),
@@ -542,6 +754,47 @@ sample_gauges(#{partitions := Partitions}) ->
     broker_metrics:gauge(subscription_backlog, Backlog1),
     broker_metrics:gauge(cursor_lag, Lag1),
     ok.
+
+%%%_* failover active election ------------------------------------------------
+
+%% The consumer list is the order; the active is the first member with a live
+%% attachment (ADR-019 §19.4). No separate membership table, and no `failover'
+%% state on disk: a standby that dies is simply skipped, and the next reconnect
+%% joins at the tail.
+refresh_all_active(SubRefs, State) ->
+    lists:foldl(fun(SubRef, Acc) -> refresh_active(SubRef, Acc) end, State, SubRefs).
+
+refresh_active(SubRef, State) ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [{_, #{kind := failover, consumers := Consumers}}] ->
+            #{active_of := Active} = State,
+            Old = maps:get(SubRef, Active, undefined),
+            New = first_attached(Consumers),
+            case {Old, New} of
+                {undefined, _} ->
+                    State#{active_of := Active#{SubRef => New}};
+                {_, Old} ->
+                    State;
+                {_, _} ->
+                    broker_metrics:inc(failover_promotions),
+                    State#{active_of := Active#{SubRef => New}}
+            end;
+        _ ->
+            State
+    end.
+
+first_attached([C | Rest]) ->
+    case ets:lookup(?ATTACHMENTS, C) of
+        [{_, #{pid := Pid}}] ->
+            case is_process_alive(Pid) of
+                true -> C;
+                false -> first_attached(Rest)
+            end;
+        [] ->
+            first_attached(Rest)
+    end;
+first_attached([]) ->
+    undefined.
 
 %%%_* inflight (tier 3) ---------------------------------------------------------
 
@@ -564,7 +817,7 @@ flush_client_inflight(ClientId, State) ->
             end;
         [] ->
             State#{inflight_dirty := maps:remove(ClientId, Dirty)}
-        end.
+    end.
 
 flush_all_dirty_inflight(State) ->
     #{inflight_dirty := Dirty} = State,
@@ -581,39 +834,88 @@ do_detach(ClientId, Pid, State) ->
         [{_, #{pid := Pid, ref := Ref, persist := Persist}}] ->
             _ = erlang:demonitor(Ref, [flush]),
             true = ets:delete(?ATTACHMENTS, ClientId),
+            State1 = release_member_claims(ClientId, State),
+            State2 = refresh_all_active(subs_of(ClientId), State1),
             case Persist of
-                true -> {ok, State};
-                false -> {ok, teardown_session(ClientId, State)}
+                true -> {ok, State2};
+                false -> {ok, teardown_session(ClientId, State2)}
             end;
         _ ->
             {ok, State}
     end.
 
+%% The offsets this connection was holding return to the pool the moment it is
+%% gone, whether or not its session survives: a claim is a lease tied to a live
+%% attachment, and an offset held by a dead reader would pin `low' forever
+%% (ADR-019 §19.2 -- this is also why S2-D needs no retry timer).
+release_member_claims(ClientId, State) ->
+    lists:foreach(
+      fun({SubRef, _}) ->
+              lists:foreach(
+                fun({{S, P}, Row}) when S =:= SubRef ->
+                        case maps:get(kind, Row, undefined) of
+                            shared ->
+                                true = ets:insert(?CURSORS,
+                                                  {{S, P}, broker_cursor:release(Row, ClientId)});
+                            _ ->
+                                ok
+                        end;
+                   (_) ->
+                        ok
+                end, ets:match_object(?CURSORS, {{SubRef, '_'}, '_'}))
+      end, entities_of(ClientId)),
+    State.
+
 %% clean_session teardown (§4.2): disk first, then Router, then memory, so a
 %% crash mid-teardown restarts with *less* than it had, never a session whose
-%% files the client believes deleted.
+%% files the client believes deleted. Exclusive subscriptions are deleted
+%% outright; group memberships only lose this consumer (§19.2).
 teardown_session(ClientId, State) ->
-    ok = broker_subscription_files:delete_client(ClientId),
-    lists:foreach(
-      fun({SubRef, _Info}) ->
-              _ = broker_router:unregister(SubRef),
-              remove_local(SubRef)
-      end, entities_of(ClientId)),
+    lists:foreach(fun({SubRef, Info}) -> teardown_one(SubRef, Info, ClientId) end,
+                  entities_of(ClientId)),
     true = ets:delete(?INFLIGHT, ClientId),
+    ok = broker_subscription_files:delete_inflight(ClientId),
     #{cursor_dirty := CD, inflight_dirty := ID} = State,
     State#{cursor_dirty := maps:remove(ClientId, CD),
            inflight_dirty := maps:remove(ClientId, ID)}.
+
+teardown_one(SubRef, #{kind := exclusive}, _ClientId) ->
+    ok = broker_subscription_files:delete_subscription(SubRef),
+    _ = broker_router:unregister(SubRef),
+    remove_local(SubRef);
+teardown_one(SubRef, #{consumers := Consumers} = Info, ClientId) ->
+    case lists:delete(ClientId, Consumers) of
+        [] ->
+            ok = broker_subscription_files:delete_subscription(SubRef),
+            _ = broker_router:unregister(SubRef),
+            remove_local(SubRef);
+        Rest ->
+            ok = persist_entity(SubRef, Info#{consumers => Rest}),
+            true = ets:insert(?ENTITIES, {SubRef, Info#{consumers => Rest}})
+    end.
 
 remove_local(SubRef) ->
     true = ets:delete(?ENTITIES, SubRef),
     lists:foreach(fun({{S, P}, _Row}) -> true = ets:delete(?CURSORS, {S, P}) end,
                   ets:match_object(?CURSORS, {{SubRef, '_'}, '_'})).
 
+drop_dirty(SubRef, State) ->
+    #{cursor_dirty := CD, inflight_dirty := ID} = State,
+    State#{cursor_dirty := maps:remove(SubRef, CD),
+           inflight_dirty := ID}.
+
+subs_of(ClientId) ->
+    [SubRef || {{C, SubRef}} <- ets:match_object(?MEMBERS, {{ClientId, '_'}}), C =:= ClientId].
+
+entities_of(ClientId) ->
+    [{SubRef, Info} || SubRef <- subs_of(ClientId),
+                       {_, Info} <- ets:lookup(?ENTITIES, SubRef)].
+
 %%%_* Tables, timers ------------------------------------------------------------
 
 create_tables() ->
     lists:foreach(fun create_protected_table/1,
-                  [?ENTITIES, ?CURSORS, ?ATTACHMENTS, ?INFLIGHT]).
+                  [?ENTITIES, ?MEMBERS, ?CURSORS, ?ATTACHMENTS, ?INFLIGHT]).
 
 create_protected_table(Name) ->
     _ = ets:new(Name, [named_table, set, protected, {read_concurrency, true}]).

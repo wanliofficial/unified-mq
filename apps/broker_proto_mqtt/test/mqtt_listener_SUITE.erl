@@ -179,7 +179,9 @@ listener_serves_publish_subscribe_puback_and_delivery(_Config) ->
     Sub = connect(Port),
     #connack{return_code = 0} =
         open(Sub, #{client_id => <<"sub">>, clean => false}),
-    SubRef = {<<"sub">>, <<"t/#">>},
+    %% ADR-019 §19.1: the SubRef carries the kind, so an MQTT (exclusive)
+    %% subscription is `{exclusive, ClientId, Filter}'.
+    SubRef = {exclusive, <<"sub">>, <<"t/#">>},
     #suback{return_codes = [1]} = subscribe(Sub, 1, <<"t/#">>, 1),
     P = route_partition(<<"t/a">>),
     {ok, Anchor} = broker_subscription:cursor(SubRef, P),

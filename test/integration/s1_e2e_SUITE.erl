@@ -257,7 +257,7 @@ qos1_posture_follows_backend_capability(Config) ->
     Sub = connect(Port),
     #connack{return_code = 0} = open(Sub, #{client_id => <<"q1-sub">>}),
     Partition = route_partition(<<"q1/x">>),
-    SubRef = {<<"q1-sub">>, <<"q1/#">>},
+    SubRef = {exclusive, <<"q1-sub">>, <<"q1/#">>},
     case MaxQos of
         1 ->
             #suback{return_codes = [1]} = subscribe(Sub, 1, <<"q1/#">>, 1),
@@ -306,7 +306,7 @@ subscription_qos_is_not_escalated(Config) ->
     #connack{return_code = 0} = open(Sub, #{client_id => <<"mix-sub">>}),
     #suback{return_codes = [0]} = subscribe(Sub, 1, <<"mix/#">>, 0),
     Partition = route_partition(<<"mix/x">>),
-    SubRef = {<<"mix-sub">>, <<"mix/#">>},
+    SubRef = {exclusive, <<"mix-sub">>, <<"mix/#">>},
     {ok, Anchor} = broker_subscription:cursor(SubRef, Partition),
     {ok, C0, H0} = broker_queue:watermarks(Partition),
     Pub = connect(Port),
@@ -381,7 +381,7 @@ clean_session_false_restores_the_subscription_set(Config) ->
 clean_session_true_discards_the_session(Config) ->
     Port = ?config(port, Config),
     ClientId = <<"wipe-me">>,
-    SubsPath = broker_subscription_files:subs_path(ClientId),
+    SubsPath = broker_subscription_files:subs_path({exclusive, ClientId, <<"wipe/#">>}),
     Sub1 = connect(Port),
     #connack{session_present = 0, return_code = 0} =
         open(Sub1, #{client_id => ClientId, clean => false}),
@@ -398,11 +398,17 @@ clean_session_true_discards_the_session(Config) ->
     %% already gone even though the connection is still up.
     [] = broker_subscription:subscriptions(ClientId),
     %% Closing the clean connection finishes the job on disk (detach with
-    %% persist=false). Poll: nothing may recreate the file.
+    %% persist=false). Poll: nothing may recreate the file...
     ok = close_sock(Sub2),
     ok = wait_until(fun() -> not filelib:is_regular(SubsPath) end,
                    {subs_file_survived_clean_session, SubsPath}),
-    {error, not_found} = broker_subscription:session(ClientId).
+    %% ...and the attachment must be gone too. v2 deletes a subscription's file
+    %% the moment the last consumer leaves (there is no per-client file to keep
+    %% an empty set in), so the file check alone no longer proves the detach
+    %% ran -- the session view is what says the client has nothing left.
+    ok = wait_until(fun() ->
+                            broker_subscription:session(ClientId) =:= {error, not_found}
+                    end, {session_survived_clean_session, ClientId}).
 
 %% E7: a non-clean subscriber that goes offline while QoS1 traffic arrives is
 %% caught up by the reconnect round in offset order, with packet ids of its own
@@ -413,7 +419,7 @@ offline_catch_up_is_offset_ordered(Config) ->
     MaxQos = ?config(max_qos, Config),
     Port = ?config(port, Config),
     ClientId = <<"catch-up">>,
-    SubRef = {ClientId, <<"off/#">>},
+    SubRef = {exclusive, ClientId, <<"off/#">>},
     Partition = route_partition(<<"off/x">>),
     Sub1 = connect(Port),
     #connack{session_present = 0, return_code = 0} =

@@ -8,5 +8,9 @@
     {env, [{data_dir, "data"},
            {cursor_max_regress, 64},
            {cursor_flush_interval_ms, 100},
-           {inflight_flush_interval_ms, 100}]}
+           {inflight_flush_interval_ms, 100},
+           %% ADR-019 §19.1: the per-{SubRef, Partition} bound on
+           %% `acked ∪ assigned'. A full window refuses further claims instead of
+           %% evicting a live assignment.
+           {shared_state_max, 4096}]}
 ]}.

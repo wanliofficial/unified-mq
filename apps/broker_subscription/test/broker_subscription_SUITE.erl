@@ -61,7 +61,26 @@ all() ->
      filling_the_hole_promotes_low_once,
      acked_below_low_is_idempotent,
      shared_state_max_refuses_more_claims,
-     release_returns_offsets_to_the_pool].
+     release_returns_offsets_to_the_pool,
+     rollback_only_returns_what_is_still_held,
+     claim_stops_before_the_watermark,
+     %% ADR-019 §19.1/§19.2/§19.4: worker-level state (claim, ack ownership,
+     %% group membership, failover election).
+     join_adds_a_consumer_in_order,
+     leave_promotes_the_next_member,
+     leave_of_the_last_member_removes_the_subref,
+     the_worker_never_claims_past_the_watermark,
+     a_dead_consumer_releases_its_whole_page,
+     a_non_holder_ack_counts_and_changes_nothing,
+     %% ADR-019 §19.3: the v2 file layout and the v1 migration.
+     inflight_stays_client_keyed,
+     migration_rewrites_v1_subs_and_cursors,
+     migration_is_idempotent_after_a_partial_write,
+     migration_refuses_to_boot_on_a_corrupt_v1_file,
+     orphan_cursors_files_are_removed_at_boot,
+     %% ADR-019 §19.2 (plan §2.5): dispatch recipients by kind.
+     a_qos0_publish_reaches_exactly_one_shared_member,
+     a_durable_wake_reaches_every_shared_member].
 
 %%%_* Fixtures ------------------------------------------------------------
 
@@ -152,7 +171,7 @@ boot_fails_loudly_on_a_corrupt_subs_file(_Config) ->
     ok = boot(),
     {ok, _SubRef} = broker_subscription:subscribe(<<"c1">>, <<"a/b">>, 1),
     ok = bounce_subscription_app(),
-    Path = broker_subscription_files:subs_path(<<"c1">>),
+    Path = broker_subscription_files:subs_path({exclusive, <<"c1">>, <<"a/b">>}),
     ok = file:write_file(Path, <<"not a term at all">>),
     %% The running worker never re-reads the file (§5.3: `.subs' is consulted
     %% at boot); the refusal has to come from the next boot.
@@ -168,8 +187,11 @@ boot_fails_loudly_on_a_corrupt_subs_file(_Config) ->
     %% the controller's, not ours: a start that just failed can still be in
     %% `starting' state for a moment, where `start' answers
     %% `{error, {already_started, _}}'.
-    ok = broker_subscription_files:write_subs(<<"c1">>,
-                                              [{<<"a/b">>, 1, [{0, 1}, {1, 1}]}]),
+    ok = broker_subscription_files:write_subs(
+           {exclusive, <<"c1">>, <<"a/b">>},
+           #{kind => exclusive, key => <<"c1">>, filter => <<"a/b">>, qos => 1,
+             consumers => [<<"c1">>], init_cursors => [{0, 1}, {1, 1}],
+             created_at => 0}),
     ok = start_after_settle(),
     [_] = broker_subscription:subscriptions(<<"c1">>),
     ok.
@@ -198,7 +220,7 @@ start_after_settle() ->
 subscribe_mints_a_subref_the_route_can_see(_Config) ->
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
-    {<<"c1">>, <<"sport/#">>} = SubRef,
+    {exclusive, <<"c1">>, <<"sport/#">>} = SubRef,
     [SubRef] = route_refs(<<"sport/tennis/a">>),
     [S] = broker_subscription:subscriptions(<<"c1">>),
     #{qos := 1, filter := <<"sport/#">>} = S,
@@ -235,19 +257,19 @@ ack_moves_the_cursor_over_the_contiguous_prefix_only(_Config) ->
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
     {ok, 1} = broker_subscription:cursor(SubRef, 0),
-    ok = broker_subscription:ack(SubRef, 0, 2),
-    ok = broker_subscription:ack(SubRef, 0, 3),
+    ok = broker_subscription:ack(SubRef, 0, 2, <<"c1">>),
+    ok = broker_subscription:ack(SubRef, 0, 3, <<"c1">>),
     {ok, 1} = broker_subscription:cursor(SubRef, 0),
-    ok = broker_subscription:ack(SubRef, 0, 1),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
     {ok, 4} = broker_subscription:cursor(SubRef, 0),
     ok.
 
 an_ack_behind_the_cursor_is_a_noop(_Config) ->
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
-    ok = broker_subscription:ack(SubRef, 0, 1),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
     {ok, 2} = broker_subscription:cursor(SubRef, 0),
-    ok = broker_subscription:ack(SubRef, 0, 1),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
     {ok, 2} = broker_subscription:cursor(SubRef, 0),
     ok.
 
@@ -257,7 +279,7 @@ acking_a_dead_subscription_is_idempotent_ok(_Config) ->
     ok = broker_subscription:unsubscribe(<<"c1">>, <<"gone">>),
     %% A conn_fsm racing its own UNSUBSCRIBE must not get an exit-shaped
     %% protocol error for one in-flight ack.
-    ok = broker_subscription:ack(SubRef, 0, 1),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
     {error, {unknown_subscription, SubRef}} = broker_subscription:cursor(SubRef, 0),
     ok.
 
@@ -289,14 +311,14 @@ committed_is_min_cursor_minus_one_and_a_laggard_pins_it(_Config) ->
     %% refuses committed > High-1, and these cases must not *measure* that
     %% refusal when they mean to measure cursor aggregation.
     [_, _, _] = [element(2, append(0, <<"fast/x">>)) || _ <- [1, 2, 3]],
-    ok = broker_subscription:ack(A, 0, 1),
+    ok = broker_subscription:ack(A, 0, 1, <<"c1">>),
     %% B still sits at 1: min is 1, committed must not move past 0.
     {ok, Committed, _High} = broker_queue:watermarks(0),
     0 = Committed,
-    ok = broker_subscription:ack(B, 0, 1),
+    ok = broker_subscription:ack(B, 0, 1, <<"c2">>),
     {ok, 1, _} = broker_queue:watermarks(0),
-    ok = broker_subscription:ack(A, 0, 2),
-    ok = broker_subscription:ack(B, 0, 2),
+    ok = broker_subscription:ack(A, 0, 2, <<"c1">>),
+    ok = broker_subscription:ack(B, 0, 2, <<"c2">>),
     {ok, 2, _} = broker_queue:watermarks(0),
     ok.
 
@@ -306,26 +328,26 @@ flushed_cursors_back_the_watermark_it_proves(_Config) ->
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
     [_, _, _, _] = [element(2, append(0, <<"sport/x">>)) || _ <- [1, 2, 3, 4]],
-    [ok = broker_subscription:ack(SubRef, 0, O) || O <- [1, 2, 3]],
+    [ok = broker_subscription:ack(SubRef, 0, O, <<"c1">>) || O <- [1, 2, 3]],
     %% Not yet flushed (3 < 4, no tick): the watermark must not have crossed
     %% what the *disk* can vouch for -- the K6 ordering, seen from the side
     %% where breaking it would make S2's truncation delete un-acked data.
     {ok, Committed, _} = broker_queue:watermarks(0),
     0 = Committed,
-    ok = broker_subscription:ack(SubRef, 0, 4),
+    ok = broker_subscription:ack(SubRef, 0, 4, <<"c1">>),
     {ok, CommittedNow, _} = broker_queue:watermarks(0),
     4 = CommittedNow,
-    {ok, Flushed} = broker_subscription_files:read_cursors(<<"c1">>),
-    [{<<"sport/#">>, Rows}] = Flushed,
-    {0, 5} = lists:keyfind(0, 1, Rows),
+    {ok, #{kind := exclusive, rows := Rows}} =
+        broker_subscription_files:read_cursors(SubRef),
+    #{0 := #{offset := 5}} = Rows,
     ok.
 
 the_zero_regress_tier_flushes_every_ack(_Config) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 0),
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
-    ok = broker_subscription:ack(SubRef, 0, 1),
-    {ok, _} = broker_subscription_files:read_cursors(<<"c1">>),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
+    {ok, _} = broker_subscription_files:read_cursors(SubRef),
     %% R3's zero-window tier: kill right after an ack and the cursor comes
     %% back from disk at the acked point -- no rewind to re-deliver.
     exit(whereis(broker_subscription_worker), kill),
@@ -339,8 +361,8 @@ the_default_tier_rewinds_to_the_last_flush_never_loser_acks(_Config) ->
     ok = application:set_env(broker_subscription, cursor_max_regress, 10000),
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
-    ok = broker_subscription:ack(SubRef, 0, 1),
-    ok = broker_subscription:ack(SubRef, 0, 2),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
+    ok = broker_subscription:ack(SubRef, 0, 2, <<"c1">>),
     exit(whereis(broker_subscription_worker), kill),
     await_worker_restart(),
     timer:sleep(50),
@@ -357,8 +379,8 @@ a_lost_cursors_file_falls_back_to_the_subs_origin_not_committed(_Config) ->
     ok = boot(),
     {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
     [_, _, _] = [element(2, append(0, <<"sport/x">>)) || _ <- [1, 2, 3]],
-    ok = broker_subscription:ack(SubRef, 0, 1),
-    ok = broker_subscription:ack(SubRef, 0, 2),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
+    ok = broker_subscription:ack(SubRef, 0, 2, <<"c1">>),
     timer:sleep(300),
     {ok, 2, _} = broker_queue:watermarks(0),
     %% Now *lose* the cursor file (simulate the worst restore: `.cursors' gone,
@@ -367,7 +389,7 @@ a_lost_cursors_file_falls_back_to_the_subs_origin_not_committed(_Config) ->
     %% offsets 1..2 the client may still need, and taking 0 would rewind behind
     %% the subscription). In S1 nothing is truncated yet, so replaying from the
     %% origin costs duplicates only -- which §4.1 allows and R7 expects.
-    ok = file:delete(broker_subscription_files:cursors_path(<<"c1">>)),
+    ok = file:delete(broker_subscription_files:cursors_path(SubRef)),
     bounce_subscription_app(),
     {ok, 1} = broker_subscription:cursor(SubRef, 0),
     {ok, 1} = broker_subscription:cursor(SubRef, 1),
@@ -385,12 +407,12 @@ an_offline_persistent_subscriber_pins_and_releases_the_watermark(_Config) ->
     {ok, undefined} = broker_subscription:attach(<<"slow">>, Pid, true),
     ok = broker_subscription:detach(<<"slow">>, Pid),
     %% The subscriber is gone but its session (and cursor 1) is kept: it pins.
-    ok = broker_subscription:ack(Online, 0, 1),
+    ok = broker_subscription:ack(Online, 0, 1, <<"fast">>),
     {ok, Pinned, _} = broker_queue:watermarks(0),
     0 = Pinned,
     %% Catching up *online* or offline is the same ack path (T9's conn_fsm
     %% would replay from the cursor after a real reconnect).
-    ok = broker_subscription:ack(Offline, 0, 1),
+    ok = broker_subscription:ack(Offline, 0, 1, <<"slow">>),
     {ok, 1, _} = broker_queue:watermarks(0),
     ok.
 
@@ -477,7 +499,7 @@ a_dead_attached_process_detaches_and_clean_session_tears_down(_Config) ->
     ok = broker_subscription:detach(<<"c1">>, self()),
     [] = broker_subscription:subscriptions(<<"c1">>),
     [] = route_refs(<<"sport/#">>),
-    none = read_subs_or_none(<<"c1">>),
+    none = read_subs_or_none({exclusive, <<"c1">>, <<"sport/#">>}),
     {error, not_found} = broker_subscription:session(<<"c1">>),
     ok.
 
@@ -514,7 +536,7 @@ the_memory_backend_works_through_the_same_api(_Config) ->
     ok = boot(),
     {ok, WalRef} = broker_subscription:subscribe(<<"c1">>, <<"sport/#">>, 1),
     {ok, _} = append(0, <<"sport/x">>),
-    ok = broker_subscription:ack(WalRef, 0, 1),
+    ok = broker_subscription:ack(WalRef, 0, 1, <<"c1">>),
     timer:sleep(300),
     {ok, 1, _} = broker_queue:watermarks(0),
     %% Same queue/subscription API over the other registered backend (K1's
@@ -531,7 +553,7 @@ the_memory_backend_works_through_the_same_api(_Config) ->
     %% storage layer's runtime backstop refuses it -- an honest error, not a
     %% silent downgrade (ADR-011 §11.4).
     {ok, _} = append(0, <<"sport/x">>, os_buffer),
-    ok = broker_subscription:ack(MemRef, 0, 1),
+    ok = broker_subscription:ack(MemRef, 0, 1, <<"c1">>),
     timer:sleep(300),
     {ok, 1, 2} = broker_queue:watermarks(0),
     {ok, 2} = broker_subscription:cursor(MemRef, 0),
@@ -639,6 +661,318 @@ release_returns_offsets_to_the_pool(_Config) ->
     {ok, [1, 2, 3], _} = broker_cursor:claim(Row3, 3, 100, <<"b">>, 4096),
     ok.
 
+%% ADR-019 §19.5: a claim can name an offset the storage `High' has reserved but
+%% not yet flushed, so the pull loop reads back a page, finds the offset absent
+%% and hands it back. That rollback must be ownership-checked: an offset acked
+%% while the read was in flight stays acked (ack wins), and another member's
+%% offsets are never touched.
+rollback_only_returns_what_is_still_held(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1, 2, 3], Row1} = broker_cursor:claim(Row0, 3, 100, <<"a">>, 4096),
+    {ok, [4], Row2} = broker_cursor:claim(Row1, 1, 100, <<"b">>, 4096),
+    {ok, Row3} = broker_cursor:ack_shared(Row2, 2, <<"a">>),
+    Row4 = broker_cursor:rollback(Row3, [1, 2, 3, 4], <<"a">>),
+    #{assigned := Assigned} = Row4,
+    %% 4 stays with `b'; 2 is acked (not assigned any more); 1 and 3 go back.
+    #{4 := <<"b">>} = Assigned,
+    1 = map_size(Assigned),
+    0 = broker_cursor:committed(Row4),
+    %% The next claim sees 1 and 3 free, skips acked 2 and assigned 4.
+    {ok, [1, 3], _} = broker_cursor:claim(Row4, 2, 6, <<"b">>, 4096),
+    ok.
+
+%%%_* ADR-019 §19.1/§19.2/§19.4: worker-level membership and claims ------------
+
+%% D-13: the member order IS the failover election (ADR-019 §19.4), so it is
+%% written where it can be read back -- the `.subs' body -- and nowhere else.
+join_adds_a_consumer_in_order(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {shared, <<"g">>, <<"s/#">>} = SubRef,
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    #{consumers := [<<"c1">>, <<"c2">>], kind := shared, qos := 1} =
+        read_sub_body(SubRef),
+    %% Both consumers see it as *their* subscription -- `?MEMBERS' is the second
+    %% index over the same entity, not a second truth.
+    [#{sub_ref := SubRef, kind := shared, key := <<"g">>}] =
+        broker_subscription:subscriptions(<<"c2">>),
+    %% A re-join only changes the QoS; it must not move the member (that order
+    %% decides who is active after a death).
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 0),
+    #{consumers := [<<"c1">>, <<"c2">>], qos := 0} = read_sub_body(SubRef),
+    %% `join/5' is the group path; an exclusive kind is a caller bug, not a
+    %% silent exclusive subscribe.
+    {error, wrong_kind} = broker_subscription:join(exclusive, <<"g">>, <<"c3">>,
+                                                   <<"s/#">>, 1),
+    ok.
+
+%% D-12: the active is the first member with a live attachment, so a death
+%% promotes the next one without any membership table to update.
+leave_promotes_the_next_member(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(failover, <<"g">>, <<"c1">>, <<"f/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(failover, <<"g">>, <<"c2">>, <<"f/#">>, 1),
+    P1 = spawn(fun() -> timer:sleep(60000) end),
+    P2 = spawn(fun() -> timer:sleep(60000) end),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, P1, true),
+    {ok, undefined} = broker_subscription:attach(<<"c2">>, P2, true),
+    active = broker_subscription:role(SubRef, <<"c1">>),
+    standby = broker_subscription:role(SubRef, <<"c2">>),
+    ok = broker_metrics:reset(),
+    %% The active dies. Its session survives (persist=true): only the
+    %% *promotion* is the fact under test here.
+    exit(P1, kill),
+    ok = wait_role(SubRef, <<"c2">>),
+    active = broker_subscription:role(SubRef, <<"c2">>),
+    %% The counter is written by the worker when it processes the DOWN, which is
+    %% one message behind the facade's own (pid-liveness based) answer.
+    ok = wait_until(fun() ->
+                            maps:get(failover_promotions,
+                                     broker_metrics:snapshot()) =:= 1
+                    end, {promotion_not_counted, SubRef}),
+    %% ...and a live member that was never in the group is not a candidate.
+    not_consumer = broker_subscription:role(SubRef, <<"nobody">>),
+    exit(P2, kill),
+    ok.
+
+%% The last member leaving is the end of the subscription: entity, cursors,
+%% Router entry and both files (ADR-019 §19.2). Keeping the SubRef would leave
+%% `low' pinned by a phantom member and a dispatch target nobody consumes.
+leave_of_the_last_member_removes_the_subref(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    ok = broker_subscription:leave(SubRef, <<"c1">>),
+    present = read_subs_or_none(SubRef),
+    [] = broker_subscription:subscriptions(<<"c1">>),
+    [#{sub_ref := SubRef}] = broker_subscription:subscriptions(<<"c2">>),
+    ok = broker_subscription:leave(SubRef, <<"c2">>),
+    none = read_subs_or_none(SubRef),
+    [] = broker_subscription:subscriptions(<<"c2">>),
+    {error, {unknown_subscription, SubRef}} = broker_subscription:cursor(SubRef, 0),
+    [] = route_refs(<<"s/x">>),
+    ok.
+
+%% D-6b at the worker boundary: the high watermark comes from the storage
+%% contract (`High = Last + 1`), so offset `High` itself does not exist and must
+%% never be assigned -- an assignment that can never be acked pins `low' forever.
+the_worker_never_claims_past_the_watermark(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    {ok, _} = append(0, <<"s/a">>),
+    {ok, _} = append(0, <<"s/b">>),
+    {ok, _} = append(0, <<"s/c">>),
+    {ok, _Committed, High} = broker_queue:watermarks(0),
+    4 = High,
+    {ok, A} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    [1, 2, 3] = A,
+    true = lists:all(fun(O) -> O < High end, A),
+    %% The tail answers an empty page, not an offset the log does not have.
+    {ok, []} = broker_subscription:claim(SubRef, 0, 100, <<"c2">>),
+    ok.
+
+%% D-8: a claim is a lease tied to a live attachment. The moment the member is
+%% gone its whole page returns to the pool -- this is why S2-D needs no retry
+%% timer, and why a crash is a redelivery, not a lost message.
+a_dead_consumer_releases_its_whole_page(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    {ok, _} = append(0, <<"s/a">>),
+    {ok, _} = append(0, <<"s/b">>),
+    {ok, _} = append(0, <<"s/c">>),
+    {ok, [1, 2, 3]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    %% Nothing is left for c2 while c1 holds the page.
+    {ok, []} = broker_subscription:claim(SubRef, 0, 100, <<"c2">>),
+    Holder = spawn(fun() -> timer:sleep(60000) end),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, Holder, true),
+    exit(Holder, kill),
+    %% The release happens on the DOWN, so the survivor's next claim is the
+    %% assertion -- poll it rather than sleeping a fixed time.
+    [1, 2, 3] = wait_claim(SubRef, 0, <<"c2">>),
+    ok.
+
+%% D-7: an ack that names an offset the consumer does not hold answers `ok' and
+%% changes nothing. The acker is a conn_fsm whose view may lag a rebalance by one
+%% message; failing it would turn a bookkeeping race into an outage.
+a_non_holder_ack_counts_and_changes_nothing(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    {ok, _} = append(0, <<"s/a">>),
+    {ok, _} = append(0, <<"s/b">>),
+    {ok, [1, 2]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    ok = broker_metrics:reset(),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c2">>),
+    {ok, 1} = broker_subscription:cursor(SubRef, 0),
+    #{shared_ack_unowned := 1} = broker_metrics:snapshot(),
+    %% The holder's ack is the one that counts -- in order, promoting `low' once
+    %% the prefix is whole.
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
+    {ok, 2} = broker_subscription:cursor(SubRef, 0),
+    ok = broker_subscription:ack(SubRef, 0, 2, <<"c1">>),
+    {ok, 3} = broker_subscription:cursor(SubRef, 0),
+    #{shared_ack_unowned := 1} = broker_metrics:snapshot(),
+    ok.
+
+%%%_* ADR-019 §19.3: the v2 file layout and the v1 migration ------------------
+
+%% The in-flight blob is a property of the *connection*, not of a subscription
+%% (packet ids are one allocator per connection), so it stays client-keyed even
+%% though `.subs'/`.cursors' moved to SubRef. ADR-019 §19.3 (D-3 in the plan).
+inflight_stays_client_keyed(_Config) ->
+    ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 0),
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"s/#">>, 1),
+    ok = broker_subscription:inflight(<<"c1">>, #{next_pid => 7, pending => []}),
+    Path = broker_subscription_files:inflight_path(<<"c1">>),
+    true = filelib:is_regular(Path),
+    %% The name is the client's b64 and nothing else: no kind segment, no
+    %% filter -- and it is the same file the v1 layout produced.
+    Base = filename:basename(Path),
+    true = lists:suffix(".inflight", Base),
+    Stem = filename:rootname(Base, ".inflight"),
+    ClientId = <<"c1">>,
+    Stem = binary_to_list(base64:encode(ClientId, #{mode => urlsafe, padding => false})),
+    %% The subscription's own files are SubRef-keyed and *not* named after the
+    %% client stem.
+    SubsPath = broker_subscription_files:subs_path(SubRef),
+    false = filename:basename(SubsPath) =:= filename:basename(Path),
+    true = filelib:is_regular(SubsPath),
+    {ok, #{next_pid := 7}} = broker_subscription_files:read_inflight(<<"c1">>),
+    ok.
+
+%% D-15: the S1 layout (`{vsn,1,ClientId,Body}', one file family per client) is
+%% rewritten in place at boot -- the subscription *and* its cursor survive, the
+%% v1 files are gone, the v2 files are what boot step 2 read.
+migration_rewrites_v1_subs_and_cursors(_Config) ->
+    write_v1(<<"c1">>,
+             [{<<"a/#">>, 1, [{0, 1}, {1, 1}]}],
+             [{<<"a/#">>, [{0, 4}]}]),
+    ok = boot(),
+    [#{sub_ref := SubRef, kind := exclusive, filter := <<"a/#">>, qos := 1}] =
+        broker_subscription:subscriptions(<<"c1">>),
+    {exclusive, <<"c1">>, <<"a/#">>} = SubRef,
+    %% The v1 `.cursors' row wins for P0 (K5/K6 order); P1 falls back to the
+    %% init anchor carried in `.subs'.
+    {ok, 4} = broker_subscription:cursor(SubRef, 0),
+    {ok, 1} = broker_subscription:cursor(SubRef, 1),
+    false = filelib:is_regular(v1_subs_path(<<"c1">>)),
+    false = filelib:is_regular(v1_cursors_path(<<"c1">>)),
+    true = filelib:is_regular(broker_subscription_files:subs_path(SubRef)),
+    true = filelib:is_regular(broker_subscription_files:cursors_path(SubRef)),
+    %% The migration is complete enough that a second boot finds nothing to do.
+    ok = bounce_subscription_app(),
+    {ok, 4} = broker_subscription:cursor(SubRef, 0),
+    ok.
+
+%% D-16: a crash between "v2 written" and "v1 deleted" leaves both families on
+%% disk. The next boot redoes the same writes and the same deletes -- the bytes
+%% the second pass produces are identical to the first pass's.
+migration_is_idempotent_after_a_partial_write(_Config) ->
+    write_v1(<<"c1">>, [{<<"a/#">>, 1, [{0, 1}]}], [{<<"a/#">>, [{0, 2}]}]),
+    SubRef = {exclusive, <<"c1">>, <<"a/#">>},
+    %% Pass 1 runs *without* booting: exactly the state a crash after the write
+    %% leaves behind (both families present, v1 not yet unlinked).
+    ok = broker_subscription_files:migrate_v1(),
+    First = read_sub_body(SubRef),
+    false = filelib:is_regular(v1_subs_path(<<"c1">>)),
+    %% Recreate the v1 files: this is the crash residue the next boot sees.
+    write_v1(<<"c1">>, [{<<"a/#">>, 1, [{0, 1}]}], [{<<"a/#">>, [{0, 2}]}]),
+    ok = broker_subscription_files:migrate_v1(),
+    Second = read_sub_body(SubRef),
+    %% Rewriting the same subscription produces the same record (`created_at'
+    %% is the one field the clock owns, so it is compared out of the body).
+    true = maps:remove(created_at, First) =:= maps:remove(created_at, Second),
+    false = filelib:is_regular(v1_subs_path(<<"c1">>)),
+    false = filelib:is_regular(v1_cursors_path(<<"c1">>)),
+    %% And the end state boots and serves the same cursor.
+    ok = boot(),
+    {ok, 2} = broker_subscription:cursor(SubRef, 0),
+    ok.
+
+%% A v1 file that does not decode is a boot refusal, not a skip: booting without
+%% a subscription that exists on disk serves `not_found' for a live session
+%% (ADR-011 §11.2). The v1 file is *not* deleted -- the operator still has the
+%% evidence of what broke.
+migration_refuses_to_boot_on_a_corrupt_v1_file(_Config) ->
+    %% Boot once cleanly so every dependency is up, then plant the corrupt v1
+    %% pair where the next boot's migration will find it.
+    ok = boot(),
+    ok = application:stop(broker_subscription),
+    Path = write_v1(<<"c1">>, not_a_list_of_entries, none),
+    {error, {{shutdown,
+              {failed_to_start_child, broker_subscription_worker,
+               {subscription_boot_failed,
+                {session_scan,
+                 {migration, Path,
+                  {corrupt_v1_subs, Path, <<"c1">>, not_a_list_of_entries}}}}}},
+             _}} =
+        start_subscription(),
+    undefined = whereis(broker_subscription_worker),
+    %% The v1 file is *not* deleted: the operator still has the evidence.
+    true = filelib:is_regular(Path),
+    ok.
+
+%% An orphan `.cursors' is the residue of a teardown that died between two
+%% unlinks. Keeping it would let a later subscription that happens to mint the
+%% same SubRef resume from a dead one's position.
+orphan_cursors_files_are_removed_at_boot(_Config) ->
+    OkDir = sessions_dir(),
+    ok = filelib:ensure_dir(filename:join(OkDir, "x")),
+    Orphan = {shared, <<"g">>, <<"o/#">>},
+    ok = broker_subscription_files:write_cursors(
+           Orphan, #{kind => shared, rows => #{0 => broker_cursor:new_shared(1)}}),
+    true = filelib:is_regular(broker_subscription_files:cursors_path(Orphan)),
+    ok = boot(),
+    false = filelib:is_regular(broker_subscription_files:cursors_path(Orphan)),
+    %% ...and a live pair is left alone: the sweep only removes cursors whose
+    %% `.subs' is gone.
+    {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"s/#">>, 1),
+    ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
+    timer:sleep(200),
+    ok = bounce_subscription_app(),
+    true = filelib:is_regular(broker_subscription_files:cursors_path(SubRef)),
+    ok.
+
+%%%_* ADR-019 §19.2/plan §2.5: dispatch recipients by kind --------------------
+
+%% A QoS0 publish never enters storage, so there is no offset to claim: the push
+%% IS the delivery, and pushing to every member would deliver N copies.
+a_qos0_publish_reaches_exactly_one_shared_member(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 0),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 0),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, self(), true),
+    {ok, undefined} = broker_subscription:attach(<<"c2">>, self(), true),
+    Refs = route_refs(<<"s/x">>),
+    [SubRef] = Refs,
+    ok = broker_subscription:dispatch(Refs, {undefined, undefined, msg(<<"s/x">>)}),
+    receive
+        {broker_deliver, ClientId, 0, [SubRef], {undefined, undefined, _}} ->
+            %% The lowest-ordered attached member, and only that one.
+            <<"c1">> = ClientId,
+            no_more = receive {broker_deliver, _, _, _, _} -> more
+                      after 100 -> no_more end
+    after 1000 -> exit(qos0_push_not_delivered) end,
+    ok.
+
+%% A durable wake is only a hint: `claim/4' decides who reads the offset, so
+%% every attached member is told. Telling one would stall the group whenever that
+%% member is slow (ADR-019 §19.2).
+a_durable_wake_reaches_every_shared_member(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    {ok, undefined} = broker_subscription:attach(<<"c1">>, self(), true),
+    {ok, undefined} = broker_subscription:attach(<<"c2">>, self(), true),
+    Refs = route_refs(<<"s/x">>),
+    ok = broker_subscription:dispatch(Refs, {0, 7, msg(<<"s/x">>)}),
+    Got = collect_deliveries(2, []),
+    [<<"c1">>, <<"c2">>] = lists:sort(Got),
+    ok.
+
 %%%_* Helpers -------------------------------------------------------------------
 
 append(Partition, Dest) ->
@@ -670,8 +1004,86 @@ sessions_dir() ->
     %% Only used after boot/0 with the fixture's data_dir.
     broker_subscription_files:sessions_dir().
 
-read_subs_or_none(ClientId) ->
-    case broker_subscription_files:read_subs(ClientId) of
+read_subs_or_none(SubRef) ->
+    case broker_subscription_files:read_subscription(SubRef) of
         {ok, none} -> none;
         {ok, _} -> present
     end.
+
+read_sub_body(SubRef) ->
+    {ok, Body} = broker_subscription_files:read_subscription(SubRef),
+    Body.
+
+%% A live attachment is what makes a member a failover candidate; the worker
+%% learns about the death from the DOWN, so the assertion polls.
+wait_role(SubRef, ClientId) ->
+    _ = wait_until(fun() -> broker_subscription:role(SubRef, ClientId) =:= active end,
+                   {role_never_became_active, SubRef, ClientId}),
+    ok.
+
+wait_claim(SubRef, Partition, Consumer) ->
+    wait_until(fun() ->
+                       case broker_subscription:claim(SubRef, Partition, 100, Consumer) of
+                           {ok, []} -> false;
+                           {ok, Offsets} -> Offsets;
+                           _ -> false
+                       end
+               end, {claim_never_succeeded, SubRef, Partition, Consumer}).
+
+wait_until(Fun, Error) ->
+    wait_until(Fun, Error, 200).
+
+wait_until(_Fun, Error, 0) ->
+    exit(Error);
+wait_until(Fun, Error, N) ->
+    case Fun() of
+        false ->
+            timer:sleep(20),
+            wait_until(Fun, Error, N - 1);
+        true ->
+            ok;
+        Other ->
+            Other
+    end.
+
+collect_deliveries(0, Acc) ->
+    Acc;
+collect_deliveries(N, Acc) ->
+    receive
+        {broker_deliver, ClientId, _QoS, _Refs, _Delivery} ->
+            collect_deliveries(N - 1, [ClientId | Acc])
+    after 1000 ->
+            exit({missing_deliveries, N, Acc})
+    end.
+
+%% The S1 on-disk layout, written by hand: `{vsn, 1, ClientId, Body}' where the
+%% body is `[{Filter, QoS, InitCursors}]' and the cursor body is
+%% `[{Filter, [{Partition, Offset}]}]'. Boot's `migrate_v1/0' is the only reader.
+v1_subs_path(ClientId) ->
+    filename:join(sessions_dir(), stem(ClientId) ++ ".subs").
+
+v1_cursors_path(ClientId) ->
+    filename:join(sessions_dir(), stem(ClientId) ++ ".cursors").
+
+stem(ClientId) ->
+    binary_to_list(base64:encode(ClientId, #{mode => urlsafe, padding => false})).
+
+start_subscription() ->
+    case application:start(broker_subscription) of
+        ok -> ok;
+        {error, _} = Error -> Error
+    end.
+
+%% Writes one v1 client family. `Entries' is the `.subs' body (or a deliberately
+%% corrupt value); `CursorEntries' is `none' when there is no `.cursors' at all.
+write_v1(ClientId, Entries, CursorEntries) ->
+    ok = filelib:ensure_dir(filename:join(sessions_dir(), "x")),
+    ok = file:write_file(v1_subs_path(ClientId),
+                         term_to_binary({vsn, 1, ClientId, Entries})),
+    case CursorEntries of
+        none -> ok;
+        _ -> ok = file:write_file(v1_cursors_path(ClientId),
+                                  term_to_binary({vsn, 1, ClientId, CursorEntries}))
+    end,
+    v1_subs_path(ClientId).
+
