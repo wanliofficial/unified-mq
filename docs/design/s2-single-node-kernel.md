@@ -137,7 +137,7 @@
 ### D9 会话文件 v2 的迁移策略
 
 - **问题**：`.subs`/`.cursors`/`.inflight` 形状改变后，S1 数据目录能否原地升级？
-- **已定案（M0 采纳；并入 ADR-013）：保留 `{vsn,1,...}` 读取分支，写入永远 `vsn 2`；boot 时读到 v1 立即重写为 v2（一次性迁移，失败则**拒绝启动**而不是回退到空会话——S1 的 K5 原则）。提供 `tools/migrate_s1_to_s2.escript` 与演练用例。
+- **已定案（M0 采纳；并入 ADR-013）：保留 `{vsn,1,...}` 读取分支，写入永远 `vsn 2`；boot 时读到 v1 立即重写为 v2（一次性迁移，失败则**拒绝启动**而不是回退到空会话——S1 的 K5 原则）。**【S2-D 落地注记，2026-11-09】** 迁移实现在 `broker_subscription_files:migrate_v1/0` 的 boot 路径（写 v2 成功后才删 v1），演练用例为 `broker_subscription_SUITE` 的 `migration_rewrites_v1_subs_and_cursors` / `migration_is_idempotent_after_a_partial_write` / `migration_refuses_to_boot_on_a_corrupt_v1_file`。独立的 `tools/migrate_s1_to_s2.escript` **未交付**——它不进入启动路径，当时判定 boot 迁移 + CT 演练已覆盖需求；若后续需要离线审计工具，列为 S6 之后按需补。
 - **影响**：`broker_subscription_files`、boot step 2、`docs/storage-and-recovery.md`。
 - **需要 ADR**：并入 ADR-013。
 

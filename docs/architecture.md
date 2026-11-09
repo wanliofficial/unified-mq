@@ -4,7 +4,7 @@
 - **状态**：描述当前已实现并实测的架构事实（S0–S6）。S6 之后明确未实现的方向在 §9 单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断“某个行为归哪一层”的测试作者
 - **对应**：`docs/roadmap.md`、`docs/design/`（各阶段设计基线）、ADR-001/002/004/007/009/010/011/016/017/018/019/020/021
-- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**631/631**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`test/cluster/`（3 节点 peer）与 `docs/benchmarks/` 的产物；引用处给出路径
+- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**631/631**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -364,7 +364,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **631/631**，零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`test/cluster/` |
+| 单元/契约/集成 | `rebar3 ct` → **631/631**，零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
 | 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 167 条均为预期 unused-export | CI/本地 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |

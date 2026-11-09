@@ -178,7 +178,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 3. 一次升级一个节点，等 `/readyz` 200 且 `cluster_no_quorum = 0` 再动下一个。
 4. 升级后对比 hash 与 `data_version`。
 
-**本版本边界**：数据格式只有 v1，没有跨版本迁移工具；真正的「v1→v2 迁移」是 S6 之后的待办。这里交付的是可查询的兼容窗口与升级顺序，不是迁移器。
+**本版本边界**：WAL 记录格式只有 v1，没有跨版本迁移工具；真正的「WAL v1→v2 迁移」是 S6 之后的待办。这里交付的是可查询的兼容窗口与升级顺序，不是迁移器。（会话文件的 `.subs`/`.cursors` v1→v2 是另一回事：boot 时由 `broker_subscription_files:migrate_v1/0` 自动完成，见 ADR-012 §12.5 / ADR-019。）
 
 ---
 

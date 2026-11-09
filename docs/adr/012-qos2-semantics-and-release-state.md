@@ -74,6 +74,8 @@ UnifiedMQ 的 QoS 2 承诺**分两段**，两段都必须写进文档与测试�
 - **写**：任何写回都升级为 `vsn=2`，一次性完成，不保留 v2→v1 降级路径（与 D9 一致：升级单向，失败拒绝启动）。
 - S1 数据目录可直接被 S2 打开；不需要离线工具（`tools/migrate_s1_to_s2.escript` 只用于演练与审计，不进入启动路径）。
 
+**【冻结后补充，2026-11-09】** 该 escript 最终**未交付**；实际交付物是 boot 路径上的 `broker_subscription_files:migrate_v1/0`（写 v2 成功后才删 v1）与三个 CT 演练用例（`migration_rewrites_v1_subs_and_cursors`、`migration_is_idempotent_after_a_partial_write`、`migration_refuses_to_boot_on_a_corrupt_v1_file`）。迁移本来就不依赖离线工具，因此这一缺口不影响「S1 数据目录可直接被 S2 打开」的承诺。
+
 ## 后果（Consequences）
 
 - **+** QoS 2 的重复窗口被明确限定在"Broker 崩溃"这一种情况，测试与文档可机械核对。
