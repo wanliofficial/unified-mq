@@ -542,7 +542,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 | Kafka | ✅ payload 逐字节透传 | ✅ Record Headers 放 `ce-*`；投递写回 Record Headers | Kafka 0.11+ record batch |
 | Pulsar | ✅ payload 逐字节透传 | ✅ Message properties 放 `ce-*`；投递写回 properties | Pulsar 2.10+ |
 
-**统一策略执行**：六个协议在写入前都调用 `broker_event:apply_policy/1`（默认 `pass_through` 为 no-op）。拒绝路径按协议各自的错误语义表达：MQTT 5 → `0x83`；WS → `{"op":"error","error":"cloudevent_rejected"}`；NATS → `-ERR` 并断开；AMQP → channel error 406；Kafka → `INVALID_RECORD`（87）；Pulsar → SendError。
+**统一策略执行**：六个协议在写入前都调用 `broker_event:apply_policy/1`（默认 `pass_through` 为 no-op）。拒绝路径按协议各自的错误语义表达：MQTT 5 → `0x83`；WS → `{"op":"error","code":"cloudevent_rejected","reason":"…"}`；NATS → `-ERR` 并断开；AMQP → channel error 406；Kafka → `INVALID_RECORD`（87）；Pulsar → SendError（`ERROR_UNKNOWN`）。
 
 **已声明的非无损点**（`report/5` 的 `losses` 必须被调用方读取）：
 
