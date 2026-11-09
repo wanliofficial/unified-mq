@@ -163,6 +163,8 @@ rebar3 as t14 release
 
 **Gate 证据**：`docs/benchmarks/reliability/report-osbuffer-tail-*.json`（S-B1a/b/c 计数与断言）；`s2-powerloss-*.md`（S-B2 实机掉电 + `fsync` 对照）；既有 CT 三套截图/日志（`replicated_commit`）。
 
+> **落地注记（2026-11-09）**：实际交付的 S-B1 证据文件名是 [`report-osbuffer-mqtt-replicated-tail-20261107-131941.json`](../benchmarks/reliability/report-osbuffer-mqtt-replicated-tail-20261107-131941.json)，结论与断言写在 [`s2-b-osbuffer-loss.md`](../benchmarks/reliability/s2-b-osbuffer-loss.md)。S-B2 的 dm-flakey **实机**报告至今未产生（需 root，本环境 `sudo` 需密码），这是 `docs/roadmap.md` Gate S2 唯一未勾选项；`s2_powerloss.py --skip-prereq` 可打印完整步骤并退出 0，因此它不阻塞 CI。
+
 ---
 
 ## 7. 风险
