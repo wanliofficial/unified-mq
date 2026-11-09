@@ -97,6 +97,11 @@
 
 **禁止**：任何 binary 键、动态拼接键、以 destination/client_id/message_id 为维度的键。
 
+> **时点说明**：本表是 S2-A 交付时的**登记注册表**（26 个键）。之后每个阶段继续按同一「封闭 atom 集合」规则登记新键，当前 `broker_metrics:keys()` 共 **58** 个（`broker_metrics_SUITE` 的 `?KEYS` 是机械钉住集合的权威，不是本表）。
+>
+> 三行当时标注「只登记键」的条目现已接线：`
+> redelivery_total` 与 `dlq_size` 在 `broker_subscription_worker:955`（重试调度）与 `broker_dlq:146`（GC 时递减）；`retention_deleted_bytes` 在 `wal_writer:641`；`cloudevents_validate_ok/_failed` 在 `broker_event` 的 `attach_event/2` 与 `reject/1`。
+
 ---
 
 ## 5. 任务拆解
@@ -154,7 +159,7 @@
 
 | 用例 | 断言 |
 |---|---|
-| `keys_are_stable` | `keys()` 等于 §4 表；集合变化必须改测试 |
+| `keys_are_stable` | `?KEYS`（测试套件内定义的 58 键）等于 `keys()`，顺序无关；集合变化必须改测试 |
 | `inc_accumulates` | `inc(k, 3)` 后 `snapshot()` 为 3 |
 | `gauge_overwrites` | `gauge(k, 5)`、`gauge(k, 2)` 后为 2 |
 | `gauge_add_accumulates` | `gauge_add/2` 增减与返回值；Kind 不符/未知键被拒 |
@@ -193,5 +198,5 @@ rebar3 as t14 release
 |---|---|
 | `persistent_term` 更新触发全局 GC | 只在启动时写一次；`reset/0` 只清 counters，不重建引用 |
 | 直方图原子操作在每消息路径的成本 | 只对 publish/ack/wal_sync 三处做直方图；其余用 counter |
-| `snapshot/0` 遍历所有键在键多时变慢 | 键数 ≤ 40，O(40) 可接受；S6 导出层再加缓存 |
+| `snapshot/0` 遍历所有键在键多时变慢 | S2-A 时 ≤ 40 键，O(40) 可接受；S6 后键集合为 58（§4 时点说明），遍历仍是 O(键数)，导出层再加缓存 |
 | 埋点遗漏导致 Gate 4 证据不足 | §4 表逐项对照 review；`keys_are_stable` 钉住集合 |

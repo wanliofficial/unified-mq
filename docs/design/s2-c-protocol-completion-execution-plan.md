@@ -95,7 +95,7 @@
 ### 3.4 Retain（T-C4/T-C5）
 
 - 存储单元：`Topic -> #{msg := #broker_message{}, qos := 0..2}`；`msg` 里保留原始 `proto_meta`（含 retain=1），供补发时构造帧。
-- 更新顺序（QoS>0）：`append(fsync)` → `broker_retain:store/1`（同步 fsync+rename）→ **PUBACK/PUBREC** → `dispatch`。store 返回 `{error, _}` 时不断连地重试一次，仍失败则断连且不回 ack。
+- 更新顺序（QoS>0）：`append(fsync)` → `broker_retain:store/1`（同步 fsync+rename）→ **PUBACK/PUBREC** → `dispatch`。store 返回真正的写盘错误 `{error, _}`（非 `overflow`）时**直接断连且不回 ack**（无重试；`overflow` 已在 `retain_store/3` 吞成 `ok`）。
 - 更新顺序（QoS0）：`broker_retain:store/1`（内存 + 标记脏）→ `dispatch`；不 append。
 - 零长度 payload：从树中删除；消息仍 dispatch；`retain_clears` +1。
 - 补发：SUBACK 之后从连接状态里的 `retained_queue` 排空；每条占用 `pending` 窗口（`max_inflight`），PUBACK/PUBCOMP 释放后继续；不推进任何 cursor。
@@ -306,3 +306,4 @@ rebar3 as t14 release
 5. **`broker_retain_SUITE` 每个用例独立 `data_dir`**：首轮曾因共享仓库内 `data/retain` 让上一个用例的快照被下一个读到，改为逐例隔离。
 6. **`killed` 不是 `mqtt_disconnect`**：DISCONNECT 现在让 FSM `{stop, normal, ...}` 并清 `will`，`terminate/3` 靠 `will =:= undefined` 判断"干净告别"。原先用 `mqtt_disconnect` 作为 stop reason 会让正常的客户端告别被记成异常终止。
 7. **T14/T15 的 `data_dir` 期望数从 2 改为 3**：新增 `broker_retain` 也持有 `data_dir`；两个 harness 的渲染断言同步更新，防止某个 app 静默指向开发机路径。
+8. **retain 写盘错误无重试**：§3.4 原文写「不断连地重试一次，仍失败则断连」，实现里 `retain_store/3` 只对真正的写盘错误 `{error, _}`（非 `overflow`）直接 `{stop, {retain_store_failed, _}, D}` 断连且不回 ack，没有重试层。

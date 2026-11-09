@@ -130,7 +130,7 @@
 | `apps/broker_subscription/src/broker_subscription_worker.erl` | `?MEMBERS` 表、claim/ack/4、dirty 按 SubRef、boot 两张索引、`do_detach` 清 assigned |
 | `apps/broker_subscription/src/broker_subscription_files.erl` | SubRef 路径与 v2 编解码、`migrate_v1/0`、`delete_subscription/1`、`delete_inflight/1` |
 | `apps/broker_subscription/src/broker_subscription.app.src` | `shared_state_max` |
-| `apps/broker_metrics/src/broker_metrics.erl` | 四个新计数键（闭合原子集） |
+| `apps/broker_metrics/src/broker_metrics.erl` | 五个新计数键（闭合原子集，见 §2.6 表） |
 | `apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl` | `subs_for/2` 带 Kind、shared 的 claim-pull、`ack/4`、teardown 用 `leave/2`、failover 的 standby 跳过 |
 | 三份套件 | `broker_subscription_SUITE` 新增 ~12 例；`mqtt_conn_SUITE` 新增 ~6 例（shared 端到端）；`s1_e2e_SUITE` 的文件路径断言 |
 | `tools/docker/s1_recovery.py`、`tools/docker/mq_harness.py` | T14 新增 R9（Shared 崩溃重投） |
