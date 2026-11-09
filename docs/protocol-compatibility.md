@@ -220,7 +220,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 | 层 | 用例 |
 |---|---|
-| codec / 策略 / binding（`broker_event_SUITE`） | 31 例：必需属性缺失、类型错误、非法版本/时间/base64、`data`/`data_base64` 互斥、扩展保留与上限、Structured/Binary 正反向、3.1.1 损失清单、跨协议往返、事件 ID 与 Broker ID 分离、策略解析、去重开/关/过期、隔离副本、ACL 不信任事件属性 |
+| codec / 策略 / binding（`broker_event_SUITE`） | 31 例（S3 时点；S5/S6 追加头通道往返后共 35 例）：必需属性缺失、类型错误、非法版本/时间/base64、`data`/`data_base64` 互斥、扩展保留与上限、Structured/Binary 正反向、3.1.1 损失清单、跨协议往返、事件 ID 与 Broker ID 分离、策略解析、去重开/关/过期、隔离副本、ACL 不信任事件属性 |
 | 连接（`mqtt_conn_SUITE`） | 2 例：v5 `required` 拒绝回 `0x83` 且连接继续可用；3.1.1 拒绝关闭且不发 ACK |
 | 全量 | `rebar3 ct` **422/422**；`dialyzer` 0 warnings；`xref` 76 条均为预期 unused-export（S3 新增 13 条公开 API/测试入口） |
 
