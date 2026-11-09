@@ -262,7 +262,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | 控制面（`broker_meta_SUITE`） | 10 例：11 表、用户哈希、ACL、partition/node、版本、outbox |
-| 单节点集群语义（`broker_cluster_SUITE`） | 11 例：assign/epoch、Fencing、迁移两阶段、no-quorum、quorum 前后 ACK、副本不足不 ACK |
+| 单节点集群语义（`broker_cluster_SUITE`） | 11 例（S4 时点；S6 追加 `remote_append_normalises_a_successful_append` 后共 12 例）：assign/epoch、Fencing、迁移两阶段、no-quorum、quorum 前后 ACK、副本不足不 ACK |
 | 分布式（`broker_cluster_dist_SUITE`） | 4 例：3 节点组形成/复制、Leader 故障切换、失去多数派、迁移后旧 Owner Fencing |
 | 全量 | `rebar3 ct` **447/447**；`dialyzer` 0 warnings；`xref` 121 条均为预期 unused-export |
 
@@ -302,7 +302,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | WS 帧编解码（`ws_frame_SUITE`） | 9 例：握手 accept、掩码/分片、控制帧、close 载荷 |
-| WS 连接/应用协议（`ws_conn_SUITE`） | 14 例：connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack |
+| WS 连接/应用协议（`ws_conn_SUITE`） | 14 例（S5 时点；S6 追加 `cloudevent_headers_roundtrip` 后共 15 例）：connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack |
 | 真实第三方客户端（`ws_compat.py`） | 10/10 PASS（见上） |
 | 全量 | `rebar3 ct` **470/470**；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 
@@ -346,7 +346,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 | 层 | 用例 |
 |---|---|
-| NATS 线协议/连接（`nats_conn_SUITE`） | 15 例：INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK` |
+| NATS 线协议/连接（`nats_conn_SUITE`） | 15 例（S5 时点；S6 追加 `cloudevent_headers_roundtrip` 后共 16 例）：INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK` |
 | 真实第三方客户端（`nats_compat.py` + `nats.go`） | 11/11 PASS（见上） |
 | 全量 | `rebar3 ct` **485/485**（470 + 15）；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 
@@ -397,7 +397,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 | 层 | 用例 |
 |---|---|
-| AMQP 帧/字段表（`amqp_codec_SUITE`） | 14 例：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
+| AMQP 帧/字段表（`amqp_codec_SUITE`） | 14 例（S5 时点；S6 追加 `properties_roundtrip_with_ce_headers` 后共 15 例）：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
 | AMQP 连接/通道（`amqp_conn_SUITE`） | 14 例：握手+通道、direct publish/consume/ack、routing key 隔离、fanout、topic、unbind、queue delete、passive 缺失、nack requeue、prefetch、多通道、connection.close、heartbeat、坏帧尾断开 |
 | 真实第三方客户端（`amqp_compat.py` + `amqp091-go`） | 13/13 PASS（见上） |
 

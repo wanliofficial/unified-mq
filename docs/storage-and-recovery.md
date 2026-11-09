@@ -545,6 +545,6 @@ Gate「WAL 与内存实现可互换」的机械检查：`apps/broker_storage/tes
 | WAL 内部单测（codec/segment/index/meta/recovery/writer/group commit） | `apps/broker_storage/test/wal_*_SUITE.erl` |
 | 两后端契约（13 例 × 2） | `apps/broker_storage/test/broker_storage_contract.hrl` |
 | 会话文件与订阅层 | `apps/broker_subscription/test/broker_subscription_SUITE.erl` |
-| 端到端（wal/memory 双组 12 例） | `test/integration/s1_e2e_SUITE.erl` |
+| 端到端（wal/memory 双组，7 例 × 2 = 14） | `test/integration/s1_e2e_SUITE.erl` |
 | 崩溃矩阵（R1a~R9，双档） | `tools/docker/s1_recovery.py` + `tools/docker/README.md`；报告 `tools/docker/run/report-*.json`（gitignored） |
 | 真实客户端字节级 | `test/protocol-compatibility/mqtt/` |
