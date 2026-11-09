@@ -144,6 +144,8 @@ WAL 记录 = `<<Magic:8, Vsn:8, CRC32:32, Len:32>>` + `erlang:term_to_binary(Bod
 
 `truncate` 语义 = "此 offset 之前不再可被 `read_from`"，**不删除文件**。S1 段文件永不物理清理；retention 与段回收在 S2 通过**新增** optional callback 实现，不改现有签名（ADR-008 §8.3 警告不得因使用 Raft 而省略日志段管理，故此处刻意保留演进位）。
 
+**【冻结后批注 S2-F，2026-11-08】** 实际实现**没有新增 optional callback**：ADR-014 §14.1 明确「不新增 behavior callback」，段 GC 复用**既有** `truncate/2`——由 `wal_gc` 进程调用它推进逻辑边界，物理删除在 `wal_writer:truncate/2` 内部完成（写 `retired + truncate_before` 并 fsync → unlink → `wal_index:prune_below/2`）。本节末句的「保留演进位」因此未被使用，8 个回调签名保持不变。
+
 配套读路径：每分区维护稀疏间隔索引（默认每 256 条一个 `{AnchorOffset, FilePos}` 锚点，设计文档 §7.2），writer 追加时更新、recovery 重放段头重建。无索引则 `read_from` 退化为全段扫描，group commit 省下的 fsync 被读放大吃回。
 
 ### 11.7 附录：Gate「订阅位置不丢」的措辞解释（v0.3 复审已确认）
