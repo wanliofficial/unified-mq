@@ -4,10 +4,11 @@ name: ci
 # protocol compatibility, then chaos, then performance.  A failure in an earlier
 # layer stops later ones, so a broken kernel never burns an hour on benchmarks.
 #
-# NOTE: the repository pins OTP 28.3.1 and vendors `ra` under `_checkouts/`, so
-# no job needs network access at build time.  Protocol-compatibility jobs do
-# need their language toolchains and client dependencies; they are marked
-# `optional: true`-style (continue-on-error) until a runner image carries them.
+# NOTE: the repository pins OTP 28.3.1 and vendors `ra` under `_checkouts/`.
+# The kernel layer needs no network after checkout.  The protocol layer installs
+# the real client libraries (paho/websocket-client, Go modules, Maven jars) and
+# therefore does need network on a fresh runner; it is a gating job.  The chaos
+# layer additionally needs Docker (preinstalled on ubuntu-latest).
 
 on:
   push:
@@ -35,7 +36,24 @@ jobs:
       - name: Dialyzer
         run: rebar3 dialyzer
       - name: Xref
-        run: rebar3 xref
+        # rebar3 exits non-zero when xref reports warnings. The repository's only
+        # accepted class is "unused export" (progress.md lists the expected
+        # count); fail on any other warning, or on a crash with no xref output.
+        run: |
+          set +e
+          rebar3 xref > xref.log 2>&1
+          status=$?
+          set -e
+          cat xref.log
+          if [ "$status" -ne 0 ] && ! grep -q "Warning:" xref.log; then
+            exit "$status"
+          fi
+          unexpected=$(grep "Warning:" xref.log | grep -v "is unused export" || true)
+          if [ -n "$unexpected" ]; then
+            echo "unexpected xref warnings:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
       - name: Common Test (all suites)
         run: |
           # CT will happily run stale beams from a deleted suite; wipe extras
@@ -55,6 +73,11 @@ jobs:
     name: protocol compatibility (real third-party clients)
     needs: common-test
     runs-on: ubuntu-latest
+    env:
+      # The harness defaults to this host's absolute Go path; on a runner the
+      # toolchain comes from setup-go and modules from the public proxy.
+      GO_BIN: go
+      GOPROXY: https://proxy.golang.org,direct
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -66,27 +89,58 @@ jobs:
           python-version: "3.12"
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.23"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Build test tree
-        run: rebar3 as test compile
+      - name: Python client libraries
+        # Versions validated on the workstation (docs/protocol-compatibility.md).
+        run: python3 -m pip install --upgrade pip "paho-mqtt==2.1.0" "websocket-client==1.7.0"
+      - name: Go module cache (NATS, AMQP)
+        run: |
+          (cd test/protocol-compatibility/nats && go mod download)
+          (cd test/protocol-compatibility/amqp && go mod download)
+      - name: Java client jars (Kafka, Pulsar)
+        # The harness resolves jars from ~/.m2 (as on an offline workstation);
+        # populate that cache with the exact pinned coordinates it lists.
+        run: |
+          coords=(
+            org.apache.kafka:kafka-clients:3.7.1
+            com.github.luben:zstd-jni:1.5.6-3
+            org.lz4:lz4-java:1.8.0
+            org.xerial.snappy:snappy-java:1.1.10.5
+            org.slf4j:slf4j-api:1.7.36
+            org.slf4j:slf4j-simple:1.7.36
+            org.apache.pulsar:pulsar-client:3.3.1
+            org.apache.pulsar:pulsar-client-api:3.3.1
+            org.apache.pulsar:pulsar-client-admin-api:3.3.1
+            org.slf4j:slf4j-api:2.0.13
+            com.google.protobuf:protobuf-java:3.22.3
+            com.fasterxml.jackson.core:jackson-annotations:2.14.2
+            io.opentelemetry:opentelemetry-api:1.38.0
+            io.opentelemetry:opentelemetry-context:1.38.0
+            io.opentelemetry:opentelemetry-api-incubator:1.38.0-alpha
+          )
+          for c in "${coords[@]}"; do
+            mvn -q -B dependency:get -Dartifact="$c"
+          done
+      - name: Build broker tree (default profile, used by the harnesses)
+        run: rebar3 compile
       # Each adapter's harness is self-contained and starts its own broker node
-      # on an ephemeral port.  They are independent; run them in parallel.
+      # on an ephemeral port.
       - name: MQTT (paho + mosquitto)
-        run: /usr/bin/python3 test/protocol-compatibility/mqtt/t15_compat.py
+        run: python3 test/protocol-compatibility/mqtt/t15_compat.py --case all
       - name: WebSocket (websocket-client)
-        run: /usr/bin/python3 test/protocol-compatibility/ws/ws_compat.py
+        run: python3 test/protocol-compatibility/ws/ws_compat.py --all
       - name: NATS (nats.go)
-        run: /usr/bin/python3 test/protocol-compatibility/nats/nats_compat.py
+        run: python3 test/protocol-compatibility/nats/nats_compat.py --all
       - name: AMQP (amqp091-go)
-        run: /usr/bin/python3 test/protocol-compatibility/amqp/amqp_compat.py
+        run: python3 test/protocol-compatibility/amqp/amqp_compat.py --all
       - name: Kafka (kafka-clients)
-        run: /usr/bin/python3 test/protocol-compatibility/kafka/kafka_compat.py
+        run: python3 test/protocol-compatibility/kafka/kafka_compat.py --all
       - name: Pulsar (pulsar-client)
-        run: /usr/bin/python3 test/protocol-compatibility/pulsar/pulsar_compat.py
+        run: python3 test/protocol-compatibility/pulsar/pulsar_compat.py --all
 
   # ---------------------------------------------------------------- layer 3
   chaos:

@@ -49,7 +49,10 @@ def app_ebins():
 
 def build_go():
     RUN.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, GOPROXY="off", GOFLAGS="-mod=mod")
+    # Offline by default (this host keeps its module cache); CI overrides
+    # GOPROXY so a fresh runner can download the pinned modules.
+    env = dict(os.environ, GOFLAGS="-mod=mod")
+    env.setdefault("GOPROXY", "off")
     subprocess.run([GO, "build", "-o", str(RUN / "amqp_compat"), "."],
                    cwd=str(HERE), env=env, check=True)
 
