@@ -67,6 +67,8 @@ Group、分区归属/迁移、Epoch Fencing、失去多数派时的写入策略�
 - 连接层不静默降级：拒绝时 MQTT 5 回 `0x83`，3.1.1 断开；不会把可靠写入降成 `fsync`
   再 ACK。
 
+**【冻结后补充，2026-11-09】** 上面两条中，`broker_cluster:write_mode/0` 这一 API 名**未按字面实现**：实际是 `assign/4`、`migrate/4`、`finish_migration/2`、`remove/1` 这些元数据命令在 `quorum_timeout_ms` 超时后返回 `{error, no_quorum}`（`broker_cluster_meta:no_quorum/0`，同时累加 `cluster_no_quorum`）。`{on_quorum_loss, reject | os_buffer_only}` **运行时开关未实现**，已从 `broker_cluster.app.src` 移除（配置项必须有消费者）；当前行为等价于 `reject` 档——`replicated_commit` 在多数派失败时返回 `{error, {replication_failed, Acks, Needed}}` 且不 ACK，而 `os_buffer`（QoS0）之所以能继续，是因为它根本不进入复制器，不是策略分支。补上策略开关列为 S6 之后。
+
 ### D5. 复制与 ACK 等级
 
 - `replicated_commit` 的实现：本地 `fsync` 追加成功 → `broker_cluster_rep:replicate/2`

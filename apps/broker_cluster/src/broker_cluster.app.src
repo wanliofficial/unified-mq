@@ -11,8 +11,6 @@
     %% partition metadata the guard is a no-op, so S1~S3 behaviour is unchanged.
     {env, [{data_dir, "data/ra"},
            {members, []},                  %% [] -> [node()]
-           {replica_members, []},          %% [] -> [node()]
            {quorum_timeout_ms, 5000},
-           {replicate_timeout_ms, 2000},
-           {on_quorum_loss, reject}]}
+           {replicate_timeout_ms, 2000}]}
 ]}.

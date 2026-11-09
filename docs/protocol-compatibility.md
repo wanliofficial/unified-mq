@@ -250,9 +250,10 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 **失去多数派**
 
-- 元数据写（assign/migrate/finish/remove）超时（`quorum_timeout_ms`，默认 5000）返回 `{error, no_quorum}`。
-- 配置 `{on_quorum_loss, reject | os_buffer_only}`：`reject`（默认）拒绝 `replicated_commit` append；`os_buffer_only` 仅允许 QoS0 的 `os_buffer` 继续。
-- 连接层不静默降级：MQTT 5 回 `0x83`，MQTT 3.1.1 断开连接。
+- **失去多数派时的实际行为**：元数据写（assign/migrate/finish/remove）超时（`quorum_timeout_ms`，默认 5000）返回 `{error, no_quorum}`；`replicated_commit` append 的复制 quorum 拿不到多数派时返回 `{error, {replication_failed, Acks, Needed}}`，发布者拿不到 ACK。`os_buffer`（QoS0）路径根本不进入复制器，因此仍可继续——这是路径分离的结果，不是运行时策略开关。
+- CONNACK 拒绝不静默降级：MQTT 5 回 `0x83`，MQTT 3.1.1 断开连接。
+
+> **口径（S6 之后）**：ADR-021 §D4 曾计划 `{on_quorum_loss, reject | os_buffer_only}` 运行时开关。该开关**未实现**，已从 `broker_cluster.app.src` 移除（配置项必须有消费者）；当前行为等价于计划中的 `reject` 档，`os_buffer` 的可用性来自它不经过复制器。
 
 **指标**：`cluster_owner_changes`、`cluster_fencing_rejected`、`cluster_replication_failed`、`cluster_replication_latency_us`、`cluster_no_quorum`。
 

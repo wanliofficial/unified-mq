@@ -44,7 +44,6 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_cluster, members, []),
     ok = application:set_env(broker_cluster, quorum_timeout_ms, 3000),
     ok = application:set_env(broker_cluster, replicate_timeout_ms, 300),
-    ok = application:set_env(broker_cluster, on_quorum_loss, reject),
     %% `set_env' before `load' is overwritten by the .app file's env, so the
     %% apps under test are loaded explicitly first (the same lesson
     %% broker_queue_SUITE's init_per_suite records).
