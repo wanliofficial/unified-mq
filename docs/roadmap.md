@@ -248,6 +248,8 @@ unified-mq/
 
 **Gate S4 结论：✅ 通过（2026-11-08）。** 实现与证据见 [ADR-021](adr/021-cluster-control-plane-raft-and-fencing.md) 与 [`docs/design/s4-cluster-execution-plan.md`](design/s4-cluster-execution-plan.md) §5。
 
+> **口径说明（Router 分区归属）**：ADR-010 §10.5 与验证段原本设想 S4 通过 `on_partition_change/2` 通知 Router，并在启动时拒绝未实现该 callback 的旧后端。S4 实际以 `broker_cluster`（ra 元数据 + `broker_cluster_cache`）承担归属，以 `broker_queue` 的 `append_guard` / `replicator` 钩子接入数据面与 fencing；`Destination → Partition` 是迁移前后不变的纯函数，Router 不需要感知归属变化。ADR-010 以「冻结后补充 S4」记录该取代关系，冻结文本未改；Gate S4 的各项验收不受影响。
+
 ---
 
 ## 7. S5 — 协议扩展

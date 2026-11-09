@@ -1,6 +1,6 @@
 # ADR-010：`broker_router` behavior 与路由/订阅索引职责边界
 
-- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F3/F5 评审整改已并入；后续修改须走 ADR 修订流程；**T17 复核（2026-11-06）**：5 个回调与 `route_ctx` 字段一致，未触发修订
+- **状态**：**已采纳（S1 T0.5 冻结，2026-10-21）**——F3/F5 评审整改已并入；后续修改须走 ADR 修订流程；**T17 复核（2026-11-06）**：5 个回调与 `route_ctx` 字段一致，未触发修订；**S4 冻结后补充（2026-11-09）**：分区归属由 `broker_cluster` 承担，`on_partition_change/2` 保持 optional 未实现，见 §10.5 批注
 - **日期**：2026-10-21
 - **关联**：README §2.1（分层职责）/§9.1（发布生命周期第 6 步）；roadmap §3.2 抽象 2；ADR-001（Adapter 与内核分离）、ADR-008（分组模型）；设计文档 `docs/design/s1-mqtt-vertical-slice.md` §3.2
 
@@ -89,6 +89,8 @@ S1 把 MQTT 通配符匹配放在 Router。已知张力：S2 引入 Shared subsc
 
 S4 分区迁移/归属变化需要通知 Router 更新 `Destination → Partition` 映射。S1 该 callback **允许不实现**（`-optional_callbacks`），S4 补 `broker_router_hash` 实现即可，**不修改既有 callback 签名**。这是 roadmap §3.2「定稿后不改」与 S4 已知需求之间的唯一让渡点。
 
+**【冻结后补充 S4，2026-11-09】** 上面「S4 补 `broker_router_hash` 实现」的路线已被 S4 实际实现取代，**冻结文本不改**。S4 没有让 Router 感知分区归属：归属真相在 `broker_cluster`（ra Metadata Raft Group → `broker_cluster_cache` 本地镜像 → `broker_cluster:authorize_append/2`），数据面经 `broker_queue` 的 `persistent_term` 钩子 `{broker_queue, append_guard}` / `{broker_queue, replicator}` 接入（ADR-021 §D2~§D5）。`route/3` 的 `Destination → Partition` 仍是 `phash2(Destination, N)` 纯函数，迁移只改变 `(owner, epoch)`、不改变分区编号，Router 本来就没有需要更新的映射。因此 `on_partition_change/2` 继续作为 `-optional_callbacks` 保持未实现：`broker_router_hash` 不导出它，由 `broker_router_hash_SUITE:on_partition_change_stays_unimplemented_in_s1` 锁定。`route/3` 签名与 behavior 一字未改，§10.5「不修改既有 callback 签名」的目标仍然成立；不再适用的只有「S4 补实现」这一句。
+
 ### 10.6 Router 索引不持久化，重启由订阅层重建
 
 Router 的索引状态在内存（ETS），**不落盘**。冷启动顺序固定：
@@ -134,4 +136,7 @@ Router 的索引状态在内存（ETS），**不落盘**。冷启动顺序固定
 - S2 需证明：Shared subscription 可在不改 `route/3` 签名的前提下接入（否则本 ADR 需修订）。
 - S2 基准需证明：随发布者进程数增加，`route/3` 吞吐线性提升、无单点饱和（README §7.2 四约束逐条检查之一）。
 - S4 需证明：分区迁移经 `on_partition_change/2` 生效，且未实现该 callback 的旧 Router 后端在启动时被显式拒绝而非静默错误路由。
+
+  **【冻结后补充 S4，2026-11-09】** 这条按 S1 冻结时的假设书写，S4 实际路线见 §10.5 冻结后补充：分区迁移的生效点与「旧写入被拒绝」都由 `broker_cluster` 承担，而不是 Router。迁移后旧 owner 按错误 epoch 写入返回 `{error, {fenced, #{expected_epoch, actual_epoch, owner}}}`——`broker_cluster_SUITE:fencing_rejects_a_stale_epoch` / `fencing_rejects_a_non_owner`、`broker_cluster_dist_SUITE:old_owner_is_fenced_after_migration`。由于 `on_partition_change/2` 始终 optional 且 Router 不持有归属，不存在「未实现该 callback 的旧 Router 后端」这一对象；「静默错误路由」也不成立：分区编号在迁移前后不变，写错节点会被 `broker_cluster:authorize_append/2`（经 `append_guard` 钩子）拒绝。
+
 - S5 需证明：AMQP routing key / NATS subject / Kafka topic 三种路由模型都能表达为 `route/3` 返回 `[{partition_id, [SubRef]}]`。

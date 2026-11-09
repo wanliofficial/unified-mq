@@ -74,4 +74,6 @@ rebar3 xref
 2. CT 默认 `nonode@nohost`；`peer` 需要分布式 origin。`broker_cluster_dist_SUITE:init_per_suite/1` 自行 `net_kernel:start/1`，且**不得**在启动前读取并回写 cookie（会拿到 `nocookie` 导致 peer 握手超时）。
 3. peer 节点必须显式把测试套件 beam 目录加入 `-pa`，否则 `rpc(Node, prepare_peer, ...)` 报 `undef`。
 
+**与 ADR-010 §10.5 的关系**：ADR-010 冻结时设想 S4 通过 `broker_router_hash:on_partition_change/2` 通知 Router 更新 `Destination → Partition`。S4 实际未走该路线，也无需走：`route/3` 的分区是 `phash2(Destination, N)` 纯函数，迁移只改 `(owner, epoch)`，不改分区编号；归属与 fencing 由 `broker_cluster`（ra 元数据 + `broker_cluster_cache` + `broker_queue` 的 `append_guard` / `replicator` 钩子）承担，见 §1 与 ADR-021 §D2~§D5。因此 `on_partition_change/2` 继续作为 optional callback 未实现（`broker_router_hash_SUITE:on_partition_change_stays_unimplemented_in_s1` 锁定），ADR-010 以「冻结后补充」记录该取代关系，冻结文本未改。
+
 **S4 之外（明确不做）**：自动再平衡、跨机房复制、Mnesia 在线 schema 迁移工具、消息级 Raft 共识。
