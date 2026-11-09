@@ -125,12 +125,13 @@ def ensure_release():
 
 
 def substitute_data_dirs(text):
-    """Rewrite every `data_dir' to the bind mount, preserving its suffix.
+    """Rewrite every storage path to the bind mount, preserving its suffix.
 
-    Five layers own the key (storage, subscription, retain, and the S4 control
-    plane's Mnesia/ra stores). Keeping the relative suffix means ra lands in
-    `DATA_IN_CONTAINER/ra' instead of at the mount root. The count is asserted
-    so a new app cannot silently keep pointing at the dev host.
+    Five layers own `data_dir` (storage, subscription, retain, and the S4 control
+    plane's Mnesia/ra stores); `broker_admin.backup_dir` is the sixth on-disk
+    path. Keeping the relative suffix means ra lands in `DATA_IN_CONTAINER/ra'
+    instead of at the mount root. Both counts are asserted so a new app cannot
+    silently keep pointing at the dev host.
     """
     data_pat = re.compile(r'\{data_dir,\s*"([^"]*)"\}')
 
@@ -148,6 +149,11 @@ def substitute_data_dirs(text):
     text, n = data_pat.subn(map_data_dir, text)
     if n != 5:
         raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
+    backup_pat = re.compile(r'\{backup_dir,\s*"[^"]*"\}')
+    text, nb = backup_pat.subn(
+        '{backup_dir, "%s"}' % (Path(DATA_IN_CONTAINER) / "backups"), text)
+    if nb != 1:
+        raise RuntimeError(f"sys.config render: backup_dir matched {nb}, expected 1")
     return text
 
 

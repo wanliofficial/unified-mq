@@ -25,7 +25,7 @@ env, same ephemeral binding, same `ranch:get_port` readback.
 export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"
 
 # whole suite (starts one broker on an ephemeral port, runs all 10 cases)
-python3 test/protocol-compatibility/ws/ws_compat.py
+python3 test/protocol-compatibility/ws/ws_compat.py --all
 
 # one case
 python3 test/protocol-compatibility/ws/ws_compat.py --case ws-pubsub-qos1

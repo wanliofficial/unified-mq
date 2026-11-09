@@ -17,5 +17,8 @@
            {port, 8090},
            %% Empty token = no authentication (acceptable on loopback only).
            {token, <<>>},
-           {backup_dir, "/home/wanli/workspace/unified-mq/backups"}]}
+           %% Relative fallback: the release config (config/sys.config.src) sets
+           %% the deployment's absolute path; the container harness rewrites it
+           %% to the data volume.
+           {backup_dir, "backups"}]}
 ]}.

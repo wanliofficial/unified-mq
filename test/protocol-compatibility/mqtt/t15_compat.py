@@ -132,6 +132,13 @@ def render_config():
     text, n = data_pat.subn(map_data_dir, text)
     if n != 5:
         raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
+    # The admin backup directory is the sixth on-disk path; mount it too so a
+    # backup created in the container lands on the bind-mounted data volume.
+    text, n = re.subn(r'\{backup_dir,\s*"[^"]*"\}',
+                      '{backup_dir, "%s"}' % (Path(DATA_IN_CONTAINER) / "backups"),
+                      text)
+    if n != 1:
+        raise RuntimeError(f"sys.config render: backup_dir matched {n}, expected 1")
     text, n = re.subn(r'"log/s1\.log"', '"%s/log/s1.log"' % DATA_IN_CONTAINER, text)
     if n != 1:
         raise RuntimeError(f"sys.config render: log path matched {n}, expected 1")

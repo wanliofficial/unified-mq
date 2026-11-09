@@ -1,36 +1,22 @@
 # UnifiedMQ
 
-#### Description
-{**When you're done, you can delete the content in this README and update the file with details for others getting started with your repository**}
+UnifiedMQ is a multi-protocol message broker on Erlang/OTP 28. MQTT, WebSocket,
+NATS, AMQP 0-9-1, Kafka and Pulsar clients share one message kernel, with
+CloudEvents 1.0 as an optional event layer and a Raft/Mnesia control plane.
 
-#### Software Architecture
-Software architecture description
+The authoritative, up-to-date documentation is in Chinese:
 
-#### Installation
+- [README.md](README.md) — goals, architecture, acceptance criteria and roadmap.
+- [docs/roadmap.md](docs/roadmap.md) — stage status and gate evidence.
+- [docs/architecture.md](docs/architecture.md) — applications, processes and the
+  publish/subscribe data path.
+- [docs/operations.md](docs/operations.md) — deployment, admin API, backup and
+  upgrade.
+- [docs/protocol-compatibility.md](docs/protocol-compatibility.md) — per-protocol
+  capability matrix and real third-party client evidence.
+- [docs/storage-and-recovery.md](docs/storage-and-recovery.md) — WAL format,
+  sessions and recovery.
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
-
-#### Instructions
-
-1.  xxxx
-2.  xxxx
-3.  xxxx
-
-#### Contribution
-
-1.  Fork the repository
-2.  Create Feat_xxx branch
-3.  Commit your code
-4.  Create Pull Request
-
-
-#### Gitee Feature
-
-1.  You can use Readme\_XXX.md to support different languages, such as Readme\_en.md, Readme\_zh.md
-2.  Gitee blog [blog.gitee.com](https://blog.gitee.com)
-3.  Explore open source project [https://gitee.com/explore](https://gitee.com/explore)
-4.  The most valuable open source project [GVP](https://gitee.com/gvp)
-5.  The manual of Gitee [https://gitee.com/help](https://gitee.com/help)
-6.  The most popular members  [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+Status: S0–S6 are implemented and tested (631 CT cases plus six real third-party
+client suites). Deliberately unimplemented items are listed in
+[docs/security.md](docs/security.md) §12.

@@ -127,7 +127,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
   'io:format("~p~n", [broker_backup:create()]), halt().'
 ```
 
-- 输出目录由 `broker_admin.backup_dir` 决定，必须是 release 树外的绝对路径。
+- 输出目录由 `broker_admin.backup_dir` 决定，必须是 release 树外的绝对路径（容器 harness 渲染配置时会把它映射到数据卷的 `backups/`）。
 - 备份期间正在追加的 WAL 段按原样复制；恢复时按 `wal_recovery` 的撕裂尾规则处理，因此**业务数据的热备份是安全的**。`mnesia/` 与 `ra/` 为控制面，热备份不保证逐字节一致；需要一致时先静止写入或停节点。
 - `GET /api/v1/backups` 返回清单，用于核对备份是否落在预期位置。
 
