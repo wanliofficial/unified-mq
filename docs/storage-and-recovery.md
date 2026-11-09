@@ -187,9 +187,9 @@ caller:  收到 {ok, Offsets} 后才发 PUBACK
 |---|---|---|
 | `os_buffer` | 写入内核页缓存即返回；掉电可能丢 | 两个后端 |
 | `fsync` | `file:sync` 返回后才返回 | 仅 WAL |
-| `replicated_commit` | 等待共识提交 | 无极（S3/S4） |
+| `replicated_commit` | 本地 `fsync` + 复制到多数派才算成功（S4 已实现） | `broker_queue` 层，**不是后端能力值** |
 
-`capability/1` 是**实例级**答案：WAL 返回 `[os_buffer, fsync]`，内存返回 `[os_buffer]`。`broker_queue:append/3` 与 writer 各做一次校验；`mqtt_conn_fsm` 在 CONNECT 时按后端推导 `mqtt_max_qos`（内存档为 0，QoS1 在 SUBACK 回 `0x80`）。
+`capability/1` 是**实例级**答案，只列**后端**能做的档：WAL 返回 `[os_buffer, fsync]`，内存返回 `[os_buffer]`。`replicated_commit` 不在任何后端的列表里——它由 `broker_queue:append/3` 在 `broker_cluster` 装好复制器时接受（先本地 `fsync`，再 `broker_cluster_rep:replicate/2` 求多数派），没有复制器时按 ADR-011 冻结的答案返回 `{error, {unsupported_sync_mode, replicated_commit}}`。`broker_queue:append/3` 与 writer 各做一次校验；`mqtt_conn_fsm` 在 CONNECT 时按后端推导 `mqtt_max_qos`（内存档为 0；此时 QoS1 的 SUBSCRIBE 在 SUBACK 回 `0x80`，MQTT 5 回 `0x87`）。
 
 ---
 
