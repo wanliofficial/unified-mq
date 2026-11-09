@@ -157,10 +157,10 @@ rebar3 xref                     # 与 53 条基线比对
 | 任务 | 落地 | 证据 |
 |---|---|---|
 | T-F0 | 本计划 + ADR-014 §14.7 | `docs/adr/014-retention-and-segment-gc.md` |
-| T-F1 | `wal_meta` vsn 2：`{2, Committed, TruncateBefore, Retired}`，v1 读作 `[]`；`encode/3`、`write/4`，`encode/2`/`write/3` 转发 | `wal_meta_SUITE` 2 例 |
+| T-F1 | `wal_meta` vsn 2：`{2, Committed, TruncateBefore, Retired}`，v1 读作 `[]`；`encode/3`、`write/4`，`encode/2`/`write/3` 转发 | `wal_meta_SUITE` 新增 2 例 |
 | T-F2 | `wal_index:prune_below/2`（保留 `{{meta}}` 行） | `wal_index_SUITE:prune_below_removes_only_older_anchors` |
-| T-F3 | `wal_writer` state `retired`；`truncate/2` 写 meta → unlink → prune；`retention_info/1`；4 个指标 | `broker_storage_wal_SUITE` 2 例 + `broker_metrics_SUITE:keys_are_stable` |
-| T-F4 | `wal_recovery` retired 七条规则；`expect` 从首个现存段起 | `wal_recovery_SUITE` 3 例 |
+| T-F3 | `wal_writer` state `retired`；`truncate/2` 写 meta → unlink → prune；`retention_info/1`；4 个指标 | `broker_storage_wal_SUITE` 新增 2 例 + `broker_metrics_SUITE:keys_are_stable` |
+| T-F4 | `wal_recovery` retired 七条规则；`expect` 从首个现存段起 | `wal_recovery_SUITE` 新增 3 例 |
 | T-F5 | `wal_gc`（`scan/1`、`plan/3`、`run/0`、`status/0`、定时 tick）挂 `broker_storage_wal_sup` | `wal_gc_SUITE` 8 例 |
 | T-F6 | `broker_queue:retention_status/0`；`sys.config.src` / `.app.src` 的 `retention` map | `wal_gc_SUITE` status 用例 |
 | T-F7 | 本文档、ADR-014 §14.7、S2 设计 §4.6、`storage-and-recovery.md`、`progress.md`、`roadmap.md` | 本节 |
