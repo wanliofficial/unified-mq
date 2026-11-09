@@ -121,7 +121,7 @@ rebar3 xref        # 与 61 条基线比对
 | `apps/broker_storage/src/wal_writer.erl` | `max_pending_appends`（默认配 4096）、过载在 `high` 递增前拒绝并回 `{error,{overloaded,P}}`、`wal_pending_append` 差值上报 + `terminate/2` 回收、`stats/1` 增 `pending`/`max_pending` |
 | `apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl` | pull round 整轮 permit（mailbox 优先、窗口次之）+ `backpressure_pauses`；PUBLISH 前生产者门；`store_and_ack` 过载断开计数；两个 gauge 的差值上报 + `terminate/3` 回收 |
 | `apps/broker_proto_mqtt/src/broker_proto_mqtt_sup.erl` | `?CONN_KEYS` 增 `pull_mailbox_limit`、`publish_mailbox_limit` |
-| `apps/broker_proto_mqtt/src/broker_proto_mqtt.app.src`、`config/sys.config.src` | 默认值：`pull_mailbox_limit=1000`、`publish_mailbox_limit=1000`、`wal.max_pending_appends=4096` |
+| `apps/broker_proto_mqtt/src/broker_proto_mqtt.app.src`、`config/sys.config.src` | 默认值：`pull_mailbox_limit=1000`、`publish_mailbox_limit=1000`（只在 `.app.src`，`sys.config.src` 不覆盖）；`wal.max_pending_appends=4096`（`sys.config.src` 覆盖 `wal_writer` 的代码默认 0） |
 
 ### 8.2 验收证据
 
