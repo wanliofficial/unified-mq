@@ -158,6 +158,14 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 - 数据目录必须在 release 树外、ext4（tmpfs/ramfs 被存储层拒绝）。
 - 目录布局与恢复算法见 `docs/storage-and-recovery.md`。
 
+**控制面持久性（必须显式配置）**：`broker_meta` 的 11 张控制面表（用户、ACL、schema 版本、outbox）默认建为 **`ram_copies`**——`sys.config.src` 没有覆盖 `table_storage`，代码默认即 `ram_copies`，此时节点重启**全部丢失**（`maybe_set_dir` 也只在 `disc_copies` 时设置 `mnesia.dir`）。ADR-021 §D1 要求生产配置：
+
+```erlang
+{broker_meta, [{data_dir, "<abs>/data/mnesia"}, {table_storage, disc_copies}]}
+```
+
+未设置时请按「重启后用户/ACL 需重新建立」理解现状。
+
 ---
 
 ## 6. 滚动升级与版本兼容
