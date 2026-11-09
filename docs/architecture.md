@@ -371,7 +371,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | 真实客户端 | paho-mqtt 2.x / mosquitto 2.1.2（MQTT）、websocket-client、nats.go、amqp091-go、kafka-clients、官方 Pulsar Java Client；六协议全绿 | `test/protocol-compatibility/` |
 | 集群 | 3 节点 `peer`：组形成、Leader 切换、失去多数派、迁移后 Fencing | `apps/broker_cluster/test/broker_cluster_dist_SUITE.erl` |
 | 性能 | `docs/benchmarks/2026-11-09-s6-capacity.md`、`2026-11-09-s6-gameday.md` | `docs/benchmarks/` |
-| 端到端 | `wal`/`memory` 双组同一组 6 用例 = **12/12** | `test/integration/s1_e2e_SUITE.erl` |
+| 端到端 | `wal`/`memory` 双组同一组 7 用例 = **14/14**（T13 交付时 6 例 = 12/12，S2-A 追加 metrics 端到端后为 7 例） | `test/integration/s1_e2e_SUITE.erl` |
 
 各阶段 Gate 的验收状态见 `docs/roadmap.md` 与 `progress.md`。
 
