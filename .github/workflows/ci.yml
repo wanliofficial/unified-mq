@@ -156,12 +156,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Python client library
+        run: python3 -m pip install --upgrade pip "paho-mqtt==2.1.0"
       - name: Build release
         run: rebar3 as t14 release
       - name: GameDay drills
         run: |
           rm -rf _build/test/extras
-          /usr/bin/python3 tools/bench/s6_gameday.py --skip-build \
+          python3 tools/bench/s6_gameday.py --skip-build \
             --out chaos-gameday.json
       - name: Upload GameDay evidence
         if: always()
@@ -189,15 +191,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Python client library
+        run: python3 -m pip install --upgrade pip "paho-mqtt==2.1.0"
       - name: Build release
         run: rebar3 as t14 release
       - name: Capacity matrix (quick)
         run: |
-          /usr/bin/python3 tools/bench/s2_bench.py --skip-build \
+          python3 tools/bench/s2_bench.py --skip-build \
             --out capacity.json
       - name: Connection sweep
         run: |
-          /usr/bin/python3 tools/bench/s2_bench.py --publisher-sweep --skip-build \
+          python3 tools/bench/s2_bench.py --publisher-sweep --skip-build \
             --out connections.json
       - name: Upload performance evidence
         if: always()
