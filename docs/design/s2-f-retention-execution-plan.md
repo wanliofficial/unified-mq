@@ -118,12 +118,12 @@ Decision = #{cut := offset(),                 % 新的 truncate_before
 | F-4 `max_age_ms` 阈值 | `wal_gc_SUITE:max_age_deletes_only_expired_segments` |
 | F-5 组合取交集 | `wal_gc_SUITE:both_limits_intersect_and_delete_less` |
 | F-6 cut 不超过 `committed + 1` | `wal_gc_SUITE:the_cut_never_crosses_the_committed_watermark` |
-| F-7 删除后 `read_from` 从 `truncate_before` 起 | `broker_storage_wal_SUITE:read_from_starts_at_truncate_before_after_gc` |
+| F-7 删除后 `read_from` 从 `truncate_before` 起 | `broker_storage_wal_SUITE:retention_deletes_only_whole_segments_below_committed`（该用例末尾断言 `read_from(Hd, 1, 100)` 返回 `[7,8,9]`） |
 | F-8 恢复忽略并补删 retired 文件 | `wal_recovery_SUITE:retired_segments_are_ignored_and_removed` |
 | F-9 恢复拒绝缺失段 / 活跃段被 retired | `wal_recovery_SUITE:a_missing_segment_is_still_corruption`、`wal_recovery_SUITE:retiring_the_active_segment_refuses_to_start` |
 | F-10 meta v2 往返 + v1 兼容 | `wal_meta_SUITE:write_then_read_roundtrips_retired_segments`、`wal_meta_SUITE:a_v1_entry_reads_with_no_retired_segments` |
 | F-11 锚点清理 | `wal_index_SUITE:prune_below_removes_only_older_anchors` |
-| F-12 `retention_status/0` | `wal_gc_SUITE:status_reports_the_oldest_segment_and_blocked_reason` |
+| F-12 `retention_status/0` | `wal_gc_SUITE:status_reports_the_oldest_segment_and_deletable_bytes` |
 | F-13 指标 | `broker_metrics_SUITE:keys_are_stable`（4 键已在 S2-A 冻结）+ `wal_gc_SUITE` 断言 counters |
 | F-14 回归 | 全量 `rebar3 ct`、`dialyzer`、`xref` |
 

@@ -2,7 +2,7 @@
 ## Erlang/OTP + Raft + 多协议接入 + Pulsar + CloudEvents
 
 - **文档版本**：v1.2
-- **状态**：架构方案 / 待通过 PoC 验证
+- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S6 已实现并验证（`rebar3 ct` 631/631、六协议真实客户端套件），明确未实现项列在 [`docs/security.md`](docs/security.md) §12。本文 §8 的目录结构与 §12 的分阶段表是**设计建议**，实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1。
 - **目标**：构建一个以 Erlang/OTP 为核心、支持多消息协议、分布式一致性、持久化消息和标准化事件的统一消息 Broker。
 - **核心原则**：协议适配与消息内核解耦；控制面与数据面分离；共识层不替代消息语义；CloudEvents 是事件表达标准，不是传输协议。
 

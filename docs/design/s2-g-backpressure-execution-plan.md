@@ -78,7 +78,7 @@
 |---|---|
 | 消费者门限纯函数：mailbox 优先、窗口满、0=关闭 | `mqtt_backpressure_SUITE:consumer_*` |
 | 生产者门限纯函数 | `mqtt_backpressure_SUITE:producer_*` |
-| 写队列满时 append 被拒且不消费 offset | `wal_writer_SUITE:appending_above_the_pending_limit_is_refused` |
+| 写队列满时 append 被拒且不消费 offset | `wal_writer_SUITE:appending_above_the_pending_limit_is_refused_without_consuming_an_offset` |
 | 窗口满时整轮跳过并计数；ack 后恢复 | `mqtt_conn_SUITE:a_full_inflight_window_pauses_the_pull_round` |
 | 慢消费者（手动逐条 ack）连接 mailbox / in-flight 有上界，broker 进程存活 | `mqtt_conn_SUITE:a_slow_consumer_stays_bounded` |
 | 热点分区不阻塞其他分区 | `mqtt_conn_SUITE:a_hot_partition_does_not_block_the_others` |
