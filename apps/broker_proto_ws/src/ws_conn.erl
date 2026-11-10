@@ -67,11 +67,23 @@ handle_cast(_Msg, St) ->
     {noreply, St}.
 
 %% ranch sends this after `controlling_process' has moved the socket to us.
-handle_info({handshake, _Ref, Transport, Socket, _Timeout}, #st{handshake = pending} = St) ->
-    St1 = St#st{transport = Transport, socket = Socket},
-    case set_active(St1) of
-        ok -> {noreply, St1};
-        {error, Reason} -> {stop, {socket_error, Reason}, St1}
+%%
+%% For TLS it is also the call that completes the TLS handshake: ranch only does
+%% `transport_accept', so skipping it leaves an sslsocket that rejects
+%% `ssl:setopts/2' with `notsup_on_transport_accept_socket' -- which is exactly
+%% what happened before S8-B (wss was advertised by the listener spec and never
+%% worked). `ranch_tcp:handshake/2' is the no-op that returns the socket, so one
+%% call covers both.
+handle_info({handshake, _Ref, Transport, Socket, Timeout}, #st{handshake = pending} = St) ->
+    case Transport:handshake(Socket, Timeout) of
+        {ok, HSock} ->
+            St1 = St#st{transport = Transport, socket = HSock},
+            case set_active(St1) of
+                ok -> {noreply, St1};
+                {error, Reason} -> {stop, {socket_error, Reason}, St1}
+            end;
+        {error, Reason} ->
+            {stop, {tls_handshake_failed, Reason}, St#st{socket = Socket}}
     end;
 handle_info({tcp, Socket, Data}, #st{socket = Socket} = St) ->
     on_data(Data, St);

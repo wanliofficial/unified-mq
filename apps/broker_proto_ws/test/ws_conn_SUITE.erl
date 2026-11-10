@@ -43,7 +43,8 @@ all() ->
      require_auth_refuses_an_anonymous_connect,
      trace_context_roundtrips_through_a_delivery,
      trace_context_is_stripped_when_propagation_is_off,
-     a_malformed_traceparent_is_not_propagated].
+     a_malformed_traceparent_is_not_propagated,
+     wss_is_served_when_tls_is_enabled].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -61,8 +62,16 @@ end_per_suite(_Config) ->
     stop_all(),
     ok.
 
-init_per_testcase(Case, Config) ->
+init_per_testcase(Case, Config0) ->
     stop_all(),
+    %% Snapshot the ORIGINAL tls env and thread it through Config so
+    %% `end_per_testcase' restores exactly that: reading it at teardown would
+    %% capture what the wss case left behind and leak TLS into every suite that
+    %% runs after this one in the shared CT node.
+    SavedTls = saved_tls(),
+    restore_tls(SavedTls),
+    {Cert, Key} = self_signed(),
+    Config = [{certfile, Cert}, {keyfile, Key}, {saved_tls, SavedTls} | Config0],
     DataDir = filename:join([?config(priv_dir, Config), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -90,13 +99,20 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_proto_ws, listeners,
                              [#{port => 0, num_acceptors => 4, max_connections => 128}]),
     ok = application:set_env(broker_proto_ws, max_publish_bytes, 1024),
+    %% TLS has to be on *before* the listener boots: `broker_security_tls:
+    %% transport/0' is read once, by the supervisor's child spec.
+    ok = case Case of
+             wss_is_served_when_tls_is_enabled -> enable_tls(Config);
+             _ -> ok
+         end,
     {ok, _} = application:ensure_all_started(broker_storage),
     ok = create_partitions(),
     {ok, _} = application:ensure_all_started(broker_proto_ws),
     [{data_dir, DataDir}, {port, listener_port()} | Config].
 
-end_per_testcase(_Case, _Config) ->
+end_per_testcase(_Case, Config) ->
     stop_all(),
+    restore_tls(?config(saved_tls, Config)),
     ok.
 
 create_partitions() ->
@@ -446,6 +462,19 @@ publish_with_trace(Config, Parent, State) ->
     close(Publisher),
     Header.
 
+%% Regression for a real defect: the listener spec has always honoured
+%% `broker_security_tls', so a TLS-enabled node produced a `ranch_ssl' listener,
+%% but `ws_conn' never called `RanchTransport:handshake/2'. The socket was never
+%% handshaked, `ssl:setopts/2' failed with `notsup_on_transport_accept_socket',
+%% and every wss client saw a connection that closed immediately. Nothing caught
+%% it because no case ever connected over TLS.
+wss_is_served_when_tls_is_enabled(Config) ->
+    S = tls_open(Config),
+    #{<<"op">> := <<"connack">>, <<"session_present">> := false} =
+        tls_request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"wss1">>}),
+    ok = ssl:close(S),
+    ok.
+
 %%%_* Wire client -----------------------------------------------------------
 
 open(Config) ->
@@ -550,6 +579,85 @@ close(S) ->
     catch gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true)),
     catch gen_tcp:close(S),
     ok.
+
+tls_open(Config) ->
+    {ok, S} = ssl:connect("localhost", ?config(port, Config),
+                          [binary, {active, false}, {verify, verify_none}], 5000),
+    Key = base64:encode(crypto:strong_rand_bytes(16)),
+    Request = [<<"GET /ws HTTP/1.1\r\nHost: localhost\r\n"
+                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                 "Sec-WebSocket-Key: ">>, Key, <<"\r\n"
+                 "Sec-WebSocket-Version: 13\r\n\r\n">>],
+    ok = ssl:send(S, Request),
+    {ok, Response} = ssl_recv_until(S, <<"\r\n\r\n">>, <<>>),
+    <<"HTTP/1.1 101", _/binary>> = Response,
+    S.
+
+ssl_recv_until(S, Needle, Acc) ->
+    case binary:match(Acc, Needle) of
+        nomatch ->
+            case ssl:recv(S, 0, 5000) of
+                {ok, Data} -> ssl_recv_until(S, Needle, <<Acc/binary, Data/binary>>);
+                Other -> Other
+            end;
+        _ ->
+            {ok, Acc}
+    end.
+
+tls_request(S, Map) ->
+    ok = ssl:send(S, ws_frame:encode(1, json:encode(Map), true)),
+    tls_recv_json(S, <<>>).
+
+%% Skip control/irrelevant frames; the case only cares about the JSON answer.
+tls_recv_json(S, Buf) ->
+    case ws_frame:decode(Buf, 16777216) of
+        {ok, #{opcode := 1, payload := Payload}, _Rest} ->
+            json:decode(Payload);
+        {ok, _Other, Rest} ->
+            tls_recv_json(S, Rest);
+        {more, _Need} ->
+            case ssl:recv(S, 0, 5000) of
+                {ok, Data} -> tls_recv_json(S, <<Buf/binary, Data/binary>>);
+                Other -> exit({tls_recv_failed, Other, Buf})
+            end
+    end.
+
+%%%_* TLS configuration ------------------------------------------------------
+
+enable_tls(Config) ->
+    application:set_env(broker_security, tls,
+                        #{enabled => true,
+                          certfile => ?config(certfile, Config),
+                          keyfile => ?config(keyfile, Config),
+                          verify => verify_none}).
+
+saved_tls() ->
+    application:get_env(broker_security, tls, undefined).
+
+restore_tls(undefined) ->
+    application:unset_env(broker_security, tls);
+restore_tls(Value) ->
+    application:set_env(broker_security, tls, Value).
+
+%% Generated per run so nothing in the repo is a checked-in secret; the openssl
+%% shape matches `mqtt_tls_SUITE'.
+self_signed() ->
+    Dir = filename:join(["/tmp/opencode", "ws_conn_tls_test"]),
+    _ = file:del_dir_r(Dir),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    Cert = filename:join(Dir, "cert.pem"),
+    Key = filename:join(Dir, "key.pem"),
+    Cmd = io_lib:format(
+            "openssl req -x509 -newkey rsa:2048 -nodes -days 1 "
+            "-subj /CN=localhost -addext subjectAltName=DNS:localhost "
+            "-addext extendedKeyUsage=serverAuth "
+            "-keyout ~s -out ~s 2>/dev/null",
+            [Key, Cert]),
+    _ = os:cmd(lists:flatten(Cmd)),
+    case {filelib:is_regular(Cert), filelib:is_regular(Key)} of
+        {true, true} -> {Cert, Key};
+        _ -> exit({openssl_failed, Cert, Key})
+    end.
 
 wait_until(Fun) -> wait_until(Fun, ?POLL_BUDGET_MS).
 
