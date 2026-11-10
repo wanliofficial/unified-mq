@@ -22,6 +22,10 @@
            {advertise_port, 1884},
            {max_asleep_clients, 1024},
            {max_topic_ids_per_client, 1024},
+           %% Unacked downlink PUBLISHes per session (MQTT's in-flight window).
+           %% A full window parks the message in the partition; the next
+           %% PINGREQ retries from the cursor.
+           {max_inflight, 20},
            %% 1.5x/2x of a client's requested duration, capped so an absurd
            %% value cannot pin a session for a week.
            {max_duration_s, 3600}]}

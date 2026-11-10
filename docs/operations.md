@@ -104,13 +104,24 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 
 ```erlang
 {broker_proto_mqtt_quic, [
-  {listeners, [#{port => 14567}]},      % 默认 []，见下
+  {listeners, [#{port => 14567,         % 默认 []，见下
+                 max_connections => 1024}]},
   {alpn, [<<"mqtt">>]},
   {handshake_timeout_ms, 5000},
   {idle_timeout_ms, 30000},
   {max_streams_per_conn, 4}
 ]}.
 ```
+
+**listener map 的 key**（`mqtt_quic_listener:open/1`；`port` 必需，其余可省）：
+
+| key | 缺省 | 说明 |
+|---|---|---|
+| `port` | — | **必填**。UDP 端口，`0` 由内核分配。 |
+| `max_connections` | 1024 | 该 listener 的连接上限，超限的新连接被拒。 |
+| `certfile` / `keyfile` | 取自 `broker_security.tls` | 写在 map 里就**只**对这个 listener 生效，且不要求 `tls.enabled => true`。两者必须同时给，缺一个仍以 `{quic_requires_tls, Key}` 拒绝启动。 |
+| `max_streams_per_conn` | app 级同名的值（4） | 只覆盖这一个 listener 的流信用。 |
+| `handshake_timeout_ms` / `idle_timeout_ms` | app 级同名的值（5000 / 30000） | 同上，按 listener 覆盖。 |
 
 **为什么默认不监听**：QUIC 没有明文模式，没有证书时 listener 会以 `{quic_requires_tls, certfile}` 拒绝启动，而**拒绝启动是该 app 的启动失败**——即装出来的 release 起不来。所以默认 `[]`，启用顺序是：
 
