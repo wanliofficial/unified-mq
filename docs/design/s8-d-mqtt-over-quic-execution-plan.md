@@ -181,15 +181,15 @@ QUIC 组）、`dialyzer`、`xref`、`rebar3 release` 与 `rebar3 as quic release
 
 ## 完成判据（Definition of Done）
 
-- [ ] `broker_proto_mqtt_quic` 默认 profile 可编译、可 dialyzer、可 xref（不 include quicer 头、不进 `applications`）
-- [ ] `quic` profile 下 `rebar3 as quic ct` 真实 QUIC 组全绿（NIF 加载 + 握手 + 单流）
-- [ ] ALPN 必须是 `mqtt`；非 `mqtt` 的客户端握手失败
-- [ ] 无证书时该 listener 拒绝启动 `{quic_requires_tls, _}`，其它协议不受影响
-- [ ] 流关闭 ≠ 连接关闭（新流重连有断言）
-- [ ] `emqtt` 真实客户端用例全绿
-- [ ] 默认 `rebar3 ct` 零 FAILED 且用例数按 `all/0` 回填；dialyzer / xref 干净
-- [ ] `rebar3 release` 与 `rebar3 as quic release` 均装配成功
-- [ ] 四份文档同步，`docs/roadmap.md`/ADR 统一留到 B/C/D 全部结案
+- [x] `broker_proto_mqtt_quic` 默认 profile 可编译、可 dialyzer、可 xref（不 include quicer 头、不进 `applications`；`optional_applications => [quicer]`）
+- [x] `quic` profile 下 `rebar3 as quic ct` 真实 QUIC 组全绿（NIF 加载 + 握手 + 单流）——827 passed + 2 skipped，零 FAILED
+- [x] ALPN 必须是 `mqtt`；非 `mqtt` 的客户端握手失败——`a_client_with_alpn_mqtt_can_handshake` / `a_client_with_another_alpn_is_refused`
+- [x] 无证书时该 listener 拒绝启动 `{quic_requires_tls, _}`，其它协议不受影响——`no_certificate_refuses_to_start`
+- [x] 流关闭 ≠ 连接关闭（新流重连有断言）——`a_new_stream_on_the_same_connection_is_a_new_session`
+- [x] `emqtt` 真实客户端用例全绿——8/8
+- [x] 默认 `rebar3 ct` 零 FAILED 且用例数按 `all/0` 回填；dialyzer / xref 干净——823/823、52 套件；`dialyzer` 0 warnings；`xref` 175 条均为预期 unused-export
+- [x] `rebar3 release` 与 `rebar3 as quic release` 均装配成功
+- [x] 四份文档同步，`docs/roadmap.md`/ADR 统一留到 B/C/D 全部结案——已在 `4d675ce` 一次写全（ADR-022/023/024 + roadmap §10）
 
 ## 不在本阶段（明确留给后续）
 
