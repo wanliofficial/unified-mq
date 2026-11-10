@@ -127,7 +127,7 @@ roundtrip_publish(_Config) ->
     %% A short topic travels in the 16-bit id field, so the type is what tells
     %% the two apart after decoding.
     PShort = #{type => publish, dup => false, qos => 0, retain => false,
-               topic_id_type => short, topic_id => 16#6162, msg_id => 0,
+               topic_id_type => short, topic_id => <<"ab">>, msg_id => 0,
                payload => <<"v">>},
     ?assertEqual({ok, PShort}, mqtt_sn_codec:decode(mqtt_sn_codec:encode(PShort))).
 

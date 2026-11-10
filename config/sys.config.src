@@ -249,6 +249,33 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_mqtt_sn, [
+    %% S8-C: MQTT-SN 1.2 over UDP. 1884 is the conventional neighbour of MQTT's
+    %% 1883; CT binds port 0 and asks the kernel. One socket serves the whole
+    %% gateway -- sessions are told apart by {IP, Port}, then by client id.
+    {listeners, [#{port => 1884}]},
+    %% `#{1 => <<"t0/sensor/temp">>}': gateway-wide, readable by every client
+    %% without a REGISTER. Ids 0, 0xFFFE and 0xFFFF are reserved and fail boot.
+    {predefined_topics, #{}},
+    {gateway_id, 1},
+    %% 0 = never broadcast ADVERTISE on our own; SEARCHGW is always answered.
+    %% The address is broadcast by default; a single-host deployment points it
+    %% at 127.0.0.1.
+    {advertise_interval_ms, 0},
+    {advertise_address, {255, 255, 255, 255}},
+    %% Clients listen on the MQTT-SN well-known port (1884), which is not
+    %% necessarily this listener's own port.
+    {advertise_port, 1884},
+    %% Sleeping clients are detached sessions, not buffers: the cap bounds how
+    %% many sessions the gateway keeps alive with nothing on the wire.
+    {max_asleep_clients, 1024},
+    {max_topic_ids_per_client, 1024},
+    %% Unacked downlink PUBLISHes per session (MQTT's in-flight window).
+    {max_inflight, 20},
+    %% 1.5x/2x of a client's requested keepalive duration, capped here.
+    {max_duration_s, 3600}
+  ]},
+
   {broker_proto_kafka, [
     %% S5 Kafka adapter. 9092 is the standard port; 9093 avoids a local
     %% Kafka. CT binds its own ephemeral port.

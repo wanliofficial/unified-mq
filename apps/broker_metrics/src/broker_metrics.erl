@@ -374,4 +374,12 @@ key_specs() ->
      %% timeout when it never arrives). README §10.2 asks for replication
      %% latency next to the failure counter.
      {cluster_replication_latency_us, histogram},
-     {cluster_no_quorum, counter}].
+     {cluster_no_quorum, counter},
+     %% S8-C: MQTT-SN's two deployment-visible refusals plus its sleeping
+     %% census. The first counts clients turned away when `max_asleep_clients'
+     %% is full (the session then ends like a normal disconnect rather than
+     %% pretending to sleep), the second counts sessions killed by 2x keepalive
+     %% silence, and the gauge tracks how many sessions are asleep right now.
+     {mqtt_sn_sleep_denied, counter},
+     {mqtt_sn_keepalive_timeout, counter},
+     {mqtt_sn_asleep, gauge}].

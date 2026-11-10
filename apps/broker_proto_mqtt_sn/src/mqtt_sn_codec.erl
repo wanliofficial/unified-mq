@@ -147,7 +147,7 @@ decode_body(<<?PUBLISH, Flags:8, TopicId:16, MsgId:16, Payload/binary>>) ->
                            qos => qos_of(Flags),
                            retain => bit(Flags, 4),
                            topic_id_type => TopicType,
-                           topic_id => TopicId,
+                           topic_id => topic_id_value(TopicType, TopicId),
                            msg_id => MsgId,
                            payload => Payload}}
             end;
@@ -282,8 +282,9 @@ encode_body(publish, P) ->
         bor (qos_byte(maps:get(qos, P, 0)) bsl 5)
         bor flag(bit_of(maps:get(retain, P, 0)), 4)
         bor topic_type_byte(maps:get(topic_id_type, P, normal)),
-    <<?PUBLISH, Flags:8, (maps:get(topic_id, P)):16, (maps:get(msg_id, P)):16,
-      (maps:get(payload, P))/binary>>;
+    <<?PUBLISH, Flags:8,
+      (topic_id_field(maps:get(topic_id_type, P, normal), maps:get(topic_id, P))):16,
+      (maps:get(msg_id, P)):16, (maps:get(payload, P))/binary>>;
 encode_body(puback, #{topic_id := TopicId, msg_id := MsgId, return_code := RC}) ->
     <<?PUBACK, TopicId:16, MsgId:16, RC:8>>;
 encode_body(pubrec, #{msg_id := MsgId}) ->
@@ -386,6 +387,21 @@ topic_type_byte(normal) -> ?TOPIC_NORMAL;
 topic_type_byte(predefined) -> ?TOPIC_PREDEFINED;
 topic_type_byte(short) -> ?TOPIC_SHORT.
 
+%% A PUBLISH topic-id field is 16 bits that mean three different things: a
+%% normal id, a predefined id, or -- when the type is `short' -- a two-character
+%% topic name. Decoding it as a name where it is one keeps the packet shape the
+%% same as SUBSCRIBE's variable topic reference, so the session process has one
+%% rule to apply instead of two.
+topic_id_value(short, Field) ->
+    <<Field:16>>;
+topic_id_value(_Type, Id) ->
+    Id.
+
+topic_id_field(short, <<A, B>>) when is_integer(A), is_integer(B) ->
+    (A bsl 8) bor B;
+topic_id_field(_Type, Id) when is_integer(Id) ->
+    Id.
+
 %% For a predefined topic the field is the numeric id (two bytes); for normal
 %% and short topics it is the topic name itself. A short topic is exactly two
 %% characters -- the name is the id, which is why nothing is allocated for it.
@@ -419,6 +435,8 @@ topic_ref(Flags, Rest) ->
 topic_ref_bytes(predefined, TopicId) when is_integer(TopicId) ->
     <<TopicId:16>>;
 topic_ref_bytes(short, Topic) when is_binary(Topic) ->
+    %% A short topic is exactly two characters; the codec's contract is that the
+    %% caller validated it, and `mqtt_sn_topics:short/1' is where that happens.
     Topic;
 topic_ref_bytes(normal, Topic) when is_binary(Topic) ->
     Topic.

@@ -1,7 +1,8 @@
 {application, broker_proto_mqtt_sn, [
     {description, "MQTT-SN 1.2 gateway: UDP listener, session, codec and topic ids"},
     {vsn, "0.1.0"},
-    {registered, []},
+    {registered, [mqtt_sn_conn_sup]},
+    {mod, {broker_proto_mqtt_sn_app, []}},
     {applications, [kernel, stdlib, sasl, broker_core, broker_metrics,
                     broker_storage, broker_router, broker_queue,
                     broker_subscription, broker_event, broker_security,
@@ -9,11 +10,16 @@
     {env, [{%% No listener unless the release config supplies one; CT binds its
             %% own ephemeral UDP port.
             listeners, []},
-           %% `1 => <<"t0/sensor/temp">>' style table, shared by every client.
-           predefined_topics, #{},
+           %% `#{1 => <<"t0/sensor/temp">>}' style table, shared by every client.
+           {predefined_topics, #{}},
            {gateway_id, 1},
            %% 0 = only answer SEARCHGW, never broadcast ADVERTISE on our own.
            {advertise_interval_ms, 0},
+           %% Where ADVERTISE goes. The default is broadcast; a test or a
+           %% single-host deployment points it at 127.0.0.1.
+           {advertise_address, {255, 255, 255, 255}},
+           %% The MQTT-SN well-known port: where clients listen for ADVERTISE.
+           {advertise_port, 1884},
            {max_asleep_clients, 1024},
            {max_topic_ids_per_client, 1024},
            %% 1.5x/2x of a client's requested duration, capped so an absurd

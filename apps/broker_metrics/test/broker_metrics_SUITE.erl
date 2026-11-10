@@ -47,7 +47,10 @@ all() ->
          wal_pending_append, backpressure_pauses, backpressure_disconnects,
          cluster_owner_changes, cluster_fencing_rejected,
          cluster_replication_failed, cluster_replication_latency_us,
-         cluster_no_quorum]).
+         cluster_no_quorum,
+         %% S8-C: MQTT-SN's sleep refusals, keepalive deaths and how many
+         %% sessions are asleep right now.
+         mqtt_sn_sleep_denied, mqtt_sn_keepalive_timeout, mqtt_sn_asleep]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.
