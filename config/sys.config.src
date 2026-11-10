@@ -249,6 +249,38 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_mqtt_quic, [
+    %% S8-D: MQTT over QUIC (OASIS MQTT TC, Single Stream Mode, CN Draft 3).
+    %% 14567 is EMQX's conventional QUIC port, so the two are directly
+    %% comparable. One UDP listener, one TLS 1.3 handshake per QUIC connection,
+    %% one client-initiated bidi stream per MQTT Network Connection.
+    %%
+    %% **Empty on purpose.** QUIC's handshake *is* TLS 1.3, so this listener has
+    %% no cleartext mode: without a certificate it refuses to start, and a
+    %% refused listener is a boot failure for the app -- i.e. a release that
+    %% shipped the example below against the default `broker_security.tls'
+    %% (`enabled => false', `certfile => undefined') would not boot at all.
+    %% Enable it together with TLS:
+    %%
+    %%   1. give `broker_security.tls' a `certfile'/'keyfile' and set
+    %%      `enabled => true' (see docs/operations.md §TLS);
+    %%   2. replace `[]' below with `[#{port => 14567}]'.
+    {listeners, []},
+    %% The only ALPN value the spec defines. A client that offers anything else
+    %% fails the handshake -- by design, not by omission.
+    {alpn, [<<"mqtt">>]},
+    %% QUIC has no cleartext mode: without a certificate this listener refuses
+    %% to start (`{quic_requires_tls, Key}') and every other listener is
+    %% unaffected. Certificates come from `broker_security.tls' unless the
+    %% listener map above carries its own `certfile'/`keyfile'.
+    {handshake_timeout_ms, 5000},
+    {idle_timeout_ms, 30000},
+    %% Bidi-stream credit per QUIC connection: how many times a client may
+    %% reconnect on the same connection by opening a new stream after closing
+    %% the previous one. At most one MQTT stream is active at a time.
+    {max_streams_per_conn, 4}
+  ]},
+
   {broker_proto_mqtt_sn, [
     %% S8-C: MQTT-SN 1.2 over UDP. 1884 is the conventional neighbour of MQTT's
     %% 1883; CT binds port 0 and asks the kernel. One socket serves the whole

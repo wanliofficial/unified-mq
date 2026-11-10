@@ -1,0 +1,30 @@
+{application, broker_proto_mqtt_quic, [
+    {description, "MQTT over QUIC (Single Stream Mode): QUIC transport for the MQTT engine"},
+    {vsn, "0.1.0"},
+    {registered, [broker_proto_mqtt_quic_sup]},
+    {mod, {broker_proto_mqtt_quic_app, []}},
+    {applications, [kernel, stdlib, sasl, broker_proto_mqtt, broker_core,
+                    broker_metrics, broker_storage, broker_router,
+                    broker_queue, broker_subscription, broker_event,
+                    broker_security, broker_retain]},
+    %% `quicer' is optional on purpose: this app compiles in the default profile,
+    %% where the NIF is not fetched at all. Declaring it as a hard dependency
+    %% would make `application:ensure_all_started/1' fail on every node that
+    %% does not build the quic profile -- i.e. it would break the default
+    %% release. The listener refuses to start without it, which is the place
+    %% that failure belongs.
+    {optional_applications, [quicer]},
+    {env, [{%% No listener unless the release config supplies one; CT binds its
+            %% own ephemeral UDP port, exactly like the other protocol apps.
+            listeners, []},
+           %% QUIC has no cleartext mode: the handshake *is* TLS 1.3. This value
+           %% is what CN Draft 3 §2.1 mandates, and the only one this listener
+           %% offers.
+           {alpn, [<<"mqtt">>]},
+           {handshake_timeout_ms, 5000},
+           {idle_timeout_ms, 30000},
+           %% Bidi-stream credit granted to each QUIC connection up front: how
+           %% many times a client may reconnect on the same connection by opening
+           %% a new stream. See mqtt_quic_listener:open/2.
+           {max_streams_per_conn, 4}]}
+]}.
