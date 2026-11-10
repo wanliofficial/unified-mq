@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C 追加 §1 的 8083 与 UDP 1884
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -17,13 +17,16 @@
 | MQTT | 1883 | 明文（可 TLS） | `broker_proto_mqtt` |
 | WebSocket | 8080 | 明文（可 TLS） | `broker_proto_ws`（Broker 自有 JSON/binary 消息 API） |
 | MQTT over WebSocket | 8083 | 明文（可 TLS，wss） | `broker_proto_mqtt_ws`（S8-B；MQTT 3.1.1 §6 / 5.0 §6） |
+| MQTT-SN | 1884/**UDP** | 明文（无 TLS） | `broker_proto_mqtt_sn`（S8-C；MQTT-SN 1.2，无 DTLS） |
 | NATS | 4223 | 明文（可 TLS） | `broker_proto_nats` |
 | AMQP | 5673 | 明文（可 TLS） | `broker_proto_amqp` |
 | Kafka | 9093 | 明文（可 TLS） | `broker_proto_kafka` |
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
-TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前七个）同时切换。见 `docs/security.md` §9。
+TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前八个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。
+
+**例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一不受该开关控制的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
 
 `broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
 
@@ -46,6 +49,42 @@ TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 li
 - **子协议是硬门槛**：握手没带 `Sec-WebSocket-Protocol`，或带的不是 `subprotocols` 里的任一项，服务端回 **HTTP 400** 而不是升级。这是有意的——浏览器随手连的 WebSocket 不该被当成 MQTT 连接。
 - `max_frame_bytes` 限制**单个 WebSocket 帧**；MQTT 报文级上限仍是 `broker_proto_mqtt.mqtt_max_packet_size`。帧超大 → close `1002`；text 帧 → close `1003`。
 - TLS 与其他 listener 一样由 `broker_security.tls.enabled` 一个开关控制（wss）；没有单独的 WS TLS 配置。
+
+### 1.1 MQTT-SN（UDP 1884）
+
+`broker_proto_mqtt_sn` 的配置（`config/sys.config.src`）：
+
+```erlang
+{broker_proto_mqtt_sn, [
+  {listeners, [#{port => 1884}]},
+  {predefined_topics, #{}},
+  {gateway_id, 1},
+  {advertise_interval_ms, 0},
+  {advertise_address, {255, 255, 255, 255}},
+  {advertise_port, 1884},
+  {max_asleep_clients, 1024},
+  {max_topic_ids_per_client, 1024},
+  {max_inflight, 20},
+  {max_duration_s, 3600}
+]}.
+```
+
+- **一个 socket 服务整个网关**：UDP 没有连接，会话按 `{IP, Port}` 区分、`client_id` 在 CONNECT 时绑定。因此 `listeners` 里只有一条，且**没有** `num_acceptors` / `max_connections` —— 那两个旋钮属于 TCP。`port => 0` 时由内核分配，`mqtt_sn_listener:port/1` 可读回真实端口（CT 与兼容性套件都这么用）。
+- **`predefined_topics`**：`#{1 => <<"t0/sensor/temp">>}` 形状的表，**全局共享、只读**，客户端用 TopicIdType=predefined 直接引用，不需要 REGISTER。id `0`、`0xFFFE`、`0xFFFF` 是保留值，写进去会在**启动时**失败（不静默丢弃）。改这张表要重启。
+- **`advertise_address` / `advertise_port` 不是本 listener 的地址**：ADVERTISE 是广播给**客户端监听端口**的（默认 `{255,255,255,255}`:1884，即 MQTT-SN 惯用端口）。单机部署把地址指到 `127.0.0.1`；`advertise_interval_ms = 0`（默认）表示永不主动广播，但仍会应答任何 SEARCHGW。
+- **`max_inflight`**（默认 20）：每会话未 ACK 的下行 QoS 1/2 条数。窗口满时消息**留在分区里、不落会话缓冲**，下一次 PINGREQ 从 cursor 重试；不会因为客户端慢而丢消息，也不会无限吃内存。
+- **`max_asleep_clients`**（默认 1024）：休眠会话登记上限。超限时拒绝进入休眠并按**正常断开**处理（计数 `mqtt_sn_sleep_denied`），不假装睡着后丢掉期间的所有消息。
+- **`max_duration_s`**（默认 3600）：客户端请求的 keepalive/sleep 时长的上限，防止一个荒谬值把会话钉一星期。keepalive 实际是 1.5× 探测 / 2× 判死。
+- **`gateway_id`**：GWINFO 里回的网关 id。
+- **DTLS 不支持**：`broker_security.tls.enabled` 对 1884 不生效（见 §1 的例外说明）。请不要把 MQTT-SN 暴露到不可信网络。
+
+**指标**：`mqtt_sn_asleep`（当前休眠会话数，gauge）、`mqtt_sn_sleep_denied`（被拒的休眠请求，counter）、`mqtt_sn_keepalive_timeout`（2× 静默判死，counter）。三个 key 都在 `broker_metrics` 的封闭集里，`/metrics` 直接可见。
+
+**排查**：
+- 客户端连不上时先确认是 **UDP** 且端口对得上（`ss -lunp | grep 1884`）；拿 `1883`（TCP MQTT）去连必然超时。
+- 客户端反复 REGISTER 却收不到 REGACK：检查 `predefined_topics` 启动是否成功（id 0 会让 app 拒绝启动）。
+- 会话莫名消失：看 `mqtt_sn_keepalive_timeout` 是否在涨——MQTT-SN 客户端必须在自己声明的 keepalive 内发 PINGREQ。
+
 
 ---
 

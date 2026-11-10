@@ -4,7 +4,7 @@
 - **状态**：描述当前已实现并实测的架构事实（S0–S6）。S6 之后（现归 S7 及之后）明确未实现的方向在 §9 单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断“某个行为归哪一层”的测试作者
 - **对应**：`docs/roadmap.md`、`docs/design/`（各阶段设计基线）、ADR-001/002/004/007/009/010/011/016/017/018/019/020/021
-- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**673/673**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
+- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**815/815**，**50 个套件**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -50,6 +50,7 @@ apps/
 ├── broker_ws/            S8-A：纯 RFC 6455 库（ws_frame 帧编解码 + ws_handshake 握手），无进程、无配置，供两个 WS 前端共用
 ├── broker_proto_ws/      S5：WebSocket（RFC 6455）+ JSON/binary 消息 API
 ├── broker_proto_mqtt_ws/ S8-B：MQTT over WebSocket（MQTT 3.1.1 §6 / 5.0 §6），RFC 6455 传输跑同一个 mqtt_conn_fsm
+├── broker_proto_mqtt_sn/ S8-C：MQTT-SN 1.2 网关（UDP），一个 socket 服务全部会话，不复用 mqtt_conn_fsm
 ├── broker_proto_nats/    S5：NATS core（PUB/SUB、queue group、request/reply）
 ├── broker_proto_amqp/    S5：AMQP 0-9-1（exchange/queue/binding、publish/consume/ack）
 ├── broker_proto_kafka/   S5：Kafka wire（Produce/Fetch/Metadata + consumer group）
@@ -74,6 +75,7 @@ apps/
 | `broker_ws` | kernel, stdlib, crypto | **无进程、无配置** | `ws_frame`（RFC 6455 帧编解码）、`ws_handshake`（`accept/1,2` 握手 + 子协议协商）、`max_handshake/0` | 无（纯函数库） |
 | `broker_proto_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_core, broker_metrics + 内核 6 app | 每连接 `ws_conn` + ranch listener | `ws_conn`、`ws_listener`（帧编解码已委托给 `broker_ws` 的 `ws_frame`） | 每连接分片缓冲、订阅集合 |
 | `broker_proto_mqtt_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_proto_mqtt, broker_core, broker_metrics + 内核 6 app | 每连接 `mqtt_ws_conn` + ranch listener；MQTT 引擎 `mqtt_conn_fsm` 由 `broker_proto_mqtt` 的 `mqtt_conn_sup` 托管 | `mqtt_ws_conn`、`mqtt_ws_listener`、`mqtt_transport_ws`（`mqtt_transport` 的 WS 实现） | 每连接 HTTP 升级缓冲、帧分片缓冲；MQTT 状态全在 FSM 里 |
+| `broker_proto_mqtt_sn` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain | `mqtt_sn_listener`（一个 UDP socket + 一个 reader）、`mqtt_sn_conn_sup` + 每客户端 `mqtt_sn_conn` | `mqtt_sn_codec`（27 种报文）、`mqtt_sn_topics`（三种 topic id 表）、`mqtt_sn_filter`（本地 filter 校验，不依赖 `broker_proto_mqtt`）、`mqtt_sn_listener`、`mqtt_sn_conn` | `{IP,Port}`→会话、`client_id`→会话、休眠登记三张表在 listener；每会话 topic id 表、in-flight 窗口、两个 timer；订阅/游标/retain 都在下层 app |
 | `broker_proto_nats` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `nats_conn` + 订阅投递进程 + ranch listener | `nats_conn`、`nats_listener` | 每连接 sid 表、queue group 成员关系 |
 | `broker_proto_amqp` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `amqp_conn`、`amqp_topo`（exchange/queue/binding 注册表） | `amqp_codec`、`amqp_conn`、`amqp_listener` | exchange/queue/binding 拓扑、delivery tag、unacked 集合 |
 | `broker_proto_kafka` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `kafka_conn`、`kafka_group`（consumer group 协调） | `kafka_codec`、`kafka_conn`、`kafka_listener` | 每连接 topic/partition 游标、group 成员与 offset |
@@ -209,6 +211,45 @@ S8-A 把 FSM 与传输的边界收敛为一个模块名 + 一个不透明 handle
 WS 层只把 **binary** 帧当 MQTT 字节：text 帧回 close `1003`；报文与帧**无对齐要求**（payload 交给 FSM 的 `buf` 重组，一个帧里的多条报文逐条处理）；ping/pong/close 是 WS 控制流量，与 MQTT keepalive 无关。`max_frame_bytes` 限制的是帧，`mqtt_max_packet_size` 限制的仍是报文。
 
 背压刻意缺省：`mqtt_transport_ws:arm_once/1` 是语义占位 no-op（WS 层每帧投递后自行 re-arm），`send/2` 异步，`max_inflight` / `receive_maximum` 是唯一窗口控制。对端造成的失败（RST、TLS 握手不完成、re-arm 失败）以 `normal` 结束 WS 进程，并把 `{mqtt_ws_error, self(), Reason}` 交给引擎记日志——非 `normal` 退出会为每条坏 TCP 打一份监督树报告，而对端重置是常态。
+
+### 3.11 MQTT-SN 的单 socket / 多会话分层（S8-C）
+
+MQTT over WebSocket 之上是「一连接两进程」（§3.10）；MQTT-SN 恰好相反——**一个网关只有一个 UDP socket**，所有客户端共享它。这个不对称不是为了整齐，而是 UDP 没有连接可拥有：
+
+```
+broker_proto_mqtt_sn_sup (one_for_all, 1/5s)
+├── mqtt_sn_conn_sup (simple_one_for_one, temporary)
+│     └── mqtt_sn_conn × N        % 每个已 CONNECT 的端点一个；回包直接 gen_udp:send/4
+└── mqtt_sn_listener × 1          % 打开 socket，{active, 100}，按 {IP,Port} 分派
+```
+
+**listener 拥有 socket，会话不拥有。** `mqtt_sn_listener` 用 `gen_udp:open(Port, [binary, {active, ?ACTIVE_N}, {reuseaddr, true}, {broadcast, true}])` 打开一个 socket，收 `{udp, Sock, IP, Port, Bin}` 后解码、按 `{IP, Port}` 找会话，没有就按报文类型决定是新建会话（CONNECT）还是在 listener 进程里就地处理（QoS −1 无会话发布、SEARCHGW）。`{active, 100}` 而不是 `{active, true}`：邮箱必须有界，否则一个打流量的客户端能把 listener 的堆吃干净；读空后由 `{udp_passive, Sock}` 重新 arm。
+
+会话回包**不经 listener 转发**：`gen_udp` 不检查 controlling process，任何进程都能写同一 socket，因此 `mqtt_sn_conn` 直接 `gen_udp:send/4`。这不是省一次消息传递，而是**去掉一个会成为瓶颈的中转进程**——listener 在热路径上只做解码与分派。
+
+**会话键是 `{IP, Port}`，会话身份是 `client_id`。** UDP 端点会变（NAT rebind、客户端换端口），所以这两者必须分开：
+
+- `{IP,Port} → Pid`：同一个端点只跑一个会话，重连前必须先清掉旧 pid；
+- `client_id → Pid`：CONNECT 时绑定。同 `client_id` 从**新**端点 CONNECT = takeover，旧会话被关掉且**不发布 Will**（客户端没死，它搬家了）；`{sn_endpoint, Endpoint}` 消息把回包地址改写到新端点。
+- `client_id` 与 MQTT 共用一个会话域：一个 MQTT-SN 传感器与一个 MQTT 客户端用同一个 id 就是同一个会话，takeover 照样生效。
+
+**为什么不复用 `mqtt_conn_fsm`。** FSM 的整个生命周期都建立在「有一条会丢的 TCP 连接」上：半开、按 socket 接管、`{handshake, Ref, Transport, Sock, Timeout}` 交接、broker 重启后按持久会话恢复。UDP 上这些前提一个都不成立——没有连接可丢，入站不是字节流而是自带边界的数据报，重传由客户端 DUP 驱动而不是网关定时器。强行合并只会把两套连接语义塞进同一个 state record。会话只复用**下层**：`broker_router`（分区）、`broker_queue`（存储）、`broker_subscription`（游标与唤醒）、`broker_retain`（retained）、`broker_event`（CloudEvents seam），投递走与其它协议完全相同的 `{broker_deliver, ClientId, MaxQoS, Refs, {P, O, Msg}}`。
+
+**三张 topic id 表**，语义各不相同（`mqtt_sn_topics`）：
+
+| 类型 | 归属 | 由谁分配 | 上限 |
+|---|---|---|---|
+| predefined | 网关全局、只读 | 配置（`predefined_topics`），启动即校验保留 id `0`/`0xFFFE`/`0xFFFF` | 配置规模 |
+| normal | **每客户端私有** | 双向 REGISTER：SUBACK 给订阅方分配一个；客户端 PUBLISH 前自己 REGISTER；网关下行遇到客户端未知 topic 时**先发 REGISTER 再发 PUBLISH** | `max_topic_ids_per_client` |
+| short | 无表 | 两字符名字**就是** id；非恰好 2 字节直接拒绝 | — |
+
+上行超限回错误码；**下行超限即断开会话**——网关自己编不出合法 PUBLISH，不能假装成功。normal id 的「每客户端私有」是协议性质：订阅方 SUBACK 拿到的 id 在发布方的表里毫无意义。
+
+**休眠是一个状态，不是一条连接。** `DISCONNECT(duration)` = detach：保留订阅与游标，**不新建任何缓冲**（消息留在分区里，靠 cursor 追赶）；`PINGREQ(client_id)` 从新端点唤醒并回放积压。`max_asleep_clients` 超限时按正常断开处理并计 `mqtt_sn_sleep_denied`，不假装睡着再丢掉睡眠期全部消息。
+
+**每会话恰好两个 timer**：keepalive（1.5× 静默发 PINGREQ 探测、2× 判死并触发 Will）与 sleep 到期。没有第三个重传 timer —— MQTT-SN 的重传信号只有客户端的 DUP 位，网关的职责是对重复的 msg id **幂等应答**，而不是自己定时重发。
+
+**认证边界在启动期显式失败。** 1.2 的 CONNECT 没有用户名/密码字段，`broker_security:auth_required(mqtt_sn)` 恒 `false`；`broker_proto_mqtt_sn_app` 因此直接读 `require_auth` 原始列表，命中 `mqtt_sn` 就拒绝启动监听器（`{require_auth_unsupported, mqtt_sn}`）。拒绝粒度是整个 app：一个 socket 服务全部客户端，没有「只对部分客户端要求凭据」的表达力。见 `docs/security.md` §2.2 第 4 条。
 
 ---
 
@@ -374,6 +415,11 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_mqtt.max_inflight` / `pull_page_limit` / `pull_poll_interval_ms` / `inflight_snapshot_ms` / `max_keepalive_ms` | 64 / 32 / 1000 / 20 / 60000 | 投递循环与 keepalive 上限 |
 | `broker_proto_mqtt_ws.listeners` | release 配 8083；`.app.src` 默认 `[]` | S8-B：MQTT over WebSocket 的 ranch listener（`port => 0` 时由 ranch 分配临时端口） |
 | `broker_proto_mqtt_ws.subprotocols` / `max_frame_bytes` | `[mqtt, mqttv3.1, mqttv3.1.1]` / 16777216 | 子协议是握手门槛（不匹配 → HTTP 400）；后者限帧，不限 MQTT 报文 |
+| `broker_proto_mqtt_sn.listeners` | release 配 1884；`.app.src` 默认 `[]` | S8-C：每条一个 UDP socket（`port => 0` 由内核分配，`mqtt_sn_listener:port/1` 读回）。**没有** `num_acceptors` / `max_connections` 等同 TCP 旋钮 |
+| `broker_proto_mqtt_sn.predefined_topics` / `gateway_id` | `#{}` / `1` | 全局只读 topic id 表（保留 id `0`/`0xFFFE`/`0xFFFF` 启动即拒绝）与 GWINFO 的网关 id |
+| `broker_proto_mqtt_sn.advertise_interval_ms` / `advertise_address` / `advertise_port` | `0` / `{255,255,255,255}` / `1884` | `0` = 只应答 SEARCHGW；**广播目的地是客户端监听端口，不是本 listener 端口** |
+| `broker_proto_mqtt_sn.max_asleep_clients` / `max_topic_ids_per_client` | 1024 / 1024 | 休眠会话登记上限（超限按正常断开并计 `mqtt_sn_sleep_denied`）；每会话 normal topic id 上限（下行超限即断开会话） |
+| `broker_proto_mqtt_sn.max_inflight` / `max_duration_s` | 20 / 3600 | 每会话未 ACK 的下行 QoS 1/2 窗口（满则留在分区、下次 PINGREQ 重试）；keepalive/sleep 请求时长上限 |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 
@@ -395,8 +441,8 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **673/673**，`apps/*/test/` 与 `test/integration/` 的 **43 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
-| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 167 条均为预期 unused-export | CI/本地 |
+| 单元/契约/集成 | `rebar3 ct` → **815/815**，`apps/*/test/`（49 个套件）与 `test/integration/s1_e2e_SUITE` 共 **50 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
+| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 173 条均为预期 unused-export | CI/本地 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |
 | 真实客户端 | paho-mqtt 2.x / mosquitto 2.1.2（MQTT）、websocket-client、nats.go、amqp091-go、kafka-clients、官方 Pulsar Java Client；六协议全绿 | `test/protocol-compatibility/` |

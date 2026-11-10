@@ -211,29 +211,48 @@ Will（异常端点消失）、账号 takeover、休眠 + 唤醒追赶、QoS -1�
 | `sn-qos-minus1` | QoS -1 | 只发一次、无 ACK |
 
 **明确标注**：`mqtt-sn-tools` **不支持 QoS 2**，QoS2 只有仓内套件覆盖（Gate 文本如实写）。
+另两项同样只有仓内覆盖：工具**无 Will 选项**（不发 WILLTOPIC/WILLMSG），且它的 `PINGREQ` 是
+不带 client id 的两字节报文，**无法按名唤醒**休眠会话——所以 Task 3 只能覆盖休眠**请求**这一半。
+实际用例集合与理由见「交付记录」表。
 QoS -1 是否受支持以工具实际行为为准，不支持则该行从第三方矩阵移出、仅列仓内证据。
 
 ---
 
 ## Task 4 — 全量验证与文档同步
 
-`rebar3 ct`（基线 731 + 新增）、`dialyzer`、`xref`、`rebar3 as prod release`；
+`rebar3 ct`（基线 731 + 84 = 815）、`dialyzer`、`xref`、`rebar3 as prod release`；
 同步 `progress.md`、`docs/architecture.md`（app 列表/表格/§3.11）、`docs/operations.md`
 （UDP 1884 + 配置块 + `predefined_topics`）、`docs/protocol-compatibility.md` §4.11、
 `docs/security.md` §2.2（`mqtt_sn` 的 require_auth 行为）。
 
 ---
 
+## 交付记录（2026-11-10 结案）
+
+提交：`bf44d1f`（Task 1）、`41c8dea`（Task 2）、`e45969c`（Task 3）、文档同步提交紧随其后。
+
+与计划的偏差，逐条记录：
+
+| 计划处 | 实际 | 原因 |
+|---|---|---|
+| Task 2a 模块清单只列 6 个 src | 多出 `mqtt_sn_conn_sup.erl`、`mqtt_sn_filter.erl` | 前者：`simple_one_for_one` 会话监督器（listener 按名引用，绝不持有 pid）；后者：`broker_proto_mqtt_sn` 不得依赖 `broker_proto_mqtt`，因此 filter 校验（SUBSCRIBE 通配符合法性、retain 重放匹配）在本 app 内重写 20 行 |
+| Task 2b 只写 `advertise_interval_ms` | 另加 `advertise_address`（默认 `{255,255,255,255}`）与 `advertise_port`（默认 1884） | ADVERTISE 的目的地是**客户端监听端口**，不是本 listener 端口；单机部署/CT 必须能把它指到 `127.0.0.1` |
+| Task 2b 写 `metrics:inc(mqtt_sn_bad_packets)` | 未新增 bad-packet key（`broker_metrics` 的 key 集是封闭集），坏数据报直接丢弃；新增的是 `mqtt_sn_sleep_denied`、`mqtt_sn_keepalive_timeout`、`mqtt_sn_asleep` | 不为了一个诊断计数扩大封闭集；三项都是运维真正会看的（见 `docs/operations.md` §1.1） |
+| Task 2c SUBSCRIBE 只写「可能带 REGISTER」 | 额外约束：short topic 必须**恰好 2 字节**，否则拒绝而非存成客户端永远叫不出名字的 filter | 1.2 §5.4.16 语义 |
+| Task 2c 未写 QoS −1 无会话时的处理 | 无会话的 QoS −1 PUBLISH 在 **listener 进程**里就地 live push（仅 predefined/short topic 可用，不落盘、不建会话） | 1.2 明确 QoS −1 可用于「未连接」的传感器；拒绝它就等于漏实现一个必选能力 |
+| Task 3 用例表列 `sn-will`、`sn-sleep` | 实际没有这两条；改为 `sn-register-downlink`、`sn-sleep-disconnect`，最终 **10 例** | `mqtt-sn-tools` 0.0.7 **无 Will 选项**；其 `PINGREQ` 不带 client id，无法按名唤醒休眠会话，所以只能覆盖休眠**请求**侧。网关下行 REGISTER 是只有网关能驱动的一半，必须单独覆盖 |
+| Task 3 写「QoS −1 是否受支持以工具实际行为为准」 | 支持（`-q -1`），已列入第三方矩阵 | 实测通过 |
+
 ## 完成判据（Definition of Done）
 
-- [ ] `broker_proto_mqtt_sn` 监听 UDP 1884（CT 用 `port => 0`），一个 socket 一个 reader
-- [ ] `mqtt_sn_codec` 覆盖 1.2 全报文，两种长度头，拒绝路径明确
-- [ ] `mqtt_sn_conn` 覆盖 CONNECT/Will 流程、QoS -1/0/1/2、retain、REGISTER/短/预定义 topic、休眠与唤醒、keepalive 判死
-- [ ] `require_auth` 配 `mqtt_sn` 时监听器拒绝启动（`{require_auth_unsupported, mqtt_sn}`）
-- [ ] `mqtt-sn-tools` 真实客户端用例全绿；QoS2 无第三方客户端一事在 Gate 文本单列
-- [ ] 全量 `rebar3 ct` 零 FAILED，用例数按 `all/0` 回填
-- [ ] dialyzer / xref / `as prod release` 干净
-- [ ] 四份文档同步，`docs/roadmap.md`/ADR 统一留到 B/C/D 全部结案
+- [x] `broker_proto_mqtt_sn` 监听 UDP 1884（CT 用 `port => 0`），一个 socket 一个 reader
+- [x] `mqtt_sn_codec` 覆盖 1.2 全报文（27 种），两种长度头，拒绝路径明确（40 例）
+- [x] `mqtt_sn_conn` 覆盖 CONNECT/Will 流程、QoS -1/0/1/2、retain、REGISTER/短/预定义 topic、休眠与唤醒、keepalive 判死（23 例；topic id 表另有 21 例）
+- [x] `require_auth` 配 `mqtt_sn` 时监听器拒绝启动（`{require_auth_unsupported, mqtt_sn}`，`require_auth_refuses_to_start`）
+- [x] `mqtt-sn-tools` 真实客户端 10/10 全绿；QoS2 / Will / 唤醒三项无第三方覆盖一事在 `test/protocol-compatibility/mqtt_sn/README.md` 与 `docs/protocol-compatibility.md` §4.11 单列
+- [x] 全量 `rebar3 ct` 零 FAILED（**815/815**，50 套件），用例数按 `all/0` 回填（40/21/23）
+- [x] dialyzer 干净 / xref 173 条仅基线同类 unused-export / `rebar3 as prod release` 含 `broker_proto_mqtt_sn-0.1.0`
+- [x] 四份文档同步（`progress.md`、`docs/architecture.md` §3.11、`docs/operations.md` §1/§1.1、`docs/protocol-compatibility.md` §4.11、`docs/security.md` §2.2/§12），`docs/roadmap.md`/ADR 统一留到 B/C/D 全部结案
 
 ## 不在本阶段（明确留给后续）
 

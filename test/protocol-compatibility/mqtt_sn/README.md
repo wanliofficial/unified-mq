@@ -1,7 +1,7 @@
 # S8-C MQTT-SN — real-client compatibility
 
 Evidence for the Gate S8 item "通过真实第三方客户端集成测试，无自编客户端互测"
-(`docs/roadmap.md` §S8 Gate, `docs/protocol-compatibility.md` §4.14).
+(`docs/roadmap.md` §S8 Gate, `docs/protocol-compatibility.md` §4.11).
 
 The suite drives a **real `erl -noshell -s mqtt_sn_broker_boot run` broker node**
 (ephemeral UDP port `port => 0`, WAL backend, ext4 data directory) and puts
@@ -81,7 +81,7 @@ two-byte DISCONNECT and prints no warning, so the warning appearing only for
 
 ## Known limits — what this client cannot cover
 
-These are quoted in `docs/protocol-compatibility.md` §4.14 rather than hidden,
+These are quoted in `docs/protocol-compatibility.md` §4.11 rather than hidden,
 and each is covered by `mqtt_sn_conn_SUITE` inside the repository:
 
 * **QoS 2** — `mqtt-sn-tools` 0.0.7 has no QoS 2 code path (`-q` accepts

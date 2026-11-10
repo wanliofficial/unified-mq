@@ -26,7 +26,7 @@ Cases (each maps to one observable protocol contract):
                       skips the session, exactly as the level defines)
 
 What this client cannot cover, and why (quoted in docs/protocol-compatibility.md
-§4.14 rather than hidden):
+§4.11 rather than hidden):
 
   * **QoS 2** -- `mqtt-sn-tools` has no QoS 2 code path (`-q` accepts 0/1/-1
     only). The full PUBREC/PUBREL/PUBCOMP handshake is covered by

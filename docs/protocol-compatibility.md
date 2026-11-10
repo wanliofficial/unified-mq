@@ -1,12 +1,12 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
 - **文档版本**：v1.1
-- **最近一次追加**：2026-11-10——新增 §4.13：MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。此前一次：2026-11-10——§4.10 的 CloudEvents Binding 从「S7 立项」改为**结案结论**（逐协议核对官方 binding 原文后的差异表）；§4.5~§4.9 的证据表补 S7 认证用例与 trace context 用例的**当前**用例数。§4/§4.1~§4.8 原文保留为当时事实
+- **最近一次追加**：2026-11-10——新增 §4.11：MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）。此前一次：2026-11-10——§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。此前一次：2026-11-10——§4.10 的 CloudEvents Binding 从「S7 立项」改为**结案结论**（逐协议核对官方 binding 原文后的差异表）；§4.5~§4.9 的证据表补 S7 认证用例与 trace context 用例的**当前**用例数。§4/§4.1~§4.8 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
 
-> **用例数口径**：本文件的表格里，标「S5 时点」「S3 时点」等字样的是**当时快照**，标「**N 例（当前）**」的是 2026-11-10 从 `all/0`（含 `groups/0` 展开）逐套件清点的当前值。当前全量基线是 `rebar3 ct` **673/673**、**43 个套件**（含 `broker_event_trace_SUITE` 10 例与 `broker_security_identity_SUITE` 10 例）。
+> **用例数口径**：本文件的表格里，标「S5 时点」「S3 时点」等字样的是**当时快照**，标「**N 例（当前）**」的是最近一次从 `all/0`（含 `groups/0` 展开）逐套件清点的当前值。**当前全量基线（S8-C 收尾，2026-11-10）是 `rebar3 ct` 815/815、50 个套件**（`apps/*/test/` 49 个 + `test/integration/s1_e2e_SUITE` 1 个；S7 结案 673/673、43 套件 → S8-A 711/711、46 套件 → S8-B 731/731、47 套件 → S8-C 815/815、50 套件）。
 
 > 本文件是 S5 每个协议兼容性测试的基线。S0.4 仅确定「用什么客户端 / 版本 / 语言」并验证其可获取（见 `spikes/s0_4_clients/REPORT.md`）。协议能力、端到端语义、CloudEvents Binding 由 S5 逐协议填充「支持状态」列。
 
@@ -38,7 +38,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -47,6 +47,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | MQTT | 已支持 | QoS0/1/2、Retain、Will、clean session/persistent session、离线追赶、MQTT 5.0 子集（session expiry、message expiry、reason codes、properties、`$share/{group}/{filter}` Shared 订阅） | 无 topic alias、无 AUTH 扩展认证、`subscription identifier` 不透传到投递帧；QoS2 跨崩溃仍为至少一次；见 §4/§4.1/§4.2 | `apps/broker_proto_mqtt/test/`、`test/protocol-compatibility/mqtt/` |
 | WebSocket | 已支持 | RFC 6455 握手/掩码/分片/控制帧；自有应用帧 `connect`/`subscribe`/`publish`/`ack`/`unsubscribe`/`ping`/`disconnect` | v1 仅 QoS0/1；`shared` 订阅显式拒绝；应用层帧为 Broker 自有格式；见 §4.5 | `apps/broker_proto_ws/test/`、`test/protocol-compatibility/ws/` |
 | MQTT over WebSocket | 已支持（S8-B） | RFC 6455 binary 帧承载标准 MQTT（3.1.1 / 5.0 与 1883 明文完全同一份 FSM）：QoS0/1/2、Retain、Will、持久会话、离线追赶、`mqtt`/`mqttv3.1`/`mqttv3.1.1` 子协议协商、任意 URL path、wss | 无 `permessage-deflate`；text 帧 → close 1003、超长帧 → close 1002；缺失/未知子协议 → HTTP 400；背压按帧（`arm_once` no-op）；见 §4.13 | `apps/broker_proto_mqtt_ws/test/`、`test/protocol-compatibility/mqtt_ws/` |
+| MQTT-SN | 已支持（S8-C） | MQTT-SN 1.2 over UDP（默认 1884）：全部 27 种报文、QoS −1/0/1/2、Retain、Will（CONNECT 标记 → WILLTOPICREQ/WILLTOPIC/WILLMSGREQ/WILLMSG，含 `WILLTOPICUPD`/`WILLMSGUPD`）、三种 TopicIdType（预定义 / 每客户端 normal 双向 REGISTER / 两字符 short）、休眠与 `PINGREQ(client_id)` 唤醒、SEARCHGW/ADVERTISE 网关发现、keepalive 1.5×/2× | 无 DTLS（明文 UDP）；QoS 0 在休眠期间丢弃；无串口桥 / 转发器（Forwarder Encapsulation）不实现；CONNECT 无凭据字段，`require_auth` 配 `mqtt_sn` 时拒绝启动（见 §4.11、`docs/security.md` §2.2） | `apps/broker_proto_mqtt_sn/test/`、`test/protocol-compatibility/mqtt_sn/` |
 | NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth、HPUB/HMSG headers（`ce-*`） | 无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
@@ -573,9 +574,55 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 ---
 
+### 4.11 S8-C 追加（2026-11-10）：MQTT-SN 1.2（`broker_proto_mqtt_sn`）
+
+**是什么**：MQTT-SN 1.2（MQTT for Sensor Networks，UDP 上的 MQTT）网关。默认 **UDP 1884**（MQTT 1883 的邻居），CT 与兼容性套件都用 `port => 0` 让内核分配。实现的是**完整 1.2 语义**，不是「MQTT 的 UDP 转发壳」：27 种报文、QoS −1/0/1/2、Will、Retain、三种 TopicIdType、休眠与唤醒、网关发现。
+
+**为什么不是一个 UDP socket 一个进程**：UDP 没有连接，一个网关只有**一个** socket 服务所有客户端。`gen_udp` 用 `{active, 100}` 保证 reader 可读且邮箱有界，会话按 `{IP, Port}` 索引、`client_id` 在 CONNECT 时绑定；会话回包走同一个 socket 句柄（UDP 会话没有自己的 socket 可发）。同 `client_id` 从新端点重连 = takeover，且**不发布 Will**（客户端没死，它搬家了）。
+
+**为什么不复用 `mqtt_conn_fsm`**：FSM 的整个连接生命周期（半开、按 socket 接管、broker 重启后按持久会话恢复）在 UDP 上不适用——这里没有「连接」可丢；入站解码也不是字节流而是数据报。复用只会把两套生命周期缠在一起。会话只复用**下层**：`broker_subscription` / `broker_queue` / `broker_router` / `broker_retain`，投递走与其它协议相同的 `{broker_deliver, ClientId, MaxQoS, Refs, {P, O, Msg}}`。
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 报文集 | 已支持 | 27 种全实现：ADVERTISE/SEARCHGW/GWINFO、CONNECT/CONNACK、WILLTOPICREQ/WILLTOPIC/WILLMSGREQ/WILLMSG、REGISTER/REGACK、PUBLISH/PUBACK/PUBREC/PUBREL/PUBCOMP、SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK、PINGREQ/PINGRESP、DISCONNECT、WILLTOPICUPD/WILLTOPICRESP/WILLMSGUPD/WILLMSGRESP |
+| 两种长度头 | 已支持 | 首字节 `<256` 即总长（含头）；否则首字节 `1` + 2 字节大端总长。三字节头要求 `Len >= 4`、单字节头要求 `Len >= 2` |
+| QoS −1 | 已支持 | 线上是两位 `3`；不进会话状态、不产生 ACK、不重放。**无会话也受理**：只有 predefined/short topic 可用，在 listener 进程里 live push，不落盘 |
+| QoS 0 | 已支持 | 不走日志（与 MQTT 一致），休眠期间**丢弃**（能力矩阵如实声明，不是缺陷） |
+| QoS 1 / 2 | 已支持 | 与 MQTT 同序：`append(fsync)` → `retain(sync)` → ACK → dispatch（ADR-018 §18.2）；QoS2 走 PUBREC/PUBREL/PUBCOMP。下行未 ACK 窗口 `max_inflight`（默认 20），满则暂不发，下一次 PINGREQ 从 cursor 重试 |
+| Retain | 已支持 | SUBACK 之后重放；retained 存储是 `broker_retain`，与其它协议共享 |
+| Will | 已支持 | CONNECT 的 Will 位置位 → WILLTOPICREQ/WILLTOPIC/WILLMSGREQ/WILLMSG；`WILLTOPICUPD`/`WILLMSGUPD` 更新。异常死亡才发布，takeover 与 clean DISCONNECT 不发布 |
+| TopicIdType | 已支持 | **predefined**（`predefined_topics` 配置一次、全局只读、启动即校验 0/0xFFFE/0xFFFF）；**normal**（每客户端独立、双向 REGISTER：SUBACK 分配一个给订阅方，客户端 PUBLISH 前先自己 REGISTER，网关下行遇到客户端未知 topic 时先发 REGISTER 再 PUBLISH）；**short**（两字符名字**就是** id，不分配；非恰好 2 字节直接拒绝，不存成客户端永远叫不出名字的 filter） |
+| topic id 上限 | 已支持 | `max_topic_ids_per_client`（默认 1024）；上行超限回错误码，**下行超限即断开会话**——网关自己编不出合法 PUBLISH，不能假装成功 |
+| 休眠 / 唤醒 | 已支持 | DISCONNECT(duration) = detach：保留订阅与 cursor，不新建缓冲；`PINGREQ(client_id)` 从**新端点**唤醒并追赶积压（端点 rebind）。休眠登记上限 `max_asleep_clients`，超限按正常断开并计数（`mqtt_sn_sleep_denied`），不静默丢弃 |
+| keepalive | 已支持 | 每会话两个 timer：1.5× 静默发 PINGREQ 探测，2× 未响应判死并 detach（`mqtt_sn_keepalive_timeout`）。**没有逐报文重传 timer**：MQTT-SN 只有客户端的 DUP 位是诚实的重传信号 |
+| 网关发现 | 已支持 | SEARCHGW 恒回 GWINFO；`advertise_interval_ms > 0` 时按间隔广播 ADVERTISE 到 `advertise_address`:`advertise_port`（默认 `{255,255,255,255}`:1884——**目的地是客户端监听端口，不是本监听器端口**） |
+| 认证边界 | 显式失败 | MQTT-SN 1.2 的 CONNECT **没有用户名/密码字段**。`broker_security:auth_required/1` 对 `mqtt_sn` 恒 `false`（不在 `credential_capable/0`），这对认证是对的、对配置是错的：部署若要求所有 listener 出示凭据，必须被告知这个 listener 做不到。`broker_proto_mqtt_sn_app` 因此直接读 `require_auth` 原始列表，命中 `mqtt_sn` 就**拒绝启动监听器**并返回 `{require_auth_unsupported, mqtt_sn}`，不静默忽略。见 `docs/security.md` §2.2 |
+| 指标 | 已支持 | 新增三个封闭集 key：`mqtt_sn_sleep_denied`、`mqtt_sn_keepalive_timeout`（counter）、`mqtt_sn_asleep`（gauge，由 listener 维护 delta，会话死亡也归零） |
+
+**证据**：
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT 套件（字节级自测） | `apps/broker_proto_mqtt_sn/test/mqtt_sn_codec_SUITE.erl` | **40 例**：27 种报文往返、两种长度头边界、保留位/保留类型号/截断/尾随字节的拒绝路径、QoS −1 的两位 `3`、PUBLISH 短 topic 的 2 字节 binary |
+| CT 套件（topic id 表） | `apps/broker_proto_mqtt_sn/test/mqtt_sn_topics_SUITE.erl` | **21 例**：predefined 校验与保留 id、normal 双向分配与耗尽、short 的两字符约束 |
+| CT 套件（真实 UDP） | `apps/broker_proto_mqtt_sn/test/mqtt_sn_conn_SUITE.erl` | **23 例**：CONNECT/CONNACK、clean session teardown、三种 topic id、QoS −1/0/1/2 双向、UNSUBSCRIBE、retained 重放、Will vs. takeover、休眠 + 新端点唤醒 + 积压、keepalive 判死、SEARCHGW/ADVERTISE、坏数据报丢弃、`require_auth` 拒绝启动 |
+| 真实第三方客户端 | `test/protocol-compatibility/mqtt_sn/`（`mqtt-sn-tools` **0.0.7**，pinned `a1dd870`） | **10/10** 第三方用例：connect、QoS0、QoS1、client REGISTER、**gateway 下行 REGISTER**（wildcard 订阅 + 先 REGISTER 再 PUBLISH）、short topic、predefined topic、retain、sleep disconnect、QoS −1 无会话发布 |
+
+**该套件抓到的真实缺陷**：首次运行 10 例全红（`Failed to connect`）。`mqtt_sn_codec` 把 CONNECT 的 Will / CleanSession 读在 bit 7 / 6（MQTT 3.1.1 的 CONNECT 布局），而 MQTT-SN 1.2 §5.4.4 定义在 **bit 3 / 2**——`mqtt-sn-tools` 发 `0x04` 表示 clean session，于是每个合规客户端都被判 `{reserved_bits, 0x04}`。编解码两侧均已修正，`mqtt_sn_codec_SUITE` 增加两例钉死工具真实发出的字节。这类缺陷**不可能**由自编客户端发现（两侧用同一份错误布局即可互相通过）。
+
+**已声明的限制 / 边界**：
+
+- **无 DTLS**：本阶段只跑明文 UDP；DTLS 列为后续待办（设计 §1.2），因此这里是唯一没有 TLS 开关的 listener。
+- **无 Forwarder Encapsulation**（1.2 §5.5）与串口桥：设计 §1.2 明确不做。
+- **休眠期 QoS 0 丢弃**：QoS 0 从不进存储，睡眠期间无处可取；要「一条不丢」就用 QoS 1/2。
+- **第三方客户端覆盖不到三处**：`mqtt-sn-tools` 0.0.7 **无 QoS 2 代码路径**、**无 Will 选项**、其 PINGREQ 不带 client id（无法按名唤醒休眠会话）。这三项只由 `mqtt_sn_conn_SUITE` 覆盖，Gate 文本单列，不以「第三方全绿」含混带过。
+- **每客户端 normal topic id 是私有的**：订阅方 SUBACK 拿到的 id 在发布方的表里毫无意义——这是协议本身的性质，不是实现取巧；发布方必须先自己 REGISTER。
+
+---
+
 ### 4.13 S8-B 追加（2026-11-10）：MQTT over WebSocket（`broker_proto_mqtt_ws`）
 
-> 编号说明：§4.11 / §4.12 预留给 S8-C（MQTT-SN）与 S8-D（MQTT over QUIC），本节先按 S8-B 执行计划落 §4.13。
+> 编号说明：§4.11 / §4.12 预留给 S8-C（MQTT-SN，见 §4.11）与 S8-D（MQTT over QUIC），本节先按 S8-B 执行计划落 §4.13。
 
 **是什么**：MQTT 3.1.1 §6 / MQTT 5.0 §6 定义的 MQTT over WebSocket。同一条 `mqtt_conn_fsm`（与 1883 明文 MQTT、8883 TLS MQTT 完全同一份代码）跑在 RFC 6455 **binary** 帧里；WebSocket 只当字节管道，协议语义、QoS、会话、retain、Will 全部由 MQTT 引擎负责。默认端口 **8083**，TLS 跟随 `broker_security.tls.enabled`（wss）。
 
