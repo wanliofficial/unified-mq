@@ -12,7 +12,7 @@
 
 ## 1. 范围与设计约束
 
-当前系统是一个支持 **MQTT 3.1.1/5.0、WebSocket、NATS、AMQP 0-9-1、Kafka、Pulsar** 六协议的 broker，具备本地内存/WAL 两种存储后端、复制提交（Metadata Raft + `replicated_commit`）、CloudEvents 策略层与 S6 管理面。可靠性等级覆盖 ADR-007 的 L1 `os_buffer` 与 L2 `fsync`；跨节点复制与多数派由 S4 的 Raft 控制面/复制路径承担。架构上的硬约束来自已冻结的 ADR：
+当前系统是一个支持 **MQTT 3.1.1/5.0、WebSocket、NATS、AMQP 0-9-1、Kafka、Pulsar** 六种应用协议的 broker，S8 又在其上补了三种 **MQTT 系传输**（MQTT over WebSocket、MQTT-SN 1.2、MQTT over QUIC），具备本地内存/WAL 两种存储后端、复制提交（Metadata Raft + `replicated_commit`）、CloudEvents 策略层与 S6 管理面。可靠性等级覆盖 ADR-007 的 L1 `os_buffer` 与 L2 `fsync`；跨节点复制与多数派由 S4 的 Raft 控制面/复制路径承担。架构上的硬约束来自已冻结的 ADR：
 
 | 约束 | 来源 | 在代码里的落点 |
 |---|---|---|
@@ -22,7 +22,7 @@
 | Router 不串行化，路由在发布者进程内完成 | ADR-010 | 句柄/索引在 `protected` ETS，`route/3` 无 `gen_server:call` |
 | 存储只拥有全局 committed 水位，per-sub 位置归订阅层 | ADR-011 | `broker_storage` 的 API 没有订阅概念；cursor 全在 `broker_subscription` |
 | 分区创建是带外动作，boot 只 recover | ADR-011 §11.2 | `create_partition/1` 是唯一 `create` 调用者；boot 缺分区即整体启动失败 |
-| 协议适配层之间互不引用 | ADR-001 | 六个 `broker_proto_*` 只依赖内核门面，彼此没有依赖边 |
+| 协议适配层之间互不引用 | ADR-001 | 各 `broker_proto_*` 只依赖内核门面，彼此没有依赖边。**ADR-001 的原文是「不得依赖其他 Adapter 的**内部**代码」**，S8-B/S8-D 依赖的是 `broker_proto_mqtt` 的**公开面**（`mqtt_conn_fsm` 与 `mqtt_transport` 行为——它们跑的就是那一份引擎），方向单向、无反向边，没有第二份 MQTT 实现 |
 
 **S7 及之后明确未实现**（免得把"还没做"误读成"没画出来"）：S7 的全部验收项已于 2026-11-10 结案——六协议统一身份表见 `docs/security.md` §2.1，各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1（结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」，逐协议差异已列明）。S7 之后明确未实现的是：跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志签名与外部 KMS、每条规则可配置的「未知扩展属性拒绝」、去重/隔离钩子推广到五协议、OTel 等可观测性导出层，以及 `require_auth` 接进 MQTT CONNECT、`broker_meta` 用户表与数据面认证接线、`topic_meta`/`queue_meta`/`binding_meta` 的运行时读取方。README §10.2 的 trace context **传播本身已实现**（2026-11-09，`broker_event_trace`，见 `docs/security.md` §5.1），未实现的是把指标导出到外部系统。清单与 `docs/security.md` §12、`progress.md` 一致。
 
@@ -30,7 +30,7 @@
 
 ## 2. 应用划分
 
-### 2.1 18 个应用
+### 2.1 22 个应用
 
 ```
 apps/
@@ -473,10 +473,10 @@ broker_subscription_worker ──┘                              ├→ broker_
 | 证据 | 内容 | 位置 |
 |---|---|---|
 | 单元/契约/集成 | `rebar3 ct` → **823/823**，`apps/*/test/`（51 个套件）与 `test/integration/s1_e2e_SUITE` 共 **52 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
-| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 173 条均为预期 unused-export | CI/本地 |
+| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 175 条均为预期 unused-export | CI/本地 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |
-| 真实客户端 | paho-mqtt 2.x / mosquitto 2.1.2（MQTT）、websocket-client、nats.go、amqp091-go、kafka-clients、官方 Pulsar Java Client；六协议全绿 | `test/protocol-compatibility/` |
+| 真实客户端 | paho-mqtt 2.x / mosquitto 2.1.2（MQTT）、websocket-client、nats.go、amqp091-go、kafka-clients、官方 Pulsar Java Client；六协议全绿；S8 另加 paho-mqtt `transport="websockets"`（8/8）、`mqtt-sn-tools` 0.0.7（10/10）、EMQX `emqtt` 1.16.1（8/8） | `test/protocol-compatibility/` |
 | 集群 | 3 节点 `peer`：组形成、Leader 切换、失去多数派、迁移后 Fencing | `apps/broker_cluster/test/broker_cluster_dist_SUITE.erl` |
 | 性能 | `docs/benchmarks/2026-11-09-s6-capacity.md`、`2026-11-09-s6-gameday.md` | `docs/benchmarks/` |
 | 端到端 | `wal`/`memory` 双组同一组 7 用例 = **14/14**（T13 交付时 6 例 = 12/12，S2-A 追加 metrics 端到端后为 7 例） | `test/integration/s1_e2e_SUITE.erl` |
@@ -487,7 +487,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 ## 9. S7 及之后的演进位（未实现）
 
-下列方向**尚未实现**，只作为后续演进的边界说明。`docs/security.md` §12 与 `progress.md` 有同一份清单。**S7 的两项交付已全部结案（2026-11-09 / 2026-11-10）**：六协议统一走 `broker_security` 身份表（`docs/security.md` §2.1）；各协议标准 CloudEvents Binding 的结论是「统一 `ce-*` 头通道是本 Broker 的项目定义，逐字实现不立项」，逐协议差异见 `docs/roadmap.md` §9.1 与 `docs/protocol-compatibility.md` §4.10。README §10.2 的 W3C trace context 传播（`docs/security.md` §5.1）也已实现，表格里的「可观测性导出层」特指 OTel 等外部导出器，不是传播本身；「官方 Binding 逐字实现」这一行是**已给出结论、不改实现**的演进位，不是遗漏的待办。
+下列方向**尚未实现**，只作为后续演进的边界说明。`docs/security.md` §12 与 `progress.md` 有同一份清单。**S7 的两项交付已全部结案（2026-11-09 / 2026-11-10）**：六协议统一走 `broker_security` 身份表（`docs/security.md` §2.1）；各协议标准 CloudEvents Binding 的结论是「统一 `ce-*` 头通道是本 Broker 的项目定义，逐字实现不立项」，逐协议差异见 `docs/roadmap.md` §9.1 与 `docs/protocol-compatibility.md` §4.10。README §10.2 的 W3C trace context 传播（`docs/security.md` §5.1）也已实现，表格里的「可观测性导出层」特指 OTel 等外部导出器，不是传播本身；「官方 Binding 逐字实现」这一行是**已给出结论、不改实现**的演进位，不是遗漏的待办。**S8 的三条新传输没有新增未实现的协议面**：MQTT-SN 的 DTLS、QUIC 的 0-RTT 与多流、MQTT-SN 的转发器封装都在表尾单列，各自有 ADR 或设计条款说明为什么不做。
 
 | 方向 | 阶段 | 会动到的结构 | 保持不动的契约 |
 |---|---|---|---|
@@ -501,6 +501,9 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `require_auth` 接进 MQTT CONNECT | S7 之后 | `mqtt_conn_fsm:authenticate/2` 增加 `auth_required(<<"mqtt">>)` 分支 | MQTT 现有的匿名 `client_id` 即 principal 语义（S1 冻结）不变；见 `docs/security.md` §2.2 现状边界 |
 | `broker_meta` 用户表接进数据面认证 | S7 之后 | `broker_security:users/0` 增加 mnesia 读取源 | `authenticate/2`、`authenticate_conn/1` 的对外形态与错误语义不变；ADR-021 §D7 冻结后补充 |
 | `topic_meta` / `queue_meta` / `binding_meta` 的运行时读取方 | S7 之后 | 路由/队列/Topic-Binding 管理路径 | 三张表已建表、有泛型 CRUD；接入读取方不改变现有路由与队列语义 |
+| MQTT-SN over DTLS | S8 之后 | `broker_proto_mqtt_sn` 的 socket 换成 `ssl` 的 dtls 档 | MQTT-SN 1.2 报文与 topic id 模型不变；1884 目前是唯一**明文且无 TLS 路径**的端口（`docs/security.md` §12 第 8 条） |
+| QUIC 0-RTT early data 与多流模式 | 不做（CN 可选项 / EMQX 私有扩展） | — | 单流模式是 CN Draft 3 的全部内容；ADR-024 已冻结该边界 |
+| MQTT-SN 转发器封装与串口桥 | 不做（设计 §1.2） | — | 网关只终结，不做 bridge 到外部 MQTT Broker |
 
 ---
 
