@@ -424,21 +424,24 @@ broker_subscription_worker ──┘                              ├→ broker_
 | 键 | 默认 | 作用 |
 |---|---|---|
 | `broker_storage.backend` | `broker_storage_wal` | 二选一：`broker_storage_wal` / `broker_storage_memory` |
-| `broker_storage.data_dir` | 绝对路径 | WAL 根目录；必须在 release 树外（J8），且不能是 tmpfs/ramfs（J11） |
-| `broker_storage.wal` | 见下 | `batch_size=32`、`max_batch_size=256`、`batch_delay_ms=#{os_buffer=>0, fsync=>1}`、`index_anchor_interval=256`、`segment_max_records=100000` |
-| `broker_router.backend` / `partitions` | `broker_router_hash` / 4 | 路由实现与分区数；必须与 `broker_queue.partitions` 一致 |
-| `broker_queue.partitions` | 4 | 与 `broker_router.partitions` 必须一致；boot 的 recover 清单来源 |
-| `broker_subscription.data_dir` | 与 storage 相同 | `.subs`/`.cursors`/`.inflight` 根目录 |
+| `broker_storage.data_dir` | `.app.src` 未声明，代码兜底 `data` | WAL 根目录；**release 必须配绝对路径**（`config/sys.config.src` 就是），且必须在 release 树外（J8）、不能是 tmpfs/ramfs（J11）。留空则落到相对路径 `data`，即 release 树内 |
+| `broker_storage.wal` | 见下 | `batch_size=32`、`max_batch_size=256`、`batch_delay_ms=#{os_buffer=>0, fsync=>1}`、`index_anchor_interval=256`、`segment_max_records=100000`、`max_pending_appends`（代码默认 `0` = 无界，release 配 4096，超限回 `{error, {overloaded, PartitionId}}` 且不分配 offset） |
+| `broker_storage.retention` | `#{max_bytes => 0, max_age_ms => 0, check_interval_ms => 60000}` | 整段回收的三项；`0` = 不设限（S2-F） |
+| `broker_router.backend` | `broker_router_hash` | 路由实现；未知值在 `broker_router_sup:init/1` 报 `{unknown_router_backend, _}`（不启动一个没有索引写入者的 app） |
+| `broker_router.partitions` | **无默认，必填**（release 配 4） | 分区数。`.app.src` 的 `env` 为空，缺失时 `broker_router_hash:current_env/0` 回 `{error, {invalid_partitions, undefined}}`；必须与 `broker_queue.partitions` 一致 |
+| `broker_queue.partitions` | 4 | 与 `broker_router.partitions` 必须一致；boot 的 recover 清单来源（非正整数报 `{invalid_partition_count, _}`） |
+| `broker_subscription.data_dir` | `.app.src` 为 `data`；release 配与 storage 相同的绝对路径 | `.subs`/`.cursors`/`.inflight` 根目录 |
 | `broker_subscription.cursor_max_regress` / `cursor_flush_interval_ms` / `inflight_flush_interval_ms` | 64 / 100 / 100 | 有界回退窗口；`1/0/0` 选择近零回退档 |
-| `broker_retain.data_dir` | 与 storage 相同 | retained 快照 `retain/retain.v1` 的根目录（S2-C） |
-| `broker_meta.data_dir` | `data/mnesia` | Mnesia 控制面根目录；Mnesia 在其下追加 `Mnesia.<node>`（S4） |
-| `broker_cluster.data_dir` | `data/ra` | Metadata Raft 根目录；ra 在其下追加 `<node>`（S4） |
-| `broker_security.users` / `acl` | `guest/guest`、`allow` | 明文用户表与 allow-all ACL 桩 |
+| `broker_retain.data_dir` | `.app.src` 为 `data`；release 配与 storage 相同的绝对路径 | retained 快照 `retain/retain.v1` 的根目录（S2-C） |
+| `broker_meta.data_dir` | `.app.src` 未声明，代码兜底 `data`；release 配 `data/mnesia` 的绝对路径 | Mnesia 控制面根目录；Mnesia 在其下追加 `Mnesia.<node>`（S4） |
+| `broker_meta.table_storage` | `ram_copies` | 11 张控制面表的副本类型。默认 `ram_copies` = **重启即丢**，生产必须配 `disc_copies`（`maybe_set_dir/1` 也只在 `disc_copies` 时设置 `mnesia.dir`）；见 `docs/operations.md` §5 |
+| `broker_cluster.data_dir` | `data/ra`（release 配绝对路径） | Metadata Raft 根目录；ra 在其下追加 `<node>`（S4） |
+| `broker_security.users` / `acl` | `.app.src` 未声明（代码兜底 `[]` / `allow`）；release 配 `guest/guest`（tenant `t0`）、`allow` | 明文用户表与 allow-all ACL 桩；用户表为空时凭据认证一律失败，匿名连接仍可建立（principal 取 client_id） |
 | `broker_event.policy` | `pass_through` | 五档均已实现（S3，ADR-020）：`disabled` / `pass_through` / `validate_if_present` / `required` / `normalize`；未知值在 `apply_policy/2` 报 `{invalid_policy, _}` |
 | `broker_event.policies` | `[]` | 按 `{Tenant, Destination, Policy}` 的首次匹配覆盖全局策略；`<<"*">>` 为租户通配，Destination 支持 MQTT `+`/`#` |
 | `broker_metrics.enabled` / `report_interval_ms` | `true` / `60000` | 指标总开关；`0` 不启动上报进程，非正整数使 app 启动失败（响亮失败，不静默关掉可观测性） |
 | `broker_proto_mqtt.listeners` | release 配 1883；`.app.src` 默认 `[]` | 每个 map 一个 listener；连接级 knob 随 map 下发（L20 seam） |
-| `broker_proto_mqtt.mqtt_max_qos` | 1 | 必须与后端 capability 一致；内存档必须为 0 |
+| `broker_proto_mqtt.mqtt_max_qos` | 2 | S2-C 起默认允许 QoS2（ADR-018 §18.4），仍受后端 capability 约束；内存档必须为 0 |
 | `broker_proto_mqtt.max_inflight` / `pull_page_limit` / `pull_poll_interval_ms` / `inflight_snapshot_ms` / `max_keepalive_ms` | 64 / 32 / 1000 / 20 / 60000 | 投递循环与 keepalive 上限 |
 | `broker_proto_mqtt_ws.listeners` | release 配 8083；`.app.src` 默认 `[]` | S8-B：MQTT over WebSocket 的 ranch listener（`port => 0` 时由 ranch 分配临时端口） |
 | `broker_proto_mqtt_ws.subprotocols` / `max_frame_bytes` | `[mqtt, mqttv3.1, mqttv3.1.1]` / 16777216 | 子协议是握手门槛（不匹配 → HTTP 400）；后者限帧，不限 MQTT 报文 |
