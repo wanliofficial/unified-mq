@@ -30,7 +30,10 @@ all() ->
      consumer_group_join_sync_heartbeat,
      offset_commit_and_fetch,
      leave_group_removes_member,
-     correlation_id_is_echoed].
+     correlation_id_is_echoed,
+     sasl_plain_authenticates_against_the_shared_table,
+     sasl_plain_with_a_wrong_password_is_refused,
+     sasl_plain_with_an_unknown_mechanism_is_refused].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -61,8 +64,13 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, data_dir, DataDir),
     ok = application:set_env(broker_retain, data_dir, DataDir),
     ok = application:set_env(broker_event, policy, pass_through),
-    ok = application:set_env(broker_security, users, []),
+    %% S7: Kafka's SASL PLAIN credential resolves against the shared
+    %% broker_security identity table, so the suite needs a user to
+    %% authenticate as.
+    ok = application:set_env(broker_security, users,
+                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_kafka, listeners,
                              [#{port => 0, ref => ?REF,
                                 num_acceptors => 4, max_connections => 128}]),
@@ -259,6 +267,37 @@ correlation_id_is_echoed(Config) ->
               <<0>>]),
     C2 = request_with_correlation(C, 3, 8, Body, Corr),
     ?assertEqual(Corr, C2),
+    ok.
+
+%%%_* S7: the shared identity table (SASL PLAIN) -----------------------------
+
+sasl_plain_authenticates_against_the_shared_table(Config) ->
+    C = connect(Config),
+    %% SaslHandshake (API 17, v1): the client names PLAIN.
+    Handshake = request(C, 17, 1, kafka_codec:string(<<"PLAIN">>)),
+    <<ErrorCode:16/signed, _Mechanisms/binary>> = Handshake,
+    ?assertEqual(0, ErrorCode),
+    %% SaslAuthenticate (API 36, v1): the credentials.
+    Auth = request(C, 36, 1, kafka_codec:bytes(<<0, "alice", 0, "pw">>)),
+    <<AuthCode:16/signed, _Rest/binary>> = Auth,
+    ?assertEqual(0, AuthCode),
+    ok.
+
+sasl_plain_with_a_wrong_password_is_refused(Config) ->
+    C = connect(Config),
+    <<_ErrorCode:16/signed, _/binary>> = request(C, 17, 1, kafka_codec:string(<<"PLAIN">>)),
+    Auth = request(C, 36, 1, kafka_codec:bytes(<<0, "alice", 0, "wrong">>)),
+    <<AuthCode:16/signed, _Rest/binary>> = Auth,
+    %% 58 = SASL_AUTHENTICATION_FAILED.
+    ?assertEqual(58, AuthCode),
+    ok.
+
+sasl_plain_with_an_unknown_mechanism_is_refused(Config) ->
+    C = connect(Config),
+    Handshake = request(C, 17, 1, kafka_codec:string(<<"SCRAM-SHA-256">>)),
+    <<ErrorCode:16/signed, _/binary>> = Handshake,
+    %% 33 = UNSUPPORTED_SASL_MECHANISM.
+    ?assertEqual(33, ErrorCode),
     ok.
 
 %%%_* Byte-level client ----------------------------------------------------

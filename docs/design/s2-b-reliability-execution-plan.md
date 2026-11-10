@@ -1,6 +1,6 @@
 # S2-B 执行计划：三档可靠性证明（`os_buffer` 丢失边界）
 
-- **状态**：**替身档已完成（2026-11-07）**；T-B1/T-B2/T-B3/T-B4 已落地并实测（三场景 3/3 PASS），**T-B5 dm-flakey 实机报告待特权执行**；T-B6 文档已更新。证据见 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`。
+- **状态**：**替身档与 dm-flakey 实机档均已完成（实机 2026-11-09）**；T-B1~T-B6 全部落地并实测。证据见 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`。
 - **对应**：`docs/design/s2-single-node-kernel.md` §4.2；`docs/adr/007-explicit-reliability.md`；`docs/roadmap.md` §4.3 Gate S2 第 1 项
 - **估算**：4 人日
 - **退出条件**：`os_buffer` 丢失边界有 CI 常驻的确定性证明（替身）；`fsync` 档有实机掉电对照（dm-flakey 报告）；`replicated_commit` 在 driver 层被显式拒绝；Gate S2「三档可靠性等级逐档有自动化证明」可勾选。
@@ -163,7 +163,9 @@ rebar3 as t14 release
 
 **Gate 证据**：`docs/benchmarks/reliability/report-osbuffer-tail-*.json`（S-B1a/b/c 计数与断言）；`s2-powerloss-*.md`（S-B2 实机掉电 + `fsync` 对照）；既有 CT 三套截图/日志（`replicated_commit`）。
 
-> **落地注记（2026-11-09）**：实际交付的 S-B1 证据文件名是 [`report-osbuffer-mqtt-replicated-tail-20261107-131941.json`](../benchmarks/reliability/report-osbuffer-mqtt-replicated-tail-20261107-131941.json)，结论与断言写在 [`s2-b-osbuffer-loss.md`](../benchmarks/reliability/s2-b-osbuffer-loss.md)。S-B2 的 dm-flakey **实机**报告至今未产生（需 root，本环境 `sudo` 需密码），这是 `docs/roadmap.md` Gate S2 唯一未勾选项；`s2_powerloss.py --skip-prereq` 可打印完整步骤并退出 0，因此它不阻塞 CI。
+> **落地注记（2026-11-09）**：实际交付的 S-B1 证据文件名是 [`report-osbuffer-mqtt-replicated-tail-20261107-131941.json`](../benchmarks/reliability/report-osbuffer-mqtt-replicated-tail-20261107-131941.json)，结论与断言写在 [`s2-b-osbuffer-loss.md`](../benchmarks/reliability/s2-b-osbuffer-loss.md)。S-B2 的 dm-flakey **实机**报告已产出：[`s2-powerloss-20261109-215930.json`](../benchmarks/reliability/s2-powerloss-20261109-215930.json)（64 条未 fsync 尾部全丢、`high` 回到 K+1=17、`committed == 16 == K`、K 条 fsync 记录逐条可读、真 broker 在恢复后的 fs 上启动成功）。本机 `sudo` 需密码，因此新增 `tools/docker/s2_powerloss_priv.sh`：驱动仍跑在宿主，只把特权命令经 `tools/docker/host_priv.sh` 送进宿主 mount namespace，绕开 sudo 密码限制。
+>
+> 实机档要真的测到掉电，有三个必须做对的技术点（详见证据文档 §5.2）：`dmsetup suspend`/`reload`/`resume` 都会强制刷盘（把脏尾部写给还健康的设备），因此 `drop_writes` 表只能用 dm-flakey 的**定时 up/down 窗口**装载；ext4 默认 ordered 模式会提前刷出尾部，需 `mount -o data=writeback,commit=600`；注入必须落在 up 窗口内，否则连 fsync 前缀的结论都不成立。
 
 ---
 
@@ -175,6 +177,6 @@ rebar3 as t14 release
 | probe 与 broker 抢同一分区写（单写者 ADR-011） | 注入序列限定 broker 停机、probe 独占；`close` 后置 `closed=true` 使写者静默，截断后 probe VM 即 halt，无并发写 |
 | `close/1` 的 fsync 把 os_buffer 尾部刷脏页，削弱「未同步」语义 | close 后立即 `file:truncate` 到屏障 B，尾部被丢弃，最终盘态 = 纯 K 条；模型等价于掉电丢失 |
 | 屏障 B 记录边界读偏（读到尾部已扩展的 size） | B 在 os_buffer append **之前**采集，且单写者无并发；采集后文件只增不减直至截断 |
-| dm-flakey 需 root，当前会话 `sudo` 需密码 | S-B2 标记特权、CI 不阻塞；`--skip-prereq` 打印步骤退出 0；替身（S-B1）独立承载 Gate |
+| dm-flakey 需 root，本机 `sudo` 需密码 | 替身（S-B1）CI 常驻独立承载 Gate；实机档改走 `tools/docker/s2_powerloss_priv.sh`（特权容器加入宿主 mount namespace），已实测产出报告 |
 | `read_from` 遇损坏改为「失败而非空页」被误判 | 断言区分 `{error,{corrupt_record,_,_}}` 与空页；S-B1a 显式断言无 corrupt |
 | 分区数/段名假设漂移 | 复用 `mq_harness` 的 `render_config`（4 分区）与 `segment-%020d.log` 命名；参数变化走 `--fsync/--osbuffer` |

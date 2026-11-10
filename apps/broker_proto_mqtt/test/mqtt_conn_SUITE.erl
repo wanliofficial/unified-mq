@@ -38,6 +38,10 @@
 -define(N, 2).
 -define(USERS, [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}},
                 {<<"guest">>, #{password => <<"guest">>, tenant_id => <<"t0">>}}]).
+-define(TRACE_PARENT,
+        <<"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01">>).
+-define(TRACE_PARENT_UPPER,
+        <<"00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01">>).
 
 all() ->
     [connect_anonymous_is_granted_with_session_present_zero,
@@ -112,7 +116,10 @@ all() ->
      %% S2-G (design §4.7): bounded consumers and per-partition isolation.
      a_full_inflight_window_pauses_the_pull_round,
      a_slow_consumer_stays_bounded,
-     a_hot_partition_does_not_block_the_others].
+     a_hot_partition_does_not_block_the_others,
+     %% README §10.2: W3C trace context over MQTT 5 user properties.
+     v5_trace_context_roundtrips_through_user_properties,
+     v5_trace_context_is_stripped_when_propagation_is_off].
 
 %%%_* Fixtures ----------------------------------------------------------------
 
@@ -176,6 +183,8 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_event, policies, []),
     ok = application:set_env(broker_event, dedup, []),
     ok = application:set_env(broker_event, quarantine, []),
+    %% README §10.2: trace propagation is opt-in; every case starts from off.
+    ok = application:set_env(broker_event, trace_context, off),
     ok = case_env(Case),
     {ok, _Started} = application:ensure_all_started(broker_storage),
     [{data_dir, DataDir} | Config].
@@ -389,6 +398,45 @@ v5_publish_properties_reach_the_subscriber(_Config) ->
     {ok, normal} = mqtt_close(Pub),
     {ok, normal} = mqtt_close(Sub),
     ok.
+
+%%%_* README §10.2: trace context over MQTT 5 user properties -------------
+
+v5_trace_context_roundtrips_through_user_properties(_Config) ->
+    ok = application:set_env(broker_event, trace_context, on),
+    try
+        Got = publish_v5_trace(?TRACE_PARENT_UPPER, <<"vendor=v">>),
+        %% The upper-case parent is normalised by the shared apply_policy/2
+        %% seam and echoed back as user properties on delivery.
+        ?assertEqual([{<<"traceparent">>, ?TRACE_PARENT},
+                      {<<"tracestate">>, <<"vendor=v">>}],
+                     maps:get(user_properties, Got, []))
+    after
+        application:set_env(broker_event, trace_context, off)
+    end,
+    ok.
+
+v5_trace_context_is_stripped_when_propagation_is_off(_Config) ->
+    Got = publish_v5_trace(?TRACE_PARENT, <<"vendor=v">>),
+    Pairs = maps:get(user_properties, Got, []),
+    ?assertNot(lists:keymember(<<"traceparent">>, 1, Pairs)),
+    ?assertNot(lists:keymember(<<"tracestate">>, 1, Pairs)),
+    ok.
+
+publish_v5_trace(Parent, State) ->
+    ok = boot(),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"v5tsub">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"v5/tr">>, 1}], #{}),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5tpub">>, props => #{}}),
+    Props = #{user_properties => [{<<"traceparent">>, Parent},
+                                  {<<"tracestate">>, State}]},
+    mqtt_publish_v5(Pub, 3, <<"v5/tr">>, <<"hello">>, 1, Props),
+    #puback{packet_id = 3, reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    #publish{packet_id = OutPid, props = Got} = mqtt_recv_v5(csock(Sub)),
+    mqtt_puback_v5(Sub, OutPid),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
+    Got.
 
 v5_puback_without_a_matching_subscription_is_0x10(_Config) ->
     ok = boot(),

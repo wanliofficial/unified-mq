@@ -172,6 +172,24 @@ jobs:
           name: gameday
           path: chaos-gameday.json
           retention-days: 14
+      # S2-B surrogate: proves the `os_buffer` loss boundary (ADR-007 tier 1)
+      # on every run.  `kill -9` cannot show it -- the kernel writes the dirty
+      # pages back -- so the driver truncates the segment at the fsync barrier
+      # and asserts the unsynced tail is gone without a phantom "committed".
+      # This is the CI-resident half of Gate S2 item 1; the dm-flakey
+      # real-device run needs root and stays an operator action.
+      - name: os_buffer loss-boundary surrogate
+        run: |
+          rm -rf _build/test/extras
+          python3 tools/fault/os_buffer_loss.py --scenario all --skip-build \
+            --out chaos-osbuffer.json
+      - name: Upload os_buffer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osbuffer-loss-boundary
+          path: chaos-osbuffer.json
+          retention-days: 14
 
   # ---------------------------------------------------------------- layer 4
   performance:

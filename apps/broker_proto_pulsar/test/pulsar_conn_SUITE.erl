@@ -35,7 +35,10 @@ all() ->
      get_last_message_id,
      close_producer_success,
      unsubscribe_success,
-     send_without_producer_errors].
+     send_without_producer_errors,
+     sasl_token_authenticates_against_the_shared_table,
+     sasl_token_with_a_wrong_secret_is_refused,
+     sasl_plain_authenticates_against_the_shared_table].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -66,8 +69,14 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, data_dir, DataDir),
     ok = application:set_env(broker_retain, data_dir, DataDir),
     ok = application:set_env(broker_event, policy, pass_through),
-    ok = application:set_env(broker_security, users, []),
+    %% S7: Pulsar's CONNECT credential resolves against the shared
+    %% broker_security identity table, so the suite needs a user to
+    %% authenticate as.
+    ok = application:set_env(broker_security, users,
+                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}},
+                              {<<"svc">>, #{token => <<"tok">>, tenant_id => <<"t2">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_pulsar, advertised_host, <<"127.0.0.1">>),
     ok = application:set_env(broker_proto_pulsar, listeners,
                              [#{port => 0, ref => ?REF,
@@ -306,6 +315,34 @@ send_without_producer_errors(Config) ->
     ?assertEqual(0, Code),
     ok.
 
+%%%_* S7: the shared identity table -----------------------------------------
+
+sasl_token_authenticates_against_the_shared_table(Config) ->
+    %% Requiring a credential makes this a real assertion: without the valid
+    %% token the connection would be refused rather than falling through to
+    %% the anonymous path.
+    application:set_env(broker_security, require_auth, [<<"pulsar">>]),
+    C = connect(Config),
+    send_simple(C, connect_fields(<<"token">>, <<"tok">>)),
+    #{type := connected} = recv(C),
+    ok.
+
+sasl_token_with_a_wrong_secret_is_refused(Config) ->
+    application:set_env(broker_security, require_auth, [<<"pulsar">>]),
+    C = connect(Config),
+    send_simple(C, connect_fields(<<"token">>, <<"wrong">>)),
+    %% The connection is dropped, so the read fails rather than returning a
+    %% CONNECTED.
+    ?assertError(_, recv(C)),
+    ok.
+
+sasl_plain_authenticates_against_the_shared_table(Config) ->
+    application:set_env(broker_security, require_auth, [<<"pulsar">>]),
+    C = connect(Config),
+    send_simple(C, connect_fields(<<"plain">>, <<0, "alice", 0, "pw">>)),
+    #{type := connected} = recv(C),
+    ok.
+
 %%%_* Byte-level client -----------------------------------------------------
 
 connect(Config) ->
@@ -386,6 +423,13 @@ send_batch(C, ProducerId, Seq, Count, Records) ->
 connect_fields() ->
     command(2, 2, [str(1, <<"Pulsar-CT">>), varint(4, 15)]).
 
+%% @doc The CONNECT frame with an auth method and its payload.  The payload
+%% goes in field 3 (`auth_data'), the method name in field 5
+%% (`auth_method_name').
+connect_fields(Method, AuthData) ->
+    command(2, 2, [str(1, <<"Pulsar-CT">>), varint(4, 15),
+                    bin(3, AuthData), str(5, Method)]).
+
 %%%_* Topic helpers ---------------------------------------------------------
 
 read_topic(Topic) ->
@@ -424,6 +468,9 @@ varint(Field, V) ->
     [key(Field, 0), uvarint(V band 16#FFFFFFFFFFFFFFFF)].
 
 str(Field, Bin) ->
+    [key(Field, 2), uvarint(byte_size(Bin)), Bin].
+
+bin(Field, Bin) ->
     [key(Field, 2), uvarint(byte_size(Bin)), Bin].
 
 msg(Field, Fields) ->

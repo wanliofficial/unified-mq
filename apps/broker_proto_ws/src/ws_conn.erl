@@ -37,6 +37,7 @@
     handshake = pending :: pending | done,
     client_id :: binary() | undefined,
     tenant = <<"t0">> :: binary(),
+    principal = undefined :: binary() | undefined,
     clean = true :: boolean(),
     subs = #{} :: #{term() => #{filter := binary(), qos := 0..2}},
     pending = #{} :: #{pos_integer() => #{refs := [term()], partition := integer(),
@@ -300,32 +301,72 @@ do_connect(Map, St) ->
         undefined ->
             {noreply, send_error(<<"bad_request">>, <<"client_id is required">>, St)};
         ClientId when is_binary(ClientId) ->
-            Tenant = maps:get(<<"tenant">>, Map, <<"t0">>),
-            Clean = maps:get(<<"clean_start">>, Map, true),
-            Persist = Clean =:= false,
-            Present = case {Clean, broker_subscription:session(ClientId)} of
-                          {false, {ok, _}} -> true;
-                          _ -> false
-                      end,
-            %% `broker_subscription:attach/3' returns `{ok, PrevPid}' (its
-            %% contract has no error branch); a failed takeover is a
-            %% bookkeeping concern, never a reason to reject the connect.
-            {ok, Prev} = broker_subscription:attach(ClientId, self(), Persist),
-            maybe_takeover(Prev),
-            Subs = case Persist of
-                       true -> session_subs(ClientId);
-                       false -> #{}
-                   end,
-            St1 = St#st{client_id = ClientId, tenant = Tenant,
-                        clean = Clean, subs = Subs},
-            %% CONNACK first: catch-up replays offline messages, and a
-            %% client must know its session was accepted before the
-            %% first delivery arrives.
-            St2 = send_json(#{<<"op">> => <<"connack">>,
-                              <<"session_present">> => Present,
-                              <<"protocol">> => <<"unifiedmq-ws/1">>}, St1),
-            {noreply, catch_up(St2)}
+            %% The credential, when present, resolves against the shared
+            %% broker_security identity table (S7) -- the same table MQTT
+            %% uses.  The client may NOT name its own tenant: the tenant
+            %% comes from the matched user record, or from the deployment
+            %% default for an anonymous connection.
+            case authenticate(Map) of
+                {ok, Identity} ->
+                    Tenant = maps:get(tenant_id, Identity),
+                    Principal = maps:get(principal, Identity),
+                    Clean = maps:get(<<"clean_start">>, Map, true),
+                    Persist = Clean =:= false,
+                    Present = case {Clean, broker_subscription:session(ClientId)} of
+                                  {false, {ok, _}} -> true;
+                                  _ -> false
+                              end,
+                    %% `broker_subscription:attach/3' returns `{ok, PrevPid}'
+                    %% (its contract has no error branch); a failed takeover
+                    %% is a bookkeeping concern, never a reason to reject the
+                    %% connect.
+                    {ok, Prev} = broker_subscription:attach(ClientId, self(), Persist),
+                    maybe_takeover(Prev),
+                    Subs = case Persist of
+                               true -> session_subs(ClientId);
+                               false -> #{}
+                           end,
+                    St1 = St#st{client_id = ClientId, tenant = Tenant,
+                                principal = Principal,
+                                clean = Clean, subs = Subs},
+                    %% CONNACK first: catch-up replays offline messages, and a
+                    %% client must know its session was accepted before the
+                    %% first delivery arrives.
+                    St2 = send_json(#{<<"op">> => <<"connack">>,
+                                      <<"session_present">> => Present,
+                                      <<"protocol">> => <<"unifiedmq-ws/1">>}, St1),
+                    {noreply, catch_up(St2)};
+                {error, Reason} ->
+                    {noreply, send_error(<<"unauthorized">>, Reason, St)}
+            end
     end.
+
+%% @doc Resolve the connect frame's credential against the shared identity
+%% table.  `username'/`password' is the user/password shape; `token' is the
+%% bearer shape (the same one Pulsar uses).  With no credential at all the
+%% connection is anonymous unless the deployment requires one.
+authenticate(Map) ->
+    case {maps:get(<<"username">>, Map, undefined),
+          maps:get(<<"password">>, Map, undefined),
+          maps:get(<<"token">>, Map, undefined)} of
+        {undefined, undefined, undefined} ->
+            case broker_security:auth_required(<<"ws">>) of
+                true -> {error, <<"authentication required">>};
+                false -> {ok, anonymous_identity()}
+            end;
+        {Username, Password, _} when is_binary(Username), is_binary(Password) ->
+            finish(broker_security:authenticate_conn({user_pass, Username, Password}));
+        {_Username, _Password, Token} when is_binary(Token) ->
+            finish(broker_security:authenticate_conn({token, Token}));
+        _ ->
+            {error, <<"malformed credentials">>}
+    end.
+
+finish({ok, Identity}) -> {ok, Identity};
+finish({error, _}) -> {error, <<"bad_username_or_password">>}.
+
+anonymous_identity() ->
+    #{principal => undefined, tenant_id => broker_security:default_tenant()}.
 
 maybe_takeover(Pid) when is_pid(Pid), Pid =/= self() ->
     Pid ! {ws_takeover, self()},
@@ -469,13 +510,23 @@ route_and_store(Destination, QoS, Id, Msg, Ctx, St) ->
 %% top-level `ce-*' keys (project binding, docs/protocol-compatibility.md
 %% §4.10). Only binary values are binding attributes.
 ce_headers(Map) ->
+    Trace = broker_event_trace:enabled(),
     maps:filter(fun(K, V) ->
                         is_binary(K) andalso is_binary(V) andalso
-                            (is_ce_key(K) orelse K =:= <<"content-type">>)
+                            (is_ce_key(K) orelse K =:= <<"content-type">> orelse
+                             (Trace andalso is_trace_key(K)))
                 end, Map).
 
 is_ce_key(<<"ce-", _/binary>>) -> true;
 is_ce_key(_) -> false.
+
+%% W3C Trace Context (README §10.2) is not a CloudEvents attribute: it rides
+%% beside the `ce-*' keys in the same neutral header map.  It is only admitted
+%% when the deployment opted into propagation; otherwise a client-supplied
+%% `traceparent' is dropped at the door, like any other unknown header.
+is_trace_key(<<"traceparent">>) -> true;
+is_trace_key(<<"tracestate">>) -> true;
+is_trace_key(_) -> false.
 
 store_routes([], _Msg, Acc) ->
     {ok, lists:reverse(Acc)};

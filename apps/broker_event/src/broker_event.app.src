@@ -13,5 +13,6 @@
            {policies, []},
            {dedup, []},
            {dedup_max_entries, 100000},
-           {quarantine, []}]}
+           {quarantine, []},
+           {trace_context, off}]}
 ]}.

@@ -42,6 +42,8 @@
              transport :: module() | undefined,
              socket :: term() | undefined,
              client_version = <<>> :: binary(),
+             tenant = ?TENANT :: binary(),
+             principal = undefined :: binary() | undefined,
              producers = #{} :: #{integer() => binary()},
              consumers = #{} :: #{{integer(), integer()} => binary()},
              port = 0 :: inet:port_number()}).
@@ -130,8 +132,20 @@ set_active(#st{transport = T, socket = S}) ->
     T:setopts(S, [{active, once}]).
 
 dispatch(#{type := connect} = Cmd, _Tail, St) ->
-    St1 = St#st{client_version = maps:get(client_version, Cmd, <<>>)},
-    send(pulsar_codec:encode_connected(?SERVER_VERSION, ?PROTOCOL_VERSION), St1);
+    %% The credential, when the client offered one, resolves against the
+    %% shared broker_security identity table (S7) -- the same table MQTT uses.
+    %% Pulsar's CONNECT carries `auth_method_name' plus an opaque `auth_data';
+    %% the `token' method is the bearer shape, and the PLAIN method carries
+    %% `\0user\0password' inside auth_data.
+    case authenticate(Cmd) of
+        {ok, Identity} ->
+            St1 = St#st{client_version = maps:get(client_version, Cmd, <<>>),
+                        tenant = maps:get(tenant_id, Identity),
+                        principal = maps:get(principal, Identity)},
+            send(pulsar_codec:encode_connected(?SERVER_VERSION, ?PROTOCOL_VERSION), St1);
+        {error, _} ->
+            {stop, {authentication_failed, unauthenticated}, St}
+    end;
 dispatch(#{type := partitioned_metadata} = Cmd, _Tail, St) ->
     Response = pulsar_codec:encode_partitioned_metadata_response(
                  maps:get(request_id, Cmd), 0),
@@ -254,7 +268,8 @@ handle_send(Cmd, Tail, St) ->
                     Base = topic_count(destination(Topic)),
                     Results = lists:map(
                                 fun({Index, Record}) ->
-                                        append_record(Topic, Base + Index, Record)
+                                        append_record(Topic, Base + Index, Record,
+                                                      St#st.tenant)
                                 end,
                                 lists:zip(lists:seq(0, length(Records) - 1),
                                           Records)),
@@ -320,10 +335,10 @@ merge_meta(Meta, Single) ->
           null_value => maps:get(null_value, Single,
                                  maps:get(null_value, Meta, false))}.
 
-append_record(Topic, EntryId, {Meta, Payload}) ->
+append_record(Topic, EntryId, {Meta, Payload}, Tenant) ->
     _ = EntryId,
     Msg = #broker_message{message_id = message_id(),
-                          tenant_id = ?TENANT,
+                          tenant_id = Tenant,
                           destination = destination(Topic),
                           partition_id = ?PARTITION,
                           payload = Payload,
@@ -375,6 +390,42 @@ metadata(Msg) ->
     end.
 
 %%%_* Helpers -------------------------------------------------------------
+
+%% @doc Resolve the CONNECT's credential against the shared broker_security
+%% identity table (S7) -- the same table MQTT uses.
+%%
+%% Pulsar's CONNECT carries `auth_method_name' plus an opaque `auth_data':
+%%   * `token' -- auth_data is the bearer secret;
+%%   * `plain' -- auth_data is `\0user\0password' (the Pulsar spelling of
+%%     SASL PLAIN);
+%%   * anything else (including an empty method) -- no credential offered.
+%%
+%% A client that offers no usable credential stays anonymous unless the
+%% deployment requires one.
+authenticate(Cmd) ->
+    Method = maps:get(auth_method_name, Cmd, <<>>),
+    Data = maps:get(auth_data, Cmd, <<>>),
+    case {Method, Data} of
+        {<<"token">>, Token} when is_binary(Token), Token =/= <<>> ->
+            finish(broker_security:authenticate_conn({token, Token}));
+        {<<"plain">>, Data} when is_binary(Data) ->
+            case binary:split(Data, <<0>>, [global]) of
+                [_, <<>>, <<>>] -> anonymous();
+                [_, User, Pass] -> finish(broker_security:authenticate_conn({user_pass, User, Pass}));
+                _ -> {error, unauthenticated}
+            end;
+        _ ->
+            anonymous()
+    end.
+
+anonymous() ->
+    case broker_security:auth_required(<<"pulsar">>) of
+        true -> {error, unauthenticated};
+        false -> {ok, #{principal => undefined, tenant_id => broker_security:default_tenant()}}
+    end.
+
+finish({ok, Identity}) -> {ok, Identity};
+finish({error, _}) -> {error, unauthenticated}.
 
 find_consumer(ConsumerId, #st{consumers = Consumers}) ->
     case [V || {{Id, _Req}, V} <- maps:to_list(Consumers), Id =:= ConsumerId] of

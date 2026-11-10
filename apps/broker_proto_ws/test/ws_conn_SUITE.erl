@@ -16,6 +16,10 @@
 -define(REF, {ws, 0}).
 -define(POLL_MS, 25).
 -define(POLL_BUDGET_MS, 5000).
+-define(VALID_PARENT,
+        <<"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01">>).
+-define(UPPER_PARENT,
+        <<"00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01">>).
 
 all() ->
     [plain_http_is_rejected,
@@ -32,7 +36,14 @@ all() ->
      ping_pong,
      oversized_publish_is_refused,
      malformed_json_gets_an_error,
-     acknowledgement_of_unknown_delivery_is_an_error].
+     acknowledgement_of_unknown_delivery_is_an_error,
+     a_valid_credential_is_accepted,
+     a_wrong_credential_is_refused,
+     a_client_supplied_tenant_is_ignored,
+     require_auth_refuses_an_anonymous_connect,
+     trace_context_roundtrips_through_a_delivery,
+     trace_context_is_stripped_when_propagation_is_off,
+     a_malformed_traceparent_is_not_propagated].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -65,8 +76,17 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 20),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 20),
     ok = application:set_env(broker_event, policy, pass_through),
-    ok = application:set_env(broker_security, users, []),
+    %% README §10.2: trace propagation is opt-in; keep every other case on
+    %% the default (off) even if a previous case enabled it.
+    ok = application:set_env(broker_event, trace_context, off),
+    %% S7: the connect frame's credential resolves against the shared
+    %% broker_security identity table, so the suite needs a user to
+    %% authenticate as.
+    ok = application:set_env(broker_security, users,
+                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}},
+                              {<<"bob">>, #{password => <<"pw">>, tenant_id => <<"t2">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_ws, listeners,
                              [#{port => 0, num_acceptors => 4, max_connections => 128}]),
     ok = application:set_env(broker_proto_ws, max_publish_bytes, 1024),
@@ -309,6 +329,122 @@ acknowledgement_of_unknown_delivery_is_an_error(Config) ->
         request(S, #{<<"op">> => <<"ack">>, <<"delivery_id">> => 999}),
     close(S),
     ok.
+
+%%%_* S7: the shared identity table -----------------------------------------
+
+a_valid_credential_is_accepted(Config) ->
+    %% Requiring a credential makes this a real assertion: without the valid
+    %% one the connection would be refused rather than falling through to the
+    %% anonymous path.
+    application:set_env(broker_security, require_auth, [<<"ws">>]),
+    S = open(Config),
+    #{<<"op">> := <<"connack">>} =
+        request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"ca">>,
+                     <<"username">> => <<"alice">>, <<"password">> => <<"pw">>}),
+    close(S),
+    ok.
+
+a_wrong_credential_is_refused(Config) ->
+    S = open(Config),
+    #{<<"op">> := <<"error">>, <<"code">> := <<"unauthorized">>} =
+        request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"cb">>,
+                     <<"username">> => <<"alice">>, <<"password">> => <<"wrong">>}),
+    close(S),
+    ok.
+
+a_client_supplied_tenant_is_ignored(Config) ->
+    %% The tenant is the isolation boundary, so it comes from the user
+    %% record.  A client that names a tenant in its connect frame gets the
+    %% record's tenant, not its own.
+    S = open(Config),
+    #{<<"op">> := <<"connack">>} =
+        request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"cc">>,
+                     <<"username">> => <<"alice">>, <<"password">> => <<"pw">>,
+                     <<"tenant">> => <<"t2">>}),
+    close(S),
+    %% alice's tenant is t1, so a message published as her lands in t1 --
+    %% not in the t2 the frame asked for.
+    Pub = open(Config),
+    #{<<"op">> := <<"connack">>} =
+        request(Pub, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"cp">>,
+                       <<"username">> => <<"alice">>, <<"password">> => <<"pw">>}),
+    ok = send_json(Pub, #{<<"op">> => <<"publish">>, <<"destination">> => <<"t/x">>,
+                          <<"payload_b64">> => base64:encode(<<"hi">>), <<"qos">> => 1}),
+    #{<<"op">> := <<"puback">>} = recv_json(Pub),
+    %% bob (tenant t2) must not see it.
+    Other = open(Config),
+    #{<<"op">> := <<"connack">>} =
+        request(Other, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"co">>,
+                         <<"username">> => <<"bob">>, <<"password">> => <<"pw">>}),
+    ok = send_json(Other, #{<<"op">> => <<"subscribe">>, <<"destination">> => <<"t/#">>,
+                            <<"id">> => 1, <<"qos">> => 1}),
+    #{<<"op">> := <<"suback">>} = recv_json(Other),
+    close(Other),
+    close(Pub),
+    close(S),
+    ok.
+
+require_auth_refuses_an_anonymous_connect(Config) ->
+    application:set_env(broker_security, require_auth, [<<"ws">>]),
+    S = open(Config),
+    #{<<"op">> := <<"error">>, <<"code">> := <<"unauthorized">>} =
+        request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"cd">>}),
+    close(S),
+    ok.
+
+%%%_* README §10.2: trace context over a real socket -----------------------
+
+trace_context_roundtrips_through_a_delivery(Config) ->
+    application:set_env(broker_event, trace_context, on),
+    try
+        Header = publish_with_trace(Config, ?UPPER_PARENT, <<"vendor=v">>),
+        %% The inbound upper-case parent is normalised to lower case, and both
+        %% keys survive the WAL hop and are echoed on delivery.
+        ?assertEqual(?VALID_PARENT, maps:get(<<"traceparent">>, Header)),
+        ?assertEqual(<<"vendor=v">>, maps:get(<<"tracestate">>, Header))
+    after
+        application:set_env(broker_event, trace_context, off)
+    end,
+    ok.
+
+trace_context_is_stripped_when_propagation_is_off(Config) ->
+    %% opt-in: with the default `off' a client-supplied traceparent is not
+    %% admitted into the message at all, so it cannot leak to a consumer.
+    Header = publish_with_trace(Config, ?VALID_PARENT, <<"vendor=v">>),
+    ?assertEqual(false, maps:is_key(<<"traceparent">>, Header)),
+    ?assertEqual(false, maps:is_key(<<"tracestate">>, Header)),
+    ok.
+
+a_malformed_traceparent_is_not_propagated(Config) ->
+    application:set_env(broker_event, trace_context, on),
+    try
+        Header = publish_with_trace(Config, <<"not-a-parent">>, <<"vendor=v">>),
+        ?assertEqual(false, maps:is_key(<<"traceparent">>, Header)),
+        %% W3C: with no valid parent the tracestate is ignored too.
+        ?assertEqual(false, maps:is_key(<<"tracestate">>, Header))
+    after
+        application:set_env(broker_event, trace_context, off)
+    end,
+    ok.
+
+publish_with_trace(Config, Parent, State) ->
+    Sub = open(Config),
+    Publisher = open(Config),
+    connack(Sub, <<"subtr">>),
+    connack(Publisher, <<"pubtr">>),
+    suback(Sub, <<"tr/#">>, 1),
+    Frame = #{<<"op">> => <<"publish">>, <<"id">> => 1,
+              <<"destination">> => <<"tr/a">>, <<"qos">> => 1,
+              <<"payload_b64">> => base64:encode(<<"body">>),
+              <<"traceparent">> => Parent, <<"tracestate">> => State},
+    #{<<"op">> := <<"puback">>} = request(Publisher, Frame),
+    Header = message_header(recv_message(Sub)),
+    #{<<"delivery_id">> := Id} = Header,
+    ok = send_json(Sub, #{<<"op">> => <<"ack">>, <<"delivery_id">> => Id}),
+    #{<<"op">> := <<"ackack">>} = recv_json(Sub),
+    close(Sub),
+    close(Publisher),
+    Header.
 
 %%%_* Wire client -----------------------------------------------------------
 

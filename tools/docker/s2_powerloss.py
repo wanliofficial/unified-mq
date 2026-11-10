@@ -75,22 +75,43 @@ from os_buffer_loss import (  # noqa: E402
     _wal_lines,
 )
 
-RELIABILITY = TOOLS / "docs" / "benchmarks" / "reliability"
+RELIABILITY = Path(__file__).resolve().parents[2] / "docs" / "benchmarks" / "reliability"
 
 # State paths.  The image lives inside the repo tree on purpose: this host's
 # /tmp is tmpfs (design J11), and a power-loss test on a RAM disk would test
 # nothing.  Everything is overridable so an operator can move it to a dedicated
 # disk.
+#
+# The mount point is a plain directory in the repo tree as well: the *image*
+# must not live on tmpfs, but the mount point may sit on any real filesystem --
+# what gets mounted on it is the ext4 we just built, not the host's fs.
 IMAGE = Path(os.environ.get("S2B_DM_IMAGE", str(TOOLS / "docker" / "powerloss.img")))
-MOUNT = Path(os.environ.get("S2B_DM_MOUNT", "/var/lib/unified-mq-powerloss"))
+MOUNT = Path(os.environ.get("S2B_DM_MOUNT",
+                            str(TOOLS / "docker" / "powerloss-mount")))
 DM_NAME = os.environ.get("S2B_DM_NAME", "s2b-powerloss")
 IMAGE_MB = int(os.environ.get("S2B_DM_IMAGE_MB", "256"))
 DM_DEV = Path("/dev/mapper") / DM_NAME
 
-# Flakey table windows: "up" long enough that the device is healthy for the whole
-# setup+injection phase, then a reload with up=0 switches it to unreliable
-# immediately.  drop_writes (not error_writes) is what a lying disk does.
-UP_SECONDS = 3600
+# Flakey table windows.  dm-flakey alternates between an "up" state (the device
+# behaves normally) and a "down" state (drop_writes: writes are silently
+# discarded -- a disk that lies about a flush).  The cycle is timed, not
+# switched by hand, and that matters:
+#
+# Switching states with `dmsetup reload` requires `dmsetup suspend` first, and
+# suspending a device freezes its queue -- which forces a filesystem sync and
+# therefore writes the dirty tail to the device *while it is still healthy*.
+# The tail then survives the cut and the test proves nothing.  (Measured: the
+# tail count on the image goes 0 -> 64 at the `suspend` step.)
+#
+# With a timed table the transition happens on its own, with no ioctl and
+# therefore no forced sync: the tail stays in the page cache across the cut and
+# is discarded by the device when the kernel finally flushes it.
+#
+# UP_SECONDS must cover the whole setup+injection phase (the broker's fsync
+# prefix has to be written while the device is still healthy), and DOWN_SECONDS
+# must cover the flush that follows the cut.
+UP_SECONDS = int(os.environ.get("S2B_DM_UP_SECONDS", "20"))
+DOWN_SECONDS = int(os.environ.get("S2B_DM_DOWN_SECONDS", "3600"))
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +130,36 @@ def run(cmd, check=True, timeout=600):
     return proc
 
 
+# Privileged host operations (losetup/dmsetup/mkfs/mount/sync) must run in the
+# HOST's mount namespace: the dm device and the ext4 mount have to be visible to
+# the Docker daemon that starts the broker container, otherwise the container
+# would bind-mount an empty directory instead of the power-losing filesystem.
+#
+# Two ways to get there:
+#   * run this script as root (the original requirement), or
+#   * run it inside a privileged container and set S2B_HOST_EXEC to
+#     "nsenter -t 1 -m --" (see tools/docker/s2_powerloss_priv.sh).  nsenter
+#     implies --root, so the host's own binaries are used.
+#
+# The prefix is empty for the plain-root case, which keeps the original
+# invocation (sudo python3 tools/docker/s2_powerloss.py) working unchanged.
+HOST_EXEC = os.environ.get("S2B_HOST_EXEC", "").split()
+
+
+def host_run(cmd, check=True, timeout=600):
+    """Run a privileged command in the host's mount namespace."""
+    return run(HOST_EXEC + [str(c) for c in cmd], check=check, timeout=timeout)
+
+
 def require_root():
-    if os.geteuid() != 0:
-        raise SystemExit(
-            "this driver needs root (losetup/dmsetup/mkfs.ext4/mount/sync);\n"
-            "re-run with sudo, or use --skip-prereq to print the plan.\n"
-            "The CI-resident proof is tools/fault/os_buffer_loss.py.")
+    if os.geteuid() == 0 or HOST_EXEC:
+        return
+    raise SystemExit(
+        "this driver needs root (losetup/dmsetup/mkfs.ext4/mount/sync);\n"
+        "re-run with sudo, use tools/docker/s2_powerloss_priv.sh (privileged\n"
+        "container joining the host mount namespace), or --skip-prereq to\n"
+        "print the plan.\n"
+        "The CI-resident proof is tools/fault/os_buffer_loss.py.")
 
 
 def dm_table(loop, sectors, *, drop, up, down):
@@ -122,20 +167,41 @@ def dm_table(loop, sectors, *, drop, up, down):
 
     drop=True  -> immediately unreliable, writes silently discarded
     drop=False -> healthy for `up` seconds
+
+    The trailing "1 drop_writes" is the feature list: dm-flakey takes a count of
+    feature arguments before the features themselves, and `drop_writes' is what
+    makes the device silently discard writes instead of failing them -- a disk
+    that lies about a flush, which is the power loss we are modelling.  Without
+    the count the table is rejected with EINVAL.
     """
     if drop:
-        return f"0 {sectors} flakey {loop} 0 0 {down} drop_writes"
-    return f"0 {sectors} flakey {loop} 0 {up} {down}"
+        return f"0 {sectors} flakey {loop} 0 0 {down} 1 drop_writes"
+    return f"0 {sectors} flakey {loop} 0 {up} {down} 1 drop_writes"
 
 
 def flakey_load(sectors, loop, *, drop):
+    # Move the device to a plain `linear` mapping (a truthful device) so the
+    # recovered filesystem can be read back.
+    #
     # Suspend -> reload -> resume: the table swap must not race in-flight
-    # writeback, otherwise a dirty page could sneak through the old (healthy)
-    # table between the reload and its activation.
-    run(["dmsetup", "suspend", DM_NAME])
-    run(["dmsetup", "reload", DM_NAME, "--table",
-         dm_table(loop, sectors, drop=drop, up=UP_SECONDS, down=3600)])
-    run(["dmsetup", "resume", DM_NAME])
+    # writeback, otherwise a dirty page could sneak through the old table
+    # between the reload and its activation.
+    #
+    # --noudevsync: this driver may run where udev is not reachable (a
+    # privileged container without a udev daemon), and dmsetup's default waits
+    # for a udev event that never arrives.  The device node is created by the
+    # kernel, so skipping the sync only skips the "tell udev" step.
+    #
+    # NOTE: this function is only used to move the device to a plain `linear`
+    # mapping (a truthful device) -- never to install the drop_writes table.
+    # Suspending freezes the queue, which forces a filesystem sync, and that
+    # sync would write the dirty tail to the device while it is still healthy.
+    host_run(["dmsetup", "--noudevsync", "suspend", DM_NAME])
+    try:
+        host_run(["dmsetup", "--noudevsync", "reload", DM_NAME, "--table",
+                  f"0 {sectors} linear {loop} 0"])
+    finally:
+        host_run(["dmsetup", "--noudevsync", "resume", DM_NAME], check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -149,48 +215,109 @@ class Device:
         self.loop = None
         self.sectors = 0
         self.mounted = False
+        self.created_at = None
 
     def create(self):
         IMAGE.parent.mkdir(parents=True, exist_ok=True)
         if IMAGE.exists():
             IMAGE.unlink()
-        run(["truncate", "-s", f"{IMAGE_MB}M", IMAGE])
-        self.loop = run(["losetup", "--find", "--show", IMAGE]).stdout.strip()
-        self.sectors = int(run(["blockdev", "--getsz", self.loop]).stdout.strip())
-        run(["dmsetup", "create", DM_NAME, "--table",
-             dm_table(self.loop, self.sectors, drop=False, up=UP_SECONDS, down=3600)])
-        run(["mkfs.ext4", "-F", "-q", DM_DEV])
+        # A device left behind by an interrupted run would make `create` fail
+        # with EBUSY ("Device or resource busy"); clear it first so the driver
+        # is re-runnable without an operator cleaning up by hand.
+        host_run(["dmsetup", "--noudevsync", "resume", DM_NAME], check=False)
+        host_run(["dmsetup", "--noudevsync", "remove", DM_NAME], check=False)
+        host_run(["truncate", "-s", f"{IMAGE_MB}M", IMAGE])
+        self.loop = host_run(["losetup", "--find", "--show", IMAGE]).stdout.strip()
+        self.sectors = int(host_run(["blockdev", "--getsz", self.loop]).stdout.strip())
+        # The table starts in the "up" state and flips to "down" on its own
+        # after UP_SECONDS.  The clock starts here, so the whole setup and
+        # injection phase has to fit inside the up window.
+        host_run(["dmsetup", "--noudevsync", "create", DM_NAME, "--table",
+                  dm_table(self.loop, self.sectors, drop=False,
+                           up=UP_SECONDS, down=DOWN_SECONDS)])
+        self.created_at = time.monotonic()
+        host_run(["mkfs.ext4", "-F", "-q", DM_DEV])
         self.mount()
 
     def mount(self):
         MOUNT.mkdir(parents=True, exist_ok=True)
-        run(["mount", DM_DEV, MOUNT])
+        # data=writeback: ext4's default (ordered) mode forces a file's dirty
+        # data pages out at the next journal commit whenever that file's
+        # metadata is committed -- and the WAL segment's size changes on every
+        # append, so the "os_buffer tail" would be flushed to the device long
+        # before the cut and would then survive it.  Writeback mode keeps the
+        # tail in the page cache, which is the state this test is about.
+        #
+        # commit=600: with the default 5s commit interval the journal is
+        # written (and, in ordered mode, the data with it) long before the
+        # device is cut.  A long interval keeps the whole tail unsynced.
+        #
+        # The `fsync` tier is unaffected: file:sync(2) flushes the file's data
+        # and metadata regardless of the mount mode, so the K fsync'd records
+        # are still on the device when the power is cut.
+        host_run(["mount", "-o", "data=writeback,commit=600", DM_DEV, MOUNT])
         self.mounted = True
+        # mkfs creates a root-owned filesystem (including lost+found, mode 700),
+        # but the broker container runs as the invoking unprivileged user -- see
+        # mq_harness.docker_args.  Hand the whole tree to that user so the
+        # broker can write its WAL and read it back during recovery.
+        host_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", MOUNT],
+                 check=False)
 
     def unmount(self):
         if self.mounted:
-            run(["umount", MOUNT], check=False)
+            host_run(["umount", MOUNT], check=False)
             self.mounted = False
 
+    def wait_for_down(self):
+        """Block until the flakey window has flipped to the lying state.
+
+        Nothing here touches the device: the transition is purely time-based,
+        so no ioctl (and therefore no forced sync) can flush the dirty tail
+        while the device is still healthy.  We poll the image instead of
+        trusting the clock alone.
+        """
+        elapsed = time.monotonic() - self.created_at
+        remaining = UP_SECONDS - elapsed
+        if remaining > 0:
+            print(f"    waiting {remaining:.1f}s for the device to go down",
+                  flush=True)
+            time.sleep(remaining + 0.5)
+
     def drop_writes(self):
-        """The power-loss instant: device starts lying about flush."""
-        flakey_load(self.sectors, self.loop, drop=True)
+        """The power-loss instant: the device is already lying.
+
+        The state change happened on its own (see wait_for_down); the only
+        thing left to do is push the dirty pages at the device, which now
+        silently discards them.
+        """
         # Push every dirty page at the device; the ones that only existed in the
         # page cache are now reported written and silently discarded.
-        run(["sync"])
+        host_run(["sync"])
 
     def restore(self):
         """Replace the flakey layer with a plain linear mapping."""
-        run(["dmsetup", "suspend", DM_NAME])
-        run(["dmsetup", "reload", DM_NAME, "--table",
-             f"0 {self.sectors} linear {self.loop} 0"])
-        run(["dmsetup", "resume", DM_NAME])
+        host_run(["dmsetup", "--noudevsync", "suspend", DM_NAME])
+        try:
+            host_run(["dmsetup", "--noudevsync", "reload", DM_NAME, "--table",
+                      f"0 {self.sectors} linear {self.loop} 0"])
+        finally:
+            host_run(["dmsetup", "--noudevsync", "resume", DM_NAME], check=False)
 
     def destroy(self, keep_image):
         self.unmount()
-        run(["dmsetup", "remove", DM_NAME], check=False)
+        # A dm device that is still suspended cannot be removed, so resume
+        # first; the retry covers the case where the device node is still held
+        # open by a dying process.
+        host_run(["dmsetup", "--noudevsync", "resume", DM_NAME], check=False)
+        for _attempt in range(3):
+            proc = host_run(["dmsetup", "--noudevsync", "remove", DM_NAME],
+                            check=False)
+            if proc.returncode == 0:
+                break
+            time.sleep(1)
         if self.loop:
-            run(["losetup", "-d", self.loop], check=False)
+            host_run(["losetup", "-d", self.loop], check=False)
         if not keep_image and IMAGE.exists():
             IMAGE.unlink()
         if MOUNT.exists():
@@ -210,12 +337,19 @@ def scenario_powerloss(k, m, tier, dev):
     harness.DATA = MOUNT
     if MOUNT.exists():
         # The mount is fresh (mkfs), but be explicit: recovery refuses a dirty
-        # layout, so the run must start from an empty directory.
+        # layout, so the run must start from an empty directory.  The delete
+        # goes through the privileged path because mkfs' lost+found is
+        # root-owned and the driver may run unprivileged.
         for child in MOUNT.iterdir():
-            shutil.rmtree(child) if child.is_dir() else child.unlink()
+            host_run(["rm", "-rf", str(child)], check=False)
     harness.render_config(tier)
 
     # 1+2. K fsync records (durable) then M os_buffer records (page cache only).
+    #
+    # This has to finish inside the device's "up" window: the fsync'd prefix
+    # must reach a healthy device, or the test would prove nothing about the
+    # prefix either.  The probe is the slow part (a container start plus an
+    # Erlang boot), so the window is sized for it.
     out = harness.erl_probe(_erl(_INJECT, P=PARTITION, K=k, M=m, SEG=SEGMENT),
                             tier, timeout=300)
     kv = _parse_kv(out)
@@ -230,8 +364,15 @@ def scenario_powerloss(k, m, tier, dev):
     harness.assert_true(tail_count == m, f"os_buffer tail count {tail_count} != {m}")
     harness.assert_true(size_before > barrier,
                         f"segment {size_before} not past the barrier {barrier}")
+    harness.assert_true(
+        time.monotonic() - dev.created_at < UP_SECONDS,
+        f"the injection took longer than the device's up window "
+        f"({UP_SECONDS}s); the fsync prefix was written to a device that was "
+        f"already dropping writes -- raise S2B_DM_UP_SECONDS")
 
-    # 3. Power loss: drop writes, flush the dirty tail into the void.
+    # 3. Power loss: wait for the device to start lying, then flush the dirty
+    #    tail into the void.
+    dev.wait_for_down()
     dev.drop_writes()
 
     # 4. Detach while dirty, restore a truthful device, mount again.

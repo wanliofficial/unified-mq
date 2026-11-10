@@ -1,10 +1,10 @@
 # UnifiedMQ 架构
 
 - **文档版本**：v1.0（S6，2026-11-09）
-- **状态**：描述当前已实现并实测的架构事实（S0–S6）。S6 之后明确未实现的方向在 §9 单列，不与现状混写
+- **状态**：描述当前已实现并实测的架构事实（S0–S6）。S6 之后（现归 S7 及之后）明确未实现的方向在 §9 单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断“某个行为归哪一层”的测试作者
 - **对应**：`docs/roadmap.md`、`docs/design/`（各阶段设计基线）、ADR-001/002/004/007/009/010/011/016/017/018/019/020/021
-- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**631/631**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
+- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**673/673**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -24,7 +24,7 @@
 | 分区创建是带外动作，boot 只 recover | ADR-011 §11.2 | `create_partition/1` 是唯一 `create` 调用者；boot 缺分区即整体启动失败 |
 | 协议适配层之间互不引用 | ADR-001 | 六个 `broker_proto_*` 只依赖内核门面，彼此没有依赖边 |
 
-**S6 之后明确未实现**（免得把"还没做"误读成"没画出来"）：非 MQTT 协议的统一认证、跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志签名与外部 KMS、标准 CloudEvents Binding 逐字实现。清单与 `docs/security.md` §12、`progress.md` 一致。
+**S7 及之后明确未实现**（免得把"还没做"误读成"没画出来"）：S7 的全部验收项已于 2026-11-10 结案——六协议统一身份表见 `docs/security.md` §2.1，各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1（结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」，逐协议差异已列明）。S7 之后明确未实现的是：跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志签名与外部 KMS、每条规则可配置的「未知扩展属性拒绝」、去重/隔离钩子推广到五协议、OTel 等可观测性导出层，以及 `require_auth` 接进 MQTT CONNECT、`broker_meta` 用户表与数据面认证接线、`topic_meta`/`queue_meta`/`binding_meta` 的运行时读取方。README §10.2 的 trace context **传播本身已实现**（2026-11-09，`broker_event_trace`，见 `docs/security.md` §5.1），未实现的是把指标导出到外部系统。清单与 `docs/security.md` §12、`progress.md` 一致。
 
 ---
 
@@ -58,7 +58,7 @@ apps/
 |---|---|---|---|---|
 | `broker_core` | kernel, stdlib | 无 | `broker_message.hrl` 的 `#broker_message{}`、`partition_id()`、`sync_mode()` | 无（纯类型） |
 | `broker_metrics` | kernel, stdlib, sasl | `broker_metrics_server`（仅 `report_interval_ms > 0`；指标本身不在进程里） | `inc/1,2`、`observe/2`、`gauge/2`、`gauge_add/2`、`snapshot/0`、`p99/1`、`keys/0` | `counters`/`atomics` 数组 + `persistent_term` 的 `Key → {Kind,Ref,Idx}` 索引（无 ETS） |
-| `broker_meta` | kernel, stdlib, sasl, mnesia | `broker_meta_config`（配置版本 gen_server）、`broker_meta_outbox`；表访问本身由调用方同步执行 | `ensure_schema/0`、11 张表的 CRUD、`bump/1`、`reconcile/0`、`enqueue/2`、`user/1`、`acl/4` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用 |
+| `broker_meta` | kernel, stdlib, sasl, mnesia | `broker_meta_config`（配置版本 gen_server）、`broker_meta_outbox`；表访问本身由调用方同步执行 | `ensure_schema/0`、`tables/0`、通用 `put/get/delete/all/clear` + 8 张表的类型化访问器（`put_tenant/get_tenant`、`put_user/get_user`、`put_acl/acls`、`put_partition/get_partition`、`put_node/nodes`、`version/bump_version`、`enqueue/pending_outbox/mark_published`）、`reset/0` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用。11 张表**全部建表并可有行**，但 `topic_meta` / `queue_meta` / `binding_meta` 目前**没有运行时消费者**（只有 `tables/0` 与套件引用，泛型 `put/get` 可写可读）——这三张表是控制面预留，接入路由/队列/binding 的读取方列为 S7 之后 |
 | `broker_cluster` | kernel, stdlib, sasl, crypto, ra, broker_core, broker_meta, broker_metrics | `broker_cluster_cache`（归属/epoch 缓存 gen_server）与 ra server `{broker_cluster_meta, Node}`（模块 `broker_cluster_meta`，状态机 `broker_cluster_meta_machine`）；`broker_cluster_rep` 是纯函数模块，无进程 | `assign/4`、`migrate/4`、`finish_migration/2`、`remove/1`、`owner/1`、`epoch/1`、`replicas/1`、`authorize_append/2`、`guard_append/3`、`replicate/2`、`snapshot/0` | 本地 ETS 归属/epoch 缓存；ra 日志与快照；`persistent_term` 队列钩子 |
 | `broker_storage` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
@@ -364,7 +364,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **631/631**，`apps/*/test/` 与 `test/integration/` 的 **41 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
+| 单元/契约/集成 | `rebar3 ct` → **673/673**，`apps/*/test/` 与 `test/integration/` 的 **43 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
 | 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 167 条均为预期 unused-export | CI/本地 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |
@@ -377,18 +377,22 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 ---
 
-## 9. S6 之后的演进位（未实现）
+## 9. S7 及之后的演进位（未实现）
 
-下列方向**尚未实现**，只作为后续演进的边界说明；它们不作为 Gate 依据，`docs/security.md` §12 与 `progress.md` 有同一份清单。
+下列方向**尚未实现**，只作为后续演进的边界说明。`docs/security.md` §12 与 `progress.md` 有同一份清单。**S7 的两项交付已全部结案（2026-11-09 / 2026-11-10）**：六协议统一走 `broker_security` 身份表（`docs/security.md` §2.1）；各协议标准 CloudEvents Binding 的结论是「统一 `ce-*` 头通道是本 Broker 的项目定义，逐字实现不立项」，逐协议差异见 `docs/roadmap.md` §9.1 与 `docs/protocol-compatibility.md` §4.10。README §10.2 的 W3C trace context 传播（`docs/security.md` §5.1）也已实现，表格里的「可观测性导出层」特指 OTel 等外部导出器，不是传播本身；「官方 Binding 逐字实现」这一行是**已给出结论、不改实现**的演进位，不是遗漏的待办。
 
-| 方向 | 会动到的结构 | 保持不动的契约 |
-|---|---|---|
-| 非 MQTT 协议的统一认证 | 五个 `broker_proto_*` 的连接握手改走 `broker_security:authenticate/2` | 现有固定/配置租户 `t0` 的发布/订阅 API 不变 |
-| 跨节点/复制通道 TLS | `broker_cluster` 的 ra 复制链路 | Metadata Raft 语义与 Fencing 不变 |
-| Schema Registry 内容校验 | `broker_event` 校验链新增校验器 | 五档策略与冻结的指标键不变 |
-| 审计日志签名与外部 KMS | `broker_config_audit`、`broker_security` 的密钥来源 | 现有脱敏快照与 ACL 判定不变 |
-| 标准 CloudEvents Binding 逐字实现 | `broker_event_binding` 新增各协议标准映射 | 统一 `ce-*` 头通道继续可用；非无损点见 `docs/protocol-compatibility.md` §4.10 |
-| 可观测性导出层 | 在 `broker_metrics:snapshot/0` 之上加 OTel 等导出 | 计数点与冻结的键集合不变 |
+| 方向 | 阶段 | 会动到的结构 | 保持不动的契约 |
+|---|---|---|---|
+| 官方 CloudEvents Binding 逐字实现（差异已逐条列明） | S7 之后（结论已出，不立项） | 需按协议分流：MQTT 5 去前缀、Kafka 换 `ce_`、NATS 补 percent-encoding、WS 加 `cloudevents.json` 子协议、AMQP 迁 1.0 | 统一 `ce-*` 头通道继续作为默认；非无损点见 `docs/protocol-compatibility.md` §4.10 |
+| 跨节点/复制通道 TLS | S7 之后 | `broker_cluster` 的 ra 复制链路 | Metadata Raft 语义与 Fencing 不变 |
+| Schema Registry 内容校验 | S7 之后 | `broker_event` 校验链新增校验器 | 五档策略与冻结的指标键不变 |
+| 审计日志签名与外部 KMS | S7 之后 | `broker_config_audit`、`broker_security` 的密钥来源 | 现有脱敏快照与 ACL 判定不变 |
+| 每条规则可配置的「未知扩展属性拒绝」 | S7 之后 | `broker_event` 策略链 | 五档策略与冻结的指标键不变 |
+| 去重/隔离钩子推广到五协议 | S7 之后 | WS/NATS/AMQP/Kafka/Pulsar 发布路径补 `broker_event:duplicate/1` / `quarantine/2` | 五档策略与 MQTT 现有行为不变；见 `docs/cloudevents-mapping.md` |
+| OTel 等可观测性导出层 | S7 之后 | 在 `broker_metrics:snapshot/0` 之上加 OTel 等导出 | 计数点与冻结的键集合不变；`broker_event_trace` 的校验与门控已实现，不因导出层而改动 |
+| `require_auth` 接进 MQTT CONNECT | S7 之后 | `mqtt_conn_fsm:authenticate/2` 增加 `auth_required(<<"mqtt">>)` 分支 | MQTT 现有的匿名 `client_id` 即 principal 语义（S1 冻结）不变；见 `docs/security.md` §2.2 现状边界 |
+| `broker_meta` 用户表接进数据面认证 | S7 之后 | `broker_security:users/0` 增加 mnesia 读取源 | `authenticate/2`、`authenticate_conn/1` 的对外形态与错误语义不变；ADR-021 §D7 冻结后补充 |
+| `topic_meta` / `queue_meta` / `binding_meta` 的运行时读取方 | S7 之后 | 路由/队列/Topic-Binding 管理路径 | 三张表已建表、有泛型 CRUD；接入读取方不改变现有路由与队列语义 |
 
 ---
 

@@ -98,6 +98,8 @@ Group、分区归属/迁移、Epoch Fencing、失去多数派时的写入策略�
 - ACL 规则按 `{Tenant, Principal, Action, Resource}` 存储，效果 `allow | deny`；
   授权仍只使用认证主体，不读取事件属性（ADR-020 §D9）。
 
+**【冻结后补充，2026-11-10】** 上面第一条的 mnesia 适配**未实现**：`broker_security` 没有任何 `mnesia` / `broker_meta` / `source` 引用，`users/0` 只读 `application:get_env(broker_security, users, [])`，`{source, mnesia}` 这个配置项从未存在（配置项必须有消费者，故不补空壳）。S7（2026-11-09）在 env 静态表之上做了六协议统一：`authenticate_conn/1` 归一化两种凭据形态、租户来自用户记录、`auth_required/1` 决定匿名是否放行（`docs/security.md` §2.1~§2.2）。`broker_meta` 的 `broker_user` 表仍由控制面 CRUD 维护，但与数据面认证**没有接线**；这条接线列为 S7 之后。
+
 ## 后果（Consequences）
 
 - **+** 归属/epoch 有一致性来源，Fencing 可测试；控制面与数据面解耦。

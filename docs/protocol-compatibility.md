@@ -1,10 +1,12 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v1.0（S5 协议扩展全部完成：WebSocket、NATS、AMQP、Kafka、Pulsar）
-- **最近一次追加**：2026-11-09，§4.9「S5 追加」——Pulsar 适配器的范围、限制与真实 `pulsar-client` 证据；§2 替换为 S5 完成态能力矩阵。§4/§4.1~§4.8 原文保留为当时事实
-- **对应 Roadmap**：§7 S5 协议扩展、§9.2 文档产出物
+- **文档版本**：v1.1
+- **最近一次追加**：2026-11-10——§4.10 的 CloudEvents Binding 从「S7 立项」改为**结案结论**（逐协议核对官方 binding 原文后的差异表）；§4.5~§4.9 的证据表补 S7 认证用例与 trace context 用例的**当前**用例数。§4/§4.1~§4.8 原文保留为当时事实
+- **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
+
+> **用例数口径**：本文件的表格里，标「S5 时点」「S3 时点」等字样的是**当时快照**，标「**N 例（当前）**」的是 2026-11-10 从 `all/0`（含 `groups/0` 展开）逐套件清点的当前值。当前全量基线是 `rebar3 ct` **673/673**、**43 个套件**（含 `broker_event_trace_SUITE` 10 例与 `broker_security_identity_SUITE` 10 例）。
 
 > 本文件是 S5 每个协议兼容性测试的基线。S0.4 仅确定「用什么客户端 / 版本 / 语言」并验证其可获取（见 `spikes/s0_4_clients/REPORT.md`）。协议能力、端到端语义、CloudEvents Binding 由 S5 逐协议填充「支持状态」列。
 
@@ -47,7 +49,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth、HPUB/HMSG headers（`ce-*`） | 无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
-| Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema/认证；订阅游标内存态；单租户、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
+| Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id；CONNECT 凭据（`token` / SASL PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema；TLS 由 S6 统一覆盖；订阅游标内存态；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
 
 ---
 
@@ -302,7 +304,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | WS 帧编解码（`ws_frame_SUITE`） | 9 例：握手 accept、掩码/分片、控制帧、close 载荷 |
-| WS 连接/应用协议（`ws_conn_SUITE`） | 14 例（S5 时点；S6 追加 `cloudevent_headers_roundtrip` 后共 15 例）：connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack |
+| WS 连接/应用协议（`ws_conn_SUITE`） | **22 例（当前）**：S5 时点 14 例（connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack、明文 HTTP 拒绝）；S6 追加 `cloudevent_headers_roundtrip`（15）；S7 追加凭据解析、错误凭据拒绝、客户端自带租户被忽略、`require_auth` 四例（19）；trace context 追加往返、`off` 时剥离、非法 `traceparent` 不传播三例（22） |
 | 真实第三方客户端（`ws_compat.py`） | 10/10 PASS（见上） |
 | 全量 | `rebar3 ct` **470/470**；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 
@@ -334,7 +336,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 2. **at-most-once**：core NATS 没有 ack 握手。适配器在 MSG 写出后立即 `broker_subscription:ack/4` 自己的 cursor；连接在写出后崩溃可能丢这一条（与 NATS core 一致），但 broker 侧消息已 fsync，可被后续订阅/其他成员读取。
 3. **`>` 父级匹配差异**：broker 的 `#` 匹配父级，NATS 的 `>` 不匹配。已作为转换损失记录。
 4. **每连接一个匿名 client_id**：NATS 无持久会话/客户端标识，重连即新 `ClientId`；不支持 MQTT 式 session takeover。
-5. **单 tenant**：沿用 S1 单租户 `t0`；多租户隔离在 S6。
+5. **租户来自身份表**：CONNECT 的 `user`/`pass` 经 `broker_security:authenticate_conn/1` 解析，租户取匹配到的用户记录（`docs/security.md` §2.1）；未配 `require_auth` 时不带凭据的连接按部署默认租户匿名运行，客户端不能自称任意租户。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -346,7 +348,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 | 层 | 用例 |
 |---|---|
-| NATS 线协议/连接（`nats_conn_SUITE`） | 15 例（S5 时点；S6 追加 `cloudevent_headers_roundtrip` 后共 16 例）：INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK` |
+| NATS 线协议/连接（`nats_conn_SUITE`） | **20 例（当前）**：S5 时点 15 例（INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK`）；S6 追加 `cloudevent_headers_roundtrip`（16）；S7 追加有效/错误凭据、`require_auth`（19）；trace context 追加 `HMSG` 往返（20） |
 | 真实第三方客户端（`nats_compat.py` + `nats.go`） | 11/11 PASS（见上） |
 | 全量 | `rebar3 ct` **485/485**（470 + 15）；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 
@@ -376,7 +378,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、prefetch 限流、多通道隔离 | 无 `basic.get`（回 get-empty）、无 `mandatory` 的 `basic.return`、无 headers exchange 路由、拓扑瞬态（重启不保留 exchange/queue/binding）、无 publisher confirm/事务、单租户 `t0` | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
+| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、`start-ok` 的 SASL/PLAIN 凭据（走统一身份表）、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、prefetch 限流、多通道隔离 | 无 `basic.get`（回 get-empty）、无 `mandatory` 的 `basic.return`、无 headers exchange 路由、拓扑瞬态（重启不保留 exchange/queue/binding）、无 publisher confirm/事务；未配 `require_auth` 时匿名连接按部署默认租户运行 | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -386,7 +388,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 3. **无 `basic.return`**：`mandatory=true` 的不可路由消息被丢弃且不回报（不静默改变路由，但也不回 `basic.return`）。
 4. **headers exchange 不路由**：可声明，但不会按 headers 匹配投递。
 5. **消费者加入前已入队的消息不回放**：共享游标在消费者 join 时锚定到分区尾部；v1 的消费语义针对“消费者已在线时发布的消息”。这与 durable queue 的完整语义有差距，已显式记录。
-6. **无 publisher confirm / 事务 / SASL 校验**：`start-ok` 的机制/响应被解析但不做认证；单租户 `t0`，S6 再补。
+6. **无 publisher confirm / 事务**：`start-ok` 现在按 SASL/PLAIN 解析 `\0user\0pass` 并交给 `broker_security:authenticate_conn/1`，租户来自匹配到的用户记录（`docs/security.md` §2.1）；空响应的匿名连接按部署默认租户运行，凭据错误回 `ACCESS_REFUSED` 并关闭连接。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -398,7 +400,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | AMQP 帧/字段表（`amqp_codec_SUITE`） | 14 例（S5 时点；S6 追加 `properties_roundtrip_with_ce_headers` 后共 15 例）：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
-| AMQP 连接/通道（`amqp_conn_SUITE`） | 14 例：握手+通道、direct publish/consume/ack、routing key 隔离、fanout、topic、unbind、queue delete、passive 缺失、nack requeue、prefetch、多通道、connection.close、heartbeat、坏帧尾断开 |
+| AMQP 连接/通道（`amqp_conn_SUITE`） | **17 例（当前）**：S5 时点 14 例（握手+通道、direct publish/consume/ack、routing key 隔离、fanout、topic、unbind、queue delete、passive 缺失、nack requeue、prefetch、多通道、connection.close、heartbeat、坏帧尾断开）；S7 追加有效/错误凭据、`require_auth` 三例 |
 | 真实第三方客户端（`amqp_compat.py` + `amqp091-go`） | 13/13 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：
@@ -429,7 +431,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| Kafka | 部分支持 | Produce/Fetch/Metadata/ListOffsets、经典消费组（FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup）、OffsetCommit/OffsetFetch、RecordBatch v2（key/value/headers/timestamp）、多分区 | 单节点协调器、offset 内存态（重启丢）、无 `__consumer_offsets`、无事务/幂等去重、无压缩、无 Admin API（CreateTopics/DeleteTopics 等）、无 SASL/TLS、单租户 `t0` | apps/broker_proto_kafka/test/、test/protocol-compatibility/kafka/ |
+| Kafka | 部分支持 | Produce/Fetch/Metadata/ListOffsets、经典消费组（FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup）、OffsetCommit/OffsetFetch、RecordBatch v2（key/value/headers/timestamp）、多分区、`SaslHandshake`/`SaslAuthenticate`（SASL/PLAIN，走统一身份表） | 单节点协调器、offset 内存态（重启丢）、无 `__consumer_offsets`、无事务/幂等去重、无压缩、无 Admin API（CreateTopics/DeleteTopics 等）；TLS 由 S6 的 `broker_security_tls` 统一覆盖；未配 `require_auth` 时不带凭据的连接按部署默认租户匿名运行 | apps/broker_proto_kafka/test/、test/protocol-compatibility/kafka/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -439,7 +441,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 3. **消费组 offset 内存态**：`kafka_group` 的 committed offsets 在 broker 重启后清空；无 `__consumer_offsets` 主题，多节点不共享协调器。
 4. **无事务/幂等去重**：InitProducerId 返回固定值，`enable.idempotence=true` 的客户端可连接，但重复批次不会被服务端去重。
 5. **无压缩**：客户端若配置 `compression.type` 非 none，Produce 解码返回错误；官方客户端默认 none，故 12 例实测通过。
-6. **无 Admin API / SASL**：topic 自动可见但不可创建/删除；TLS 已由 S6 的 `broker_security_tls` 覆盖（六协议统一开关），SASL/统一认证仍未实现（`docs/security.md` §12）。
+6. **无 Admin API**：topic 自动可见但不可创建/删除。SASL/PLAIN（`SaslHandshake` + `SaslAuthenticate`）已接入 `broker_security:authenticate_conn/1`，凭据与 MQTT 共用同一张身份表（`docs/security.md` §2.1）；TLS 已由 S6 的 `broker_security_tls` 覆盖（六协议统一开关）。未开启 `require_auth` 时，不带凭据的连接按部署默认租户匿名运行。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -451,7 +453,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | Kafka 原语/RecordBatch（`kafka_codec_SUITE`） | 11 例：uvarint/varint/varlong、string/bytes/array、compact 值、CRC32C 已知向量、批次往返、多记录偏移、headers/timestamp、CRC 篡改检测、截断批次、空批次 |
-| Kafka 连接/协议（`kafka_conn_SUITE`） | 14 例：ApiVersions v0/v3、Metadata、Produce→Fetch、topic 相对 offset、批次连续 offset、ListOffsets earliest/latest、空 topic、非法分区、FindCoordinator、Join/Sync/Heartbeat、OffsetCommit/Fetch、LeaveGroup、correlation id 回显 |
+| Kafka 连接/协议（`kafka_conn_SUITE`） | **17 例（当前）**：S5 时点 14 例（ApiVersions v0/v3、Metadata、Produce→Fetch、topic 相对 offset、批次连续 offset、ListOffsets earliest/latest、空 topic、非法分区、FindCoordinator、Join/Sync/Heartbeat、OffsetCommit/Fetch、LeaveGroup、correlation id 回显）；S7 追加 SASL/PLAIN 握手、错误密码拒绝、未知机制拒绝三例 |
 | 真实第三方客户端（`kafka_compat.py` + `kafka-clients` 3.7.1） | 12/12 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：
@@ -485,7 +487,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| Pulsar | 部分支持 | 官方 Java Client 的 Connect/Lookup/PartitionedMetadata/Producer/Send（含 batch）/Subscribe/Flow/Ack/Seek/Unsubscribe/Ping/GetLastMessageId；properties、key、event_time、sequence_id | 无 BookKeeper/ledger（ADR-006）；无事务、无压缩、无 Key_Shared hash range、无 read-compacted、无 schema、无认证/TLS；订阅游标内存态（重启重置）；单租户 `t0`、全部写入分区 0 | apps/broker_proto_pulsar/test/、test/protocol-compatibility/pulsar/ |
+| Pulsar | 部分支持 | 官方 Java Client 的 Connect/Lookup/PartitionedMetadata/Producer/Send（含 batch）/Subscribe/Flow/Ack/Seek/Unsubscribe/Ping/GetLastMessageId；properties、key、event_time、sequence_id；CONNECT `auth_method_name`/`auth_data`（`token` 与 SASL/PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）；无事务、无压缩、无 Key_Shared hash range、无 read-compacted、无 schema；TLS 由 S6 的 `broker_security_tls` 统一覆盖；订阅游标内存态（重启重置）；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0 | apps/broker_proto_pulsar/test/、test/protocol-compatibility/pulsar/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -494,7 +496,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 2. **订阅游标内存态**：`pulsar_subscriptions` 的 cursor/unacked 在 broker 重启后重置；durable 订阅的持久化尚未实现（S6 之后）。
 3. **单分区**：所有 topic 都写入 broker 分区 0，`PARTITIONED_METADATA` 回 0；不支持分区 topic 的 per-partition lookup。
 4. **无事务/压缩/Key_Shared/schema**：`num_messages>1` 视为 batch；压缩位、事务标记、Key_Shared hash range、schema 均不支持；客户端默认不启用这些特性，故 8 例实测通过。
-5. **统一认证未实现 / TLS 已覆盖**：TLS 由 S6 的 `broker_security_tls` 覆盖；`CONNECT` 的 auth 字段被忽略，统一认证仍未实现（`docs/security.md` §12）。
+5. **统一认证已接入 / TLS 已覆盖**：`CONNECT` 的 `auth_method_name`/`auth_data` 现在经 `broker_security:authenticate_conn/1` 校验（`token` 与 SASL/PLAIN 两种承载），租户来自匹配到的用户记录；TLS 由 S6 的 `broker_security_tls` 覆盖。未开启 `require_auth` 时匿名连接按部署默认租户运行，见 `docs/security.md` §2.1。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -506,7 +508,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | Pulsar 编解码（`pulsar_codec_SUITE`） | 15 例：CRC32C 已知向量、command_size 前缀、CONNECT/PRODUCER/SUBSCRIBE/SEND/ACK/SEEK 解码、payload 往返、CRC 篡改检测、无 magic 旧格式、batch 负载、MessageMetadata/SingleMessageMetadata 往返、CONNECTED 帧 |
-| Pulsar 连接/订阅（`pulsar_conn_SUITE`） | 16 例：connect、partitioned-metadata=0、lookup broker URL、producer success、单发/批量 SEND→receipt、subscribe/flow 顺序投递、ack 后 unacked 清零、ack response 回显 request id、未 ack 关闭后重投、seek 回放、ping/pong、last-message-id、close producer、unsubscribe、未知 producer 报错 |
+| Pulsar 连接/订阅（`pulsar_conn_SUITE`） | **19 例（当前）**：S5 时点 16 例（connect、partitioned-metadata=0、lookup broker URL、producer success、单发/批量 SEND→receipt、subscribe/flow 顺序投递、ack 后 unacked 清零、ack response 回显 request id、未 ack 关闭后重投、seek 回放、ping/pong、last-message-id、close producer、unsubscribe、未知 producer 报错）；S7 追加 token/SASL-PLAIN 认证、错误 token 拒绝三例 |
 | 真实第三方客户端（`pulsar_compat.py` + `pulsar-client` 3.3.1） | 8/8 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：
@@ -524,7 +526,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-### 4.10 CloudEvents Binding 现状（S5/S6 口径）
+### 4.10 CloudEvents Binding 现状（S5–S7 口径）
 
 ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S6 补齐其余五个协议的 **Binary Mode**，统一采用协议中立的头通道：
 
@@ -535,7 +537,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 | 协议 | Structured Mode（事件 JSON 在消息体） | Binary Mode（上下文 → 协议元数据） | 说明 |
 |---|---|---|---|
-| MQTT | ✅ 正向 + 反向 + 损失报告 | ✅ 仅 MQTT 5（`ce-*` User Properties）；3.1.1 返回损失清单 | `broker_event_binding`，§4.3 |
+| MQTT | ✅ 正向 + 反向 + 损失报告 | ✅ 仅 MQTT 5（`ce-*` User Properties）；3.1.1 返回损失清单 | `broker_event_binding`，§4.3。`ce-` 前缀是本 Broker 方言，官方 MQTT 5 Binding 要求属性名**不带前缀**（见下表） |
 | WebSocket | ✅ payload 逐字节透传 | ✅ 应用帧顶层 `ce-*` 键 + `content-type`；投递帧原样回传 | `broker_event_binding:to_headers/3` |
 | NATS | ✅ payload 逐字节透传 | ✅ `HPUB` 头块 `ce-*`；投递用 `HMSG`（客户端须在 CONNECT 声明 `headers: true`，否则退化为 `MSG` 并丢失属性） | NATS 2.2 headers |
 | AMQP | ✅ payload 逐字节透传 | ✅ basic properties 的 `headers` table 放 `ce-*`，`content_type` 放 `content-type`；投递写回 properties | AMQP 0-9-1 |
@@ -551,6 +553,22 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 - AMQP 0-9-1 的 `basic.publish` 没有逐消息否认；策略拒绝表现为 channel error 406，客户端必须重新打开 channel。
 
 「逐字节透传」意味着：一个合法的 Structured CloudEvents JSON 通过这五个协议发布再消费，**字节不变**（因此 `id`/`source`/`type`/扩展都保留）。
+
+> **S7 结案（2026-11-10）**：上面是统一 `ce-*` 头通道的现状，**不是**各协议官方 Binding 的逐字实现。逐协议的官方条文核对结论已写入 `docs/roadmap.md` §9.1（Gate S7 第 3 项已勾选），要点：
+
+| 协议 | 官方规范要求 | 与本节实现的关系 |
+|---|---|---|
+| MQTT 5 | §3.1.3.1 属性名 **MUST 不加前缀**（`specversion`、`id`…）；`datacontenttype` → `Content Type` | 我们用 `ce-*` 前缀，**非逐字** |
+| MQTT 3.1.1 | §1.3 内容模式**恒为 structured**，无 binary mode | 我们的 structured 合规；binary 是额外扩展（有 `losses` 报告） |
+| WebSocket | §1.3 恒 structured + §1.5 `Sec-WebSocket-Protocol: cloudevents.json` 子协议协商 | 我们的 WS 是并列的自有协议，**未实现**官方绑定 |
+| NATS | §3.1.3.1 前缀 `ce-`；§3.1.3.2 值 **MUST** percent-encode | 键名一致，**缺 percent-encoding** |
+| Kafka | §3.2.3 前缀 **`ce_`（下划线）** | 我们用 `ce-`，**非逐字** |
+| AMQP | 只有 **AMQP 1.0** 规范（`cloudEvents_`/`cloudEvents:` 前缀，application-properties） | 我们是 0-9-1 + `headers` table，**规范不覆盖** |
+| Pulsar | 官方 bindings 目录**无此文件** | 无官方 Binding |
+
+结论：统一 `ce-*` 头通道**是本 Broker 的项目定义**，六个协议共享它以保证跨协议零重映射转发；逐字实现各协议官方绑定**不立项**（与统一通道互斥，且会破坏既有真实客户端套件）。上表的差异是显式声明的，不是待办遗漏。本节的等价映射与非无损点继续有效，不因结案而改写。
+
+> **W3C trace context（README §10.2）**：`traceparent` / `tracestate` 与 CloudEvents 属性共用同一张 `headers` map，但键名独立（无 `ce-` 前缀），由 `broker_event_trace` 在 `broker_event:apply_policy/2` 上统一校验与门控。WS/NATS 的白名单头通道只在开启传播时放行这两个键；AMQP/Kafka/Pulsar 全量透传 headers，也由同一 seam 在 `off` 时剥离；MQTT 5 走 ADR-020 的 User Property 通道，`mqtt_conn_fsm` 入站把这两个键提到 `headers`、投递时回填，同样受 `off` 门控（3.1.1 无此通道）。安全边界见 `docs/security.md` §5.1。
 
 ---
 

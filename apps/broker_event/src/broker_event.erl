@@ -70,7 +70,17 @@ apply_policy(Msg) ->
 -spec apply_policy(#broker_message{}, policy() | term()) ->
           {ok, #broker_message{}} | {error, term()}.
 apply_policy(#broker_message{} = Msg, Policy) ->
-    try apply_policy0(Msg, Policy)
+    try
+        case apply_policy0(Msg, Policy) of
+            {ok, Accepted} ->
+                %% README §10.2: trace context propagation is orthogonal to
+                %% the CloudEvents policy, so it runs on the accepted message
+                %% regardless of which policy was selected.  Off by default
+                %% (broker_event_trace:propagate/1 is then the identity).
+                {ok, broker_event_trace:propagate(Accepted)};
+            {error, _} = Error ->
+                Error
+        end
     catch
         Class:Reason:Stack ->
             %% The seam must not take the publisher down. A defect is reported

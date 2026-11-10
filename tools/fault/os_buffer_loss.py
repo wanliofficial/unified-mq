@@ -373,8 +373,10 @@ def main(argv=None):
     parser.add_argument("--osbuffer", type=int, default=64, help="M: os_buffer-mode records")
     parser.add_argument("--keep-data", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
-    parser.add_argument("--report", action="store_true", default=True,
-                        help="write docs/benchmarks/reliability/report-*.json")
+    parser.add_argument("--out", default=None,
+                        help="write the JSON report here instead of "
+                             "docs/benchmarks/reliability/report-*.json (CI uses "
+                             "this to keep the checkout clean)")
     args = parser.parse_args(argv)
 
     if not args.skip_build:
@@ -425,15 +427,20 @@ def main(argv=None):
         except Exception:
             pass
 
-    if args.report:
+    payload = json.dumps(
+        {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+         "results": results, "failures": failures},
+        indent=2, sort_keys=True) + "\n"
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload)
+    else:
         RELIABILITY.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         out = RELIABILITY / f"report-osbuffer-{'-'.join(names)}-{stamp}.json"
-        out.write_text(json.dumps(
-            {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-             "results": results, "failures": failures},
-            indent=2, sort_keys=True) + "\n")
-        print(f"\nREPORT {out}", flush=True)
+        out.write_text(payload)
+    print(f"\nREPORT {out}", flush=True)
 
     passed = len(results)
     print(f"SUMMARY passed={passed} failed={len(failures)}", flush=True)

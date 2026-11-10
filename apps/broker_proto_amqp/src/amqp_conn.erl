@@ -49,6 +49,7 @@
     phase = start :: start | tune | open | ready,
     client_id :: binary() | undefined,
     tenant = <<"t0">> :: binary(),
+    principal = undefined :: binary() | undefined,
     frame_max = ?FRAME_MAX :: pos_integer(),
     channels = #{} :: #{non_neg_integer() => #ch{}},
     tick :: reference() | undefined
@@ -148,6 +149,44 @@ handle_frame(_Frame, St) ->
 
 %%%_* Handshake ------------------------------------------------------------
 
+%% @doc Resolve the start-ok credential against the shared broker_security
+%% identity table (S7) -- the same table MQTT uses.
+%%
+%% AMQP 0-9-1's PLAIN mechanism carries the response as `\0user\0password';
+%% that is the shape this adapter reads.  `AMQPLAIN' and `EXTERNAL' are
+%% accepted as "no credential offered" -- the former names a mechanism this
+%% adapter does not implement, the latter defers to an external layer.
+%%
+%% A client that offers no usable credential stays anonymous unless the
+%% deployment requires one.
+authenticate(Mechanism, Response) ->
+    case plain_credentials(Mechanism, Response) of
+        {ok, {user_pass, User, Pass}} ->
+            finish(broker_security:authenticate_conn({user_pass, User, Pass}));
+        none ->
+            case broker_security:auth_required(<<"amqp">>) of
+                true -> {error, unauthenticated};
+                false -> {ok, anonymous_identity()}
+            end
+    end.
+
+plain_credentials(<<"PLAIN">>, Response) when is_binary(Response) ->
+    case binary:split(Response, <<0>>, [global]) of
+        %% An empty user AND password is what a client with no credentials
+        %% sends -- that is "no credential offered", not a wrong one.
+        [_, <<>>, <<>>] -> none;
+        [_, User, Pass] -> {ok, {user_pass, User, Pass}};
+        _ -> none
+    end;
+plain_credentials(_Mechanism, _Response) ->
+    none.
+
+finish({ok, Identity}) -> {ok, Identity};
+finish({error, _}) -> {error, unauthenticated}.
+
+anonymous_identity() ->
+    #{principal => undefined, tenant_id => broker_security:default_tenant()}.
+
 send_start(St) ->
     Props = amqp_codec:encode_table(#{<<"product">> => <<"UnifiedMQ">>,
                                       <<"version">> => <<"0.1.0">>,
@@ -160,10 +199,28 @@ send_start(St) ->
 handle_method(0, 10, 11, Args, #st{phase = start} = St) ->
     %% connection.start-ok: client-properties, mechanism, response, locale.
     {_Props, Rest1} = amqp_codec:get_table(Args),
-    {_Mechanism, Rest2} = amqp_codec:get_shortstr(Rest1),
-    {_Response, Rest3} = amqp_codec:get_longstr(Rest2),
+    {Mechanism, Rest2} = amqp_codec:get_shortstr(Rest1),
+    {Response, Rest3} = amqp_codec:get_longstr(Rest2),
     {_Locale, _} = amqp_codec:get_shortstr(Rest3),
-    send_tune(St#st{phase = tune});
+    %% The credential, when the client offered one, resolves against the
+    %% shared broker_security identity table (S7) -- the same table MQTT uses.
+    %% AMQP 0-9-1's PLAIN mechanism carries `\0user\0password'; that is the
+    %% shape this adapter reads.  A client that offers no mechanism stays
+    %% anonymous unless the deployment requires one.
+    case authenticate(Mechanism, Response) of
+        {ok, Identity} ->
+            send_tune(St#st{phase = tune, tenant = maps:get(tenant_id, Identity),
+                            principal = maps:get(principal, Identity)});
+        {error, _} ->
+            %% A rejected credential is a connection-level failure, not a
+            %% channel one: the handshake never completed.  connection.close
+            %% carries a reply-code and a reply-text.
+            CloseArgs = iolist_to_binary(
+                          [amqp_codec:encode_shortstr(<<"ACCESS_REFUSED">>),
+                           amqp_codec:encode_shortstr(<<"authentication failed">>)]),
+            send_method(0, 10, 50, CloseArgs, St),
+            {stop, normal, St}
+    end;
 handle_method(0, 10, 31, Args, #st{phase = tune} = St) ->
     %% connection.tune-ok: channel-max, frame-max, heartbeat.
     <<_ChannelMax:16, FrameMax:32, _Heartbeat:16>> = Args,

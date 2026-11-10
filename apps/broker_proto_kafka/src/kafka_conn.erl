@@ -46,13 +46,16 @@
 -define(SYNC_GROUP, 14).
 -define(API_VERSIONS, 18).
 -define(INIT_PRODUCER_ID, 22).
+-define(SASL_HANDSHAKE, 17).
+-define(SASL_AUTHENTICATE, 36).
 
 %% Advertised versions: exactly what this module implements.
 -define(SUPPORTED,
         [{?PRODUCE, 8}, {?FETCH, 11}, {?LIST_OFFSETS, 5}, {?METADATA, 8},
          {?OFFSET_COMMIT, 7}, {?OFFSET_FETCH, 5}, {?FIND_COORDINATOR, 2},
          {?JOIN_GROUP, 5}, {?HEARTBEAT, 3}, {?LEAVE_GROUP, 3},
-         {?SYNC_GROUP, 3}, {?INIT_PRODUCER_ID, 0}]).
+         {?SYNC_GROUP, 3}, {?INIT_PRODUCER_ID, 0},
+         {?SASL_HANDSHAKE, 1}, {?SASL_AUTHENTICATE, 1}]).
 
 -record(st, {
     ref :: term(),
@@ -61,6 +64,11 @@
     buffer = <<>> :: binary(),
     client_id :: binary() | undefined,
     tenant = <<"t0">> :: binary(),
+    principal = undefined :: binary() | undefined,
+    %% Kafka's SASL is a two-step exchange the client starts before anything
+    %% else: SaslHandshake names the mechanism, SaslAuthenticate carries the
+    %% credentials.  `sasl_done' records whether that exchange succeeded.
+    sasl_done = false :: boolean(),
     port = 0 :: inet:port_number(),
     groups = #{} :: #{binary() => binary()},   % group => member id
     pending_sync = #{} :: #{{binary(), binary()} => integer()},
@@ -166,6 +174,10 @@ request_header(_ApiKey, _Version, Bin) ->
 
 dispatch(?API_VERSIONS, Version, Corr, Body, St) ->
     handle_api_versions(Version, Corr, Body, St);
+dispatch(?SASL_HANDSHAKE, 1, Corr, Body, St) ->
+    handle_sasl_handshake(Corr, Body, St);
+dispatch(?SASL_AUTHENTICATE, 1, Corr, Body, St) ->
+    handle_sasl_authenticate(Corr, Body, St);
 dispatch(?METADATA, 8, Corr, Body, St) ->
     handle_metadata(Corr, Body, St);
 dispatch(?PRODUCE, 8, Corr, Body, St) ->
@@ -192,6 +204,86 @@ dispatch(?INIT_PRODUCER_ID, 0, Corr, Body, St) ->
     handle_init_producer_id(Corr, Body, St);
 dispatch(ApiKey, _Version, _Corr, _Body, St) ->
     {stop, {unsupported_api, ApiKey}, St}.
+
+%%%_* SASL ----------------------------------------------------------------
+
+%% @doc SaslHandshake (API 17, v1): the client names the mechanism.
+%%
+%% The reply lists the mechanisms this broker offers.  Only PLAIN is
+%% implemented: it is the one the official kafka-clients speaks without a
+%% Kerberos/JAAS realm, and it carries exactly the user/password pair the
+%% shared identity table holds.
+handle_sasl_handshake(Corr, Body, St) ->
+    {Mechanism, _} = kafka_codec:get_string(Body),
+    case Mechanism of
+        <<"PLAIN">> ->
+            %% error_code 0 = none; mechanisms = ["PLAIN"].
+            Reply = iolist_to_binary(
+                       [kafka_codec:int16(0),
+                        kafka_codec:array(fun kafka_codec:string/1, [<<"PLAIN">>])]),
+            send_response(Corr, Reply, St);
+        _ ->
+            %% error_code 33 = UNSUPPORTED_SASL_MECHANISM.
+            Reply = iolist_to_binary(
+                       [kafka_codec:int16(33),
+                        kafka_codec:array(fun kafka_codec:string/1, [])]),
+            send_response(Corr, Reply, St)
+    end.
+
+%% @doc SaslAuthenticate (API 36, v1): the client sends the credentials.
+%%
+%% PLAIN's payload is `\0username\0password'.  It resolves against the shared
+%% broker_security identity table (S7) -- the same table MQTT uses -- so a
+%% Kafka client authenticates into the same identity space as every other
+%% protocol and gets the tenant from the same user record.
+handle_sasl_authenticate(Corr, Body, St) ->
+    {AuthBytes, _} = kafka_codec:get_bytes(Body),
+    case authenticate(AuthBytes) of
+        {ok, Identity} ->
+            St1 = St#st{tenant = maps:get(tenant_id, Identity),
+                        principal = maps:get(principal, Identity),
+                        sasl_done = true},
+            %% error_code 0, no error message, empty auth bytes,
+            %% session lifetime 0 (the session does not expire).
+            Reply = <<(kafka_codec:int16(0))/binary,
+                      (kafka_codec:nullable_string(undefined))/binary,
+                      (kafka_codec:bytes(<<>>))/binary,
+                      (kafka_codec:int64(0))/binary>>,
+            send_response(Corr, Reply, St1);
+        {error, _} ->
+            %% error_code 58 = SASL_AUTHENTICATION_FAILED.
+            Reply = <<(kafka_codec:int16(58))/binary,
+                      (kafka_codec:nullable_string(<<"Authentication failed: Invalid username or password">>))/binary,
+                      (kafka_codec:bytes(<<>>))/binary,
+                      (kafka_codec:int64(0))/binary>>,
+            send_response(Corr, Reply, St)
+    end.
+
+%% @doc Resolve a PLAIN payload against the shared identity table.
+%%
+%% PLAIN is `\0username\0password'.  An empty user AND password is what a
+%% client with no credentials sends -- that is "no credential offered", not a
+%% wrong one.
+authenticate(AuthBytes) when is_binary(AuthBytes) ->
+    case binary:split(AuthBytes, <<0>>, [global]) of
+        [_, <<>>, <<>>] -> anonymous();
+        [_, User, Pass] ->
+            case broker_security:authenticate_conn({user_pass, User, Pass}) of
+                {ok, Identity} -> {ok, Identity};
+                {error, _} -> {error, unauthenticated}
+            end;
+        _ ->
+            {error, unauthenticated}
+    end;
+authenticate(_Other) ->
+    {error, unauthenticated}.
+
+anonymous() ->
+    case broker_security:auth_required(<<"kafka">>) of
+        true -> {error, unauthenticated};
+        false -> {ok, #{principal => undefined,
+                        tenant_id => broker_security:default_tenant()}}
+    end.
 
 %%%_* ApiVersions ---------------------------------------------------------
 
@@ -814,11 +906,11 @@ destination(Topic) -> <<"kafka/", Topic/binary>>.
 partition_count() ->
     length(broker_queue:partition_ids()).
 
-route_refs(Destination, _St) ->
+route_refs(Destination, St) ->
     case broker_router:env() of
         {ok, Env} ->
             Backend = application:get_env(broker_router, backend, broker_router_hash),
-            Ctx = #route_ctx{tenant_id = <<"t0">>, publisher = <<"kafka">>,
+            Ctx = #route_ctx{tenant_id = St#st.tenant, publisher = <<"kafka">>,
                              reliability = fsync},
             case Backend:route(Destination, Ctx, Env) of
                 {ok, [{_Partition, Refs}]} -> Refs;

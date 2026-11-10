@@ -13,6 +13,8 @@
 
 -define(N, 2).
 -define(REF, {nats, 0}).
+-define(VALID_PARENT,
+        <<"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01">>).
 
 -record(c, {s :: gen_tcp:socket(), buf = <<>> :: binary()}).
 
@@ -32,7 +34,11 @@ all() ->
      oversized_payload_is_refused,
      auth_failure_is_refused,
      unknown_operation_is_refused,
-     verbose_sends_ok].
+     verbose_sends_ok,
+     a_valid_credential_is_accepted,
+     a_wrong_credential_is_refused,
+     require_auth_refuses_an_anonymous_connect,
+     trace_context_roundtrips_through_hmsg].
 
 suite() -> [{timetrap, {seconds, 60}}].
 
@@ -67,8 +73,16 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 20),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 20),
     ok = application:set_env(broker_event, policy, pass_through),
-    ok = application:set_env(broker_security, users, []),
+    %% README §10.2: trace propagation is opt-in; keep every other case on the
+    %% default (off) even if a previous case enabled it.
+    ok = application:set_env(broker_event, trace_context, off),
+    %% S7: the CONNECT's user/pass resolves against the shared
+    %% broker_security identity table, so the suite needs a user to
+    %% authenticate as.
+    ok = application:set_env(broker_security, users,
+                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_nats, listeners,
                              [#{port => 0, ref => ?REF,
                                 num_acceptors => 4, max_connections => 128}]),
@@ -297,6 +311,61 @@ verbose_sends_ok(Config) ->
     {<<"+OK">>, C2} = recv_line(C1),
     {<<"+OK">>, C3} = sub_verbose(C2, <<"v.a">>, <<"1">>),
     close(C3),
+    ok.
+
+%%%_* S7: the shared identity table -----------------------------------------
+
+a_valid_credential_is_accepted(Config) ->
+    %% Requiring a credential makes this a real assertion: without the valid
+    %% one the connection would be refused rather than falling through to the
+    %% anonymous path.
+    application:set_env(broker_security, require_auth, [<<"nats">>]),
+    C0 = raw_open(Config),
+    C1 = connect_raw(C0, #{<<"user">> => <<"alice">>, <<"pass">> => <<"pw">>}),
+    %% A CONNECT that succeeds produces no error line; the PING/PONG that
+    %% follows proves the connection is alive rather than half-open.
+    {<<"PONG">>, C2} = ping(C1),
+    close(C2),
+    ok.
+
+a_wrong_credential_is_refused(Config) ->
+    C0 = raw_open(Config),
+    C1 = connect_raw(C0, #{<<"user">> => <<"alice">>, <<"pass">> => <<"wrong">>}),
+    {Line, _C2} = recv_line(C1),
+    <<"-ERR 'Authorization Violation'", _/binary>> = Line,
+    ok.
+
+require_auth_refuses_an_anonymous_connect(Config) ->
+    application:set_env(broker_security, require_auth, [<<"nats">>]),
+    C0 = raw_open(Config),
+    C1 = connect_raw(C0, #{}),
+    {Line, _C2} = recv_line(C1),
+    <<"-ERR 'Authorization Violation'", _/binary>> = Line,
+    ok.
+
+%%%_* README §10.2: trace context over the HPUB/HMSG channel --------------
+
+trace_context_roundtrips_through_hmsg(Config) ->
+    ok = application:set_env(broker_event, trace_context, on),
+    %% The header block counts against `max_payload'; the trace headers need
+    %% room, while the fixture default stays at 64 bytes for other cases.
+    ok = application:set_env(broker_proto_nats, max_payload, 1024),
+    try
+        Sub = open(Config, #{<<"headers">> => true}),
+        Pub = open(Config, #{<<"headers">> => true}),
+        {_, Sub1} = sub(Sub, <<"tr.a">>, undefined, <<"1">>),
+        {_, Pub1} = pub_headers(Pub, <<"tr.a">>, undefined,
+                                #{<<"traceparent">> => ?VALID_PARENT,
+                                  <<"tracestate">> => <<"vendor=v">>},
+                                <<"body">>),
+        {<<"tr.a">>, <<"1">>, undefined, Headers, <<"body">>, Sub2} =
+            recv_hmsg(Sub1),
+        ?assertEqual(?VALID_PARENT, maps:get(<<"traceparent">>, Headers)),
+        ?assertEqual(<<"vendor=v">>, maps:get(<<"tracestate">>, Headers)),
+        close(Sub2), close(Pub1)
+    after
+        application:set_env(broker_event, trace_context, off)
+    end,
     ok.
 
 sub_verbose(C, Subject, Sid) ->

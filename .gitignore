@@ -43,6 +43,7 @@ spikes/*/.data/
 /tools/docker/run/
 /tools/docker/__pycache__/
 /tools/docker/powerloss.img
+/tools/docker/powerloss-mount/
 
 # S2-B surrogate scratch
 /tools/fault/__pycache__/

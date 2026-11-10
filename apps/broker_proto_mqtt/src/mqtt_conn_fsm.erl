@@ -859,6 +859,7 @@ reliability_of(_) ->
 
 build_message(Topic, Payload, QoS, WirePid, Partition, Retain, Props, D) ->
     Created = erlang:system_time(millisecond),
+    {TraceHeaders, Props1} = take_trace_properties(Props),
     #broker_message{
       message_id = crypto:strong_rand_bytes(16),
       tenant_id = D#st.tenant_id,
@@ -866,10 +867,10 @@ build_message(Topic, Payload, QoS, WirePid, Partition, Retain, Props, D) ->
       partition_id = Partition,
       payload = Payload,
       payload_encoding = raw,
-      headers = #{},
+      headers = TraceHeaders,
       proto_meta = maps:merge(#{qos => QoS, dup => 0, retain => Retain,
                                 packet_id => WirePid},
-                              mqtt_meta(Props)),
+                              mqtt_meta(Props1)),
       persistence = case QoS of 0 -> transient; _ -> durable end,
       reliability = reliability_of(QoS),
       created_at = Created,
@@ -910,6 +911,44 @@ mqtt_meta(Props) ->
                  {content_type, mqtt_content_type},
                  {response_topic, mqtt_response_topic},
                  {correlation_data, mqtt_correlation_data}]).
+
+%% README §10.2 / ADR-017 §17.2: MQTT 5 PUBLISH properties live in
+%% `proto_meta', not `headers'.  Lift the two W3C trace keys into `headers'
+%% so the shared `broker_event:apply_policy/2' seam validates and gates them
+%% exactly as it does for the five header-channel protocols, and strip them
+%% from the property list so an opted-out deployment cannot leak the raw
+%% client value through the unchanged property round-trip.  3.1.1 has no
+%% properties, so this is a no-op there.
+take_trace_properties(Props) when is_map(Props) ->
+    case maps:get(user_properties, Props, []) of
+        Pairs when is_list(Pairs) ->
+            Trace = trace_pairs(Pairs),
+            Rest = [{K, V} || {K, V} <- Pairs, not is_trace_key(K)],
+            Props1 = case Rest of
+                         [] -> maps:remove(user_properties, Props);
+                         _ -> Props#{user_properties => Rest}
+                     end,
+            {Trace, Props1};
+        _ ->
+            {#{}, Props}
+    end.
+
+trace_pairs(Pairs) ->
+    lists:foldl(
+      fun({K, V}, Acc) ->
+              %% First occurrence wins; W3C forbids duplicate members, so a
+              %% second `traceparent' is dropped rather than forwarded.
+              case is_trace_key(K) andalso not maps:is_key(K, Acc) of
+                  true -> Acc#{K => V};
+                  false -> Acc
+              end;
+         (_, Acc) ->
+              Acc
+      end, #{}, Pairs).
+
+is_trace_key(<<"traceparent">>) -> true;
+is_trace_key(<<"tracestate">>) -> true;
+is_trace_key(_) -> false.
 
 %% TTL (ADR-015 §15.4): `expires_at' is the absolute ms deadline the publisher
 %% path computed from `message_ttl_ms'. `undefined' never expires -- that is the
@@ -1958,25 +1997,39 @@ publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
 %% field entirely (`encode/2,4' never reads it), which is why this can be
 %% unconditional. Message Expiry is recomputed from the absolute deadline:
 %% what the receiver gets is the remaining lifetime, not the original one.
-publish_props(#broker_message{proto_meta = Meta, expires_at = Expires}) ->
-    Props = lists:foldl(
-              fun({Key, Prop}, Acc) ->
-                      case maps:find(Key, Meta) of
-                          {ok, V} -> Acc#{Prop => V};
-                          error -> Acc
-                      end
-              end, #{},
-              [{mqtt_user_properties, user_properties},
-               {mqtt_payload_format, payload_format_indicator},
-               {mqtt_content_type, content_type},
-               {mqtt_response_topic, response_topic},
-               {mqtt_correlation_data, correlation_data}]),
+publish_props(#broker_message{proto_meta = Meta, headers = Headers,
+                              expires_at = Expires}) ->
+    Props0 = lists:foldl(
+               fun({Key, Prop}, Acc) ->
+                       case maps:find(Key, Meta) of
+                           {ok, V} -> Acc#{Prop => V};
+                           error -> Acc
+                       end
+               end, #{},
+               [{mqtt_user_properties, user_properties},
+                {mqtt_payload_format, payload_format_indicator},
+                {mqtt_content_type, content_type},
+                {mqtt_response_topic, response_topic},
+                {mqtt_correlation_data, correlation_data}]),
+    Props = add_trace_headers(Props0, Headers),
     case Expires of
         At when is_integer(At) ->
             Remaining = max(0, (At - erlang:system_time(millisecond)) div 1000),
             Props#{message_expiry_interval => Remaining};
         _ ->
             Props
+    end.
+
+%% Reverse of take_trace_properties/1: the validated (and possibly
+%% normalised) trace keys go back onto the v5 user-property list on delivery.
+add_trace_headers(Props, Headers) when is_map(Headers) ->
+    Pairs0 = maps:get(user_properties, Props, []),
+    Pairs = case is_list(Pairs0) of true -> Pairs0; false -> [] end,
+    Extra = [{K, V} || K <- [<<"traceparent">>, <<"tracestate">>],
+                       {ok, V} <- [maps:find(K, Headers)]],
+    case Extra of
+        [] -> Props;
+        _ -> Props#{user_properties => Pairs ++ Extra}
     end.
 
 %% S2.5 direct builds. 3.1.1 keeps the historical two-byte PUBACK / three-byte

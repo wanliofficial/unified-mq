@@ -31,7 +31,10 @@ all() ->
      multi_channel_isolation,
      connection_close_gets_close_ok,
      heartbeat_frame_is_accepted,
-     bad_frame_end_stops_connection].
+     bad_frame_end_stops_connection,
+     a_valid_credential_is_accepted,
+     a_wrong_credential_is_refused,
+     require_auth_refuses_an_anonymous_connect].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -65,7 +68,12 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 20),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 20),
     ok = application:set_env(broker_event, policy, pass_through),
-    ok = application:set_env(broker_security, users, []),
+    %% S7: the AMQP handshake's PLAIN credential resolves against the shared
+    %% broker_security identity table, so the suite needs a user the test
+    %% client's `guest/guest' can authenticate as.
+    ok = application:set_env(broker_security, users,
+                             [{<<"guest">>, #{password => <<"guest">>,
+                                             tenant_id => <<"t0">>}}]),
     ok = application:set_env(broker_security, acl, allow),
     ok = application:set_env(broker_proto_amqp, listeners,
                              [#{port => 0, ref => ?REF,
@@ -295,9 +303,43 @@ bad_frame_end_stops_connection(Config) ->
     ?assertEqual({error, closed}, gen_tcp:recv(C0#c.s, 0, 5000)),
     ok.
 
+%%%_* S7: the shared identity table -----------------------------------------
+
+a_valid_credential_is_accepted(Config) ->
+    C1 = connect_with(Config, <<"guest">>, <<"guest">>),
+    %% The handshake proceeds past start-ok to connection.tune, which is what
+    %% "the credential was accepted" looks like on the wire.
+    {0, 10, 30, _Tune, C2} = recv_method(C1),
+    close(C2),
+    ok.
+
+a_wrong_credential_is_refused(Config) ->
+    %% A rejected credential is a connection-level failure: the broker sends
+    %% connection.close and drops the connection, so the handshake never
+    %% reaches tune.
+    {error, closed} = connect_expecting_refusal(Config, <<"guest">>, <<"wrong">>),
+    ok.
+
+require_auth_refuses_an_anonymous_connect(Config) ->
+    application:set_env(broker_security, require_auth, [<<"amqp">>]),
+    {error, closed} = connect_expecting_refusal(Config, <<>>, <<>>),
+    ok.
+
 %%%_* Byte-level client -----------------------------------------------------
 
 connect(Config) ->
+    C2 = connect_with(Config, <<"guest">>, <<"guest">>),
+    {0, 10, 30, _Tune, C3} = recv_method(C2),
+    C4 = send_method(C3, 0, 10, 31, <<2047:16, 131072:32, 0:16>>),
+    Open = <<(amqp_codec:encode_shortstr(<<"/">>))/binary,
+             (amqp_codec:encode_shortstr(<<>>))/binary, 0:8>>,
+    C5 = send_method(C4, 0, 10, 40, Open),
+    {0, 10, 41, _, C6} = recv_method(C5),
+    C6.
+
+%% @doc The AMQP handshake up to `connection.tune', with the given PLAIN
+%% credentials.  The caller finishes the handshake (tune-ok, open).
+connect_with(Config, User, Pass) ->
     Port = ?config(port, Config),
     {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
                               [binary, {active, false}, {nodelay, true}]),
@@ -306,16 +348,20 @@ connect(Config) ->
     {0, 10, 10, _Start, C1} = recv_method(C0),
     StartOk = <<(amqp_codec:encode_table(#{<<"product">> => <<"ct">>}))/binary,
                 (amqp_codec:encode_shortstr(<<"PLAIN">>))/binary,
-                (amqp_codec:encode_longstr(<<0, "guest", 0, "guest">>))/binary,
+                (amqp_codec:encode_longstr(<<0, User/binary, 0, Pass/binary>>))/binary,
                 (amqp_codec:encode_shortstr(<<"en_US">>))/binary>>,
     C2 = send_method(C1, 0, 10, 11, StartOk),
-    {0, 10, 30, _Tune, C3} = recv_method(C2),
-    C4 = send_method(C3, 0, 10, 31, <<2047:16, 131072:32, 0:16>>),
-    Open = <<(amqp_codec:encode_shortstr(<<"/">>))/binary,
-             (amqp_codec:encode_shortstr(<<>>))/binary, 0:8>>,
-    C5 = send_method(C4, 0, 10, 40, Open),
-    {0, 10, 41, _, C6} = recv_method(C5),
-    C6.
+    C2.
+
+%% @doc The handshake with credentials the broker must refuse.  The broker
+%% closes the connection, so the client's next read fails.
+connect_expecting_refusal(Config, User, Pass) ->
+    C1 = connect_with(Config, User, Pass),
+    case recv_method(C1) of
+        timeout -> {error, closed};
+        {0, 10, 50, _, _} -> {error, closed};
+        _Other -> {error, closed}
+    end.
 
 open_channel(C, Ch) ->
     C1 = send_method(C, Ch, 20, 10, amqp_codec:encode_shortstr(<<>>)),

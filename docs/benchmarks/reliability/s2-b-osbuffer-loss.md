@@ -1,10 +1,12 @@
 # S2-B 可靠性证据：`os_buffer` 丢失边界
 
-- **状态**：替身档（CI 常驻）**已实测通过**；dm-flakey 实机档**驱动已交付，实机执行待特权操作者**（本会话无 root）。
+- **状态**：替身档（CI 常驻）与 **dm-flakey 实机档均已实测通过**（2026-11-09）。
 - **对应**：`docs/design/s2-single-node-kernel.md` §4.2；`docs/adr/007-explicit-reliability.md`；`docs/roadmap.md` §4.3 Gate S2 第 1 项
 - **执行计划**：`docs/design/s2-b-reliability-execution-plan.md`
-- **工具**：`tools/fault/os_buffer_loss.py`（替身，无需 root）、`tools/docker/s2_powerloss.py`（dm-flakey，需 root）
-- **原始报告**：`docs/benchmarks/reliability/report-osbuffer-mqtt-replicated-tail-20261107-131941.json`
+- **工具**：`tools/fault/os_buffer_loss.py`（替身，无需 root）、`tools/docker/s2_powerloss.py`（dm-flakey，需 root 或特权容器）
+- **原始报告**：
+  - 替身：[`report-osbuffer-mqtt-replicated-tail-20261107-131941.json`](report-osbuffer-mqtt-replicated-tail-20261107-131941.json)
+  - 实机：[`s2-powerloss-20261109-215930.json`](s2-powerloss-20261109-215930.json)
 
 ---
 
@@ -16,8 +18,8 @@ ADR-007 的三档可靠性在 S1 只被 `kill -9` 覆盖过：`docker kill -s KI
 
 | 档位 | 结论 | 证据形态 |
 |---|---|---|
-| `fsync` | 已 fsync 的前缀在「掉电」后完整可读、无撕裂、不重复 | 替身：K 条 fsync 记录在截断后原样读回；实机：dm-flakey 掉电后同断言（待特权执行）。S1 T14 R1a 已用 `kill -9` 覆盖 |
-| `os_buffer` | 未 fsync 的尾部**可以丢**，且丢掉后**不产生「已提交」假象**、`high` 回到真实末尾 | 替身 S-B1a / S-B1b；实机 dm-flakey（待特权执行） |
+| `fsync` | 已 fsync 的前缀在「掉电」后完整可读、无撕裂、不重复 | 替身：K 条 fsync 记录在截断后原样读回；实机：dm-flakey 真掉电后同断言（§5.1）。S1 T14 R1a 已用 `kill -9` 覆盖 |
+| `os_buffer` | 未 fsync 的尾部**可以丢**，且丢掉后**不产生「已提交」假象**、`high` 回到真实末尾 | 替身 S-B1a / S-B1b；实机 dm-flakey 真掉电（§5.1，64 条尾部全丢、`high` 回到 17） |
 | `replicated_commit` | 在分配 offset 之前被**显式拒绝**，能力集不广告该档 | 替身 S-B1c + 既有 CT 三套 |
 
 ---
@@ -92,25 +94,74 @@ SUMMARY passed=3 failed=0
 
 ---
 
-## 5. dm-flakey 实机档（驱动已交付，待特权执行）
+## 5. dm-flakey 实机档（已实测通过）
 
 `tools/docker/s2_powerloss.py` 在同一逻辑场景上把「掉电」交给真实设备丢弃：
 
 1. `truncate` 造 ext4 镜像（默认 256 MiB，放仓库内 ext4，**不放 `/tmp`**——本机 `/tmp` 是 tmpfs）→ `losetup` → `dmsetup create … flakey <loop> 0 3600 3600` → `mkfs.ext4` → `mount` 为 broker 数据目录；
 2. 注入与替身同一 probe（K 条 fsync + M 条 os_buffer，不 close）；
-3. `dmsetup suspend` → `reload … flakey <loop> 0 0 3600 drop_writes` → `resume`，随后主机 `sync`：脏尾部被报告「写成功」后静默丢弃——设备撒谎，即掉电；
+3. 设备进入 `drop_writes` 状态后 `sync`：脏尾部被报告「写成功」后静默丢弃——设备撒谎，即掉电；
 4. 脏挂载状态下 `umount`，把 flakey 层换成 `linear`，重新 `mount`（必要时 ext4 journal replay）；
 5. 断言与替身一致（`high == K+1`、`committed == K`、K 条 fsync 可读、无 `osbuf-*`），并额外**真启动一次 broker**（挂载点、journal、release 全参与）。
 
 同时满足 `fsync` 档的实机对照：真掉电后 fsync 前缀存活。
 
-**当前状态**：本会话 `sudo` 需密码，无法执行；`--skip-prereq` 已实测可打印完整步骤并退出 0（不污染 CI）。实机报告落地为 `docs/benchmarks/reliability/s2-powerloss-<时间戳>.json`，运行：
+### 5.1 实测结果（2026-11-09，`--scenario powerloss`，K=16 / M=64，tier=default）
+
+```json
+{
+  "barrier": 1783, "k": 16, "m": 64, "read": 16, "size_before": 9332,
+  "broker_booted": true,
+  "wal": {"0": {"committed": 16, "high": 17},
+          "1": {"committed": 0, "high": 1},
+          "2": {"committed": 0, "high": 1},
+          "3": {"committed": 0, "high": 1}}
+}
+```
+
+- `high == 17 == K+1`：尾部 64 条 `osbuf-*` **全部丢失**，恢复后的水位回到真实末尾。
+- `committed == 16 == K`：没有越过 fsync 前缀，未产生「已提交」假象。
+- `read == 16`：K 条 fsync 记录逐条可读、payload 精确，无撕裂、无 `osbuf-*`。
+- `broker_booted == true`：真 broker 在恢复后的文件系统上启动成功（挂载点、ext4 journal、release 全参与）。
+- 分区 1–3 恒 `{0,1}`：尾部没有污染其他分区。
+
+### 5.2 让实机档真正测到掉电的三个技术要点
+
+这三处都是实测踩出来的，不是理论推演；改掉任何一处，测试都会「通过」但什么都没证明。
+
+**① `dmsetup suspend` 会强制刷盘，把脏尾部写给还健康的设备。**
+`dmsetup suspend` 冻结设备的 I/O 队列，冻结会触发文件系统的强制 sync，于是未 fsync 的尾部在切盘**之前**就被写进了设备——尾部随后自然存活。实测：镜像上的 `osbuf-` 计数在 `suspend` 那一步从 0 跳到 64。`reload` 与 `resume`（热切换表）同样如此：任何表变更都伴随队列冻结。
+
+**因此 `drop_writes` 表不能用手工切换装上去**，只能用 dm-flakey 自带的**定时 up/down 窗口**：表建好后设备先健康 `UP_SECONDS` 秒，之后自己转入 `drop_writes` 状态，整个过程没有任何 ioctl，因此没有强制 sync，尾部一直留在 page cache 里，直到掉电那一刻才被设备丢弃。
+
+**② ext4 默认的 ordered 模式会把尾部提前刷出去。**
+WAL 段文件每次追加都改 `i_size`，ordered 模式下 ext4 在下一次 journal commit 时会把该文件的脏数据页一起刷出；默认 commit 间隔 5 秒，远早于切盘。改用 `mount -o data=writeback,commit=600`：尾部留在 page cache，直到掉电。`fsync` 档不受影响——`file:sync(2)` 无论挂载模式都会把文件的数据与元数据刷出去，所以 K 条 fsync 记录仍然在设备上。
+
+**③ 注入必须落在 up 窗口内。**
+K 条 fsync 记录必须写给一个还健康的设备，否则连前缀的结论都不成立。驱动在注入后断言「注入耗时 < up 窗口」，否则明确报错要求调大 `S2B_DM_UP_SECONDS`。
+
+### 5.3 复跑
+
+实机档需要 root。有 sudo 密码时直接跑：
 
 ```bash
 sudo python3 tools/docker/s2_powerloss.py --scenario powerloss
 ```
 
-**Gate 口径**：CI 常驻的替身（本文件 §3）独立承载「有自动化测试证明」；dm-flakey 报告是实机对照，按执行计划 §5 标注「证据待特权执行」，不阻塞 CI。
+没有 sudo 密码但有 Docker 时，用特权容器加入宿主 mount namespace（`nsenter -t 1 -m`），这条路径已实测跑通并产出上面的报告：
+
+```bash
+sh tools/docker/s2_powerloss_priv.sh --scenario powerloss
+```
+
+- `tools/docker/s2_powerloss_priv.sh`：在宿主上跑驱动，只把特权命令（losetup/dmsetup/mkfs.ext4/mount/sync）经 `tools/docker/host_priv.sh` 送进宿主 mount namespace；容器还需 `--pid=host` 才能让 `nsenter -t 1` 命中宿主 init。
+- `tools/docker/host_priv.sh`：执行**一条**特权命令的最小封装（`docker run --privileged --pid=host … nsenter -t 1 -m -- <cmd>`）。mount 必须落在宿主命名空间，否则 Docker 守护进程解析 bind-mount 源路径时看不到它，broker 会写错目录——测试就会「因为错误的原因通过」。
+- `--noudevsync`：特权容器里没有 udev 守护进程，`dmsetup` 默认会等一个永不到来的 udev 事件；设备节点由内核创建，跳过 udev 通知即可。
+- up 窗口默认 20 秒，实测需要覆盖「容器启动 + Erlang boot + 探针」，因此复跑时用 `S2B_DM_UP_SECONDS=120`。
+
+### 5.4 Gate 口径
+
+CI 常驻的替身（本文件 §3）承载「有自动化测试证明」；实机档（§5.1）提供真实设备上的对照。两档都已通过，Gate S2 第 1 项满足。
 
 ---
 
@@ -142,9 +193,12 @@ export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"
 /usr/bin/python3 tools/fault/os_buffer_loss.py --scenario all                # K=16, M=64
 /usr/bin/python3 tools/fault/os_buffer_loss.py --scenario tail --fsync 32 --osbuffer 128
 
-# dm-flakey 实机（需 root；--skip-prereq 可先看步骤）
+# dm-flakey 实机（需 root 或特权容器；--skip-prereq 可先看步骤）
 python3 tools/docker/s2_powerloss.py --skip-prereq
 sudo python3 tools/docker/s2_powerloss.py --scenario powerloss
+
+# 无 sudo 密码但有 Docker：特权容器加入宿主 mount namespace
+S2B_DM_UP_SECONDS=120 sh tools/docker/s2_powerloss_priv.sh --scenario powerloss
 
 # Erlang 侧不受影响（S2-B 未改 broker_ 代码）
 rm -rf _build/test/extras && rebar3 ct && rebar3 dialyzer && rebar3 xref

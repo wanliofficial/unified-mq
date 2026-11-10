@@ -102,9 +102,22 @@
   ]},
 
   {broker_security, [
+    %% S7: the identity table every protocol authenticates against -- MQTT,
+    %% WebSocket, NATS, AMQP, Kafka and Pulsar all resolve their credential
+    %% here.  A record may carry `password' (the user/password shape) and/or
+    %% `token' (the bearer shape Pulsar's `token' auth method uses).
     {users, [
       {<<"guest">>, #{password => <<"guest">>, tenant_id => <<"t0">>}}
     ]},
+    %% S7: the tenant an anonymous connection runs as.  A client never picks
+    %% its own tenant -- the tenant comes from the matched user record, and
+    %% this is the fallback when there is no record.
+    {default_tenant, <<"t0">>},
+    %% S7: which protocols must present a credential.  Empty means every
+    %% protocol accepts an anonymous connection (the posture before S7).  List
+    %% a protocol to make its handshake the only way in, e.g. [<<"ws">>].
+    %% A protocol whose handshake cannot carry a credential is never required.
+    {require_auth, []},
     %% S6 ACL: `allow' keeps the pre-S6 allow-all posture. Replace with an
     %% ordered first-match rule list to enforce policy:
     %%   [{#{effect => deny,  principal => <<"*">>, action => <<"*">>,
@@ -157,7 +170,12 @@
     {dedup_max_entries, 100000},
     %% Opt-in isolation copies for rejected events:
     %% {Tenant, Destination, <<"$invalid/{tenant}/{destination}">>}.
-    {quarantine, []}
+    {quarantine, []},
+    %% README §10.2 / W3C Trace Context. `off' (default) strips client-supplied
+    %% `traceparent'/'tracestate'; `on' validates and propagates them for every
+    %% tenant; `{trusted_tenants, [<<"t1">>]}' limits propagation to the listed
+    %% tenants. Trace headers never affect identity, tenant or ACL decisions.
+    {trace_context, off}
   ]},
 
   {broker_proto_mqtt, [

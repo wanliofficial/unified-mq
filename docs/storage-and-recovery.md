@@ -4,7 +4,7 @@
 - **状态**：已实现并实测的磁盘格式、刷盘策略与恢复语义；S6 之后明确未实现的方向单列于 §14
 - **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、ADR-018（retain 树与 `.inflight` v2）、ADR-019（会话文件按 SubRef 与 v1→v2 迁移）、ADR-021（Metadata Raft 与复制提交）、设计文档 §5.3/§7/§8
 - **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`、`apps/broker_retain/src/broker_retain_files.erl`、`apps/broker_meta/src/broker_meta.erl`、`apps/broker_cluster/src/broker_cluster_meta.erl`
-- **证据**：`rebar3 ct` **631/631**；T14 真实容器 `kill -9` 矩阵（R1a~R9 × 双档）；S2-B 掉电/OS 缓冲注入（`tools/fault/`、`tools/docker/s2_powerloss.py`）；T15 真实客户端 10/10
+- **证据**：`rebar3 ct` **673/673**；T14 真实容器 `kill -9` 矩阵（R1a~R9 × 双档）；S2-B 掉电/OS 缓冲注入（`tools/fault/`、`tools/docker/s2_powerloss.py`）；T15 真实客户端 10/10
 
 > 本文回答三个问题：**盘上有什么、什么时候真正落盘、崩溃后哪些字节会被信任**。架构分层与进程归属见 [`architecture.md`](architecture.md)。
 
@@ -454,7 +454,7 @@ S1 的布局是「一个 client 一个文件」：`{b64(ClientId)}.subs` 的 bod
 
 ### 11.2 明确不保证
 
-- **掉电（power loss）**：`kill -9` 不覆盖 `os_buffer` 窗口；`os_buffer` 档的掉电丢页缓存已由 S2-B 的 `tools/fault/os_buffer_loss.py` / `tools/docker/s2_powerloss.py` 注入验证。**dm-flakey 实机报告需要 root，尚未补**（`docs/roadmap.md` Gate S2 第 1 项保持未勾选）；目录级 fsync 也未实现。
+- **掉电（power loss）**：`kill -9` 不覆盖 `os_buffer` 窗口；`os_buffer` 档的掉电丢页缓存已由 S2-B 的 `tools/fault/os_buffer_loss.py`（替身）与 `tools/docker/s2_powerloss.py`（**dm-flakey 实机，已于 2026-11-09 实测通过**：64 条未 fsync 尾部全丢、`high` 回到 K+1、`committed == K`、真 broker 在恢复后的 fs 上启动成功）注入验证；口径见 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md` §5。目录级 fsync 仍未实现。
 - **不重复**：默认档 cursor/in-flight 有回退窗口，重复是契约内行为；只有零回退档能逼近"零重复"。
 - **retention / 空间回收**：S2-F 起整段可删，但边界只到 `committed`；`meta.log` 自身仍只增不减（不压缩）。被慢消费者钉住的段不会被回收。
 - **TTL 不删数据**：`expires_at` 只在读者侧过滤（S2-E）；过期记录仍占段空间，直到 S2-F 的段级 GC 回收。
@@ -530,7 +530,7 @@ Gate「WAL 与内存实现可互换」的机械检查：`apps/broker_storage/tes
 | 方向 | 状态 | 会改什么 / 必须保持 |
 |---|---|---|
 | retention / compaction | **部分实现** | ✅ S2-F 已实现段删除（`wal_gc` + `meta.log` v2 retired）；`meta.log` 压缩仍待做。保持记录头格式；水位只低不高 |
-| 掉电验证 | **部分实现** | ✅ S2-B 的 OS 缓冲注入；dm-flakey 实机报告待 root。保持 `fsync` 档的 ACK 时机 |
+| 掉电验证 | **已实现** | ✅ S2-B 的 OS 缓冲注入（替身 + dm-flakey 实机，2026-11-09）。保持 `fsync` 档的 ACK 时机 |
 | 复制（S4） | **已实现** | ✅ 复制后端 `replicated_commit`，提交点在共识返回后。保持同一 behavior、ACK 与 capability 一一对应 |
 | 慢消费者/背压（S2-G） | **已实现** | ✅ cursor 回收、离线 QoS0 skip、per-consumer 配额。保持 `committed = min(活 cursor)-1` 的方向性 |
 | 会话迁入 Mnesia 控制面 | **未实现** | 把 `.subs`/`.cursors`/`.inflight` 迁入 `subscription_meta`/`cursor_meta`/`session_meta`。保持 `broker_subscription` 对外 API |

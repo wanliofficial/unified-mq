@@ -42,6 +42,7 @@
     handshake = pending :: pending | done,
     client_id :: binary() | undefined,
     tenant = <<"t0">> :: binary(),
+    principal = undefined :: binary() | undefined,
     verbose = false :: boolean(),
     echo = true :: boolean(),
     attached = false :: boolean(),
@@ -186,10 +187,17 @@ handle_connect(Json, St) ->
         Map when is_map(Map) ->
             case check_auth(Map) of
                 ok ->
-                    St1 = ensure_client(St#st{verbose = maps:get(<<"verbose">>, Map, false),
-                                              echo = maps:get(<<"echo">>, Map, true),
-                                              headers_cap = maps:get(<<"headers">>, Map, false) =:= true}),
-                    maybe_ok(St1);
+                    case resolve_identity(Map) of
+                        {ok, Identity} ->
+                            St1 = ensure_client(St#st{verbose = maps:get(<<"verbose">>, Map, false),
+                                                      echo = maps:get(<<"echo">>, Map, true),
+                                                      headers_cap = maps:get(<<"headers">>, Map, false) =:= true,
+                                                      tenant = maps:get(tenant_id, Identity),
+                                                      principal = maps:get(principal, Identity)}),
+                            maybe_ok(St1);
+                        {error, _} ->
+                            err_close(<<"Authorization Violation">>, St)
+                    end;
                 {error, _} ->
                     err_close(<<"Authorization Violation">>, St)
             end;
@@ -199,6 +207,35 @@ handle_connect(Json, St) ->
         _:_ ->
             err_close(<<"Protocol Violation">>, St)
     end.
+
+%% @doc Resolve the CONNECT's credential against the shared broker_security
+%% identity table (S7) -- the same table MQTT uses.
+%%
+%% NATS's own `auth_token' is a protocol-native shared secret and stays as it
+%% was; `user'/`pass' is the user/password shape the shared table speaks.  A
+%% CONNECT with neither is anonymous unless the deployment requires one.
+resolve_identity(Map) ->
+    case {maps:get(<<"user">>, Map, undefined),
+          maps:get(<<"pass">>, Map, undefined),
+          maps:get(<<"token">>, Map, undefined)} of
+        {undefined, undefined, undefined} ->
+            case broker_security:auth_required(<<"nats">>) of
+                true -> {error, unauthenticated};
+                false -> {ok, anonymous_identity()}
+            end;
+        {User, Pass, _} when is_binary(User), is_binary(Pass) ->
+            finish(broker_security:authenticate_conn({user_pass, User, Pass}));
+        {_User, _Pass, Token} when is_binary(Token) ->
+            finish(broker_security:authenticate_conn({token, Token}));
+        _ ->
+            {error, unauthenticated}
+    end.
+
+finish({ok, Identity}) -> {ok, Identity};
+finish({error, _}) -> {error, unauthenticated}.
+
+anonymous_identity() ->
+    #{principal => undefined, tenant_id => broker_security:default_tenant()}.
 
 check_auth(Map) ->
     case application:get_env(broker_proto_nats, auth_token, undefined) of
@@ -434,13 +471,21 @@ route_message(Destination, Msg, St) ->
     end.
 
 ce_headers(Headers) ->
+    Trace = broker_event_trace:enabled(),
     maps:filter(fun(K, V) ->
                         is_binary(K) andalso is_binary(V) andalso
-                            (is_ce_key(K) orelse K =:= <<"content-type">>)
+                            (is_ce_key(K) orelse K =:= <<"content-type">> orelse
+                             (Trace andalso is_trace_key(K)))
                 end, Headers).
 
 is_ce_key(<<"ce-", _/binary>>) -> true;
 is_ce_key(_) -> false.
+
+%% W3C Trace Context (README §10.2): admitted only when propagation is on,
+%% so an opted-out deployment never forwards a client-supplied traceparent.
+is_trace_key(<<"traceparent">>) -> true;
+is_trace_key(<<"tracestate">>) -> true;
+is_trace_key(_) -> false.
 
 store_routes([], _Msg) ->
     ok;

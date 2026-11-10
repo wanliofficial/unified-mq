@@ -2,7 +2,7 @@
 ## Erlang/OTP + Raft + 多协议接入 + Pulsar + CloudEvents
 
 - **文档版本**：v1.2
-- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S6 已实现并验证（`rebar3 ct` 631/631、六协议真实客户端套件），明确未实现项列在 [`docs/security.md`](docs/security.md) §12。本文 §8 的目录结构与 §12 的分阶段表是**设计建议**，实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1。
+- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S7 已实现并验证（`rebar3 ct` 673/673、六协议真实客户端套件），S7 及之后仍未实现的方向列在 [`docs/security.md`](docs/security.md) §12。本文 §8 的目录结构与 §12 的分阶段表是**设计建议**，实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1。
 - **目标**：构建一个以 Erlang/OTP 为核心、支持多消息协议、分布式一致性、持久化消息和标准化事件的统一消息 Broker。
 - **核心原则**：协议适配与消息内核解耦；控制面与数据面分离；共识层不替代消息语义；CloudEvents 是事件表达标准，不是传输协议。
 
@@ -17,8 +17,8 @@
 1. 多协议接入：AMQP、MQTT、Kafka 协议、WebSocket、NATS、Pulsar。
 2. 统一消息内核：路由、订阅、队列、ACK、重投递、死信、过期、流控和背压。
 3. 分布式能力：节点成员管理、分区归属、Leader 选举、复制日志和故障恢复。
-4. 控制面：用户、租户、ACL、Topic/Queue、Binding、订阅、集群和配置版本管理。
-5. 事件互操作：支持 CloudEvents 1.0 核心属性、JSON 事件格式、Structured Mode、Binary Mode，以及按需实现的协议绑定。
+4. 控制面：用户、租户、ACL、Topic/Queue、Binding、订阅、集群和配置版本管理。**已接线的是用户/租户/ACL（`broker_security` 消费）、订阅元数据、集群节点与分区归属、配置版本与 outbox；`topic_meta` / `queue_meta` / `binding_meta` 三张表已建表并有泛型 CRUD，但还没有运行时读取方**（见 `docs/architecture.md` §2.1 的表）。
+5. 事件互操作：支持 CloudEvents 1.0 核心属性、JSON 事件格式、Structured Mode、Binary Mode，以及按需实现的协议绑定。**当前实现的是统一 `ce-*` 头通道的 Binary Mode 映射**（六个协议共享，见 `docs/protocol-compatibility.md` §4.10）；各协议**官方** Binding 的逐字结论已给出，结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」——逐协议差异见 `docs/roadmap.md` §9.1。
 6. 可观测与运维：指标、日志、追踪、健康检查、管理 API 和配置审计。
 
 ### 1.2 非目标与边界
@@ -464,7 +464,7 @@ CloudEvents `source + id` 可作为业务事件去重的候选键，但 Broker �
 - 队列深度、订阅积压、Cursor 延迟、DLQ 规模。
 - WAL 写入/刷盘延迟、日志段大小、恢复时间、复制延迟与 Raft 状态。
 - CloudEvents 校验成功/失败计数、格式转换失败、未知版本与属性映射损失。
-- 按需在可信上下文中传播 trace context；遵循相应规范和隐私要求。
+- 按需在可信上下文中传播 trace context（**已实现**）：`broker_event_trace` 按 W3C 校验并规范化 `traceparent`/`tracestate`，合法值随消息存 WAL、投递时回填；`broker_event.trace_context` 默认 `off`（剥离客户端提供的 trace 头），可设 `on` 或 `{trusted_tenants, [...]}`，且 trace 属性不参与身份/租户/ACL 判定（`docs/security.md` §5.1）。OTel 等导出层仍未实现（`docs/architecture.md` §9）。
 
 ---
 

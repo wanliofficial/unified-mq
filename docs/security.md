@@ -31,9 +31,46 @@
 
 - 成功返回 `{ok, Username}`；`Username` 即 principal。
 - 失败恒返回 `{error, bad_username_or_password}`——**不区分**「用户不存在」与「密码错」，避免用户名枚举。
-- 认证只发生在 MQTT CONNECT（`mqtt_conn_fsm`）。匿名连接（未配置用户名/密码）的 principal 是 `undefined`，在 ACL 判定里保持 S1 的「无规则即放行」姿态（§4）。
 
-**现状边界（必须如实说明）**：WebSocket / NATS / AMQP / Kafka / Pulsar 的连接层目前没有走 `broker_security:authenticate/2`。它们的租户来自协议字段或配置默认值（`t0`），NATS 另有自己的 `auth_token`。因此「所有协议都已统一认证」**不成立**；租户隔离与 ACL 的数据结构对它们已就位，但身份入口尚未统一。这是 S6 之后的明确待办，不是已完成项。
+### 2.1 六个协议共用一张身份表（S7）
+
+`broker_security:authenticate_conn/1` 是**除 MQTT 外**五个协议适配器的统一认证入口（MQTT 走下面「现状边界」里那条等价路径）。六种协议各自的握手形状不同，归一化成两种凭据形态：
+
+| 形态 | 载体 | 谁用 |
+|---|---|---|
+| `{user_pass, Name, Secret}` | 用户名 + 密码 | WS `connect` 帧、NATS CONNECT、AMQP `start-ok` 的 PLAIN、Kafka SASL/PLAIN、Pulsar `plain`（MQTT 见「现状边界」） |
+| `{token, Secret}` | 单一 bearer 值 | Pulsar `token` 认证方法、NATS `auth_token` |
+
+两者都查**同一张** `users` 表，因此**一个身份列表服务六个协议**。表的每条记录可以带 `password` 和/或 `token`：
+
+```erlang
+{users, [
+  {<<"guest">>, #{password => <<"guest">>, tenant_id => <<"t0">>}},
+  {<<"svc">>,  #{token => <<"tok">>,    tenant_id => <<"t3">>}}
+]}
+```
+
+**租户来自记录，不来自客户端。** 这是本次修复的核心：修复前 WS/NATS/AMQP/Kafka/Pulsar 的租户来自协议字段或硬编码的 `t0`，客户端可以自称任何租户；修复后租户一律由匹配到的用户记录给出，协议帧里的 `tenant` 字段被忽略。
+
+`authenticate_conn/1` 的失败形态同样统一：未知用户、错误密码、未知 token、错误 token、以及两种形态之间的差异，对外都是同一个 `bad_username_or_password`，探测方无法据此枚举。
+
+### 2.2 匿名连接是部署决策
+
+`broker_security.require_auth` 是一个协议名列表：
+
+- 不在列表里的协议接受匿名连接，租户是 `broker_security.default_tenant`（默认 `t0`）。
+- 在列表里的协议必须出示凭据，否则连接被拒。
+- **握手里带不了凭据的协议永远不会被要求**——要求一个协议出示它根本没法出示的东西只会把客户端全锁在外面，而不是变得更安全。
+
+各协议拒绝认证失败时的表现沿用它们各自的语义：MQTT 回 CONNACK 拒绝码、WS 回 `unauthorized` 错误帧、NATS 回 `-ERR 'Authorization Violation'`、AMQP 发 `connection.close`（握手级失败，通道从未打开）、Kafka SASL 回 `SASL_AUTHENTICATION_FAILED`、Pulsar 直接断开连接。
+
+NATS 的 `auth_token`（`broker_proto_nats.auth_token`）是 NATS 协议原生的共享密钥，语义与身份表不同，因此保持原样；NATS 的 `user`/`pass` 走身份表。
+
+**现状边界（必须如实说明）**：
+
+1. **MQTT 不走 `authenticate_conn/1`**：`mqtt_conn_fsm:authenticate/2` 直接调 `broker_security:authenticate/2`（`mqtt_conn_fsm.erl:429`）。代码路径不同、语义等价——两者读同一张 `users` 表、比对同一 `password` 字段、失败回同一个 `bad_username_or_password`；MQTT 的凭据形态只有 user/pass 一种，归一化没有增益，因此没有为统一而统一。
+2. **`require_auth` 对 MQTT 无声无效**：`mqtt_conn_fsm` 从不调用 `broker_security:auth_required/1`，所以配置 `{require_auth, [<<"mqtt">>]}` **不会**拒绝匿名 CONNECT（`credential_capable/0` 里含 `<<"mqtt">>` 只是为将来接线性留位）。当前 MQTT 的匿名放行由 CONNECT 里「无用户名/无密码即匿名」这条分支决定。把 `auth_required/1` 接进 CONNECT 路径列为 S7 之后。
+3. **MQTT 的匿名 CONNECT 仍把 `client_id` 当作 principal**（S1 冻结的语义，`docs/design/s1-mqtt-vertical-slice.md` §13 L10）。这个 principal 不在身份表里，因此它的租户是 `default` 而不是任何用户记录的租户——这是 S1 的既有行为，本次未改。
 
 ---
 
@@ -89,6 +126,18 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 - 事件里的 `source` / `subject` / 自定义扩展永远不参与身份判定；伪造 `source=bob` 不能借用 bob 的规则。
 
 证据：`broker_security_audit_SUITE` 的 `event_attribute_cannot_change_the_acl_decision`、`forged_event_source_cannot_impersonate_another_principal`。
+
+### 5.1 Trace context 不参与身份判定（README §10.2）
+
+`broker_event_trace` 接在 `broker_event:apply_policy/2`（六协议共用的入站 seam）上，按 W3C Trace Context 校验 `traceparent` / `tracestate`：只接受 version 00、非全零的有效值并规范化为小写；`tracestate` 受 32 成员 / 512 字节上限约束；没有有效 parent 时整个 state 被忽略。合法值留在 `#broker_message.headers` 里随 WAL 持久化、投递时由各协议原样回填——这就是 §10.2 要的「传播」，没有给冻结的 `#broker_message` 加字段。
+
+**隐私与信任边界**：`broker_event.trace_context` 默认 `off`，客户端提供的 trace 头被剥离而不是转发；`on` 全量传播，`{trusted_tenants, [...]}` 只对列出的租户传播（「可信上下文」与「按需」）。WebSocket / NATS 的头通道是白名单，未开启传播时连入站都不放行这两个键；AMQP / Kafka / Pulsar 全量透传 headers，由同一 seam 在 `off` 时剥离。
+
+**MQTT 5 的通道**：ADR-017 §17.2 把 PUBLISH 属性放在 `proto_meta` 而非 `headers`，所以 `mqtt_conn_fsm` 在构造消息时把 User Properties 里的 `traceparent` / `tracestate` 提到 `headers`、从属性表里剔除，投递时再从（已校验/规范化的）`headers` 回填到 User Properties——`off` 时同样不会经原属性往返泄漏客户端值。3.1.1 没有 properties，天然无此通道。六个协议至此都受同一个门控。
+
+**与 ACL 的同构约束**：trace 头是客户端可控的，但 `propagate/1` 只改写这两个 header 键，`tenant_id` / `principal` / `destination` 逐字段不变；`broker_security:authorize/2` 只读 `action` / `tenant_id` / `destination`，从不读取 headers。伪造 `traceparent` 或在头里夹带 `tenant_id` / `principal` 都不能借用别人的租户或身份。
+
+证据：`broker_event_trace_SUITE`（10 例，含 `trace_headers_cannot_escalate_the_tenant`），以及 `ws_conn_SUITE` / `nats_conn_SUITE` / `mqtt_conn_SUITE` 的端到端往返用例（含 `off` 时剥离、非法值剔除、大写规范化）。OTel 等导出层仍未实现（`docs/architecture.md` §9）。
 
 ---
 
@@ -179,13 +228,18 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 
 ---
 
-## 12. 明确的未实现项（S6 之后）
+## 12. 明确的未实现项（S7 之后）
 
-1. 除 MQTT 外五种协议统一走 `broker_security` 身份表。
-2. 跨节点/复制通道的 TLS。
-3. Schema Registry 内容校验。
-4. 审计日志签名与防篡改、外部 KMS。
-5. 每条规则可配置的「未知扩展属性拒绝」策略。
-6. 除 MQTT 外五种协议的 **标准** CloudEvents Binding 逐字实现（当前是统一 `ce-*` 头通道的等价映射，非无损点见 `docs/protocol-compatibility.md` §4.10）；统一认证仍只覆盖 MQTT。
+**S7 的全部验收项已于 2026-11-10 结案**（`docs/roadmap.md` §9 的 Gate S7 已无未勾选项）：身份表统一见 §2.1；各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1 与 `docs/protocol-compatibility.md` §4.10——**结论是「统一 `ce-*` 头通道是本 Broker 的项目定义，没有任何协议按官方条文逐字实现」**，差异逐条列明（MQTT 5 规范要求不加前缀、Kafka 用 `ce_`、NATS 需 percent-encoding、WebSocket 需子协议协商、AMQP 仅 1.0 有规范、Pulsar 无规范）。逐字实现**不立项**，因此不再作为待办。
 
-这些在 `progress.md` 的 S6 结论里同样标注为待办，不作为 Gate 通过的依据。
+**S7 之后明确未实现**（不作为 Gate 依据，`progress.md` 有同一份清单）：
+
+1. 跨节点/复制通道的 TLS。
+2. Schema Registry 内容校验。
+3. 审计日志签名与防篡改、外部 KMS。
+4. 每条规则可配置的「未知扩展属性拒绝」策略。
+5. `broker_event:duplicate/1` / `quarantine/2` 仅接在 MQTT 发布路径，其余五协议未接（见 `docs/cloudevents-mapping.md` 的「接线范围」注）。
+6. 可观测性导出层（OTel 等；`broker_metrics:snapshot/0` 之上）。
+7. `require_auth` 尚未接进 MQTT 的 CONNECT 路径（`mqtt_conn_fsm` 不调用 `auth_required/1`，见 §2.2 现状边界第 2 条）；`broker_meta` 的 `broker_user` 与数据面认证的接线（ADR-021 §D7 冻结后补充）；`topic_meta` / `queue_meta` / `binding_meta` 三张表的运行时读取方。
+
+六协议统一走 `broker_security` 身份表已于 2026-11-09 完成，见 §2.1，不再列为待办。

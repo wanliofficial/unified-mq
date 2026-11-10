@@ -54,11 +54,13 @@ rebar3 xref
 | S6-3 | 3 节点基准首次启动 `ra.app` 不在 peer 代码路径 | 把 `_build/test/checkouts/*/ebin`（vendored ra）加入 peer `-pa` |
 | S6-4 | 基准里 `application:set_env` 被 `.app` 默认值覆盖 | 先 `application:load/1` 再 `set_env/3` |
 
-## 5. 明确未实现（S6 之后）
+## 5. 明确未实现（S6 之后；S7 承接）
 
-1. 除 MQTT 外五种协议统一走 `broker_security` 身份表（当前用配置/协议字段租户）。
+本节是 S6 交付时点的清单，保留原始口径；后续进展见 `docs/roadmap.md` §9 与 `docs/security.md` §2.1 / §12。
+
+1. **除 MQTT 外五种协议统一走 `broker_security` 身份表 —— 2026-11-09 已完成**：WS/NATS/AMQP/Kafka/Pulsar 都经 `broker_security:authenticate_conn/1` 解析凭据，租户来自用户记录（`docs/security.md` §2.1）。
 2. 跨节点/复制通道 TLS。
 3. Schema Registry 内容校验。
 4. 审计日志签名/防篡改、外部 KMS。
 5. 未知扩展属性「按租户可配拒绝」。
-6. 除 MQTT 外五种协议的**标准** CloudEvents Binding 逐字实现（当前是统一 `ce-*` 头通道的等价映射，非无损点见 `docs/protocol-compatibility.md` §4.10）。
+6. 除 MQTT 外五种协议的**标准** CloudEvents Binding 逐字实现 —— **已立项为 S7**（`docs/roadmap.md` §9）：交付形态是逐协议给出逐字实现或「无官方 Binding」的明确结论；当前仍是统一 `ce-*` 头通道的等价映射，非无损点见 `docs/protocol-compatibility.md` §4.10。

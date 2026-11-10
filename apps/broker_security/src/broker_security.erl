@@ -23,9 +23,10 @@
 -module(broker_security).
 
 -export([authenticate/2, authorize/2, tenant_id/1,
-         authorized/2, acl_rules/0, redacted_config/0]).
+         authorized/2, acl_rules/0, redacted_config/0,
+         authenticate_conn/1, auth_required/1, default_tenant/0]).
 
--export_type([principal/0, request/0]).
+-export_type([principal/0, request/0, credential/0, conn_identity/0]).
 
 %% §4.3: S1's Principal is the username itself. S6 keeps that: a principal is
 %% the authenticated identity, and the tenant is a property of the identity.
@@ -34,6 +35,22 @@
                  | #{action := publish | subscribe | admin,
                      tenant_id => binary(),
                      destination => binary()}.
+
+%% @doc How a protocol carries a credential, normalized.
+%%
+%% Every protocol has its own handshake shape, but they all reduce to one of
+%% two forms: a name plus a secret (`{user_pass, Name, Secret}'), or a single
+%% shared secret with no name (`{token, Secret}' -- Pulsar's `token' auth
+%% method, and any future protocol that only carries a bearer value).
+%%
+%% Both forms resolve against the SAME `users' table, so one identity list
+%% serves all six protocols.
+-type credential() :: {user_pass, binary(), binary()} | {token, binary()}.
+
+%% @doc The identity a connection ends up with: who it is and which tenant it
+%% belongs to. The tenant comes from the matched user record, never from the
+%% client -- a client that names its own tenant gets its own tenant ignored.
+-type conn_identity() :: #{principal := principal(), tenant_id := binary()}.
 
 %% @doc Rejects with the same reason whether the username is unknown or the
 %% password merely differs -- the error must not leak "this user exists".
@@ -74,6 +91,81 @@ tenant_id(Principal) ->
 -spec acl_rules() -> allow | [map()] | term().
 acl_rules() ->
     application:get_env(broker_security, acl, allow).
+
+%%%_* Protocol connections --------------------------------------------------
+
+%% @doc Authenticate a protocol connection's credential and resolve the
+%% identity it runs as.
+%%
+%% This is the single entry point every protocol adapter uses, so all six
+%% protocols share one identity table and one tenant derivation:
+%%
+%%   * `{user_pass, Name, Secret}' matches the `users' table by name and
+%%     compares the secret against that record's `password'.
+%%   * `{token, Secret}' matches the `users' table by the record's `token'
+%%     field -- a protocol that carries only a bearer value (Pulsar's `token'
+%%     auth method) still resolves to a named principal and therefore to a
+%%     tenant.
+%%
+%% The error is always `bad_username_or_password' so a probe cannot tell
+%% "no such user" from "wrong secret" -- and a token lookup reports the same
+%% thing, so the two credential shapes are not distinguishable either.
+-spec authenticate_conn(credential()) -> {ok, conn_identity()} | {error, term()}.
+authenticate_conn({user_pass, Name, Secret})
+  when is_binary(Name), is_binary(Secret) ->
+    case user_record(Name) of
+        #{password := Secret} -> {ok, identity(Name)};
+        _ -> {error, bad_username_or_password}
+    end;
+authenticate_conn({token, Secret}) when is_binary(Secret) ->
+    case user_by_token(Secret) of
+        {ok, Name} -> {ok, identity(Name)};
+        error -> {error, bad_username_or_password}
+    end;
+authenticate_conn(_Other) ->
+    {error, bad_username_or_password}.
+
+%% @doc Whether a protocol must present a credential at all.
+%%
+%% A protocol that is not required accepts anonymous connections and runs them
+%% as the default tenant, which is the posture every adapter had before the
+%% identity table was shared.  Requiring a credential is what turns the
+%% shared table from "extra info" into the actual gate.
+%%
+%% A protocol whose handshake cannot carry a credential is never required:
+%% demanding one would lock every client out rather than secure anything.
+-spec auth_required(binary()) -> boolean().
+auth_required(Protocol) when is_binary(Protocol) ->
+    lists:member(Protocol, required_protocols())
+        andalso lists:member(Protocol, credential_capable());
+auth_required(_Other) ->
+    false.
+
+%% @doc The tenant an anonymous (or not-required) connection runs as.
+%%
+%% Fixed per deployment: an unauthenticated client cannot pick its own
+%% tenant, because the tenant is the isolation boundary.
+-spec default_tenant() -> binary().
+default_tenant() ->
+    case application:get_env(broker_security, default_tenant, <<"t0">>) of
+        Tenant when is_binary(Tenant) -> Tenant;
+        _ -> <<"t0">>
+    end.
+
+%%%_* Internal: identity ----------------------------------------------------
+
+identity(Name) ->
+    #{principal => Name, tenant_id => tenant_id(Name)}.
+
+%% The protocols whose handshakes can carry a credential at all.
+credential_capable() ->
+    [<<"mqtt">>, <<"ws">>, <<"nats">>, <<"amqp">>, <<"kafka">>, <<"pulsar">>].
+
+required_protocols() ->
+    case application:get_env(broker_security, require_auth, []) of
+        List when is_list(List) -> [P || P <- List, is_binary(P)];
+        _ -> []
+    end.
 
 %% @doc A copy of the security configuration safe to log or serve: passwords
 %% are replaced, user names and tenants are kept.
@@ -173,6 +265,20 @@ user_record(Username) ->
     case lists:keyfind(Username, 1, users()) of
         {_, Record} -> Record;
         false -> #{}
+    end.
+
+%% A user record may carry a `token' instead of (or besides) a `password'.
+%% That is the credential shape for protocols whose handshake only carries a
+%% bearer value -- Pulsar's `token' auth method is the one in-tree example.
+%%
+%% A token miss reports the same error as a password miss, so the two
+%% credential shapes are not distinguishable by the failure either.
+user_by_token(Token) ->
+    case lists:dropwhile(fun({_, #{token := T}}) -> T =/= Token;
+                             (_) -> true
+                          end, users()) of
+        [{Name, _} | _] -> {ok, Name};
+        [] -> error
     end.
 
 users() ->

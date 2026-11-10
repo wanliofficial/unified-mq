@@ -1,0 +1,42 @@
+{
+  "evidence": {
+    "barrier": 1783,
+    "broker_booted": true,
+    "device": {
+      "dm": "/dev/mapper/s2b-powerloss",
+      "image": "/home/wanli/workspace/unified-mq/tools/docker/powerloss.img",
+      "image_mb": 256,
+      "loop": "/dev/loop0",
+      "mount": "/home/wanli/workspace/unified-mq/tools/docker/powerloss-mount",
+      "sectors": 524288
+    },
+    "k": 16,
+    "m": 64,
+    "read": 16,
+    "size_before": 9332,
+    "wal": {
+      "0": {
+        "committed": 16,
+        "high": 17
+      },
+      "1": {
+        "committed": 0,
+        "high": 1
+      },
+      "2": {
+        "committed": 0,
+        "high": 1
+      },
+      "3": {
+        "committed": 0,
+        "high": 1
+      }
+    }
+  },
+  "generated_at": "2026-11-09T21:59:30+0800",
+  "kernel": "6.18.48-amd64-desktop-rolling",
+  "mode": "dm-flakey drop_writes",
+  "scenario": "powerloss",
+  "seconds": 148.61,
+  "tier": "default"
+}

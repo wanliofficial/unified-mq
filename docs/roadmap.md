@@ -29,9 +29,10 @@ flowchart LR
     S4 --> S5
     S5 --> S6[S6 生产化]
     S4 --> S6
+    S6 --> S7[S7 身份统一与事件绑定]
 ```
 
-S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。
+S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。
 
 ---
 
@@ -46,6 +47,7 @@ S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面�
 | **S4** | 集群与一致性 | Metadata Raft + 分区归属 + 消息复制 | 故障注入全套（崩溃/分区/失去多数派）达标 |
 | **S5** | 协议扩展 | AMQP / NATS / Kafka / WebSocket / Pulsar | 每个协议通过真实客户端兼容矩阵 |
 | **S6** | 生产化 | 安全 / 可观测 / 运维 / 容量 | 压测报告 + 故障演练 + 运维手册 |
+| **S7** | 身份统一与事件绑定 | 六协议共用身份表（已完成）+ 标准 CloudEvents Binding 逐字结论（已完成） | 租户来自用户记录 + 每个协议的 Binding 有明确结论 |
 
 ---
 
@@ -184,12 +186,12 @@ unified-mq/
 
 ### 4.3 Gate S2
 
-- [ ] 三档可靠性等级逐档有自动化测试证明（尤其 `os_buffer` 档的丢失边界）——**自动化证明已完成**（`os_buffer` 替身三场景 CI 常驻 + `replicated_commit` 显式拒绝 + `fsync` 对照，见 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`）；**待补** dm-flakey 实机报告（特权/操作者）后勾选
+- [x] 三档可靠性等级逐档有自动化测试证明（尤其 `os_buffer` 档的丢失边界）——**两档证据齐备**：`os_buffer` 替身三场景 CI 常驻（`docs/benchmarks/reliability/s2-b-osbuffer-loss.md` §3）+ `replicated_commit` 显式拒绝 + `fsync` 对照，**外加 dm-flakey 实机掉电报告**（2026-11-09，§5.1：64 条未 fsync 尾部全丢、`high` 回到 K+1、`committed == K`、真 broker 在恢复后的 fs 上启动成功）
 - [x] 慢消费者 / 热点分区场景不导致 OOM——**S2-G 结构 + S2-I 数字**：慢消费者 20 000 条 RSS +37.1 MiB、热点分区冷路径 14 ms / RSS +41.3 MiB、300 连接 +0.4 MiB，均通过且 broker 存活（`docs/benchmarks/2026-11-08-s2-baseline.md` §4）
 - [x] 基准报告已出：单机吞吐、消息大小 / 批量大小 / 分区数 / 订阅数的影响、延迟分位——[`docs/benchmarks/2026-11-08-s2-baseline.md`](benchmarks/2026-11-08-s2-baseline.md)（1 KiB / 8 连接 935 msg/s；`kill -9` 恢复 4.14 s；复跑命令在文首）
 - [x] 无单一 GenServer 成为全局瓶颈（依据 README 7.2 的四项约束逐条检查）——报告 §5 逐条给代码事实与数字：1 → 8 连接 4.4x、1 → 16 分区 875 → 1056 msg/s、100 订阅 25 740 投递/s、热点积压时冷分区 14 ms
 
-> **Gate S2 状态（2026-11-08）**：第 2/3/4 项已通过，第 1 项待 `dm-flakey` 实机报告（需 root，`sudo python3 tools/docker/s2_powerloss.py --scenario powerloss`）。**Gate 整体暂不宣布通过**；证据与口径见 [`docs/benchmarks/2026-11-08-s2-baseline.md`](benchmarks/2026-11-08-s2-baseline.md) 与 `progress.md`「Gate S2 验收结论」。
+> **Gate S2 状态（2026-11-09）**：**四项全部通过，Gate S2 通过。** 第 1 项的 dm-flakey 实机掉电报告已产出（`docs/benchmarks/reliability/s2-powerloss-20261109-215930.json`，口径与复跑见 `s2-b-osbuffer-loss.md` §5）；无 sudo 密码但有 Docker 的机器可用 `sh tools/docker/s2_powerloss_priv.sh --scenario powerloss` 复跑。证据与口径另见 [`docs/benchmarks/2026-11-08-s2-baseline.md`](benchmarks/2026-11-08-s2-baseline.md) 与 `progress.md`「Gate S2 验收结论」。
 
 ---
 
@@ -308,9 +310,47 @@ unified-mq/
 
 ---
 
-## 9. 附录
+## 9. S7 — 身份统一与事件绑定
 
-### 9.1 关键 ADR 索引
+**目标**：把 S6 之后遗留的两件事从「散落在文档角落的待办」变成有验收清单的正式阶段。两项交付均已于 2026-11-09 / 2026-11-10 落地。
+
+S7 有两项交付：
+
+1. **六个协议共用一张身份表**（2026-11-09 已完成，见 `docs/security.md` §2.1）。修复前只有 MQTT 走 `broker_security`，其余五种协议的租户来自协议字段或硬编码的 `t0`，客户端可以自称任何租户；现在六种协议都经 `broker_security` 的用户表解析凭据，租户一律来自匹配到的用户记录。
+2. **各协议标准 CloudEvents Binding 的逐字结论**（2026-11-10 结案，见 §9.1）。结论不是「六个协议都已逐字实现」——**没有任何一个协议是本仓库按官方条文逐字实现的**；结论是逐协议说清「官方规范要求什么、本仓库做了什么、差在哪里」，避免文档继续暗示「还没做」或反过来暗示「已经一致」。
+
+### 9.1 标准 CloudEvents Binding：逐协议结论（2026-11-10 结案）
+
+判定依据是 CloudEvents 官方仓库的 binding 原文（`github.com/cloudevents/spec/tree/main/cloudevents/bindings`，逐份 grep 条文），**不以本表此前的旧表述为准**。官方目录只有六份文件——`amqp`、`http`、`kafka`、`mqtt`、`nats`、`websockets`，**没有 Pulsar**，也没有「WebSocket 有官方 Binding」之外的第三方约定。
+
+| 协议 | 官方条文要求 | 本仓库实现 | 结论 |
+|---|---|---|---|
+| **MQTT 5.0** | `mqtt-protocol-binding.md` §3.1：`Content Type` ← `datacontenttype`；其余属性逐个进 User Property，且 §3.1.3.1「CloudEvents attribute names **MUST be used unchanged**」——即 `specversion`/`id`/`source`/`type`，**不加任何前缀**；值取属性类型的规范字符串形式（§3.1.3.2） | User Property 用 `ce-specversion`/`ce-id`/…（`broker_event_codec:encode_binary/1` 生成 `<<"ce-", Name>>`），入站按 `ce-specversion` 判二进制模式（`broker_event_binding:has_ce_props/1`） | **非逐字**：键名多了 `ce-` 前缀，与规范的 MUST 相反；模式判定也不按 `Content Type` 前缀 |
+| **MQTT 3.1.1** | 同一文件 §1.3：「With MQTT 3.1.1, the content mode is **always structured**」且 payload **MUST** 用 JSON 事件格式；3.1.1 无元数据通道，因此**不存在** binary mode | Structured Mode 逐字节支持（`to_mqtt/3` 的 structured 分支对 3.1.1 不写 `Content Type`，与规范一致）；另额外提供 Binary Mode，把无法承载的属性全列进 `report/5` 的 `losses` | **结构化方向合规**；Binary Mode 是规范之外的扩展（有显式损失报告，非静默丢弃） |
+| **WebSocket** | `websockets-protocol-binding.md` §1.3「content mode is always structured」；§1.4/§1.5 用 `Sec-WebSocket-Protocol` 协商事件格式子协议，JSON 必须支持 `cloudevents.json`，消息用 Text 帧 | WS 端点与该子协议无关：是与 `cloudevents.json` 并列的 **Broker 自有应用层协议**（JSON/二进制帧，见 §4.5），上下文走 Binary Mode 的 `ce-*` 顶层键 | **未实现官方 Binding**，显式声明「自有协议」；官方只定义 structured + 子协议协商 |
+| **NATS** | `nats-protocol-binding.md` §3.1.3.1：属性进 NATS header，名字加 **`ce-`（连字符）**前缀（`ce-specversion`、`ce-datacontenttype`…）；§3.1.3.2：值 **MUST** 按 RFC3986 percent-encode | 键名与规范**完全一致**（同一 `ce-` 前缀，含 `ce-datacontenttype`）；未做 percent-encoding | **键名一致、编码不合规**：header 值未按 §3.1.3.2 编码，含 `,`/`"`/空格的属性值在严格对端会失真 |
+| **Kafka** | `kafka-protocol-binding.md` §3.2.3：属性逐个进 Record Header，前缀是 **`ce_`（下划线）**（`ce_specversion`、`ce_id`…），键与值均为字符串 | 前缀用 `ce-`（连字符） | **非逐字**：分隔符不同（`ce-` vs `ce_`） |
+| **AMQP** | `amqp-protocol-binding.md` 只定义 **AMQP 1.0**：binary mode 把属性放进 **application-properties**，前缀 `cloudEvents_` 或 `cloudEvents:` | 实现的是 **AMQP 0-9-1**：属性在 basic properties 的 `headers` table，前缀 `ce-` | **规范不覆盖本实现**：0-9-1 没有官方 Binding，需先引入 AMQP 1.0 才有逐字实现对象 |
+| **Pulsar** | 官方 bindings 目录**无此文件** | `ce-*` 进 Message properties | **无官方 Binding**：统一 `ce-*` 通道是本 Broker 的定义 |
+
+**结论落地方式**（不是「都已逐字实现」）：
+
+1. 六个协议共用的 `ce-*` 头通道是**本 Broker 的项目方言**，继续作为默认行为，`docs/protocol-compatibility.md` §4.10 如实标注每处与官方的差异，不再出现「与官方 Binding 一致」的表述。
+2. 需要与官方互操作时，只能在对应协议上做逐字映射，且必须先解决上表的硬冲突：MQTT 5 的**去前缀**（与现有 `ce-` 通道互斥，需要按协议分流）、Kafka 的 `ce_` 分隔符、NATS 的 percent-encoding、WebSocket 的子协议协商、AMQP 的 1.0 迁移。
+3. 这些逐字实现在本阶段**不立项**（会破坏六协议统一头通道与既有真实客户端套件），因此记为「已给出结论、不改实现」，而不是留成隐性待办。清单同步在 `docs/security.md` §12 与 `docs/architecture.md` §9。
+
+### 9.2 Gate S7
+
+- [x] 六个协议共用一张身份表，租户来自用户记录而非客户端——`broker_security_identity_SUITE` 10 例 + 五个协议套件的认证用例（WS 4、NATS 3、AMQP 3、Kafka 3、Pulsar 3）；见 `docs/security.md` §2.1
+- [x] 匿名连接是部署决策（`require_auth`），且「握手里带不了凭据的协议」永不被要求
+- [x] 每个协议的标准 CloudEvents Binding 有明确结论：逐字实现，或显式声明「无官方 Binding」——2026-11-10 逐份核对官方 binding 原文后结案，见 §9.1：**没有一个协议是逐字实现**；MQTT 5 前缀相反（规范 MUST 不加前缀）、Kafka 分隔符不同（`ce_` vs `ce-`）、NATS 键名一致但缺 percent-encoding、WebSocket 未实现子协议化 structured 绑定、AMQP 仅有 1.0 规范（本仓库是 0-9-1）、Pulsar 无官方 Binding。结论为「统一 `ce-*` 是本 Broker 定义，逐字实现不立项」
+- [x] `docs/security.md` §12 与 `docs/architecture.md` §9 的遗留清单与实际一致（2026-11-09 核对：认证统一已从清单移除，标准 Binding 归入 S7 Gate）
+
+---
+
+## 10. 附录
+
+### 10.1 关键 ADR 索引
 
 | ADR | 主题 | 定稿阶段 |
 |---|---|---|
@@ -336,7 +376,7 @@ unified-mq/
 | ADR-020 | CloudEvents codec 策略与 Binding 边界 | S3（已采纳） |
 | ADR-021 | 集群控制面、Metadata Raft 与 Fencing | S4（已采纳） |
 
-### 9.2 文档产出物
+### 10.2 文档产出物
 
 | 文档 | 阶段 | 对应 README 章节 |
 |---|---|---|
