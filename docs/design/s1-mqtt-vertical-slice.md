@@ -812,7 +812,7 @@ S0.3 REPORT §3 明确指出 `kill -9` 无法证明 `os_buffer` 档的真实丢�
 
 | 项 | 问题 | 处置 | 影响 |
 |---|---|---|---|
-| **M16** | v5 CONNECT 原来回 4 字节 3.1.1 CONNACK `20 02 00 87`。paho-mqtt 2.x 按 v5 解析 `flags|reason|properties-length`，在属性解码器抛 `IndexError`；mosquitto 2.1.2 报 `A network protocol error`——**两个真实客户端都拿不到 0x87**，"可读的拒绝"不成立 | `mqtt_conn_fsm` 对 `{unacceptable_protocol_version, 5}` 改发 5 字节 v5 帧型 `20 03 00 87 00`（零属性）；3.1.1 的所有响应字节不变，T9 的 `connect_mqtt5_is_refused` 改为断言原始 5 字节。paho 与 mosquitto 均读出 135 = 0x87（"Not authorized"）后关闭 | §4.5、§9-T15、`test/protocol-compatibility/mqtt/README.md` |
+| **M16** | v5 CONNECT 原来回 4 字节 3.1.1 CONNACK `20 02 00 87`。paho-mqtt 2.x 按 v5 解析 `flags\|reason\|properties-length`，在属性解码器抛 `IndexError`；mosquitto 2.1.2 报 `A network protocol error`——**两个真实客户端都拿不到 0x87**，"可读的拒绝"不成立 | `mqtt_conn_fsm` 对 `{unacceptable_protocol_version, 5}` 改发 5 字节 v5 帧型 `20 03 00 87 00`（零属性）；3.1.1 的所有响应字节不变，T9 的 `connect_mqtt5_is_refused` 改为断言原始 5 字节。paho 与 mosquitto 均读出 135 = 0x87（"Not authorized"）后关闭 | §4.5、§9-T15、`test/protocol-compatibility/mqtt/README.md` |
 
 **T15 实测证据摘要**：`python3 test/protocol-compatibility/mqtt/t15_compat.py` **8/8 PASS**。tee 捕获 **46 个帧（c2s + s2c）全部 `roundtrip=ok`**，即生产 `mqtt_frame` 对每个真实客户端帧 `decode→encode` 后字节完全一致；另有 6 个**预期**拒绝事件（两个 v5 CONNECT 与两个 v5 CONNACK、一个 QoS2 PUBLISH、一个含 NUL 的 SUBSCRIBE）。关键字节：CONNECT `10 26 … 04 c2 00 01 …`、SUBSCRIBE `82 0f …`、QoS1 PUBLISH `32 17 …`、PUBACK `40 02 00 02`、PINGREQ `c0 00`、PINGRESP `d0 00`、CONNACK `20 02 00 00`、SUBACK `90 03 00 01 01`；保留位在入站为 `33`（`retain=1`）而投递为 `32`（`retain=0`）；Will CONNECT 的 flags 为 `ce` 且异常断连后订阅端零投递。mosquitto 的默认空 ClientID 被 §4.2/§9-T9 的规则拒绝，驱动显式加 `-i`（`README.md` 已记）。
 

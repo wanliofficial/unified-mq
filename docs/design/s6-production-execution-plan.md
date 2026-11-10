@@ -49,7 +49,7 @@ rebar3 xref
 
 | # | 现象 | 处理 |
 |---|---|---|
-| S6-1 | 3 节点复制基准第一次跑通时，`replicated_commit` 全部判失败 | `broker_cluster_rep:remote_append/2` 原返回 `{ok, Offset}`，`collect/2` 只认裸 `ok`。归一化为 `ok | {error,_}`，补回归用例 `remote_append_normalises_a_successful_append`（S4 单副本/无多数派用例从未覆盖成功分支） |
+| S6-1 | 3 节点复制基准第一次跑通时，`replicated_commit` 全部判失败 | `broker_cluster_rep:remote_append/2` 原返回 `{ok, Offset}`，`collect/2` 只认裸 `ok`。归一化为 `ok \| {error,_}`，补回归用例 `remote_append_normalises_a_successful_append`（S4 单副本/无多数派用例从未覆盖成功分支） |
 | S6-2 | 磁盘 GameDay 用 `chmod` 模拟只读无效 | 已打开的 WAL fd 忽略权限位；改用真实只读 bind mount（EROFS） |
 | S6-3 | 3 节点基准首次启动 `ra.app` 不在 peer 代码路径 | 把 `_build/test/checkouts/*/ebin`（vendored ra）加入 peer `-pa` |
 | S6-4 | 基准里 `application:set_env` 被 `.app` 默认值覆盖 | 先 `application:load/1` 再 `set_env/3` |
