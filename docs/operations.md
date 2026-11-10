@@ -18,6 +18,7 @@
 | WebSocket | 8080 | 明文（可 TLS） | `broker_proto_ws`（Broker 自有 JSON/binary 消息 API） |
 | MQTT over WebSocket | 8083 | 明文（可 TLS，wss） | `broker_proto_mqtt_ws`（S8-B；MQTT 3.1.1 §6 / 5.0 §6） |
 | MQTT-SN | 1884/**UDP** | 明文（无 TLS） | `broker_proto_mqtt_sn`（S8-C；MQTT-SN 1.2，无 DTLS） |
+| MQTT over QUIC | 14567/**UDP** | **强制 TLS 1.3**（无明文模式） | `broker_proto_mqtt_quic`（S8-D；CN Draft 3 单流模式，`rebar3 as quic` 才构建） |
 | NATS | 4223 | 明文（可 TLS） | `broker_proto_nats` |
 | AMQP | 5673 | 明文（可 TLS） | `broker_proto_amqp` |
 | Kafka | 9093 | 明文（可 TLS） | `broker_proto_kafka` |
@@ -27,6 +28,8 @@
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前八个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。
 
 **例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一不受该开关控制的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
+
+**QUIC 是另一个方向的例外**：它**没有明文模式**，握手本身就是 TLS 1.3，所以 `broker_security.tls.enabled` 对它不是「开关」而是「证书来源」——关掉这个开关不会让 14567 变明文，只会让 listener 找不到证书而**拒绝启动**（`{quic_requires_tls, Key}`，只影响这一个 app）。
 
 `broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
 
@@ -84,6 +87,51 @@ TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 li
 - 客户端连不上时先确认是 **UDP** 且端口对得上（`ss -lunp | grep 1884`）；拿 `1883`（TCP MQTT）去连必然超时。
 - 客户端反复 REGISTER 却收不到 REGACK：检查 `predefined_topics` 启动是否成功（id 0 会让 app 拒绝启动）。
 - 会话莫名消失：看 `mqtt_sn_keepalive_timeout` 是否在涨——MQTT-SN 客户端必须在自己声明的 keepalive 内发 PINGREQ。
+
+### 1.2 MQTT over QUIC（UDP 14567，默认关闭）
+
+`broker_proto_mqtt_quic` 实现 OASIS MQTT TC《MQTT over QUIC — Single Stream Mode》CN Draft 3：MQTT 报文零改动，整条连接走**一条客户端发起的双向流**，ALPN 固定 `mqtt`。
+
+**构建前提**：`quicer`（msquic + quictls 的 NIF）只在 `quic` profile 里，且第一次构建要编 C 依赖（`cmake`/`ninja`/`cc`，约 10–15 分钟）：
+
+```sh
+rebar3 as quic compile      # 或 rebar3 as quic ct / release
+```
+
+默认 profile（`rebar3 compile/ct/release`）**完全不拉 quicer**，`broker_proto_mqtt_quic` 照常编译并启动，只是列表里没有 listener；手工开 listener 会得到 `{error, quicer_not_available}`。
+
+**配置**（`config/sys.config.src` 里默认 `listeners => []`）：
+
+```erlang
+{broker_proto_mqtt_quic, [
+  {listeners, [#{port => 14567}]},      % 默认 []，见下
+  {alpn, [<<"mqtt">>]},
+  {handshake_timeout_ms, 5000},
+  {idle_timeout_ms, 30000},
+  {max_streams_per_conn, 4}
+]}.
+```
+
+**为什么默认不监听**：QUIC 没有明文模式，没有证书时 listener 会以 `{quic_requires_tls, certfile}` 拒绝启动，而**拒绝启动是该 app 的启动失败**——即装出来的 release 起不来。所以默认 `[]`，启用顺序是：
+
+1. 给 `broker_security.tls` 配 `certfile`/`keyfile` 并 `enabled => true`（见 `docs/security.md` §9）；
+2. 把 `listeners` 改成 `[#{port => 14567}]` 再重启。
+
+证书也可以直接写在 listener map 里（`#{port => 14567, certfile => "...", keyfile => "..."}`），那样不依赖 `broker_security.tls`——但 QUIC 仍然是 TLS 1.3，这一点不会变。14567 是 EMQX 的 QUIC 惯用端口，便于与 EMQX 对照测试。
+
+- **`alpn`**：CN Draft 3 §2.1 只定义 `mqtt` 一个值，客户端不带它就**握手失败**（`{error, transport_down, #{status := alpn_neg_failure}}`），不会静默降级。
+- **`max_streams_per_conn`**：每条 QUIC 连接在建连时一次性拿到的双向流信用，语义是「**同一连接上最多重连几次**」（流关闭 ≠ 连接关闭，客户端可以开新流重新 CONNECT），不是并发流数——单流模式同一时刻只有一条活动 MQTT 流。quicer 0.4.12 不支持运行期补充信用，所以它是一次给足的配额。
+- **`idle_timeout_ms`** 是 QUIC 连接级的 idle timeout；MQTT 自己的 keepalive 仍在 CONNECT 里协商，两者互不替代。
+- **没有 0-RTT、没有多流（EMQX 私有扩展）**：本实现只做规范的单流模式。
+
+**指标**：QUIC 连接与 MQTT 会话走同一套引擎指标（`connections_current`、`publish_total`、`protocol_errors` 等）；`protocol_errors` 在这一层尤其值得看——它涨说明传输层把事件当成了协议数据（S8-D 收尾就修过一处：`active, 1` 被 quicer 当作 multi 模式，每包多一个 `{quic, passive, ...}` 事件）。
+
+**排查**：
+- 先确认是 **UDP**：`ss -lunp | grep 14567`。QUIC listener 不出现在 `inet:i/0` 里，TCP 客户端连不上是正常的。
+- 握手瞬间失败但 UDP 端口在听：多半是 **ALPN 不是 `mqtt`**，或客户端不信任证书（自签证书需客户端显式 `verify => none` 或导入 CA）。
+- `rebar3 as quic release` 出来的 release 起不来且日志里有 `{quic_requires_tls, _}`：证书没配，见上面的启用顺序。
+- 客户端在同一 QUIC 连接上重连超过 `max_streams_per_conn` 次后新流不再到达：日志里会有 `quic: stream credit exhausted`，让客户端新建 QUIC 连接（或调大该值）。
+- 真实客户端对照：`test/protocol-compatibility/mqtt_quic/` 用 EMQX 的 `emqtt` 1.16.1 跑 8 个用例，见 `docs/protocol-compatibility.md` §4.12。
 
 
 ---

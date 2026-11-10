@@ -244,5 +244,6 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 6. 可观测性导出层（OTel 等；`broker_metrics:snapshot/0` 之上）。
 7. `require_auth` 尚未接进 MQTT 的 CONNECT 路径（`mqtt_conn_fsm` 不调用 `auth_required/1`，见 §2.2 现状边界第 2 条）；`broker_meta` 的 `broker_user` 与数据面认证的接线（ADR-021 §D7 冻结后补充）；`topic_meta` / `queue_meta` / `binding_meta` 三张表的运行时读取方。
 8. **MQTT-SN over DTLS 未实现**（S8-C 只跑明文 UDP）：`broker_security.tls.enabled` 不作用于 1884，这是目前唯一不受该开关控制的 listener；DTLS 列为后续待办（`docs/design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md` §1.2）。
+9. **MQTT over QUIC 的 0-RTT early data 与多流模式未实现**（S8-D 只做 CN Draft 3 的单流模式）：0-RTT 是 CN 的可选项，本轮不接收；多流是 EMQX 私有扩展，不在规范内。QUIC 本身**强制 TLS 1.3**（无明文模式），证书来源见 §9 与 `docs/operations.md` §1.2——`tls.enabled` 对它是「证书来源」而不是开关。另：quicer 0.4.12 不支持运行期补充流信用，`max_streams_per_conn` 是建连时的一次性配额。
 
 六协议统一走 `broker_security` 身份表已于 2026-11-09 完成，见 §2.1，不再列为待办。

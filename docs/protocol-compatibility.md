@@ -1,12 +1,12 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
-- **文档版本**：v1.1
-- **最近一次追加**：2026-11-10——新增 §4.11：MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）。此前一次：2026-11-10——§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。此前一次：2026-11-10——§4.10 的 CloudEvents Binding 从「S7 立项」改为**结案结论**（逐协议核对官方 binding 原文后的差异表）；§4.5~§4.9 的证据表补 S7 认证用例与 trace context 用例的**当前**用例数。§4/§4.1~§4.8 原文保留为当时事实
+- **文档版本**：v1.2
+- **最近一次追加**：2026-11-11——新增 §4.12：MQTT over QUIC（S8-D，EMQX `emqtt` 1.16.1 真实客户端 8/8 + CT 17 例）。此前一次：2026-11-10——§4.11 MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）；再此前：§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。§4/§4.1~§4.10 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
 
-> **用例数口径**：本文件的表格里，标「S5 时点」「S3 时点」等字样的是**当时快照**，标「**N 例（当前）**」的是最近一次从 `all/0`（含 `groups/0` 展开）逐套件清点的当前值。**当前全量基线（S8-C 收尾，2026-11-10）是 `rebar3 ct` 815/815、50 个套件**（`apps/*/test/` 49 个 + `test/integration/s1_e2e_SUITE` 1 个；S7 结案 673/673、43 套件 → S8-A 711/711、46 套件 → S8-B 731/731、47 套件 → S8-C 815/815、50 套件）。
+> **用例数口径**：本文件的表格里，标「S5 时点」「S3 时点」等字样的是**当时快照**，标「**N 例（当前）**」的是最近一次从 `all/0`（含 `groups/0` 展开）逐套件清点的当前值。**当前全量基线（S8-D 收尾，2026-11-11）是 `rebar3 ct` 823/823、52 个套件**（`apps/*/test/` 51 个 + `test/integration/s1_e2e_SUITE` 1 个；S7 结案 673/673、43 套件 → S8-A 711/711、46 套件 → S8-B 731/731、47 套件 → S8-C 815/815、50 套件 → S8-D 823/823、52 套件）。**QUIC 的真实 QUIC 用例只在 `rebar3 as quic ct` 下展开**（默认 profile 无 quicer，该组不出现），所以默认全量数的是 config 组（`broker_proto_mqtt_quic` 17 例）；`rebar3 as quic ct` 下该套件 23 例（多出 6 例真实 QUIC），全量 **827 passed + 2 skipped**（`mqtt_quic_transport_SUITE` 的两个「quicer 缺失」用例在 quicer 在场时按设计 skip），零 FAILED。
 
 > 本文件是 S5 每个协议兼容性测试的基线。S0.4 仅确定「用什么客户端 / 版本 / 语言」并验证其可获取（见 `spikes/s0_4_clients/REPORT.md`）。协议能力、端到端语义、CloudEvents Binding 由 S5 逐协议填充「支持状态」列。
 
@@ -38,7 +38,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -48,6 +48,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | WebSocket | 已支持 | RFC 6455 握手/掩码/分片/控制帧；自有应用帧 `connect`/`subscribe`/`publish`/`ack`/`unsubscribe`/`ping`/`disconnect` | v1 仅 QoS0/1；`shared` 订阅显式拒绝；应用层帧为 Broker 自有格式；见 §4.5 | `apps/broker_proto_ws/test/`、`test/protocol-compatibility/ws/` |
 | MQTT over WebSocket | 已支持（S8-B） | RFC 6455 binary 帧承载标准 MQTT（3.1.1 / 5.0 与 1883 明文完全同一份 FSM）：QoS0/1/2、Retain、Will、持久会话、离线追赶、`mqtt`/`mqttv3.1`/`mqttv3.1.1` 子协议协商、任意 URL path、wss | 无 `permessage-deflate`；text 帧 → close 1003、超长帧 → close 1002；缺失/未知子协议 → HTTP 400；背压按帧（`arm_once` no-op）；见 §4.13 | `apps/broker_proto_mqtt_ws/test/`、`test/protocol-compatibility/mqtt_ws/` |
 | MQTT-SN | 已支持（S8-C） | MQTT-SN 1.2 over UDP（默认 1884）：全部 27 种报文、QoS −1/0/1/2、Retain、Will（CONNECT 标记 → WILLTOPICREQ/WILLTOPIC/WILLMSGREQ/WILLMSG，含 `WILLTOPICUPD`/`WILLMSGUPD`）、三种 TopicIdType（预定义 / 每客户端 normal 双向 REGISTER / 两字符 short）、休眠与 `PINGREQ(client_id)` 唤醒、SEARCHGW/ADVERTISE 网关发现、keepalive 1.5×/2× | 无 DTLS（明文 UDP）；QoS 0 在休眠期间丢弃；无串口桥 / 转发器（Forwarder Encapsulation）不实现；CONNECT 无凭据字段，`require_auth` 配 `mqtt_sn` 时拒绝启动（见 §4.11、`docs/security.md` §2.2） | `apps/broker_proto_mqtt_sn/test/`、`test/protocol-compatibility/mqtt_sn/` |
+| MQTT over QUIC | 已支持（S8-D） | MQTT over QUIC（OASIS TC《Single Stream Mode》CN Draft 3）over UDP（默认 14567）：同一份 `mqtt_conn_fsm`，因此 QoS0/1/2、Retain、Will、持久会话、MQTT 5.0 properties 与 1883 完全一致；ALPN 固定 `mqtt`；一条客户端发起的双向流承载整条 MQTT 连接；流关闭 ≠ 连接关闭（同连接新流 = 新会话）；强制 TLS 1.3 | 无 0-RTT early data；无多流（EMQX 私有扩展）；无运行期流信用补充（`max_streams_per_conn` 建连时给足）；默认不监听（无证书即拒绝启动）；只有 `rebar3 as quic` 构建才带 NIF；见 §4.12 | `apps/broker_proto_mqtt_quic/test/`、`test/protocol-compatibility/mqtt_quic/` |
 | NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth、HPUB/HMSG headers（`ce-*`） | 无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
@@ -622,7 +623,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 ### 4.13 S8-B 追加（2026-11-10）：MQTT over WebSocket（`broker_proto_mqtt_ws`）
 
-> 编号说明：§4.11 / §4.12 预留给 S8-C（MQTT-SN，见 §4.11）与 S8-D（MQTT over QUIC），本节先按 S8-B 执行计划落 §4.13。
+> 编号说明：§4.11 是 S8-C（MQTT-SN，已落地），§4.12 是 S8-D（MQTT over QUIC，已落地），本节按 S8-B 执行计划落在 §4.13。
 
 **是什么**：MQTT 3.1.1 §6 / MQTT 5.0 §6 定义的 MQTT over WebSocket。同一条 `mqtt_conn_fsm`（与 1883 明文 MQTT、8883 TLS MQTT 完全同一份代码）跑在 RFC 6455 **binary** 帧里；WebSocket 只当字节管道，协议语义、QoS、会话、retain、Will 全部由 MQTT 引擎负责。默认端口 **8083**，TLS 跟随 `broker_security.tls.enabled`（wss）。
 
@@ -657,6 +658,52 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 - **无 `permessage-deflate`**：MQTT over WebSocket 的压缩扩展未实现，带宽敏感部署需在客户端关闭该扩展。
 - **背压按帧而非按报文**：一个超大帧会一次性交给 FSM；窗口控制仍靠 `max_inflight` / `receive_maximum`，与 TCP 传输一致。
 - **帧上限与报文上限是两个旋钮**：`max_frame_bytes`（WS 层）与 `mqtt_max_packet_size`（MQTT 层）分别生效，调小前者不会改变 MQTT 报文的法定上限。
+
+---
+
+### 4.12 S8-D 追加（2026-11-11）：MQTT over QUIC（`broker_proto_mqtt_quic`）
+
+**是什么**：OASIS MQTT TC 的 [MQTT over QUIC — Single Stream Mode（Committee Note Draft 3）](https://github.com/oasis-tcs/mqtt/) 实现。规范的核心只有一句：**MQTT 报文零改动**，整条 MQTT Network Connection 走**一条客户端发起的双向流**。所以本仓库没有为它写第二个 MQTT 引擎——`mqtt_conn_fsm` 与 1883 / 8083 是同一份代码，`mqtt_transport_quic` 是第三个传输实现（TCP/TLS → WebSocket → QUIC）。默认 **UDP 14567**（EMQX 的 QUIC 惯用端口，便于对照）。
+
+**与前三节的差别在哪**：QUIC 上「流关闭」不等于「连接关闭」（CN Draft 3 §2.1）。客户端关掉流只结束这条 MQTT 连接，它可以在同一条 QUIC 连接上新开一条流重新 CONNECT。因此比 TCP 多一个进程层次：listener → acceptor → 每连接一个 `mqtt_quic_conn`（拥有连接句柄）→ 每流一个 `mqtt_conn_fsm`。分层细节见 `docs/architecture.md` §3.12。
+
+**构建门控**：`quicer`（msquic + quictls 的 NIF）是 `quic` profile 的依赖，默认 `rebar3 compile/ct/release` 完全不拉它；`broker_proto_mqtt_quic` 在默认 profile 里照常编译、照常启动，只是没有 listener。手工打开会得到 `{error, quicer_not_available}`（`optional_applications => [quicer]`）。
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| MQTT 3.1.1 / 5.0 | 已支持 | 同一份 `mqtt_conn_fsm`：CONNECT/CONNACK、PUBLISH 双向 QoS0/1/2、SUBACK、UNSUBSCRIBE、PINGREQ/PINGRESP、DISCONNECT、retain、Will、持久会话与离线追赶、takeover |
+| ALPN | 仅 `mqtt` | CN Draft 3 §2.1 唯一值。客户端带别的 ALPN → 握手失败（`{error, transport_down, #{status := alpn_neg_failure}}`），不静默降级 |
+| 传输 | 强制 TLS 1.3 | QUIC 没有明文模式。证书取自 listener map 或 `broker_security.tls`；都没有 → listener 拒绝启动 `{quic_requires_tls, Key}` |
+| 单流模式 | 已支持 | 一条客户端发起的 bidi 流承载整条连接；`peer_unidi_stream_count => 0`，服务端不发流 |
+| 流关闭 ≠ 连接关闭 | 已支持 | 同一条 QUIC 连接上开新流 = 新 MQTT 会话（`a_new_stream_on_the_same_connection_is_a_new_session`） |
+| 流信用 | 建连时一次性授予 | `max_streams_per_conn`（默认 4）= **同一连接上的重连次数**，不是并发流数；quicer 0.4.12 运行期补信用无效（实测），超出后新流不到达并记 `quic: stream credit exhausted` |
+| 会话状态 | 与 1883 同域 | client id 全局唯一，QUIC 与 TCP 同 id 是 takeover；订阅/游标/retain 全部复用 `broker_subscription` / `broker_queue` / `broker_retain` |
+| 背压 | 按流 | `arm_once/1` = `quicer:setopt(Stream, active, once)`；`max_inflight` / `receive_maximum` 仍是窗口控制 |
+| 0-RTT early data | **不支持** | CN 里的可选项，本轮不接收 |
+| 多流模式 | **不支持** | EMQX 私有扩展，不在规范里 |
+| datagram / unidi 流 | **不支持** | 非单流模式语义 |
+
+**证据**：
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT 套件（传输契约，纯函数） | `apps/broker_proto_mqtt_quic/test/mqtt_quic_transport_SUITE.erl` | **13 例**：`decode_msg/2` 的 binary/atom 分派、按 stream 匹配、关闭类事件归一、`send`/`arm_once`/`close` 在缺 NIF 时的明确错误 |
+| CT 套件（listener） | `apps/broker_proto_mqtt_quic/test/mqtt_quic_listener_SUITE.erl` | **config 4 例**（无证书拒绝、证书来自 `broker_security.tls`、默认值、默认不监听）+ **quic 6 例**（临时端口、ALPN `mqtt` 握手、非 `mqtt` 被拒、真实 CONNECT→CONNACK、**PINGREQ 不是协议错误**、同连接新流 = 新会话）。默认 profile 只有 config 组；`rebar3 as quic ct` 才展开 quic 组 |
+| 真实第三方客户端 | `test/protocol-compatibility/mqtt_quic/`（EMQX `emqtt` **1.16.1** + `quicer` 0.4.12，ALPN `mqtt`） | **8/8**：connect、QoS0、QoS1、QoS2、retain、Will、MQTT 5.0、持久会话续连。被测节点**只**起 QUIC listener，端口是内核分配的临时 UDP 端口 |
+
+**`emqtt` 的能力边界（Gate 文本必须照实写）**：`emqtt` 的 QUIC 支持是 EMQX 侧的**实验特性**——它按 `peer_bidi_stream_count => 3`、`active => 1`、异步发送工作；公开 API **没有流级关闭**（`close/1` 会连连接一起关），因此「关掉流、在同一条连接的新流上重新 CONNECT」这半边断言在本仓库的 CT 里（raw `quicer` + 同一引擎），不在第三方驱动里。同理，0-RTT 与多流两边都没有实现，第三方套件也不声称覆盖。诚实的结论是：**一个独立客户端的实验性 QUIC 路径在本 Broker 上跑通上述 8 个用例**，而不是「MQTT over QUIC 对所有客户端互通」。
+
+**顺带修掉的两个真实问题**（都写在代码注释里，撤掉修复即复现）：
+
+1. `arm_once/1` 曾写 `setopt(Stream, active, 1)`。quicer 把整数 active 当 `{active, N}`（multi 模式），收满 N 条后向 owner 发 `{quic, passive, Stream, undefined}`——FSM 不认识它，**每读一个报文记一条 `unexpected event` 并 `protocol_errors` +1**。改用原子 `once` 后消失，回归断言是 `a_pingreq_is_not_a_protocol_error`（报文本身在坏版本里照常回，只能对计数器断言）。
+2. `broker_cluster_dist_SUITE` 的 peer 代码路径过滤写死了 `_build/test`。CT 的构建目录按 profile 命名，`rebar3 as quic ct` 下该串不匹配，于是 peer 只拿到 suite 目录、连 `ra.app` 都找不到，四个分布式用例全部在 `init_per_testcase` 失败。改为「以 `ebin` 结尾」后与 profile 无关。
+
+**已声明的限制 / 边界**：
+
+- **默认不监听**：QUIC 无证书即拒绝启动，而拒绝启动是该 app 的启动失败，release 会起不来。启用顺序见 `docs/operations.md` §1.2。
+- **流信用是配额不是补充**：同一 QUIC 连接上重连超过 `max_streams_per_conn` 次后，客户端必须新建 QUIC 连接。这是 quicer 0.4.12 的实测限制，不是设计偏好。
+- **只有 `rebar3 as quic` 构建带 NIF**：默认 release 里没有 `quicer`，也就没有 QUIC 端口。运维上要先确认 `rebar3 as quic release` 的产物。
+- **DTLS 不相关**：QUIC 自带 TLS 1.3，与 MQTT-SN 的明文 UDP 是两回事；`broker_security.tls.enabled` 对 QUIC 是「证书来源」而不是「开关」。
 
 ---
 

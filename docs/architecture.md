@@ -4,7 +4,7 @@
 - **状态**：描述当前已实现并实测的架构事实（S0–S6）。S6 之后（现归 S7 及之后）明确未实现的方向在 §9 单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断“某个行为归哪一层”的测试作者
 - **对应**：`docs/roadmap.md`、`docs/design/`（各阶段设计基线）、ADR-001/002/004/007/009/010/011/016/017/018/019/020/021
-- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**815/815**，**50 个套件**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
+- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**823/823**，**52 个套件**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -51,6 +51,7 @@ apps/
 ├── broker_proto_ws/      S5：WebSocket（RFC 6455）+ JSON/binary 消息 API
 ├── broker_proto_mqtt_ws/ S8-B：MQTT over WebSocket（MQTT 3.1.1 §6 / 5.0 §6），RFC 6455 传输跑同一个 mqtt_conn_fsm
 ├── broker_proto_mqtt_sn/ S8-C：MQTT-SN 1.2 网关（UDP），一个 socket 服务全部会话，不复用 mqtt_conn_fsm
+├── broker_proto_mqtt_quic/ S8-D：MQTT over QUIC（CN Draft 3 单流模式），同一 mqtt_conn_fsm 跑在 quicer 流上
 ├── broker_proto_nats/    S5：NATS core（PUB/SUB、queue group、request/reply）
 ├── broker_proto_amqp/    S5：AMQP 0-9-1（exchange/queue/binding、publish/consume/ack）
 ├── broker_proto_kafka/   S5：Kafka wire（Produce/Fetch/Metadata + consumer group）
@@ -251,6 +252,32 @@ broker_proto_mqtt_sn_sup (one_for_all, 1/5s)
 
 **认证边界在启动期显式失败。** 1.2 的 CONNECT 没有用户名/密码字段，`broker_security:auth_required(mqtt_sn)` 恒 `false`；`broker_proto_mqtt_sn_app` 因此直接读 `require_auth` 原始列表，命中 `mqtt_sn` 就拒绝启动监听器（`{require_auth_unsupported, mqtt_sn}`）。拒绝粒度是整个 app：一个 socket 服务全部客户端，没有「只对部分客户端要求凭据」的表达力。见 `docs/security.md` §2.2 第 4 条。
 
+### 3.12 MQTT over QUIC 的连接/流两层（S8-D）
+
+OASIS MQTT TC 的《MQTT over QUIC — Single Stream Mode》CN Draft 3 只做一件事：**MQTT 报文一个字节不改**，整条 Network Connection 走**一条客户端发起的双向流**。所以这里既不是「新协议」也不是「新引擎」——`mqtt_conn_fsm` 与 1883/8083 是同一份代码，`mqtt_transport_quic` 是第 3 个传输实现（§3.9）。
+
+多出来的一层来自 QUIC 本身：**流会关，连接不会**。客户端关掉流只是结束这条 MQTT 连接，它可以在同一条 QUIC 连接上新开一条流重新 CONNECT。于是比 TCP 多一个「谁在两次流之间活着」的进程：
+
+```
+broker_proto_mqtt_quic_sup (one_for_all, 1/5s)
+└── mqtt_quic_listener × N        % 每个配置的 listener 一个；拥有 quicer listener 句柄
+      ├── acceptor 进程           % quicer:accept/3 循环；把每条连接交接出去
+      └── mqtt_quic_conn × N      % 每条 QUIC 连接一个；拥有连接句柄，循环处理新流
+            └── mqtt_conn_fsm     % 每条流一个（mqtt_conn_sup 的子进程），handle = stream
+```
+
+**listener 不自己服务连接，acceptor 也不服务**：quicer 的 acceptor 只负责 `accept`，连接句柄的所有权必须显式 `controlling_process/2` 交给 `mqtt_quic_conn`，否则 `{quic, new_stream, ...}` 会落进错误的邮箱。交接顺序是「先移所有权、再通知」（`Pid ! {quic_conn, Conn}`），与 TCP 的 `{handshake, ...}` 同理：一句 `Pid ! connect` 之前，FSM 不许碰它不拥有的句柄。
+
+**服务端必须自己完成 TLS 握手。** `quicer:accept/3` 只报告传输层连接，`quicer:handshake/2` 才真正跑 TLS；而 `{quic, connected, ...}` 投给连接的 owner，所以握手只能由 `mqtt_quic_conn` 在拿到句柄之后做。握手失败（错 ALPN、明文探测、客户端中途走掉）是常态：进程以 `normal` 停止并记一条 info，不占用监督树的重启强度。
+
+**流信用一次性授予，不按需补充。** `peer_bidi_stream_count => max_streams_per_conn`（默认 4）在 `quicer:listen/2` 时给足；`peer_unidi_stream_count => 0`（服务端不发流）。本想「关一条补一条」，但 quicer 0.4.12 / msquic 2.5.11 下运行期 `setopt(Conn, settings, ...)` 返回 `ok` 而新的 MAX_STREAMS 帧**不会**让客户端的新流到达（实测：listen 时授 4 → 4 条顺序到达；握手后追加 → 永不到达）。4 因此是**重连配额**而不是并发目标，Single Stream Mode 仍然只有一条活动流；`{quic, peer_needs_streams, ...}` 只记一条 warning，不假装能补。
+
+**MQTT 层看不见 QUIC 的事件。** quicer 把 payload 与事件塞进同一个 `{quic, X, Stream, Props}` 形状，只有 `X` 的类型能区分，所以 `decode_msg/2` 按 `is_binary/1` 分派（§3.9）。这里还有一处**实测踩到的真缺陷**：`arm_once/1` 最初写 `setopt(Stream, active, 1)`，而 quicer 把整数 active 当 `{active, N}`（multi 模式）——收满 N 条后向 owner 发 `{quic, passive, Stream, undefined}` 并把流切回 passive。FSM 不认识这个消息，于是**每读一个报文记一条 `unexpected event` 并 `protocol_errors` +1**。改用原子 `once`（`ACCEPTOR_RECV_MODE_ONCE`）后一读一 arm 且不再有 passive 事件；回归断言是 `mqtt_quic_listener_SUITE:a_pingreq_is_not_a_protocol_error`（报文在坏版本里也照常回去，只能对计数器断言）。
+
+**QUIC 没有明文模式。** 握手就是 TLS 1.3，因此证书来源与其它 listener 不同：listener map 自带 `certfile`/`keyfile`，否则取 `broker_security.tls`；两者都没有就 `{stop, {quic_requires_tls, certfile | keyfile}}`，**只让这一个 app 起不来**。`broker_security.tls.enabled` 不能把 QUIC 变成明文，只能让它在找不到证书时拒绝启动。ALPN 只提供 `mqtt`（CN Draft 3 §2.1 的唯一值），客户端不带 `mqtt` 就握手失败——静默接受别的 ALPN 等于让客户端以为自己在说另一种协议。
+
+**quicer 是 profile 门控依赖，不是默认依赖。** 默认 `rebar3 compile/ct/release` 完全不拉 `quicer`（`optional_applications => [quicer]`，listener 在缺 NIF 时以 `{error, quicer_not_available}` 干净拒绝）；`rebar3 as quic ...` 才把它编进来，`quic` profile 的 `relx` 因此复制了完整的 release app 列表——profile 的 `relx` 会**替换**顶层那份，漏掉就等于装出一个只有 QUIC 的 release。所有 `quicer:` 调用集中在 `mqtt_quic_nif` 一个模块，`include` 也不越界：本 app 只通过裸消息元组与 quicer 交互，没有它的头文件依赖。
+
 ---
 
 ## 4. 启动顺序与 boot steps
@@ -420,6 +447,10 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_mqtt_sn.advertise_interval_ms` / `advertise_address` / `advertise_port` | `0` / `{255,255,255,255}` / `1884` | `0` = 只应答 SEARCHGW；**广播目的地是客户端监听端口，不是本 listener 端口** |
 | `broker_proto_mqtt_sn.max_asleep_clients` / `max_topic_ids_per_client` | 1024 / 1024 | 休眠会话登记上限（超限按正常断开并计 `mqtt_sn_sleep_denied`）；每会话 normal topic id 上限（下行超限即断开会话） |
 | `broker_proto_mqtt_sn.max_inflight` / `max_duration_s` | 20 / 3600 | 每会话未 ACK 的下行 QoS 1/2 窗口（满则留在分区、下次 PINGREQ 重试）；keepalive/sleep 请求时长上限 |
+| `broker_proto_mqtt_quic.listeners` | release 配 `[]`（示例 `#{port => 14567}` 注释掉）；`.app.src` 默认 `[]` | S8-D：每条一个 QUIC listener。**默认关闭是刻意的**：QUIC 无证书必然拒绝启动，而拒绝启动是该 app 的启动失败，默认开会让不带证书的 release 起不来 |
+| `broker_proto_mqtt_quic.alpn` | `[<<"mqtt">>]` | CN Draft 3 §2.1 的唯一 ALPN；客户端不带它就握手失败 |
+| `broker_proto_mqtt_quic.handshake_timeout_ms` / `idle_timeout_ms` | 5000 / 30000 | TLS 1.3 握手超时与 QUIC idle timeout |
+| `broker_proto_mqtt_quic.max_streams_per_conn` | 4 | 每条 QUIC 连接**建连时**授予的双向流信用 = 同一连接上的重连次数（不是并发流数；见 `mqtt_quic_listener:open/2`） |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 
@@ -441,7 +472,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **815/815**，`apps/*/test/`（49 个套件）与 `test/integration/s1_e2e_SUITE` 共 **50 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped` | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
+| 单元/契约/集成 | `rebar3 ct` → **823/823**，`apps/*/test/`（51 个套件）与 `test/integration/s1_e2e_SUITE` 共 **52 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
 | 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 173 条均为预期 unused-export | CI/本地 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |
