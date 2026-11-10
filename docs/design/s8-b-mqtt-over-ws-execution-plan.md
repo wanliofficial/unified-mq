@@ -338,27 +338,29 @@ test/protocol-compatibility/mqtt_ws/
 └── data/                       # gitignore：WAL / sessions
 ```
 
-**boot 助手**照 `ws_broker_boot.erl`：逐 app `application:load`、`broker_storage/wal`、`create_partition`、`application:ensure_all_started(broker_proto_mqtt)` **和** `broker_proto_mqtt_ws`、`ranch:get_port({mqtt_ws, 0})` 回读、打印 `PORT <n>` + `MQTT-WS-READY`。
+**boot 助手**照 `ws_broker_boot.erl`：逐 app `application:load`、`broker_storage/wal`、`create_partition`、`application:ensure_all_started(broker_proto_mqtt_ws)`（`broker_proto_mqtt` 只作为依赖被启动，**自己的 TCP 监听器保持空**——这样任何用例都不可能偷偷走明文 MQTT）、`ranch:get_port({mqtt_ws, 0})` 回读、打印 `PORT <n>` + `MQTT-WS-BROKER-READY`。
 
 **驱动脚本**用 `paho.mqtt.client.Client(CallbackAPIVersion.VERSION2, transport="websockets")` + `ws_set_options(path="/mqtt")`（顺带验证任意 path）。
 
-用例（草案）：
+已实现：**9 例**（`--all` 连跑 3 次全绿；8 例 paho 第三方 + 1 例原始 socket 探针），报告 `run/report.json` 里 `third_party_cases: 8` / `transport_probes: 1`。
 
-| 用例 | 断言 |
-|---|---|
-| `ws-connect` | `connect()` 成功，`on_connect` reason_code == 0；子协议协商不回退 |
-| `ws-pubsub-qos0` | QoS0 订阅 + 发布往返 |
-| `ws-pubsub-qos1` | QoS1 往返，PUBACK 正常 |
-| `ws-pubsub-qos2` | QoS2 四步握手完成（设计 §9.2 要求） |
-| `ws-retain` | retained 消息在新订阅者连上后即时投递 |
-| `ws-will` | 客户端异常断开，订阅者收到 will |
-| `ws-message-across-frames` | 见下"跨帧证据" |
-| `ws-text-frame-rejected` | 见下"text 帧证据" |
-| `ws-mqtt5` | `MQTTv5` + `transport="websockets"` connect + pub/sub |
+| 用例 | 客户端 | 断言 |
+|---|---|---|
+| `ws-connect` | paho-mqtt 2.1.0 | `connect()` 成功，`on_connect` reason_code == 0 |
+| `ws-pubsub-qos0` | paho-mqtt | QoS0 订阅 + 发布往返，`qos == 0` |
+| `ws-pubsub-qos1` | paho-mqtt | QoS1 往返，双向 PUBACK，`info.is_published()` |
+| `ws-pubsub-qos2` | paho-mqtt | QoS2 四步握手（PUBREC/PUBREL/PUBCOMP）双向完成 |
+| `ws-retain` | paho-mqtt | retained 消息在新订阅者连上后即时投递，`retain = 1` |
+| `ws-will` | paho-mqtt | 不发 DISCONNECT 直接关 socket，订阅者收到 Will |
+| `ws-mqtt5` | paho-mqtt | `MQTTv5` + `transport="websockets"` connect + pub/sub |
+| `ws-path` | paho-mqtt | `ws_set_options(path="/mqtt")` 被接受 |
+| `ws-raw-framing` | **原始 socket 探针** | 跨帧重组 + text 帧 → close 1003；报告内 `third_party: false` |
 
-**跨帧与 text 帧证据怎么做（paho 不会故意做这两件事）**：`mqtt_ws_compat.py` 里在 paho 用例全绿之后，加一个**独立的原始 socket 子检查**（同一脚本、同一 broker，但自己 `socket` + `ws_frame` 手工发）：它只用来证明"服务端接受跨帧 / 拒绝 text 帧"，报告里单列 `ws-raw-framing` 小节并注明"raw framing probe，非 paho 用例"。**不**把 raw 探针算作第三方客户端证据。
+**跨帧与 text 帧证据怎么做（paho 不会故意做这两件事）**：`mqtt_ws_compat.py` 里有一个**独立的原始 socket 子检查**（同一脚本、同一 broker，但自己 `socket` + `struct` 手工掩码发帧，**不用** `ws_frame`）：它只用来证明"服务端接受跨帧 / 拒绝 text 帧"，报告里单列 `ws-raw-framing`、`client: "raw-socket-probe"`、`third_party: false`。**不**把 raw 探针算作第三方客户端证据。
 
-`report.json` 结构照 `ws_compat.py`（每用例 `name/status/detail`），README 写清：客户端版本、路径、paho 覆盖的用例、raw 探针的边界。
+**实测踩到的坑（paho 2.1.0）**：`MQTTMessageInfo.wait_for_publish/1` 成功时返回 `None`（只在部分错误上抛异常），所以 `check(info.wait_for_publish(...))` 恒假——判据必须用 `info.is_published()`。
+
+`report.json` 每条用例记 `case` / `client`（`paho-mqtt` 或 `raw-socket-probe`）/ `seconds` / `evidence`（失败则 `error`），顶层另有 `third_party_cases` 与 `transport_probes` 两个计数。README 写清客户端版本、路径、paho 覆盖的用例、raw 探针的边界。
 
 **验证**
 
@@ -430,7 +432,7 @@ git commit -m "docs(s8-b): record MQTT over WebSocket in architecture, ops and p
 - [x] `mqtt_ws_conn` 完成 HTTP 升级（子协议协商，缺失/不匹配 → 400）、binary 帧解码、text 帧 → close 1003、控制帧独立处理
 - [x] `mqtt_transport_ws` 实现 `mqtt_transport` 四回调，FSM 零改动接入
 - [x] `mqtt_ws_conn_SUITE` 全绿（18/18；含 wss、跨帧、单帧多报文、text 帧拒绝）
-- [ ] `paho-mqtt 2.1.0` websocket 用例全绿，`report.json` / `broker.log` 落盘
+- [x] `paho-mqtt 2.1.0` websocket 用例全绿（8/8，另有 1 例 raw framing 探针单列），`report.json` / `broker.log` 落盘
 - [x] `rebar3 ct` 总例数 = 729（基线 711 + 本套件 18），零 FAILED
 - [ ] dialyzer / xref 干净，`rebar3 as prod release` 装配成功（release 内含 `broker_proto_mqtt_ws`）
 - [ ] `docs/architecture.md` / `operations.md` / `protocol-compatibility.md` §4.13 / `progress.md` 同步，用例数回填
