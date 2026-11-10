@@ -196,7 +196,8 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
         versions => ['tlsv1.2', 'tlsv1.3']}}
 ```
 
-- `broker_security_tls:transport/0` 返回 `{ranch_tcp, []}`（禁用）或 `{ranch_ssl, Opts}`（启用）。六个协议的 supervisor 都调用它，**一个开关覆盖所有 listener**，没有哪个 listener 能「知道 TLS 但不消费配置」。
+- `broker_security_tls:transport/0` 返回 `{ranch_tcp, []}`（禁用）或 `{ranch_ssl, Opts}`（启用）。六个协议的 supervisor 都调用它（S8-B 起 MQTT over WebSocket 是第七个 listener，同样只读这一个开关），**一个开关覆盖所有 listener**，没有哪个 listener 能「知道 TLS 但不消费配置」。
+- **协议侧还要真的把 TLS 握手跑完**：ranch 对 TLS 只做 `transport_accept`，协议进程收到 `{handshake, Ref, Transport, Sock, Timeout}` 后必须自己调 `Transport:handshake/2`（`ranch_tcp` 是 no-op，`ranch_ssl` 才完成握手），否则首个 `ssl:setopts/2` 报 `notsup_on_transport_accept_socket`。这正是 S8-B 修掉的既有缺陷：`broker_proto_ws` 的 wss 在此前**完全不可用**（listener 明明是 `ranch_ssl`），现由 `ws_conn_SUITE` 的 wss 用例钉住；`broker_proto_mqtt_ws` 从第一版起就正确握手。
 - 启动时 `broker_security_app:start/2` 校验：启用且缺 PEM 文件 → 应用启动失败；禁用永远合法。
 - 轮换：替换同路径 PEM，调用 `broker_security_tls:reload/0`（管理 API `POST /api/v1/tls/reload`），清 `ssl` PEM 缓存，下一个握手用新证书；已建立连接保持原证书（标准 TLS 语义）。
 - 脱敏：`redacted_config/0` 不返回密钥内容。

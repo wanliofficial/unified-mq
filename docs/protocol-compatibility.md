@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
 - **文档版本**：v1.1
-- **最近一次追加**：2026-11-10——§4.10 的 CloudEvents Binding 从「S7 立项」改为**结案结论**（逐协议核对官方 binding 原文后的差异表）；§4.5~§4.9 的证据表补 S7 认证用例与 trace context 用例的**当前**用例数。§4/§4.1~§4.8 原文保留为当时事实
+- **最近一次追加**：2026-11-10——新增 §4.13：MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。此前一次：2026-11-10——§4.10 的 CloudEvents Binding 从「S7 立项」改为**结案结论**（逐协议核对官方 binding 原文后的差异表）；§4.5~§4.9 的证据表补 S7 认证用例与 trace context 用例的**当前**用例数。§4/§4.1~§4.8 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -38,7 +38,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -46,6 +46,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 |---|---|---|---|---|
 | MQTT | 已支持 | QoS0/1/2、Retain、Will、clean session/persistent session、离线追赶、MQTT 5.0 子集（session expiry、message expiry、reason codes、properties、`$share/{group}/{filter}` Shared 订阅） | 无 topic alias、无 AUTH 扩展认证、`subscription identifier` 不透传到投递帧；QoS2 跨崩溃仍为至少一次；见 §4/§4.1/§4.2 | `apps/broker_proto_mqtt/test/`、`test/protocol-compatibility/mqtt/` |
 | WebSocket | 已支持 | RFC 6455 握手/掩码/分片/控制帧；自有应用帧 `connect`/`subscribe`/`publish`/`ack`/`unsubscribe`/`ping`/`disconnect` | v1 仅 QoS0/1；`shared` 订阅显式拒绝；应用层帧为 Broker 自有格式；见 §4.5 | `apps/broker_proto_ws/test/`、`test/protocol-compatibility/ws/` |
+| MQTT over WebSocket | 已支持（S8-B） | RFC 6455 binary 帧承载标准 MQTT（3.1.1 / 5.0 与 1883 明文完全同一份 FSM）：QoS0/1/2、Retain、Will、持久会话、离线追赶、`mqtt`/`mqttv3.1`/`mqttv3.1.1` 子协议协商、任意 URL path、wss | 无 `permessage-deflate`；text 帧 → close 1003、超长帧 → close 1002；缺失/未知子协议 → HTTP 400；背压按帧（`arm_once` no-op）；见 §4.13 | `apps/broker_proto_mqtt_ws/test/`、`test/protocol-compatibility/mqtt_ws/` |
 | NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth、HPUB/HMSG headers（`ce-*`） | 无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
@@ -569,6 +570,46 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 结论：统一 `ce-*` 头通道**是本 Broker 的项目定义**，六个协议共享它以保证跨协议零重映射转发；逐字实现各协议官方绑定**不立项**（与统一通道互斥，且会破坏既有真实客户端套件）。上表的差异是显式声明的，不是待办遗漏。本节的等价映射与非无损点继续有效，不因结案而改写。
 
 > **W3C trace context（README §10.2）**：`traceparent` / `tracestate` 与 CloudEvents 属性共用同一张 `headers` map，但键名独立（无 `ce-` 前缀），由 `broker_event_trace` 在 `broker_event:apply_policy/2` 上统一校验与门控。WS/NATS 的白名单头通道只在开启传播时放行这两个键；AMQP/Kafka/Pulsar 全量透传 headers，也由同一 seam 在 `off` 时剥离；MQTT 5 走 ADR-020 的 User Property 通道，`mqtt_conn_fsm` 入站把这两个键提到 `headers`、投递时回填，同样受 `off` 门控（3.1.1 无此通道）。安全边界见 `docs/security.md` §5.1。
+
+---
+
+### 4.13 S8-B 追加（2026-11-10）：MQTT over WebSocket（`broker_proto_mqtt_ws`）
+
+> 编号说明：§4.11 / §4.12 预留给 S8-C（MQTT-SN）与 S8-D（MQTT over QUIC），本节先按 S8-B 执行计划落 §4.13。
+
+**是什么**：MQTT 3.1.1 §6 / MQTT 5.0 §6 定义的 MQTT over WebSocket。同一条 `mqtt_conn_fsm`（与 1883 明文 MQTT、8883 TLS MQTT 完全同一份代码）跑在 RFC 6455 **binary** 帧里；WebSocket 只当字节管道，协议语义、QoS、会话、retain、Will 全部由 MQTT 引擎负责。默认端口 **8083**，TLS 跟随 `broker_security.tls.enabled`（wss）。
+
+**为什么不并进 8080**：`broker_proto_ws`（S5）是 Broker 自己的 JSON/binary 消息 API，与标准 MQTT over WebSocket 的应用协议完全不同。合并会让 S5 已钉死的线上字节行为与 MQTT 客户端需求互相牵制，因此是两个 app、两个端口。
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| RFC 6455 握手 + 子协议协商 | 已支持 | 只在 `Sec-WebSocket-Protocol` 命中 `mqtt` / `mqttv3.1` / `mqttv3.1.1` 时升级；缺失或不匹配 → **HTTP 400** |
+| URL path | 任意 | 协议规定的是子协议不是路径；`/`、`/mqtt`、`/ws/x` 都可（客户端库的 path 与部署约定一致即可） |
+| 报文与帧对齐 | 无要求 | 一个报文可跨多个帧（交 FSM 的 `buf` 重组）；一个帧可含多个报文（逐条处理） |
+| 数据帧类型 | 仅 binary | text 帧 → close **1003**，不把其 payload 当 MQTT 字节 |
+| 控制帧 | 已支持 | ping → pong、close 回 close 后断开；与 MQTT keepalive 相互独立 |
+| 帧大小上限 | 已支持 | `max_frame_bytes`（默认 16 MiB）；超限 → close **1002**（`ws_frame` 对每个 decode 错误统一 1002）。报文级上限仍是 `mqtt_max_packet_size` |
+| MQTT 3.1.1 / 5.0 | 已支持 | CONNECT/CONNACK、PUBLISH 双向 QoS0/1/2、SUBSCRIBE/SUBACK、UNSUBSCRIBE、PINGREQ/PINGRESP、DISCONNECT、retain、Will、持久会话与离线追赶、takeover 全部复用 FSM |
+| TLS（wss） | 已支持 | 与其他 listener 同一开关；`mqtt_ws_conn` 显式完成 `Transport:handshake/2` |
+| 背压 | 刻意缺省 | `mqtt_transport_ws:arm_once/1` 是 no-op，WS 层每帧后自行 re-arm；`max_inflight` / `receive_maximum` 是唯一窗口控制 |
+| `permessage-deflate` | **不支持** | 设计 §2 明确排除；客户端提出该扩展时得到的是未压缩连接 |
+| MQTT-SN / QUIC | 不在本节 | 分别见 S8-C（§4.11）与 S8-D（§4.12） |
+
+**证据**：
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT 套件（字节级自测） | `apps/broker_proto_mqtt_ws/test/mqtt_ws_conn_SUITE.erl` | **19 例**（子协议协商 + 两条 400 拒绝、CONNECT、QoS1/QoS2 双向、retained 后到订阅、跨帧、单帧多报文、WS ping/pong、text→1003、client close、超长帧、任意 path、Will、wss、明文 TCP 打 wss 端口） |
+| 真实第三方客户端 | `test/protocol-compatibility/mqtt_ws/`（paho-mqtt **2.1.0**，`transport="websockets"`） | **8/8** 第三方用例：connect、QoS0/QoS1/QoS2 往返、retain、Will、MQTT 5.0、非根 path |
+| 传输探针（**非**第三方证据） | 同上脚本的 `ws-raw-framing` | 1 例：跨帧重组 + text 帧 → close 1003；报告内 `third_party: false`、`client: "raw-socket-probe"` |
+| 回归（顺带修复） | `apps/broker_proto_ws/test/ws_conn_SUITE.erl` | 新增 `wss_is_served_when_tls_is_enabled`；撤掉 `ws_conn` 的 `Transport:handshake/2` 该例必 FAILED（已实测） |
+
+**已声明的限制 / 边界**：
+
+- **子协议是硬门槛**：没有 `Sec-WebSocket-Protocol` 的握手被 400 拒绝，不「猜」对方是 MQTT。浏览器随手连的 WebSocket 因此不会被当成 MQTT 连接。
+- **无 `permessage-deflate`**：MQTT over WebSocket 的压缩扩展未实现，带宽敏感部署需在客户端关闭该扩展。
+- **背压按帧而非按报文**：一个超大帧会一次性交给 FSM；窗口控制仍靠 `max_inflight` / `receive_maximum`，与 TCP 传输一致。
+- **帧上限与报文上限是两个旋钮**：`max_frame_bytes`（WS 层）与 `mqtt_max_packet_size`（MQTT 层）分别生效，调小前者不会改变 MQTT 报文的法定上限。
 
 ---
 

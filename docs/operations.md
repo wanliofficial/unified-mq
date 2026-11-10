@@ -15,16 +15,37 @@
 | 组件 | 默认端口 | 协议 | 说明 |
 |---|---|---|---|
 | MQTT | 1883 | 明文（可 TLS） | `broker_proto_mqtt` |
-| WebSocket | 8080 | 明文（可 TLS） | `broker_proto_ws` |
+| WebSocket | 8080 | 明文（可 TLS） | `broker_proto_ws`（Broker 自有 JSON/binary 消息 API） |
+| MQTT over WebSocket | 8083 | 明文（可 TLS，wss） | `broker_proto_mqtt_ws`（S8-B；MQTT 3.1.1 §6 / 5.0 §6） |
 | NATS | 4223 | 明文（可 TLS） | `broker_proto_nats` |
 | AMQP | 5673 | 明文（可 TLS） | `broker_proto_amqp` |
 | Kafka | 9093 | 明文（可 TLS） | `broker_proto_kafka` |
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
-TLS 由 `broker_security.tls.enabled` 一个开关统一控制，六个协议 listener 同时切换。见 `docs/security.md` §9。
+TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前七个）同时切换。见 `docs/security.md` §9。
 
-`broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与后续的 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
+`broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
+
+**两个 WebSocket 端口不是一件事**。`8080` 是 Broker 自己的 JSON/binary 消息 API（S5），`8083` 是标准 MQTT over WebSocket（S8-B）：同一个 `mqtt_conn_fsm` 跑在 RFC 6455 binary 帧里，客户端是普通 MQTT 库（如 paho-mqtt 的 `transport="websockets"`）。端口内容互不兼容，**不要**把 MQTT 客户端指向 8080。
+
+`broker_proto_mqtt_ws` 的配置（`config/sys.config.src`）：
+
+```erlang
+{broker_proto_mqtt_ws, [
+  {listeners, [#{port => 8083,
+                 ref => {mqtt_ws, 8083},
+                 num_acceptors => 10,
+                 max_connections => 1024}]},
+  {subprotocols, [<<"mqtt">>, <<"mqttv3.1">>, <<"mqttv3.1.1">>]},
+  {max_frame_bytes, 16777216}
+]}.
+```
+
+- **任一 URL path 都接受**（`/`、`/mqtt`、`/ws/...`）：MQTT over WebSocket 规定的是子协议，不是路径。客户端库里的 path 只需与服务端部署约定一致即可。
+- **子协议是硬门槛**：握手没带 `Sec-WebSocket-Protocol`，或带的不是 `subprotocols` 里的任一项，服务端回 **HTTP 400** 而不是升级。这是有意的——浏览器随手连的 WebSocket 不该被当成 MQTT 连接。
+- `max_frame_bytes` 限制**单个 WebSocket 帧**；MQTT 报文级上限仍是 `broker_proto_mqtt.mqtt_max_packet_size`。帧超大 → close `1002`；text 帧 → close `1003`。
+- TLS 与其他 listener 一样由 `broker_security.tls.enabled` 一个开关控制（wss）；没有单独的 WS TLS 配置。
 
 ---
 

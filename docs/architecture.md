@@ -49,6 +49,7 @@ apps/
 ├── broker_proto_mqtt/    MQTT 3.1.1/5 编解码 + 连接 FSM + ranch listener（S8：mqtt_transport 传输抽象，可跑 TCP/TLS/WS/QUIC）
 ├── broker_ws/            S8-A：纯 RFC 6455 库（ws_frame 帧编解码 + ws_handshake 握手），无进程、无配置，供两个 WS 前端共用
 ├── broker_proto_ws/      S5：WebSocket（RFC 6455）+ JSON/binary 消息 API
+├── broker_proto_mqtt_ws/ S8-B：MQTT over WebSocket（MQTT 3.1.1 §6 / 5.0 §6），RFC 6455 传输跑同一个 mqtt_conn_fsm
 ├── broker_proto_nats/    S5：NATS core（PUB/SUB、queue group、request/reply）
 ├── broker_proto_amqp/    S5：AMQP 0-9-1（exchange/queue/binding、publish/consume/ack）
 ├── broker_proto_kafka/   S5：Kafka wire（Produce/Fetch/Metadata + consumer group）
@@ -72,6 +73,7 @@ apps/
 | `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 其余 6 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener`、`mqtt_transport`（行为）与 `mqtt_transport_tcp`（TCP/TLS 实现） | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器）+ 传输 handle |
 | `broker_ws` | kernel, stdlib, crypto | **无进程、无配置** | `ws_frame`（RFC 6455 帧编解码）、`ws_handshake`（`accept/1,2` 握手 + 子协议协商）、`max_handshake/0` | 无（纯函数库） |
 | `broker_proto_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_core, broker_metrics + 内核 6 app | 每连接 `ws_conn` + ranch listener | `ws_conn`、`ws_listener`（帧编解码已委托给 `broker_ws` 的 `ws_frame`） | 每连接分片缓冲、订阅集合 |
+| `broker_proto_mqtt_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_proto_mqtt, broker_core, broker_metrics + 内核 6 app | 每连接 `mqtt_ws_conn` + ranch listener；MQTT 引擎 `mqtt_conn_fsm` 由 `broker_proto_mqtt` 的 `mqtt_conn_sup` 托管 | `mqtt_ws_conn`、`mqtt_ws_listener`、`mqtt_transport_ws`（`mqtt_transport` 的 WS 实现） | 每连接 HTTP 升级缓冲、帧分片缓冲；MQTT 状态全在 FSM 里 |
 | `broker_proto_nats` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `nats_conn` + 订阅投递进程 + ranch listener | `nats_conn`、`nats_listener` | 每连接 sid 表、queue group 成员关系 |
 | `broker_proto_amqp` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `amqp_conn`、`amqp_topo`（exchange/queue/binding 注册表） | `amqp_codec`、`amqp_conn`、`amqp_listener` | exchange/queue/binding 拓扑、delivery tag、unacked 集合 |
 | `broker_proto_kafka` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `kafka_conn`、`kafka_group`（consumer group 协调） | `kafka_codec`、`kafka_conn`、`kafka_listener` | 每连接 topic/partition 游标、group 成员与 offset |
@@ -190,9 +192,23 @@ MQTT 本身对传输不可知——3.1.1 §6 与 5.0 §6 允许 TCP / TLS / WebS
 S8-A 把 FSM 与传输的边界收敛为一个模块名 + 一个不透明 handle，走四个回调（`send/2`、`arm_once/1`、`close/1`、`decode_msg/2`），见 [`mqtt_transport.erl`](../apps/broker_proto_mqtt/src/mqtt_transport.erl)：
 
 - `decode_msg/2` 是语义核心：把邮箱里的消息归一为 `{data,Bin}` | `closed` | `{error,R}` | `other`，且**按 handle 匹配本连接的 socket**——一个节点跑多个 listener 时，A 连接的字节绝不会喂进 B 的状态机；`other` 让 FSM 自己的事件（投递、poll tick、`connect` 交接）照常穿过。
-- 实现按依赖归属放置：`mqtt_transport_tcp` 在本 app（同时覆盖 `ranch_tcp` 与 `ranch_ssl`，用 `is_port/1` 分派——`gen_tcp` socket 是 port、`ssl` socket 是元组，且只有 `ssl` 导出 `setopts/2`），WebSocket 与 QUIC 的实现在各自 app，这样本 app 不依赖它们。
+- 实现按依赖归属放置：`mqtt_transport_tcp` 在本 app（同时覆盖 `ranch_tcp` 与 `ranch_ssl`，用 `is_port/1` 分派——`gen_tcp` socket 是 port、`ssl` socket 是元组，且只有 `ssl` 导出 `setopts/2`），`mqtt_transport_ws` 在 `broker_proto_mqtt_ws`（S8-B），QUIC 的实现在 `broker_proto_mqtt_quic`（S8-D），这样本 app 不依赖它们。
 
 握手消息 `{handshake, Ref, Transport, Sock, Timeout}` 带的是 **ranch 自己的** transport（`ranch_tcp`/`ranch_ssl`），不是 `mqtt_transport`：ranch 对 TLS 只做 `transport_accept`，因此协议侧必须自己调 `Transport:handshake/2`（TCP 是 no-op、SSL 才真正完成 TLS 握手）后才能 arm，否则首个 `ssl:setopts` 报 `notsup_on_transport_accept_socket`。
+
+
+### 3.10 MQTT over WebSocket 的两进程分层（S8-B）
+
+`broker_proto_mqtt_ws` 每连接跑**两个进程**，这个划分就是设计本身：
+
+- `mqtt_ws_conn` 是 ranch 协议进程，拥有 socket，负责 RFC 6455 升级（`ws_handshake:accept/2` 做子协议协商）、帧编解码，并把 binary 帧的 payload 原样转给 MQTT 引擎；
+- `mqtt_conn_fsm` 仍在 `broker_proto_mqtt` 的 `mqtt_conn_sup` 下，`transport => mqtt_transport_ws`，其 **handle 是 `mqtt_ws_conn` 的 pid**，不是 socket。
+
+不把帧解码塞进 `mqtt_transport_ws:decode_msg/2`，是因为它必须是 `(Msg, Handle)` 的纯函数，而「半个帧」「升级是否完成」是每连接状态；放进进程字典或 ETS 会用隐藏状态换掉一个干净的行为。
+
+WS 层只把 **binary** 帧当 MQTT 字节：text 帧回 close `1003`；报文与帧**无对齐要求**（payload 交给 FSM 的 `buf` 重组，一个帧里的多条报文逐条处理）；ping/pong/close 是 WS 控制流量，与 MQTT keepalive 无关。`max_frame_bytes` 限制的是帧，`mqtt_max_packet_size` 限制的仍是报文。
+
+背压刻意缺省：`mqtt_transport_ws:arm_once/1` 是语义占位 no-op（WS 层每帧投递后自行 re-arm），`send/2` 异步，`max_inflight` / `receive_maximum` 是唯一窗口控制。对端造成的失败（RST、TLS 握手不完成、re-arm 失败）以 `normal` 结束 WS 进程，并把 `{mqtt_ws_error, self(), Reason}` 交给引擎记日志——非 `normal` 退出会为每条坏 TCP 打一份监督树报告，而对端重置是常态。
 
 ---
 
@@ -356,6 +372,8 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_mqtt.listeners` | release 配 1883；`.app.src` 默认 `[]` | 每个 map 一个 listener；连接级 knob 随 map 下发（L20 seam） |
 | `broker_proto_mqtt.mqtt_max_qos` | 1 | 必须与后端 capability 一致；内存档必须为 0 |
 | `broker_proto_mqtt.max_inflight` / `pull_page_limit` / `pull_poll_interval_ms` / `inflight_snapshot_ms` / `max_keepalive_ms` | 64 / 32 / 1000 / 20 / 60000 | 投递循环与 keepalive 上限 |
+| `broker_proto_mqtt_ws.listeners` | release 配 8083；`.app.src` 默认 `[]` | S8-B：MQTT over WebSocket 的 ranch listener（`port => 0` 时由 ranch 分配临时端口） |
+| `broker_proto_mqtt_ws.subprotocols` / `max_frame_bytes` | `[mqtt, mqttv3.1, mqttv3.1.1]` / 16777216 | 子协议是握手门槛（不匹配 → HTTP 400）；后者限帧，不限 MQTT 报文 |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 

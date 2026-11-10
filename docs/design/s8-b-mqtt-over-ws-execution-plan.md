@@ -394,6 +394,8 @@ rebar3 as prod release
 
 若 Task 1 的核实确认既有 `ws_conn` 的 wss 不可用，Task 4 里补 `RanchTransport:handshake/2` 并加一条回归用例（`ws_conn_SUITE` 加一例 wss）。若实测能用，只在 `progress.md` 记录核实结论，不改代码。
 
+**已执行**：缺口确认存在（Task 1 实测 + Task 4 复现），已修 `apps/broker_proto_ws/src/ws_conn.erl`：`{handshake, _Ref, Transport, Socket, Timeout}` 分支先 `Transport:handshake(Socket, Timeout)`，失败 → `{stop, {tls_handshake_failed, Reason}, _}`；`ranch_tcp:handshake/2` 是 no-op 返回原 socket，所以一个分支覆盖两种 transport。回归用例 `ws_conn_SUITE:wss_is_served_when_tls_is_enabled`（自签证书 + TLS 快照/恢复 + `ssl:connect` 后走同一套 WS 握手拿 CONNACK），套件 22 → **23 例**。**反向验证**：`git stash` 掉 `ws_conn.erl` 的修复后该例 FAILED，恢复后通过。`docs/security.md` §9 按"例外"条款补了「协议侧必须真的把 TLS 握手跑完」一段。
+
 **4c. 回填用例数（强制）**
 
 ```bash
@@ -405,6 +407,8 @@ erl -noshell -pa _build/test/lib/*/ebin -eval '
 ```
 
 `rebar3 ct` 通过的总例数 = 711 + 本阶段新增，两者都要写（区分"基线"与"S8-B 新增"）。
+
+**已执行**：`mqtt_ws_conn_SUITE` 19 例、`ws_conn_SUITE` 23 例（+1）；全量 **731/731**（47 套件，基线 711 + 19 + 1），零 FAILED；`dialyzer` 0 warnings；`xref` 仅预期 unused-export；`rebar3 as prod release` 装配成功，`_build/prod/rel/unified_mq/lib/broker_proto_mqtt_ws-0.1.0` 存在。
 
 **4d. 文档同步（本阶段只动这 4 个文件）**
 
@@ -431,12 +435,12 @@ git commit -m "docs(s8-b): record MQTT over WebSocket in architecture, ops and p
 - [x] `broker_proto_mqtt_ws` app 建立，监听 TCP 8083（CT 用 `port => 0`），TLS 走 `broker_security_tls`
 - [x] `mqtt_ws_conn` 完成 HTTP 升级（子协议协商，缺失/不匹配 → 400）、binary 帧解码、text 帧 → close 1003、控制帧独立处理
 - [x] `mqtt_transport_ws` 实现 `mqtt_transport` 四回调，FSM 零改动接入
-- [x] `mqtt_ws_conn_SUITE` 全绿（18/18；含 wss、跨帧、单帧多报文、text 帧拒绝）
+- [x] `mqtt_ws_conn_SUITE` 全绿（19/19，连跑 3 次稳定；含 wss、跨帧、单帧多报文、text 帧拒绝、明文 TCP 打 wss 端口）
 - [x] `paho-mqtt 2.1.0` websocket 用例全绿（8/8，另有 1 例 raw framing 探针单列），`report.json` / `broker.log` 落盘
-- [x] `rebar3 ct` 总例数 = 729（基线 711 + 本套件 18），零 FAILED
-- [ ] dialyzer / xref 干净，`rebar3 as prod release` 装配成功（release 内含 `broker_proto_mqtt_ws`）
-- [ ] `docs/architecture.md` / `operations.md` / `protocol-compatibility.md` §4.13 / `progress.md` 同步，用例数回填
-- [ ] 既有 `broker_proto_ws` 的 wss 缺口已核实：要么修复并加回归，要么在 `progress.md` 记录"实测可用"
+- [x] `rebar3 ct` 总例数 = 731（基线 711 + 本套件 19 + ws_conn 回归 1），零 FAILED
+- [x] dialyzer / xref 干净，`rebar3 as prod release` 装配成功（release 内含 `broker_proto_mqtt_ws`）
+- [x] `docs/architecture.md` / `operations.md` / `protocol-compatibility.md` §4.13 / `progress.md` 同步，用例数回填
+- [x] 既有 `broker_proto_ws` 的 wss 缺口已修复并加回归（见 4b）
 
 ## 不在本阶段（明确留给后续）
 
