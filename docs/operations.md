@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C 追加 §1 的 8083 与 UDP 1884
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -25,9 +25,9 @@
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
-TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前八个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。
+TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前九个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
 
-**例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一不受该开关控制的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
+**例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一**明文且没有 TLS 路径**的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
 
 **QUIC 是另一个方向的例外**：它**没有明文模式**，握手本身就是 TLS 1.3，所以 `broker_security.tls.enabled` 对它不是「开关」而是「证书来源」——关掉这个开关不会让 14567 变明文，只会让 listener 找不到证书而**拒绝启动**（`{quic_requires_tls, Key}`，只影响这一个 app）。
 

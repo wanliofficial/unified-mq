@@ -22,6 +22,9 @@
 | AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack；见 §4.7 |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅（**S5-Kafka：12/12 用例**） | Produce/Fetch/Metadata/ListOffsets、经典消费组、OffsetCommit/Fetch、RecordBatch v2；单节点协调器、offset 内存态、无压缩/事务/Admin API，见 §4.8 |
 | Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅（**S5-Pulsar：8/8 用例**） | 官方 Java Client 实测：produce/consume、properties、key、batch、ack/redelivery、seek、unsubscribe、producer name；无 BookKeeper/事务/压缩/Key_Shared，见 §4.9 |
+| MQTT over WebSocket | S8-B | `paho-mqtt`（`transport="websockets"`） | Python | paho-mqtt 2.1.0 | ✅（**S8-B：8/8 用例** +1 raw framing 探针单列） | 同一 `mqtt_conn_fsm`，RFC 6455 binary 帧；子协议 `mqtt`/`mqttv3.1`/`mqttv3.1.1` 硬门槛，见 §4.13 |
+| MQTT-SN 1.2 | S8-C | `mqtt-sn-tools`（`mqtt-sn-pub`/`mqtt-sn-sub`） | C（CLI） | 0.0.7（pinned `a1dd870`） | ✅（**S8-C：10/10 用例**） | UDP 网关，不复用 `mqtt_conn_fsm`；工具无 QoS 2 / 无 Will / `PINGREQ` 不带 client id，见 §4.11 |
+| MQTT over QUIC | S8-D | EMQX `emqtt`（`emqtt_quic`，ALPN `mqtt`） | Erlang | emqtt 1.16.1 + quicer 0.4.12 | ✅（**S8-D：8/8 用例**） | CN Draft 3 单流模式；`emqtt` 的 QUIC 是 EMQX 实验特性，无流级关闭 / 无 0-RTT / 无多流，见 §4.12 |
 
 ---
 
@@ -613,7 +616,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 **已声明的限制 / 边界**：
 
-- **无 DTLS**：本阶段只跑明文 UDP；DTLS 列为后续待办（设计 §1.2），因此这里是唯一没有 TLS 开关的 listener。
+- **无 DTLS**：本阶段只跑明文 UDP；DTLS 列为后续待办（设计 §1.2），因此这里是唯一**明文且没有 TLS 路径**的 listener（QUIC 的 14567 也只把 `tls.enabled` 当证书来源，但它强制 TLS 1.3）。
 - **无 Forwarder Encapsulation**（1.2 §5.5）与串口桥：设计 §1.2 明确不做。
 - **休眠期 QoS 0 丢弃**：QoS 0 从不进存储，睡眠期间无处可取；要「一条不丢」就用 QoS 1/2。
 - **第三方客户端覆盖不到三处**：`mqtt-sn-tools` 0.0.7 **无 QoS 2 代码路径**、**无 Will 选项**、其 PINGREQ 不带 client id（无法按名唤醒休眠会话）。这三项只由 `mqtt_sn_conn_SUITE` 覆盖，Gate 文本单列，不以「第三方全绿」含混带过。
@@ -625,7 +628,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 > 编号说明：§4.11 是 S8-C（MQTT-SN，已落地），§4.12 是 S8-D（MQTT over QUIC，已落地），本节按 S8-B 执行计划落在 §4.13。
 
-**是什么**：MQTT 3.1.1 §6 / MQTT 5.0 §6 定义的 MQTT over WebSocket。同一条 `mqtt_conn_fsm`（与 1883 明文 MQTT、8883 TLS MQTT 完全同一份代码）跑在 RFC 6455 **binary** 帧里；WebSocket 只当字节管道，协议语义、QoS、会话、retain、Will 全部由 MQTT 引擎负责。默认端口 **8083**，TLS 跟随 `broker_security.tls.enabled`（wss）。
+**是什么**：MQTT 3.1.1 §6 / MQTT 5.0 §6 定义的 MQTT over WebSocket。同一条 `mqtt_conn_fsm`（与 1883 明文 MQTT、打开 `tls.enabled` 后同一端口的 TLS MQTT 完全同一份代码）跑在 RFC 6455 **binary** 帧里；WebSocket 只当字节管道，协议语义、QoS、会话、retain、Will 全部由 MQTT 引擎负责。默认端口 **8083**，TLS 跟随 `broker_security.tls.enabled`（wss）。
 
 **为什么不并进 8080**：`broker_proto_ws`（S5）是 Broker 自己的 JSON/binary 消息 API，与标准 MQTT over WebSocket 的应用协议完全不同。合并会让 S5 已钉死的线上字节行为与 MQTT 客户端需求互相牵制，因此是两个 app、两个端口。
 

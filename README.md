@@ -481,14 +481,14 @@ CloudEvents `source + id` 可作为业务事件去重的候选键，但 Broker �
 
 | 协议 | 传输 | 默认端口 | 真实客户端证据 |
 |---|---|---|---|
-| MQTT 3.1.1 / 5.0 | TCP / TLS | 1883 / 8883 | paho-mqtt 2.x + mosquitto 2.1.2，10/10 |
-| MQTT over WebSocket | TCP / TLS | 8083 | paho-mqtt 2.1.0（`transport="websockets"`），8/8 |
+| MQTT 3.1.1 / 5.0 | TCP（`tls.enabled` 打开时同一端口即 TLS） | 1883 | paho-mqtt 2.x + mosquitto 2.1.2，10/10 |
+| MQTT over WebSocket | TCP（同上，即 wss） | 8083 | paho-mqtt 2.1.0（`transport="websockets"`），8/8 |
 | MQTT-SN 1.2 | **UDP**（无 DTLS） | 1884 | `mqtt-sn-tools` 0.0.7，10/10 |
 | MQTT over QUIC | **UDP**，强制 TLS 1.3 | 14567（默认关闭） | EMQX `emqtt` 1.16.1，8/8 |
-| WebSocket（Broker 自有 API） | TCP / TLS | 8080 | `websocket-client` 1.7.0，10/10 |
-| NATS / AMQP / Kafka / Pulsar | TCP / TLS | 4223 / 5673 / 9093 / 6650 | 官方客户端各 8~13 例 |
+| WebSocket（Broker 自有 API） | TCP（同上） | 8080 | `websocket-client` 1.7.0，10/10 |
+| NATS / AMQP / Kafka / Pulsar | TCP（同上） | 4223 / 5673 / 9093 / 6650 | 官方客户端各 8~13 例 |
 
-MQTT over QUIC 只在 `rebar3 as quic` 构建里带 NIF，默认 release 不含该端口；启用前必须先配证书（`docs/operations.md` §1.2）。
+端口不随 TLS 变化：`broker_security.tls.enabled` 是**整个 listener 的开关**（`broker_security_tls:transport/0` 决定走 `ranch_tcp` 还是 `ranch_ssl`），打开后原端口直接说 TLS，没有「明文 1883 + TLS 8883」这样的双端口。MQTT over QUIC 只在 `rebar3 as quic` 构建里带 NIF，默认 release 不含该端口；启用前必须先配证书（`docs/operations.md` §1.2）。
 
 ### 11.2 CloudEvents 一致性
 
