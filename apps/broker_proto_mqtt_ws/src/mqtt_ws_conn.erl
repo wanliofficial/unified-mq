@@ -27,6 +27,12 @@
 %%   * ping/pong/close are WebSocket control traffic, independent of MQTT
 %%     keepalive.
 %%
+%% A peer-caused failure (TCP reset, a TLS handshake that never completes, a
+%% failed re-arm) stops this process with reason `normal' and hands
+%% `{mqtt_ws_error, self(), Reason}' to the engine, which logs it once. Exiting
+%% non-normally would instead print a supervisor report for every broken TCP
+%% connection -- and a reset peer is routine, not a broker fault.
+%%
 %% Backpressure is deliberately absent. This process re-arms its socket after
 %% every delivery instead of waiting for the FSM to ask for more, which is why
 %% `mqtt_transport_ws:arm_once/1' is a no-op. A frame is handed to the FSM as one
@@ -52,7 +58,14 @@
     buffer = <<>> :: binary(),
     fsm :: pid() | undefined,
     selected :: binary() | undefined,
-    frag = undefined :: undefined | {0 | 1 | 2, [binary()]}
+    frag = undefined :: undefined | {0 | 1 | 2, [binary()]},
+    %% A socket-level failure (reset, TLS handshake refused, arm failed). It is
+    %% recorded instead of becoming this process's stop reason: a peer that
+    %% resets a connection is a fact of life, and a non-`normal' exit here would
+    %% print a supervisor report per broken TCP connection. The detail is handed
+    %% to the engine instead, which logs it once, exactly like the socket
+    %% transport's `{tcp_error, ...}'.
+    error = undefined :: term() | undefined
 }).
 
 %%%_* Lifecycle --------------------------------------------------------------
@@ -71,7 +84,7 @@ terminate(_Reason, #st{} = St) ->
     %% Tell the FSM the carrier is gone so it stops through its ordinary
     %% shutdown path (which is what publishes the Will). Sending to a dead pid is
     %% harmless: the FSM may have initiated this shutdown itself.
-    notify_fsm(St, {mqtt_ws_closed, self()}),
+    notify_fsm(St, closing_msg(St)),
     case St#st.socket of
         undefined -> ok;
         Sock -> _ = (catch (St#st.transport):close(Sock)), ok
@@ -96,10 +109,12 @@ handle_info({handshake, _Ref, RanchTransport, Socket, Timeout},
             St1 = St#st{transport = RanchTransport, socket = HSock},
             case set_active(St1) of
                 ok -> {noreply, St1};
-                {error, Reason} -> {stop, {socket_error, Reason}, St1}
+                {error, Reason} -> stop_with_error({socket_error, Reason}, St1)
             end;
         {error, Reason} ->
-            {stop, {tls_handshake_failed, Reason}, St#st{socket = Socket}}
+            %% A peer that cannot complete the TLS handshake (a plain TCP client
+            %% on a wss port, an unsupported cipher) never becomes a connection.
+            stop_with_error({tls_handshake_failed, Reason}, St#st{socket = Socket})
     end;
 
 %% Client bytes, before or after the upgrade.
@@ -113,9 +128,9 @@ handle_info({tcp_closed, Socket}, #st{socket = Socket} = St) ->
 handle_info({ssl_closed, Socket}, #st{socket = Socket} = St) ->
     {stop, normal, St};
 handle_info({tcp_error, Socket, Reason}, #st{socket = Socket} = St) ->
-    {stop, {socket_error, Reason}, St};
+    stop_with_error({socket_error, Reason}, St);
 handle_info({ssl_error, Socket, Reason}, #st{socket = Socket} = St) ->
-    {stop, {socket_error, Reason}, St};
+    stop_with_error({socket_error, Reason}, St);
 
 %% Requests from `mqtt_transport_ws' (the FSM is the sender, our pid the handle).
 handle_info({mqtt_ws_send, Bin}, St) ->
@@ -291,8 +306,15 @@ set_active(#st{transport = T, socket = S}) ->
 rearm_or_stop(St) ->
     case set_active(St) of
         ok -> {noreply, St};
-        {error, Reason} -> {stop, {socket_error, Reason}, St}
+        {error, Reason} -> stop_with_error({socket_error, Reason}, St)
     end.
+
+%% Peer-caused failures stop `normal' and carry the detail to the engine.
+stop_with_error(Reason, St) ->
+    {stop, normal, St#st{error = Reason}}.
+
+closing_msg(#st{error = undefined}) -> {mqtt_ws_closed, self()};
+closing_msg(#st{error = Reason}) -> {mqtt_ws_error, self(), Reason}.
 
 notify_fsm(#st{fsm = Fsm}, Msg) when is_pid(Fsm) ->
     Fsm ! Msg,

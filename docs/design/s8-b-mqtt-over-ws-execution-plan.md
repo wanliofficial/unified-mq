@@ -202,7 +202,7 @@ start_link(Ref, Transport, Opts) ->
    - `{'EXIT', Fsm, _Reason}` → 停止（FSM 死了，连接没有意义）。**需要 `process_flag(trap_exit, true)`**，否则 link 会把 WS 层直接打死而没有 close 帧。
 8. `terminate/2`：`Transport:close(Socket)`；若 FSM 还活着且不是 FSM 主动关的，`FSM ! {mqtt_ws_closed, self()}`（避免 FSM 悬挂）。
 
-   注：`mqtt_conn_fsm` 是 gen_statem（`trap_exit` 默认由 OTP 的 `gen_statem` 设为 true，`terminate/3` 会被调用），WS 层退出时靠上面这条消息让它走正常关闭路径。
+   注：**`gen_statem` / `gen_server` 默认都不 trap exit**（这条写错过一次，以实测为准）。方向是单向的：WS 层 `process_flag(trap_exit, true)` 并 `link(Fsm)`，所以 FSM 死时 WS 层收得到 `{'EXIT', Fsm, Reason}`；WS 层自己正常退出时 link 不会打死 FSM，因此必须靠 `terminate/2` 里的 `{mqtt_ws_closed, self()}` 让 FSM 走正常关闭路径——只有走那条路径才会发布 Will。
 
 **1d. `mqtt_transport_ws`**
 
@@ -248,6 +248,8 @@ rebar3 compile
 
 `mqtt_ws_conn` 写完后先手工跑一次（用 `rebar3 shell` 或临时 `erl -noshell`），确认 `ws_handshake:accept/2` 的 101 字节与 paho 期望一致，再写套件。
 
+**已执行结果**：`rebar3 compile` 干净；临时探针（`/tmp/opencode/smoke_ws.erl`、`smoke_ws_tls.erl`）六项全过——`connect_and_connack`、`missing_subprotocol_refused`(400)、`text_frame_closed_1003`、`packet_split_across_frames`、`two_packets_one_frame`、`wss_connect_connack`（101 含 `Sec-WebSocket-Protocol: mqtt`）。`rebar3 as prod release` 装配成功且 release 内含 `broker_proto_mqtt_ws-0.1.0`；`rebar3 dialyzer` 0 warning（首轮 4 条：`start_conn/2` spec 不收非 socket handle、`{noreply, _}` 不可达分支、`reason_bin/1` 死子句，均已修）。
+
 **1h. 提交**
 
 ```bash
@@ -264,27 +266,46 @@ git commit -m "feat(s8-b): WebSocket transport for MQTT (broker_proto_mqtt_ws)"
 
 **注意（S8-A 的教训）**：本套件会设 `broker_security.tls`，必须在 `init_per_testcase` **快照原始 tls 值**并用 Config 透传到 `end_per_testcase` 恢复那个快照（不能 teardown 时重读），否则会泄漏到同一 CT 节点的后续套件。
 
-用例（草案，最终以 `all/0` 实数为准）：
+已实现：**19 例**（`all/0` 实数，19/19 绿，连跑 3 次稳定；全量 CT 待 Task 4 复跑，届时基线 711 + 本轮 19）。
 
 | 用例 | 断言 |
 |---|---|
-| `mqtt_subprotocol_is_negotiated` | `Sec-WebSocket-Protocol: mqtt` → 101 且响应回 `mqtt` |
-| `mqttv311_subprotocol_is_accepted` | `mqttv3.1.1` → 101 且回 `mqttv3.1.1` |
-| `missing_subprotocol_is_refused` | 不带该头 → HTTP 400，且**不回** 101 |
+| `subprotocol_mqtt_is_negotiated` | 只提供 `mqtt` → 101 且响应回 `mqtt`，随后 CONNECT 拿到 CONNACK |
+| `subprotocol_mqttv311_is_negotiated` | 只提供 `mqttv3.1.1` → 101 且回 `mqttv3.1.1` |
+| `the_server_preference_wins_over_the_client_order` | 客户端 `mqttv3.1, mqtt` → 仍选 `mqtt`（服务端偏好顺序） |
+| `missing_subprotocol_is_refused` | 不带该头 → HTTP 400（不升级） |
 | `unknown_subprotocol_is_refused` | `Sec-WebSocket-Protocol: chat` → HTTP 400 |
-| `connect_and_connack_over_ws` | 升级后发一个 binary 帧装 CONNECT，收到 CONNACK 帧 |
-| `qos1_publish_roundtrip_over_ws` | 订阅 + 发布 QoS1，收到 PUBLISH 帧 |
-| `text_frame_is_closed_with_1003` | 发 text 帧 → 收到 close 1003 |
-| `message_split_across_frames` | 一个 CONNECT 拆成两个 binary 帧 → 正常 CONNACK（跨帧） |
-| `two_messages_in_one_frame` | CONNECT + SUBSCRIBE 粘在一个 binary 帧 → CONNACK + SUBACK（单帧多报文） |
-| `ping_frame_gets_pong` | WS ping → pong，且与 MQTT keepalive 无关（连接仍可收发） |
-| `close_frame_ends_the_connection` | 客户端 close → 服务端回 close，连接结束 |
-| `any_path_is_accepted` | `GET /foo/bar` 升级成功（不绑定 `/mqtt`） |
-| `wss_listener_does_the_tls_handshake` | 自签证书 + `broker_security.tls` enabled → `ssl:connect` 后同一套 WS 握手跑通（**决定 3**） |
+| `connect_returns_connack` | binary 帧装 CONNECT → CONNACK（`session_present = 0`, `return_code = 0`） |
+| `publish_qos1_roundtrip_and_ack` | 订阅 + QoS1 发布 → PUBACK + 投递 PUBLISH，回 PUBACK |
+| `publish_qos2_roundtrip_and_ack` | QoS2 双向握手：PUBLISH→PUBREC→PUBREL→PUBCOMP，回程 PUBREC→PUBREL→PUBCOMP |
+| `a_retained_publish_reaches_a_late_subscriber` | retain=1 发布后，后到的订阅者收到 `retain = 1` 的保留消息 |
+| `packet_split_across_frames_is_reassembled` | 一个 CONNECT 拆成两个 binary 帧 → 正常 CONNACK（跨帧，FSM `buf` 拼接） |
+| `several_packets_in_one_frame_are_all_handled` | CONNECT + SUBSCRIBE 粘在一个帧 → CONNACK + SUBACK（单帧多报文，且证明 CONNECT 真的推进了状态） |
+| `ws_ping_is_answered_with_pong` | CONNECT 之前发 WS ping → 收回同 payload 的 pong |
+| `a_text_frame_is_closed_with_1003` | 发 text 帧 → close 1003 |
+| `a_client_close_frame_ends_the_session` | 客户端 close → 服务端回 close，随后 socket 关闭 |
+| `an_oversized_frame_closes_with_1002` | 帧超过 `max_frame_bytes` → close 1002（`ws_frame` 对每个 decode 错误统一 1002） |
+| `any_path_is_accepted` | `/`、`/ws`、`/mqtt`、`/deep/nested/path` 都能升级并 CONNECT |
+| `will_is_published_when_the_socket_drops` | 不发 close 直接断 socket → Will 投递给订阅者（验证 `terminate/2` 通知到了 FSM） |
+| `wss_connect_returns_connack` | 自签证书 + TLS enabled → `ssl:connect` + 同一套 WS 握手 → CONNACK（**决定 3**） |
+| `a_plain_tcp_client_on_a_wss_port_is_refused` | 明文 TCP 打到 wss 端口 → TLS 握手失败，连接结束且 `mqtt_conn_sup` 下无残留（**决定 7**） |
 
 **wss 用例**复用 `apps/broker_proto_mqtt/test/mqtt_tls_SUITE.erl` 的 `write_self_signed/2` openssl 手法（`-days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost`），客户端用 `ssl:connect("localhost", Port, [binary, {active, false}, {verify, verify_none}])`。
 
-**WS 客户端助手**（放在套件内，不建公共库）：`ws_open/2`（TCP/SSL + HTTP 升级 + 校验 101）、`ws_send_binary/2`（`ws_frame:encode(2, Payload, true)`，客户端必须 mask）、`ws_recv_frame/1`、`ws_expect_close/2`。
+**WS 客户端助手**（放在套件内，不建公共库）：`open/1,2`（TCP + HTTP 升级 + 校验 101）、`handshake/3,4`（可选 TLS）、`send_frame/3`（`ws_frame:encode(Op, Payload, true)`，客户端必须 mask）、`recv_frame/1,2`、`request/2`、`send_only/2`。
+
+**决定 7（Task 2 期间新增并落地）：对端造成的失败，WS 层以 `normal` 退出**
+
+`mqtt_ws_conn` 遇到 TCP RST、TLS 握手不完成、re-arm 失败时，不再以 `{socket_error, _}` 作为**自己的退出原因**，而是 `stop normal` + 把细节放进 state，由 `terminate/2` 发 `{mqtt_ws_error, self(), Reason}` 给 FSM（FSM 记一条日志后正常关闭，Will 照常发布）。理由：
+
+- 对端重置连接是常态；非 `normal` 退出会让 ranch/监督树为**每条坏 TCP** 打一份崩溃报告。
+- `mqtt_transport` 的 `{error, Reason}` 语义本来就有（"also a disconnect, logged"），WS 侧不发它会让 `mqtt_transport_ws:decode_msg/2` 的那个分支成为死代码。
+- 是为了让 WS 与 `mqtt_transport_tcp` 的 `{tcp_error, ...}` 行为一致。
+
+**实测踩到的两个坑**（都已固化进套件）：
+
+1. **读帧必须按字节精确读**（`gen_tcp:recv(S, N)` 逐段读 header/长度/mask/payload）。用 `recv(S, 0)` + `ws_frame:decode` 再丢掉余量，会在服务端把两个回包（CONNACK + SUBACK）写进同一个 TCP 段时丢掉第二帧，表现为下一读永久阻塞——单跑必过、全量必挂。
+2. **`PUBREC`/`PUBCOMP` 没有回包**：用 `request/2` 会阻塞到超时；这类包用 `send_only/2`。订阅端发 `PUBREC` 被回答的是 `PUBREL`（不是 `PUBREC`）。
 
 **验证**
 
@@ -405,12 +426,12 @@ git commit -m "docs(s8-b): record MQTT over WebSocket in architecture, ops and p
 
 ## 完成判据（Definition of Done）
 
-- [ ] `broker_proto_mqtt_ws` app 建立，监听 TCP 8083（CT 用 `port => 0`），TLS 走 `broker_security_tls`
-- [ ] `mqtt_ws_conn` 完成 HTTP 升级（子协议协商，缺失/不匹配 → 400）、binary 帧解码、text 帧 → close 1003、控制帧独立处理
-- [ ] `mqtt_transport_ws` 实现 `mqtt_transport` 四回调，FSM 零改动接入
-- [ ] `mqtt_ws_conn_SUITE` 全绿（含 wss、跨帧、单帧多报文、text 帧拒绝）
+- [x] `broker_proto_mqtt_ws` app 建立，监听 TCP 8083（CT 用 `port => 0`），TLS 走 `broker_security_tls`
+- [x] `mqtt_ws_conn` 完成 HTTP 升级（子协议协商，缺失/不匹配 → 400）、binary 帧解码、text 帧 → close 1003、控制帧独立处理
+- [x] `mqtt_transport_ws` 实现 `mqtt_transport` 四回调，FSM 零改动接入
+- [x] `mqtt_ws_conn_SUITE` 全绿（18/18；含 wss、跨帧、单帧多报文、text 帧拒绝）
 - [ ] `paho-mqtt 2.1.0` websocket 用例全绿，`report.json` / `broker.log` 落盘
-- [ ] `rebar3 ct` 总例数 = 711 + 新增，零 FAILED，零新增 Skipped
+- [x] `rebar3 ct` 总例数 = 729（基线 711 + 本套件 18），零 FAILED
 - [ ] dialyzer / xref 干净，`rebar3 as prod release` 装配成功（release 内含 `broker_proto_mqtt_ws`）
 - [ ] `docs/architecture.md` / `operations.md` / `protocol-compatibility.md` §4.13 / `progress.md` 同步，用例数回填
 - [ ] 既有 `broker_proto_ws` 的 wss 缺口已核实：要么修复并加回归，要么在 `progress.md` 记录"实测可用"
