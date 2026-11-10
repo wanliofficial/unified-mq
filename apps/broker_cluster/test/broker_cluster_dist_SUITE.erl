@@ -139,14 +139,21 @@ old_owner_is_fenced_after_migration(Config) ->
 
 start_peers(Case, Config) ->
     Names = [peer_name(Case, N) || N <- [1, 2, 3]],
-    %% Only the build tree: passing every path CT added (including priv and
-    %% log directories) makes peer boot needlessly slow and can time out.
-    %% The suite's own beam directory is added explicitly -- `prepare_peer/1'
-    %% runs on the peer, and CT keeps test modules outside `ebin'.
+    %% Only the code directories (`.../ebin'): passing every path CT added
+    %% (including priv and log directories) makes peer boot needlessly slow and
+    %% can time out. The suite's own beam directory is added explicitly --
+    %% `prepare_peer/1' runs on the peer, and CT keeps test modules outside
+    %% `ebin'.
+    %%
+    %% "ends in ebin" rather than "contains `_build/test'": CT's build directory
+    %% is named after the rebar3 profile, so a hard-coded `_build/test' silently
+    %% drops every dependency -- and `_build/<profile>/checkouts/ra/ebin' --
+    %% under `rebar3 as quic ct', which made all four cases below fail in
+    %% `prepare_peer/1' with `{error, {ra, {"no such file or directory",
+    %% "ra.app"}}}'.
     SuiteDir = filename:dirname(code:which(?MODULE)),
     CodePaths = lists:usort(
-                  [SuiteDir | [D || D <- code:get_path(),
-                                    string:find(D, "_build/test") =/= nomatch]]),
+                  [SuiteDir | [D || D <- code:get_path(), is_code_dir(D)]]),
     lists:map(
       fun({I, Name}) ->
               DataDir = filename:join([?config(priv_dir, Config),
@@ -177,6 +184,10 @@ stop_peer(Config, Node) ->
 peer_name(Case, I) ->
     list_to_atom("s4_" ++ sanitise(atom_to_list(Case)) ++ "_" ++
                  integer_to_list(I)).
+
+%% A directory the peer can put on `-pa': the profile-independent test.
+is_code_dir(Dir) ->
+    filename:basename(Dir) =:= "ebin".
 
 sanitise(S) ->
     [case C of _ when C >= $a andalso C =< $z -> C;
