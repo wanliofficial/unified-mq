@@ -51,6 +51,7 @@ all() ->
      truncated_packets_are_rejected,
      unknown_type_is_rejected,
      publish_reserved_bits_are_rejected,
+     connect_flags_follow_the_sn_layout,
      connect_reserved_bits_are_rejected,
      will_topic_reserved_bits_are_rejected,
      publish_invalid_topic_id_type_is_rejected,
@@ -309,12 +310,39 @@ publish_reserved_bits_are_rejected(_Config) ->
                  mqtt_sn_codec:decode(<<9, 16#0C, 16#08, 0, 0, 0, 1, 0, 0>>)),
     ok.
 
+connect_flags_follow_the_sn_layout(_Config) ->
+    %% MQTT-SN 1.2 §5.4.4 puts Will in bit 3 and CleanSession in bit 2, not in
+    %% the MQTT 3.1.1 positions 7 and 6. `mqtt-sn-tools' sends 0x04 for a clean
+    %% session, which this codec rejected on the first real-client run: the
+    %% bytes below are the ones that tool puts on the wire.
+    ClientId = <<"mqtt-sn-tools-1">>,
+    Len = 6 + byte_size(ClientId),
+    ?assertEqual({ok, #{type => connect, will => false, clean_session => true,
+                        protocol_id => 1, duration => 10,
+                        client_id => ClientId}},
+                 mqtt_sn_codec:decode(<<Len, 16#04, 16#04, 16#01, 0, 10,
+                                       ClientId/binary>>)),
+    %% Will (0x08) and no clean session: the other shape on the wire.
+    ?assertEqual({ok, #{type => connect, will => true, clean_session => false,
+                        protocol_id => 1, duration => 5,
+                        client_id => <<"c1">>}},
+                 mqtt_sn_codec:decode(<<8, 16#04, 16#08, 16#01, 0, 5, "c1">>)),
+    ok.
+
 connect_reserved_bits_are_rejected(_Config) ->
-    %% CONNECT: only bit 7 (will) and bit 6 (clean session) are defined.
+    %% CONNECT: bits 1-0 are the only reserved ones. The PUBLISH layout above
+    %% Will/CleanSession is "not used" by CONNECT (§5.4.4), so a client that
+    %% sets it anyway is read, not killed -- 0x40 means neither Will nor a
+    %% clean session.
+    ?assertEqual({ok, #{type => connect, will => false, clean_session => false,
+                        protocol_id => 1, duration => 10, client_id => <<"c1">>}},
+                 mqtt_sn_codec:decode(<<8, 16#04, 16#40, 1, 0, 10, "c1">>)),
     ?assertMatch({error, {reserved_bits, 16#01}},
-                 mqtt_sn_codec:decode(<<9, 16#04, 16#01, 1, 0, 10, "c1", 16#40>>)),
-    ?assertMatch({error, {reserved_bits, 16#20}},
-                 mqtt_sn_codec:decode(<<8, 16#04, 16#20, 1, 0, 10, "c1">>)),
+                 mqtt_sn_codec:decode(<<8, 16#04, 16#01, 1, 0, 10, "c1">>)),
+    ?assertMatch({error, {reserved_bits, 16#02}},
+                 mqtt_sn_codec:decode(<<8, 16#04, 16#02, 1, 0, 10, "c1">>)),
+    ?assertMatch({error, {reserved_bits, 16#03}},
+                 mqtt_sn_codec:decode(<<8, 16#04, 16#03, 1, 0, 10, "c1">>)),
     ok.
 
 will_topic_reserved_bits_are_rejected(_Config) ->

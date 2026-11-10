@@ -98,13 +98,19 @@ decode_body(<<?GWINFO, GwId:8, GwAdd/binary>>) ->
     {ok, #{type => gwinfo, gw_id => GwId, gw_add => GwAdd}};
 decode_body(<<?CONNECT, Flags:8, ProtocolId:8, Duration:16, ClientId/binary>>)
   when byte_size(ClientId) > 0 ->
-    case reserved(Flags, 2#00111111) of
+    %% MQTT-SN 1.2 §5.4.4: Will is bit 3 and CleanSession bit 2. The byte has
+    %% the PUBLISH flag layout above them (DUP, QoS, Retain), which CONNECT
+    %% does not use but which a client may leave at zero; only the two bottom
+    %% bits are reserved. Reading Will/CleanSession out of bits 7/6 -- the
+    %% MQTT 3.1.1 CONNECT layout -- silently rejects every conforming client,
+    %% which is exactly what the first run of `mqtt-sn-tools' did.
+    case reserved(Flags, 2#00000011) of
         true ->
             {error, {reserved_bits, Flags}};
         false ->
             {ok, #{type => connect,
-                   will => bit(Flags, 7),
-                   clean_session => bit(Flags, 6),
+                   will => bit(Flags, 3),
+                   clean_session => bit(Flags, 2),
                    protocol_id => ProtocolId,
                    duration => Duration,
                    client_id => ClientId}}
@@ -257,8 +263,8 @@ encode_body(searchgw, #{radius := Radius}) ->
 encode_body(gwinfo, #{gw_id := GwId} = P) ->
     <<?GWINFO, GwId:8, (maps:get(gw_add, P, <<>>))/binary>>;
 encode_body(connect, P) ->
-    Flags = flag(bit_of(maps:get(will, P, 0)), 7)
-        bor flag(bit_of(maps:get(clean_session, P, 0)), 6),
+    Flags = flag(bit_of(maps:get(will, P, 0)), 3)
+        bor flag(bit_of(maps:get(clean_session, P, 0)), 2),
     <<?CONNECT, Flags:8, (maps:get(protocol_id, P, 1)):8,
       (maps:get(duration, P, 0)):16, (maps:get(client_id, P))/binary>>;
 encode_body(connack, #{return_code := RC}) ->
