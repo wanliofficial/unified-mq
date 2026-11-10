@@ -170,7 +170,7 @@ listener 写 `#{port => 14567}`（14567 用 EMQX 的 QUIC 默认端口便于对�
 
 ## Task 4 — 全量验证与文档同步
 
-`rebar3 ct`（默认 profile，基线 815 + Task 1/2 新增，不得回归）、`rebar3 as quic ct`（含真实
+`rebar3 ct`（默认 profile，基线 806 + Task 1/2 新增，不得回归）、`rebar3 as quic ct`（含真实
 QUIC 组）、`dialyzer`、`xref`、`rebar3 release` 与 `rebar3 as quic release`；同步 `progress.md`、
 `docs/architecture.md`（app 列表/表格/§3.12）、`docs/operations.md`（UDP 14567 + 证书要求 + 构建
 前提）、`docs/protocol-compatibility.md` §4.12、`docs/security.md`（QUIC 强制 TLS 1.3）。

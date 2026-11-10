@@ -364,9 +364,9 @@ S7 有两项交付：
 
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
-| S8-A 传输底座 | ✅ 完成（2026-11-10，HEAD `28aa4c4`） | `mqtt_transport` 行为 + `mqtt_transport_tcp`；`broker_ws` 纯 RFC 6455 库；**顺带修好 MQTT over TLS**（此前从未真正工作） | `ws_frame_SUITE` 9、`ws_handshake_SUITE` 15、`ws_conn_SUITE` 22、`mqtt_conn_SUITE` 70、`mqtt_transport_tcp_SUITE` 10、`mqtt_tls_SUITE` 4；全量 711/711（46 套件） |
-| S8-B MQTT over WebSocket | ✅ 完成（2026-11-10） | `broker_proto_mqtt_ws`，TCP 8083；两进程分层；子协议必须命中 `mqtt`/`mqttv3.1`/`mqttv3.1.1` 否则 400；仅 binary 帧（text → close 1003） | `mqtt_ws_conn_SUITE` 19；paho-mqtt 2.1.0 websocket **8/8**；顺带修好既有 `broker_proto_ws` 的 wss 握手（`ws_conn_SUITE` 23）；全量 731/731（47 套件） |
-| S8-C MQTT-SN 1.2 | ✅ 完成（2026-11-10） | `broker_proto_mqtt_sn`，UDP 1884；单 socket 单 reader、会话按 `{IP,Port}` + `client_id` 双索引；27 种报文 / QoS −1~2 / Will / Retain / 三种 topic id / 休眠唤醒 / SEARCHGW+ADVERTISE；**不复用 `mqtt_conn_fsm`** | `mqtt_sn_codec_SUITE` 40 + `mqtt_sn_topics_SUITE` 21 + `mqtt_sn_conn_SUITE` 23 = 84；`mqtt-sn-tools` 0.0.7 **10/10**；抓到 codec 把 CONNECT 的 Will/CleanSession 读错位（bit 7/6 应为 3/2）的真实缺陷；全量 815/815（50 套件） |
+| S8-A 传输底座 | ✅ 完成（2026-11-10，HEAD `28aa4c4`） | `mqtt_transport` 行为 + `mqtt_transport_tcp`；`broker_ws` 纯 RFC 6455 库；**顺带修好 MQTT over TLS**（此前从未真正工作） | `ws_frame_SUITE` 9、`ws_handshake_SUITE` 15、`ws_conn_SUITE` 22、`mqtt_conn_SUITE` 70、`mqtt_transport_tcp_SUITE` 10、`mqtt_tls_SUITE` 4；全量 702/702（46 套件） |
+| S8-B MQTT over WebSocket | ✅ 完成（2026-11-10） | `broker_proto_mqtt_ws`，TCP 8083；两进程分层；子协议必须命中 `mqtt`/`mqttv3.1`/`mqttv3.1.1` 否则 400；仅 binary 帧（text → close 1003） | `mqtt_ws_conn_SUITE` 19；paho-mqtt 2.1.0 websocket **8/8**；顺带修好既有 `broker_proto_ws` 的 wss 握手（`ws_conn_SUITE` 23）；全量 722/722（47 套件） |
+| S8-C MQTT-SN 1.2 | ✅ 完成（2026-11-10） | `broker_proto_mqtt_sn`，UDP 1884；单 socket 单 reader、会话按 `{IP,Port}` + `client_id` 双索引；27 种报文 / QoS −1~2 / Will / Retain / 三种 topic id / 休眠唤醒 / SEARCHGW+ADVERTISE；**不复用 `mqtt_conn_fsm`** | `mqtt_sn_codec_SUITE` 40 + `mqtt_sn_topics_SUITE` 21 + `mqtt_sn_conn_SUITE` 23 = 84；`mqtt-sn-tools` 0.0.7 **10/10**；抓到 codec 把 CONNECT 的 Will/CleanSession 读错位（bit 7/6 应为 3/2）的真实缺陷；全量 806/806（50 套件） |
 | S8-D MQTT over QUIC | ✅ 完成（2026-11-11，HEAD `0fc9049`） | `broker_proto_mqtt_quic`，UDP 14567（默认关闭）；CN Draft 3 单流模式；ALPN 固定 `mqtt`；强制 TLS 1.3；流关闭 ≠ 连接关闭；quicer 走 `quic` profile 门控 | `mqtt_quic_transport_SUITE` 13 + `mqtt_quic_listener_SUITE` 4（默认）/ 10（`quic`）；EMQX `emqtt` 1.16.1 **8/8**；修 `active, 1` → `once` 与 cluster dist 的 `_build/test` 硬编码；全量 823/823（52 套件），`as quic ct` 827 passed + 2 skipped |
 
 ### 10.2 Gate S8

@@ -1,7 +1,7 @@
 # S8-B 执行计划 — MQTT over WebSocket（`broker_proto_mqtt_ws`）
 
 - **对应设计**：[`docs/design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md`](../design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md) §4、§7、§9.1、§9.2、§10
-- **基线（改动前）**：46 套件 / 711 例（`all/0` 含 `groups/0`），dialyzer/xref/release 通过；HEAD `4a357aa`
+- **基线（改动前）**：46 套件 / 702 例（`all/0` 含 `groups/0`），dialyzer/xref/release 通过；HEAD `4a357aa`
 - **范围**：只实现 MQTT over WebSocket。**不改** `mqtt_conn_fsm` 的协议语义（S8-A 已把传输抽成 `mqtt_transport`），不改 `broker_proto_ws` 的自有 JSON/二进制 API。
 - **阶段顺序**：设计 §13 第 3 步。C（MQTT-SN）、D（MQTT over QUIC）各自另写计划
 - **执行约束**（仓库既定规则）：
@@ -266,7 +266,7 @@ git commit -m "feat(s8-b): WebSocket transport for MQTT (broker_proto_mqtt_ws)"
 
 **注意（S8-A 的教训）**：本套件会设 `broker_security.tls`，必须在 `init_per_testcase` **快照原始 tls 值**并用 Config 透传到 `end_per_testcase` 恢复那个快照（不能 teardown 时重读），否则会泄漏到同一 CT 节点的后续套件。
 
-已实现：**19 例**（`all/0` 实数，19/19 绿，连跑 3 次稳定；全量 CT 待 Task 4 复跑，届时基线 711 + 本轮 19）。
+已实现：**19 例**（`all/0` 实数，19/19 绿，连跑 3 次稳定；全量 CT 待 Task 4 复跑，届时基线 702 + 本轮 19）。
 
 | 用例 | 断言 |
 |---|---|
@@ -406,9 +406,9 @@ erl -noshell -pa _build/test/lib/*/ebin -eval '
   halt().'
 ```
 
-`rebar3 ct` 通过的总例数 = 711 + 本阶段新增，两者都要写（区分"基线"与"S8-B 新增"）。
+`rebar3 ct` 通过的总例数 = 702 + 本阶段新增，两者都要写（区分"基线"与"S8-B 新增"）。
 
-**已执行**：`mqtt_ws_conn_SUITE` 19 例、`ws_conn_SUITE` 23 例（+1）；全量 **731/731**（47 套件，基线 711 + 19 + 1），零 FAILED；`dialyzer` 0 warnings；`xref` 仅预期 unused-export；`rebar3 as prod release` 装配成功，`_build/prod/rel/unified_mq/lib/broker_proto_mqtt_ws-0.1.0` 存在。
+**已执行**：`mqtt_ws_conn_SUITE` 19 例、`ws_conn_SUITE` 23 例（+1）；全量 **722/722**（47 套件，基线 702 + 19 + 1），零 FAILED；`dialyzer` 0 warnings；`xref` 仅预期 unused-export；`rebar3 as prod release` 装配成功，`_build/prod/rel/unified_mq/lib/broker_proto_mqtt_ws-0.1.0` 存在。
 
 **4d. 文档同步（本阶段只动这 4 个文件）**
 
@@ -437,7 +437,7 @@ git commit -m "docs(s8-b): record MQTT over WebSocket in architecture, ops and p
 - [x] `mqtt_transport_ws` 实现 `mqtt_transport` 四回调，FSM 零改动接入
 - [x] `mqtt_ws_conn_SUITE` 全绿（19/19，连跑 3 次稳定；含 wss、跨帧、单帧多报文、text 帧拒绝、明文 TCP 打 wss 端口）
 - [x] `paho-mqtt 2.1.0` websocket 用例全绿（8/8，另有 1 例 raw framing 探针单列），`report.json` / `broker.log` 落盘
-- [x] `rebar3 ct` 总例数 = 731（基线 711 + 本套件 19 + ws_conn 回归 1），零 FAILED
+- [x] `rebar3 ct` 总例数 = 722（基线 702 + 本套件 19 + ws_conn 回归 1），零 FAILED
 - [x] dialyzer / xref 干净，`rebar3 as prod release` 装配成功（release 内含 `broker_proto_mqtt_ws`）
 - [x] `docs/architecture.md` / `operations.md` / `protocol-compatibility.md` §4.13 / `progress.md` 同步，用例数回填
 - [x] 既有 `broker_proto_ws` 的 wss 缺口已修复并加回归（见 4b）

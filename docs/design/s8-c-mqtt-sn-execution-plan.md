@@ -220,7 +220,7 @@ QoS -1 是否受支持以工具实际行为为准，不支持则该行从第三�
 
 ## Task 4 — 全量验证与文档同步
 
-`rebar3 ct`（基线 731 + 84 = 815）、`dialyzer`、`xref`、`rebar3 as prod release`；
+`rebar3 ct`（基线 722 + 84 = 806）、`dialyzer`、`xref`、`rebar3 as prod release`；
 同步 `progress.md`、`docs/architecture.md`（app 列表/表格/§3.11）、`docs/operations.md`
 （UDP 1884 + 配置块 + `predefined_topics`）、`docs/protocol-compatibility.md` §4.11、
 `docs/security.md` §2.2（`mqtt_sn` 的 require_auth 行为）。
@@ -250,7 +250,7 @@ QoS -1 是否受支持以工具实际行为为准，不支持则该行从第三�
 - [x] `mqtt_sn_conn` 覆盖 CONNECT/Will 流程、QoS -1/0/1/2、retain、REGISTER/短/预定义 topic、休眠与唤醒、keepalive 判死（23 例；topic id 表另有 21 例）
 - [x] `require_auth` 配 `mqtt_sn` 时监听器拒绝启动（`{require_auth_unsupported, mqtt_sn}`，`require_auth_refuses_to_start`）
 - [x] `mqtt-sn-tools` 真实客户端 10/10 全绿；QoS2 / Will / 唤醒三项无第三方覆盖一事在 `test/protocol-compatibility/mqtt_sn/README.md` 与 `docs/protocol-compatibility.md` §4.11 单列
-- [x] 全量 `rebar3 ct` 零 FAILED（**815/815**，50 套件），用例数按 `all/0` 回填（40/21/23）
+- [x] 全量 `rebar3 ct` 零 FAILED（**806/806**，50 套件），用例数按 `all/0` 回填（40/21/23）
 - [x] dialyzer 干净 / xref 173 条仅基线同类 unused-export / `rebar3 as prod release` 含 `broker_proto_mqtt_sn-0.1.0`
 - [x] 四份文档同步（`progress.md`、`docs/architecture.md` §3.11、`docs/operations.md` §1/§1.1、`docs/protocol-compatibility.md` §4.11、`docs/security.md` §2.2/§12），`docs/roadmap.md`/ADR 统一留到 B/C/D 全部结案
 
