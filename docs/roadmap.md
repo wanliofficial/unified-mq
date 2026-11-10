@@ -321,7 +321,7 @@ S7 有两项交付：
 
 ### 9.1 标准 CloudEvents Binding：逐协议结论（2026-11-10 结案）
 
-判定依据是 CloudEvents 官方仓库的 binding 原文（`github.com/cloudevents/spec/tree/main/cloudevents/bindings`，逐份 grep 条文），**不以本表此前的旧表述为准**。官方目录只有六份文件——`amqp`、`http`、`kafka`、`mqtt`、`nats`、`websockets`，**没有 Pulsar**，也没有「WebSocket 有官方 Binding」之外的第三方约定。
+判定依据是 CloudEvents 官方仓库的 binding 原文（`github.com/cloudevents/spec/tree/main/cloudevents/bindings`，逐份 grep 条文），**不以本表此前的旧表述为准**。官方目录只有六份文件——`amqp-protocol-binding.md`、`http-protocol-binding.md`、`kafka-protocol-binding.md`、`mqtt-protocol-binding.md`、`nats-protocol-binding.md`、`websockets-protocol-binding.md`（版本标记为 1.0.3-wip），**没有 Pulsar**，也没有除这六份之外的协议约定。下文引用均为该目录下的文件与节号，可逐条复核。
 
 | 协议 | 官方条文要求 | 本仓库实现 | 结论 |
 |---|---|---|---|
@@ -329,8 +329,8 @@ S7 有两项交付：
 | **MQTT 3.1.1** | 同一文件 §1.3：「With MQTT 3.1.1, the content mode is **always structured**」且 payload **MUST** 用 JSON 事件格式；3.1.1 无元数据通道，因此**不存在** binary mode | Structured Mode 逐字节支持（`to_mqtt/3` 的 structured 分支对 3.1.1 不写 `Content Type`，与规范一致）；另额外提供 Binary Mode，把无法承载的属性全列进 `report/5` 的 `losses` | **结构化方向合规**；Binary Mode 是规范之外的扩展（有显式损失报告，非静默丢弃） |
 | **WebSocket** | `websockets-protocol-binding.md` §1.3「content mode is always structured」；§1.4/§1.5 用 `Sec-WebSocket-Protocol` 协商事件格式子协议，JSON 必须支持 `cloudevents.json`，消息用 Text 帧 | WS 端点与该子协议无关：是与 `cloudevents.json` 并列的 **Broker 自有应用层协议**（JSON/二进制帧，见 §4.5），上下文走 Binary Mode 的 `ce-*` 顶层键 | **未实现官方 Binding**，显式声明「自有协议」；官方只定义 structured + 子协议协商 |
 | **NATS** | `nats-protocol-binding.md` §3.1.3.1：属性进 NATS header，名字加 **`ce-`（连字符）**前缀（`ce-specversion`、`ce-datacontenttype`…）；§3.1.3.2：值 **MUST** 按 RFC3986 percent-encode | 键名与规范**完全一致**（同一 `ce-` 前缀，含 `ce-datacontenttype`）；未做 percent-encoding | **键名一致、编码不合规**：header 值未按 §3.1.3.2 编码，含 `,`/`"`/空格的属性值在严格对端会失真 |
-| **Kafka** | `kafka-protocol-binding.md` §3.2.3：属性逐个进 Record Header，前缀是 **`ce_`（下划线）**（`ce_specversion`、`ce_id`…），键与值均为字符串 | 前缀用 `ce-`（连字符） | **非逐字**：分隔符不同（`ce-` vs `ce_`） |
-| **AMQP** | `amqp-protocol-binding.md` 只定义 **AMQP 1.0**：binary mode 把属性放进 **application-properties**，前缀 `cloudEvents_` 或 `cloudEvents:` | 实现的是 **AMQP 0-9-1**：属性在 basic properties 的 `headers` table，前缀 `ce-` | **规范不覆盖本实现**：0-9-1 没有官方 Binding，需先引入 AMQP 1.0 才有逐字实现对象 |
+| **Kafka** | `kafka-protocol-binding.md` §3.2.3.1：属性逐个进 Record Header，前缀是 **`ce_`（下划线）**（`ce_specversion`、`ce_id`…），键与值均为字符串 | 前缀用 `ce-`（连字符） | **非逐字**：分隔符不同（`ce-` vs `ce_`） |
+| **AMQP** | `amqp-protocol-binding.md` 只定义 **AMQP 1.0**（§1.2）：binary mode 把属性放进 **application-properties**，前缀 `cloudEvents_` 或 `cloudEvents:`（§3.1.3.1） | 实现的是 **AMQP 0-9-1**：属性在 basic properties 的 `headers` table，前缀 `ce-` | **规范不覆盖本实现**：0-9-1 没有官方 Binding，需先引入 AMQP 1.0 才有逐字实现对象 |
 | **Pulsar** | 官方 bindings 目录**无此文件** | `ce-*` 进 Message properties | **无官方 Binding**：统一 `ce-*` 通道是本 Broker 的定义 |
 
 **结论落地方式**（不是「都已逐字实现」）：

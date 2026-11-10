@@ -562,7 +562,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 | MQTT 3.1.1 | §1.3 内容模式**恒为 structured**，无 binary mode | 我们的 structured 合规；binary 是额外扩展（有 `losses` 报告） |
 | WebSocket | §1.3 恒 structured + §1.5 `Sec-WebSocket-Protocol: cloudevents.json` 子协议协商 | 我们的 WS 是并列的自有协议，**未实现**官方绑定 |
 | NATS | §3.1.3.1 前缀 `ce-`；§3.1.3.2 值 **MUST** percent-encode | 键名一致，**缺 percent-encoding** |
-| Kafka | §3.2.3 前缀 **`ce_`（下划线）** | 我们用 `ce-`，**非逐字** |
+| Kafka | §3.2.3.1 前缀 **`ce_`（下划线）** | 我们用 `ce-`，**非逐字** |
 | AMQP | 只有 **AMQP 1.0** 规范（`cloudEvents_`/`cloudEvents:` 前缀，application-properties） | 我们是 0-9-1 + `headers` table，**规范不覆盖** |
 | Pulsar | 官方 bindings 目录**无此文件** | 无官方 Binding |
 
