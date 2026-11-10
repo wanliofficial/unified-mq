@@ -98,7 +98,7 @@ TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 li
 rebar3 as quic compile      # 或 rebar3 as quic ct / release
 ```
 
-默认 profile（`rebar3 compile/ct/release`）**完全不拉 quicer**，`broker_proto_mqtt_quic` 照常编译并启动，只是列表里没有 listener；手工开 listener 会得到 `{error, quicer_not_available}`。
+默认 profile（`rebar3 compile/ct/release`）**完全不拉 quicer**，`broker_proto_mqtt_quic` 照常编译并启动（它出现在两个 release 的 app 列表里，`optional_applications => [quicer]`），只是列表里没有 listener；手工开 listener 会得到 `{error, quicer_not_available}`。
 
 **配置**（`config/sys.config.src` 里默认 `listeners => []`）：
 

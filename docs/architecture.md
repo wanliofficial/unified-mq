@@ -276,7 +276,7 @@ broker_proto_mqtt_quic_sup (one_for_all, 1/5s)
 
 **QUIC 没有明文模式。** 握手就是 TLS 1.3，因此证书来源与其它 listener 不同：listener map 自带 `certfile`/`keyfile`，否则取 `broker_security.tls`；两者都没有就 `{stop, {quic_requires_tls, certfile | keyfile}}`，**只让这一个 app 起不来**。`broker_security.tls.enabled` 不能把 QUIC 变成明文，只能让它在找不到证书时拒绝启动。ALPN 只提供 `mqtt`（CN Draft 3 §2.1 的唯一值），客户端不带 `mqtt` 就握手失败——静默接受别的 ALPN 等于让客户端以为自己在说另一种协议。
 
-**quicer 是 profile 门控依赖，不是默认依赖。** 默认 `rebar3 compile/ct/release` 完全不拉 `quicer`（`optional_applications => [quicer]`，listener 在缺 NIF 时以 `{error, quicer_not_available}` 干净拒绝）；`rebar3 as quic ...` 才把它编进来，`quic` profile 的 `relx` 因此复制了完整的 release app 列表——profile 的 `relx` 会**替换**顶层那份，漏掉就等于装出一个只有 QUIC 的 release。所有 `quicer:` 调用集中在 `mqtt_quic_nif` 一个模块，`include` 也不越界：本 app 只通过裸消息元组与 quicer 交互，没有它的头文件依赖。
+**quicer 是 profile 门控依赖，不是默认依赖。** 默认 `rebar3 compile/ct/release` 完全不拉 `quicer`（`optional_applications => [quicer]`，listener 在缺 NIF 时以 `{error, quicer_not_available}` 干净拒绝）；`rebar3 as quic ...` 才把它编进来，`quic` profile 的 `relx` 因此复制了完整的 release app 列表——profile 的 `relx` 会**替换**顶层那份，漏掉就等于装出一个只有 QUIC 的 release。**`broker_proto_mqtt_quic` 本身在两个 release 的 app 列表里**（它不依赖 NIF 就能启动，只是 `listeners => []`），差别只是 `quic` release 多带 `quicer-0.4.12`；把该 app 从默认列表里去掉会让手工构建与 release 的启动行为不一致。所有 `quicer:` 调用集中在 `mqtt_quic_nif` 一个模块，`include` 也不越界：本 app 只通过裸消息元组与 quicer 交互，没有它的头文件依赖。
 
 ---
 

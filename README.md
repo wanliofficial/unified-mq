@@ -2,7 +2,7 @@
 ## Erlang/OTP + Raft + 多协议接入 + Pulsar + CloudEvents
 
 - **文档版本**：v1.2
-- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S7 已实现并验证（`rebar3 ct` 673/673、六协议真实客户端套件），S7 及之后仍未实现的方向列在 [`docs/security.md`](docs/security.md) §12。本文 §8 的目录结构与 §12 的分阶段表是**设计建议**，实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1。
+- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S8 已实现并验证（`rebar3 ct` 823/823、52 套件；六协议真实客户端套件 + MQTT-SN / MQTT over QUIC / MQTT over WebSocket 三套真实客户端证据），S8 及之后仍未实现的方向列在 [`docs/security.md`](docs/security.md) §12。本文 §8 的目录结构与 §12 的分阶段表是**设计建议**，实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1。
 - **目标**：构建一个以 Erlang/OTP 为核心、支持多消息协议、分布式一致性、持久化消息和标准化事件的统一消息 Broker。
 - **核心原则**：协议适配与消息内核解耦；控制面与数据面分离；共识层不替代消息语义；CloudEvents 是事件表达标准，不是传输协议。
 
@@ -476,6 +476,19 @@ CloudEvents `source + id` 可作为业务事件去重的候选键，但 Broker �
 - Pulsar 优先覆盖官方 Java Client；其他协议也要明确客户端与版本矩阵。
 - 验证连接中多个命令交错、断连恢复、认证失败、超时、流控和异常帧处理。
 - 为每个协议建立能力矩阵，区分“已支持”“部分支持”“计划支持”。
+
+**当前实现状态**（截至 2026-11-11，详见 [`docs/protocol-compatibility.md`](docs/protocol-compatibility.md) §2 能力矩阵与 §4 逐协议证据）：
+
+| 协议 | 传输 | 默认端口 | 真实客户端证据 |
+|---|---|---|---|
+| MQTT 3.1.1 / 5.0 | TCP / TLS | 1883 / 8883 | paho-mqtt 2.x + mosquitto 2.1.2，10/10 |
+| MQTT over WebSocket | TCP / TLS | 8083 | paho-mqtt 2.1.0（`transport="websockets"`），8/8 |
+| MQTT-SN 1.2 | **UDP**（无 DTLS） | 1884 | `mqtt-sn-tools` 0.0.7，10/10 |
+| MQTT over QUIC | **UDP**，强制 TLS 1.3 | 14567（默认关闭） | EMQX `emqtt` 1.16.1，8/8 |
+| WebSocket（Broker 自有 API） | TCP / TLS | 8080 | `websocket-client` 1.7.0，10/10 |
+| NATS / AMQP / Kafka / Pulsar | TCP / TLS | 4223 / 5673 / 9093 / 6650 | 官方客户端各 8~13 例 |
+
+MQTT over QUIC 只在 `rebar3 as quic` 构建里带 NIF，默认 release 不含该端口；启用前必须先配证书（`docs/operations.md` §1.2）。
 
 ### 11.2 CloudEvents 一致性
 

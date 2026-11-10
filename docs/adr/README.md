@@ -29,6 +29,14 @@
 | [018](018-retain-will-and-qos2-amendments.md) | Retain/Will 语义与持久化边界；QoS 2 握手幂等与 `.inflight` v2 形状修订 | MQTT 3.1.1 §3.1.2.5/§3.3.1.3/§3.6.1；ADR-007/012；S2 设计 §4.3 |
 | [019](019-shared-assignment-ack-ownership-and-session-layout.md) | Shared 的 worker 原子 claim、`ack/4` 归属校验与会话文件按 SubRef 布局 | README §5.2；ADR-010/**013（修订 §13.2/§13.3/§13.5）**/015；S2 设计 §4.4 |
 
+### S8 决策（已采纳，2026-11-10 / 2026-11-11）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [022](022-mqtt-sn-gateway.md) | MQTT-SN 网关：单 socket / 多会话、topic id 三表与休眠语义；**不复用 `mqtt_conn_fsm`** | MQTT-SN 1.2 §5.4/§6.2/§6.13；ADR-001/010/013/018 |
+| [023](023-mqtt-over-websocket-two-processes.md) | MQTT over WebSocket 的两进程分层；帧解码不进 `decode_msg/2` | MQTT 3.1.1 §6 / 5.0 §6；RFC 6455；ADR-001 |
+| [024](024-mqtt-over-quic.md) | MQTT over QUIC：连接/流两层、profile 门控依赖、流信用与 `active, once` | OASIS MQTT TC《Single Stream Mode》CN Draft 3 §2.1；ADR-001/022/023 |
+
 ## Gate S0 验收清单（roadmap §2）
 
 - [x] S0.1（ra 评估）与 S0.3（WAL）产出明确结论（采用 ra / 采用方案 A 自研 WAL）

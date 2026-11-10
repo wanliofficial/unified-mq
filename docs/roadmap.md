@@ -30,9 +30,10 @@ flowchart LR
     S5 --> S6[S6 生产化]
     S4 --> S6
     S6 --> S7[S7 身份统一与事件绑定]
+    S7 --> S8[S8 MQTT 传输扩展]
 ```
 
-S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。
+S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。
 
 ---
 
@@ -48,6 +49,7 @@ S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面�
 | **S5** | 协议扩展 | AMQP / NATS / Kafka / WebSocket / Pulsar | 每个协议通过真实客户端兼容矩阵 |
 | **S6** | 生产化 | 安全 / 可观测 / 运维 / 容量 | 压测报告 + 故障演练 + 运维手册 |
 | **S7** | 身份统一与事件绑定 | 六协议共用身份表（已完成）+ 标准 CloudEvents Binding 逐字结论（已完成） | 租户来自用户记录 + 每个协议的 Binding 有明确结论 |
+| **S8** | MQTT 传输扩展 | MQTT-SN 1.2 / MQTT over QUIC / MQTT over WebSocket（三条复用同一 MQTT 引擎的传输） | 三种传输各有一份真实第三方客户端证据 + 能力矩阵与限制清单 |
 
 ---
 
@@ -348,9 +350,43 @@ S7 有两项交付：
 
 ---
 
-## 10. 附录
+## 10. S8 — MQTT 传输扩展（MQTT-SN / MQTT over QUIC / MQTT over WebSocket）
 
-### 10.1 关键 ADR 索引
+**目标**：在既有 MQTT 引擎之上补齐三种 MQTT 系传输，同时**不写第二个 MQTT 实现**。设计见 [`docs/design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md`](design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md)。
+
+**做法**：S8-A 先把「传输」抽成 `mqtt_transport` 行为（`send`/`arm_once`/`close`/`decode_msg`）并抽 `broker_ws` 纯 RFC 6455 库；S8-B/C/D 各自实现一种前端。三种传输对 `mqtt_conn_fsm` 的关系不同，这正是设计要回答的部分：
+
+- **S8-B MQTT over WebSocket**：同一 `mqtt_conn_fsm`（handle = WS 进程 pid），每连接两进程；
+- **S8-C MQTT-SN**：**不复用** `mqtt_conn_fsm`（UDP 没有「一条会丢的连接」这个前提），单 socket 服务全部会话，只复用下层路由/队列/订阅；
+- **S8-D MQTT over QUIC**：同一 `mqtt_conn_fsm`（handle = QUIC stream），比 TCP 多一层「连接在流之间存活」。
+
+### 10.1 阶段表
+
+| 子阶段 | 状态 | 产出 | 证据 |
+|---|---|---|---|
+| S8-A 传输底座 | ✅ 完成（2026-11-10，HEAD `28aa4c4`） | `mqtt_transport` 行为 + `mqtt_transport_tcp`；`broker_ws` 纯 RFC 6455 库；**顺带修好 MQTT over TLS**（此前从未真正工作） | `ws_frame_SUITE` 9、`ws_handshake_SUITE` 15、`ws_conn_SUITE` 22、`mqtt_conn_SUITE` 70、`mqtt_transport_tcp_SUITE` 10、`mqtt_tls_SUITE` 4；全量 711/711（46 套件） |
+| S8-B MQTT over WebSocket | ✅ 完成（2026-11-10） | `broker_proto_mqtt_ws`，TCP 8083；两进程分层；子协议必须命中 `mqtt`/`mqttv3.1`/`mqttv3.1.1` 否则 400；仅 binary 帧（text → close 1003） | `mqtt_ws_conn_SUITE` 19；paho-mqtt 2.1.0 websocket **8/8**；顺带修好既有 `broker_proto_ws` 的 wss 握手（`ws_conn_SUITE` 23）；全量 731/731（47 套件） |
+| S8-C MQTT-SN 1.2 | ✅ 完成（2026-11-10） | `broker_proto_mqtt_sn`，UDP 1884；单 socket 单 reader、会话按 `{IP,Port}` + `client_id` 双索引；27 种报文 / QoS −1~2 / Will / Retain / 三种 topic id / 休眠唤醒 / SEARCHGW+ADVERTISE；**不复用 `mqtt_conn_fsm`** | `mqtt_sn_codec_SUITE` 40 + `mqtt_sn_topics_SUITE` 21 + `mqtt_sn_conn_SUITE` 23 = 84；`mqtt-sn-tools` 0.0.7 **10/10**；抓到 codec 把 CONNECT 的 Will/CleanSession 读错位（bit 7/6 应为 3/2）的真实缺陷；全量 815/815（50 套件） |
+| S8-D MQTT over QUIC | ✅ 完成（2026-11-11，HEAD `0fc9049`） | `broker_proto_mqtt_quic`，UDP 14567（默认关闭）；CN Draft 3 单流模式；ALPN 固定 `mqtt`；强制 TLS 1.3；流关闭 ≠ 连接关闭；quicer 走 `quic` profile 门控 | `mqtt_quic_transport_SUITE` 13 + `mqtt_quic_listener_SUITE` 4（默认）/ 10（`quic`）；EMQX `emqtt` 1.16.1 **8/8**；修 `active, 1` → `once` 与 cluster dist 的 `_build/test` 硬编码；全量 823/823（52 套件），`as quic ct` 827 passed + 2 skipped |
+
+### 10.2 Gate S8
+
+- [x] MQTT-SN：`mqtt-sn-tools` 真实客户端用例全绿，日志与 `report.json` 落盘——`test/protocol-compatibility/mqtt_sn/`，**10/10**
+- [x] MQTT-SN：QoS2 与休眠/唤醒由仓内套件覆盖并有明确说明——`mqtt_sn_conn_SUITE`（QoS −1/0/1/2、休眠 + 新端点唤醒 + 积压、keepalive 判死）；第三方工具无 QoS2/无 Will/`PINGREQ` 不带 client id，能力边界已在 `docs/protocol-compatibility.md` §4.11 单列
+- [x] MQTT over QUIC：`emqtt` 单流客户端用例全绿，ALPN `mqtt` 有握手证据——`test/protocol-compatibility/mqtt_quic/`，**8/8**；ALPN 由 `mqtt_quic_listener_SUITE:a_client_with_alpn_mqtt_can_handshake` 与非 `mqtt` 被拒两例钉死
+- [x] MQTT over WebSocket：`paho-mqtt` websocket 传输用例全绿，子协议与 binary 帧有证据——`test/protocol-compatibility/mqtt_ws/`，**8/8**（另 1 例 raw framing 探针单列）
+- [x] 三协议各一行能力矩阵 + 逐协议限制清单——`docs/protocol-compatibility.md` §2 与 §4.11（SN）/ §4.12（QUIC）/ §4.13（WS）
+- [x] `rebar3 ct` 既有 673 例零回归；`as quic ct` 全绿；dialyzer/xref 干净——当前 **823/823（52 套件，零 FAILED / 零 Skipped）**；`rebar3 as quic ct` **827 passed + 2 skipped**（`mqtt_quic_transport_SUITE` 的两个「quicer 缺失」用例按设计 skip），零 FAILED
+- [x] `rebar3 release` 与 `as quic release` 均装配成功
+- [x] 文档同步：roadmap、architecture、operations、security、README、progress
+
+**明确的非目标**：MQTT-SN over DTLS、QUIC 0-RTT、QUIC 多流（EMQX 私有扩展）、`permessage-deflate`。四项都写进 `docs/security.md` §12 与各自的 §4.x 限制表。
+
+---
+
+## 11. 附录
+
+### 11.1 关键 ADR 索引
 
 | ADR | 主题 | 定稿阶段 |
 |---|---|---|
@@ -375,8 +411,11 @@ S7 有两项交付：
 | ADR-019 | Shared 分配、`ack/4` 归属与会话文件按 SubRef 布局 | S2（已采纳） |
 | ADR-020 | CloudEvents codec 策略与 Binding 边界 | S3（已采纳） |
 | ADR-021 | 集群控制面、Metadata Raft 与 Fencing | S4（已采纳） |
+| ADR-022 | MQTT-SN 网关：单 socket / 多会话、topic id 三表与休眠语义 | S8-C（已采纳） |
+| ADR-023 | MQTT over WebSocket 的两进程分层 | S8-B（已采纳） |
+| ADR-024 | MQTT over QUIC：连接/流两层、profile 门控依赖与流信用 | S8-D（已采纳） |
 
-### 10.2 文档产出物
+### 11.2 文档产出物
 
 | 文档 | 阶段 | 对应 README 章节 |
 |---|---|---|
@@ -392,6 +431,11 @@ S7 有两项交付：
 | `docs/design/s2.5-mqtt5-execution-plan.md` | S2.5（已完成 2026-11-08） | 4.1、11.1 |
 | `docs/design/s3-cloudevents-execution-plan.md` | S3（已完成 2026-11-08） | 3、4 |
 | `docs/design/s4-cluster-execution-plan.md` | S4（已完成 2026-11-08） | 6、11.3 |
+| `docs/design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md` | S8（设计，2026-11-10） | 4.1、11.1 |
+| `docs/design/s8-a-foundation-execution-plan.md` | S8-A（已完成 2026-11-10） | 4.1、11.1 |
+| `docs/design/s8-b-mqtt-over-ws-execution-plan.md` | S8-B（已完成 2026-11-10） | 4.1、11.1 |
+| `docs/design/s8-c-mqtt-sn-execution-plan.md` | S8-C（已完成 2026-11-10） | 4.1、11.1 |
+| `docs/design/s8-d-mqtt-over-quic-execution-plan.md` | S8-D（已完成 2026-11-11） | 4.1、11.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |

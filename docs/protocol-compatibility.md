@@ -702,7 +702,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 - **默认不监听**：QUIC 无证书即拒绝启动，而拒绝启动是该 app 的启动失败，release 会起不来。启用顺序见 `docs/operations.md` §1.2。
 - **流信用是配额不是补充**：同一 QUIC 连接上重连超过 `max_streams_per_conn` 次后，客户端必须新建 QUIC 连接。这是 quicer 0.4.12 的实测限制，不是设计偏好。
-- **只有 `rebar3 as quic` 构建带 NIF**：默认 release 里没有 `quicer`，也就没有 QUIC 端口。运维上要先确认 `rebar3 as quic release` 的产物。
+- **只有 `rebar3 as quic` 构建带 NIF**：默认 release 里没有 `quicer`，也就没有 QUIC 端口（`broker_proto_mqtt_quic` 这个 app 本身在两个 release 里都有，只是 `listeners => []`）。运维上要先确认 `rebar3 as quic release` 的产物。
 - **DTLS 不相关**：QUIC 自带 TLS 1.3，与 MQTT-SN 的明文 UDP 是两回事；`broker_security.tls.enabled` 对 QUIC 是「证书来源」而不是「开关」。
 
 ---
