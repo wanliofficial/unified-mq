@@ -1,0 +1,22 @@
+{application, broker_proto_mqtt_sn, [
+    {description, "MQTT-SN 1.2 gateway: UDP listener, session, codec and topic ids"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics,
+                    broker_storage, broker_router, broker_queue,
+                    broker_subscription, broker_event, broker_security,
+                    broker_retain]},
+    {env, [{%% No listener unless the release config supplies one; CT binds its
+            %% own ephemeral UDP port.
+            listeners, []},
+           %% `1 => <<"t0/sensor/temp">>' style table, shared by every client.
+           predefined_topics, #{},
+           {gateway_id, 1},
+           %% 0 = only answer SEARCHGW, never broadcast ADVERTISE on our own.
+           {advertise_interval_ms, 0},
+           {max_asleep_clients, 1024},
+           {max_topic_ids_per_client, 1024},
+           %% 1.5x/2x of a client's requested duration, capped so an absurd
+           %% value cannot pin a session for a week.
+           {max_duration_s, 3600}]}
+]}.
