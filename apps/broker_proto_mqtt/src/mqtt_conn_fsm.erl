@@ -41,6 +41,10 @@
 -include_lib("broker_router/include/broker_router.hrl").
 
 -record(st, {socket,
+             %% S8: which module carries this connection's bytes. Defaults to
+             %% the plain/TLS socket one, so every existing caller (the CT
+             %% helper included) keeps working without naming a transport.
+             transport = mqtt_transport_tcp :: mqtt_transport:t(),
              opts = #{},
              buf = <<>>,
              poll_ref = undefined,
@@ -92,7 +96,8 @@ start_link(Socket, Opts) ->
 callback_mode() -> [handle_event_function, state_enter].
 
 init({Socket, Opts}) ->
-    {ok, awaiting_owner, #st{socket = Socket, opts = Opts}}.
+    Transport = maps:get(transport, Opts, mqtt_transport_tcp),
+    {ok, awaiting_owner, #st{socket = Socket, opts = Opts, transport = Transport}}.
 
 %% -- state entry: the poll sentinel and the keepalive timer live only in
 %% `connected'; entering it is the first moment a session can lose a wakeup.
@@ -112,28 +117,78 @@ handle_event(_Et, connect, awaiting_owner, #st{socket = Sock} = D) ->
 %% `mqtt_conn_sup:start_conn/2' with no socket (T12), so this is where it first
 %% becomes safe to touch it -- the same point the test helper reaches with
 %% `connect' after its own `controlling_process'.
-handle_event(_Et, {handshake, _Ref, _Transport, Sock, _Timeout}, awaiting_owner, D) ->
-    arm_socket(Sock, D#st{socket = Sock});
+%%
+%% The message carries ranch's OWN transport module (`ranch_tcp' / `ranch_ssl'),
+%% not our `mqtt_transport': the two are different layers. ranch only does
+%% `transport_accept' for TLS, so `handshake/2' is the no-op that returns the
+%% socket for TCP and the call that actually completes the TLS handshake for
+%% SSL -- without it the first `ssl:setopts' fails `notsup_on_transport_accept
+%% _socket'. The socket it returns (unchanged for TCP, the sslsocket for TLS)
+%% becomes the handle every later `mqtt_transport' callback uses.
+handle_event(_Et, {handshake, _Ref, RanchTransport, Sock, Timeout}, awaiting_owner, D) ->
+    case RanchTransport:handshake(Sock, Timeout) of
+        {ok, HSock} ->
+            arm_socket(HSock, D#st{socket = HSock});
+        {error, Reason} ->
+            log(warning, "transport handshake failed ~p", [Reason]),
+            {stop, normal, D}
+    end;
 
-%% -- transport death is legal in every live state
-handle_event(_Et, {tcp_closed, _}, _StateName, D) -> {stop, normal, D};
-handle_event(_Et, {tcp_error, _, Reason}, _StateName, D) ->
-    log(warning, "socket error ~p", [Reason]),
-    {stop, normal, D};
+%% -- transport death is legal in every live state, and it is no longer a
+%% `handle_event' clause of its own: `closed' / `{error, _}' arrive through the
+%% transport's `decode_msg/2' in `event/3' below, so every transport (TCP, TLS,
+%% WebSocket, QUIC) reaches the same shutdown path.
 
 %% -- anything before the handoff cannot be served (no socket ownership yet)
 handle_event(_Et, Content, awaiting_owner, D) ->
     log(warning, "event before socket handoff: ~p", [Content]),
     {keep_state, D};
 
+%% S8: before the state matrix sees an event, the transport gets a look at it.
+%% `{tcp,...}' / `{ssl,...}' / `{quic,...}' are transport-shaped, and each
+%% implementation knows its own shapes; anything it does not claim (`other') is
+%% an ordinary event -- a `broker_deliver', a poll tick, a `connect' handoff --
+%% and takes the same path it always did.
 handle_event(_Et, Content, StateName, D0) ->
+    case (D0#st.transport):decode_msg(Content, D0#st.socket) of
+        {data, Data} ->
+            transport_data(Data, StateName, D0);
+        closed ->
+            {stop, normal, D0};
+        {error, Reason} ->
+            log(warning, "socket error ~p", [Reason]),
+            {stop, normal, D0};
+        other ->
+            dispatch(Content, StateName, D0)
+    end.
+
+%% Incoming bytes: buffer, decode as many frames as are complete, then re-arm.
+%% Exactly one re-arm per delivery, including the path that consumed several
+%% frames -- arming per frame would deliver the same buffer twice.
+transport_data(Data, StateName, #st{buf = Buf} = D0) ->
+    broker_metrics:inc(bytes_in, byte_size(Data)),
+    D = D0#st{buf = <<Buf/binary, Data/binary>>},
+    case tcp_frames(D, StateName) of
+        {state, S, D1} ->
+            %% `{keep_state, _}' would DISCARD the state `S' the frame loop just
+            %% moved into -- a CONNECT that lands in the same delivery as its
+            %% CONNACK reply would be followed by a PINGREQ while the machine
+            %% still believed it was in `awaiting_connect'. `next_state' is what
+            %% the pre-S8 code returned, and it is what makes the entered state
+            %% real.
+            {next_state, S, ka_arm(S, active_once(D1))};
+        {stop, Reason, D1} ->
+            {stop, Reason, D1}
+    end.
+
+dispatch(Content, StateName, D0) ->
     case event(Content, StateName, D0) of
         {state, StateName, D1} ->
             %% Any processed event re-arms the poll sentinel -- whose tick just
             %% cleared its own ref, so re-arming here is the only thing that
             %% keeps a quiet connection from falling asleep for good. The
-            %% keepalive deadline is NOT re-armed here: `event/3`'s {tcp,...}
-            %% clause owns that, see ka_arm/2.
+            %% keepalive deadline is NOT re-armed here: `transport_data/3'
+            %% owns that, see ka_arm/2.
             {keep_state, arm_poll(StateName, D1)};
         {state, NextState, D1} ->
             {next_state, NextState, D1};
@@ -143,19 +198,6 @@ handle_event(_Et, Content, StateName, D0) ->
 
 %%%_* Event matrix ------------------------------------------------------------
 
-event({tcp, _Sock, Data}, StateName, #st{buf = Buf} = D0) ->
-    broker_metrics:inc(bytes_in, byte_size(Data)),
-    D = D0#st{buf = <<Buf/binary, Data/binary>>},
-    case tcp_frames(D, StateName) of
-        {state, S, D1} ->
-            %% exactly one re-arm per {tcp,...} delivery, including the path
-            %% that consumed several frames -- arming per frame would deliver
-            %% the same buffer twice.
-            active_once(D1),
-            {state, S, ka_arm(S, D1)};
-        {stop, Reason, D1} ->
-            {stop, Reason, D1}
-    end;
 event(connect, awaiting_connect, D) ->
     %% duplicated handoff: the socket is already armed
     {state, awaiting_connect, D};
@@ -319,15 +361,15 @@ decode_error(Reason, _StateName, D) ->
 
 %% The one arming point: both handoffs (the test helper's `connect' after its
 %% own `controlling_process', and ranch's `{handshake, ...}') end up here.
-arm_socket(Sock, D) when Sock =/= undefined ->
-    case inet:setopts(Sock, [{active, once}]) of
+arm_socket(Sock, #st{transport = T} = D) when Sock =/= undefined ->
+    case T:arm_once(Sock) of
         ok -> {next_state, awaiting_connect, D};
         {error, Reason} -> {stop, {setopts_failed, Reason}, D}
     end.
 
-active_once(#st{socket = Sock}) ->
-    _ = inet:setopts(Sock, [{active, once}]),
-    ok.
+active_once(#st{transport = T, socket = Sock} = D) ->
+    _ = T:arm_once(Sock),
+    D.
 
 %%%_* CONNECT -----------------------------------------------------------------
 
@@ -2135,7 +2177,7 @@ send_frame(Bin, #st{socket = Sock} = D) ->
             broker_metrics:inc(mqtt_publish_dropped_oversize),
             D;
         true ->
-            case (catch gen_tcp:send(Sock, Bin)) of
+            case (catch (D#st.transport):send(Sock, Bin)) of
                 ok ->
                     broker_metrics:inc(bytes_out, byte_size(Bin)),
                     D;
@@ -2263,7 +2305,7 @@ terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
         true ->
             ok
     end,
-    _ = D#st.socket =/= undefined andalso (catch gen_tcp:close(D#st.socket)),
+    _ = D#st.socket =/= undefined andalso (catch (D#st.transport):close(D#st.socket)),
     ok.
 
 publish_will(mqtt_disconnect, _D) ->

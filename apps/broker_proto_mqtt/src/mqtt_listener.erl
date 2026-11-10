@@ -27,11 +27,24 @@
 -export([start_link/3]).
 
 -spec start_link(ranch:ref(), module(), map()) -> {ok, pid()} | {error, term()}.
-start_link(_Ref, _Transport, Opts) ->
-    case mqtt_conn_sup:start_conn(undefined, Opts) of
+start_link(_Ref, RanchTransport, Opts) ->
+    %% S8: the FSM must know how to write, arm and close this socket. Ranch's
+    %% own transport is not that module -- it names the acceptor layer, and the
+    %% fsm needs the `mqtt_transport' callbacks. Both socket flavours are served
+    %% by `mqtt_transport_tcp', so the only thing to decide here is whether the
+    %% listener was configured with something else (an embedded WebSocket or
+    %% QUIC front end passes its own module through `Opts').
+    ConnOpts = maps:merge(#{transport => transport_for(RanchTransport)}, Opts),
+    case mqtt_conn_sup:start_conn(undefined, ConnOpts) of
         {ok, Pid} ->
             true = link(Pid),
             {ok, Pid};
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% Both `ranch_tcp' and `ranch_ssl' are served by `mqtt_transport_tcp' (it
+%% dispatches per socket with `is_port/1'), so ranch's transport only has to be
+%% consumed, not interpreted. A `transport' already present in the per-listener
+%% map wins, which is how the WebSocket and QUIC front ends inject their own.
+transport_for(_RanchTransport) -> mqtt_transport_tcp.
