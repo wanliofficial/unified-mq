@@ -16,9 +16,13 @@ start_link() ->
 %% cannot inherit a socket it does not own. `undefined' is the ranch-shaped
 %% start (T12): the socket arrives later in `{handshake, ...}', after ranch has
 %% done the ownership transfer.
--spec start_conn(inet:socket() | undefined, map()) -> {ok, pid()} | {error, term()}.
-start_conn(Socket, Opts) ->
-    supervisor:start_child(?MODULE, [Socket, Opts]).
+%%
+%% The first argument is the `mqtt_transport' handle, not necessarily a socket:
+%% MQTT over WebSocket passes the pid of its WS layer, which owns the socket on
+%% the engine's behalf.
+-spec start_conn(term(), map()) -> {ok, pid()} | {error, term()}.
+start_conn(Handle, Opts) ->
+    supervisor:start_child(?MODULE, [Handle, Opts]).
 
 init([]) ->
     Child = {mqtt_conn_fsm,

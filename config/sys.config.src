@@ -230,6 +230,25 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_mqtt_ws, [
+    %% S8-B: MQTT over WebSocket. A separate app and port from the broker's own
+    %% ws API above (8080) -- the two speak entirely different protocols, and
+    %% keeping them apart is what lets this one change without touching S5's
+    %% pinned wire behaviour. Any URL path is accepted; the subprotocol decides
+    %% whether the peer is an MQTT client. TLS follows `broker_security.tls'
+    %% (wss), exactly like every other listener.
+    {listeners, [
+      #{port => 8083,
+        ref => {mqtt_ws, 8083},
+        num_acceptors => 10,
+        max_connections => 1024}
+    ]},
+    %% MQTT 3.1.1 §6 / MQTT 5.0 §6 name `mqtt'; the older spellings are still
+    %% sent by clients in the field. Order is the server's preference.
+    {subprotocols, [<<"mqtt">>, <<"mqttv3.1">>, <<"mqttv3.1.1">>]},
+    {max_frame_bytes, 16777216}
+  ]},
+
   {broker_proto_kafka, [
     %% S5 Kafka adapter. 9092 is the standard port; 9093 avoids a local
     %% Kafka. CT binds its own ephemeral port.
