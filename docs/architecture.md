@@ -46,7 +46,8 @@ apps/
 ├── broker_event/         CloudEvents codec/binding/五档策略/去重（S3）
 ├── broker_security/      username/password 认证与 allow-all ACL 桩（纯函数）
 ├── broker_admin/         S6：HTTP 管理面（health/metrics/status/config/backup/tls reload）
-├── broker_proto_mqtt/    MQTT 3.1.1/5 编解码 + 连接 FSM + ranch listener
+├── broker_proto_mqtt/    MQTT 3.1.1/5 编解码 + 连接 FSM + ranch listener（S8：mqtt_transport 传输抽象，可跑 TCP/TLS/WS/QUIC）
+├── broker_ws/            S8-A：纯 RFC 6455 库（ws_frame 帧编解码 + ws_handshake 握手），无进程、无配置，供两个 WS 前端共用
 ├── broker_proto_ws/      S5：WebSocket（RFC 6455）+ JSON/binary 消息 API
 ├── broker_proto_nats/    S5：NATS core（PUB/SUB、queue group、request/reply）
 ├── broker_proto_amqp/    S5：AMQP 0-9-1（exchange/queue/binding、publish/consume/ack）
@@ -68,8 +69,9 @@ apps/
 | `broker_security` | kernel, stdlib, sasl, ssl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
 | `broker_retain` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_retain`（gen_server） | `put/2`、`delete/2`、`lookup/1`、`entries/0`、`stats/0`、`flush/0` | 每 topic 一条 retained 消息（ETS/内存树）+ `retain/retain.v1` 快照 |
 | `broker_admin` | kernel, stdlib, sasl, crypto, broker_core, broker_metrics, broker_security | `broker_admin_listener`（HTTP accept） | `broker_admin_http:handle/4`、`metrics_text/0`、`broker_backup`、`broker_config_audit`、`broker_version:info/0` | 只读快照；备份清单文件 |
-| `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 其余 6 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener` | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器） |
-| `broker_proto_ws` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `ws_conn` + ranch listener | `ws_frame`（RFC 6455 编解码）、`ws_conn`、`ws_listener` | 每连接分片缓冲、订阅集合 |
+| `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 其余 6 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener`、`mqtt_transport`（行为）与 `mqtt_transport_tcp`（TCP/TLS 实现） | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器）+ 传输 handle |
+| `broker_ws` | kernel, stdlib, crypto | **无进程、无配置** | `ws_frame`（RFC 6455 帧编解码）、`ws_handshake`（`accept/1,2` 握手 + 子协议协商）、`max_handshake/0` | 无（纯函数库） |
+| `broker_proto_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_core, broker_metrics + 内核 6 app | 每连接 `ws_conn` + ranch listener | `ws_conn`、`ws_listener`（帧编解码已委托给 `broker_ws` 的 `ws_frame`） | 每连接分片缓冲、订阅集合 |
 | `broker_proto_nats` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `nats_conn` + 订阅投递进程 + ranch listener | `nats_conn`、`nats_listener` | 每连接 sid 表、queue group 成员关系 |
 | `broker_proto_amqp` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `amqp_conn`、`amqp_topo`（exchange/queue/binding 注册表） | `amqp_codec`、`amqp_conn`、`amqp_listener` | exchange/queue/binding 拓扑、delivery tag、unacked 集合 |
 | `broker_proto_kafka` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `kafka_conn`、`kafka_group`（consumer group 协调） | `kafka_codec`、`kafka_conn`、`kafka_listener` | 每连接 topic/partition 游标、group 成员与 offset |
@@ -180,6 +182,17 @@ ranch acceptor: accept(Socket)
 ```
 
 一连接一进程，**没有代理进程**；`mqtt_conn_fsm` 内嵌投递循环（pull loop），而不是独立的 dispatcher 进程（S2 再抽）。
+
+### 3.9 传输抽象：`mqtt_transport` 行为（S8-A）
+
+MQTT 本身对传输不可知——3.1.1 §6 与 5.0 §6 允许 TCP / TLS / WebSocket（QUIC 见 OASIS 单流便条），且帧格式完全一致。S8 之前 `mqtt_conn_fsm` 硬编码 `gen_tcp:send/2` 与 `inet:setopts/2`，带来两个代价：多一种传输就要复制一份状态机，而且 ranch 给的传输被忽略——因此 **MQTT over TLS 从未真正工作**（ssl socket 上每次 write 都失败）。
+
+S8-A 把 FSM 与传输的边界收敛为一个模块名 + 一个不透明 handle，走四个回调（`send/2`、`arm_once/1`、`close/1`、`decode_msg/2`），见 [`mqtt_transport.erl`](../apps/broker_proto_mqtt/src/mqtt_transport.erl)：
+
+- `decode_msg/2` 是语义核心：把邮箱里的消息归一为 `{data,Bin}` | `closed` | `{error,R}` | `other`，且**按 handle 匹配本连接的 socket**——一个节点跑多个 listener 时，A 连接的字节绝不会喂进 B 的状态机；`other` 让 FSM 自己的事件（投递、poll tick、`connect` 交接）照常穿过。
+- 实现按依赖归属放置：`mqtt_transport_tcp` 在本 app（同时覆盖 `ranch_tcp` 与 `ranch_ssl`，用 `is_port/1` 分派——`gen_tcp` socket 是 port、`ssl` socket 是元组，且只有 `ssl` 导出 `setopts/2`），WebSocket 与 QUIC 的实现在各自 app，这样本 app 不依赖它们。
+
+握手消息 `{handshake, Ref, Transport, Sock, Timeout}` 带的是 **ranch 自己的** transport（`ranch_tcp`/`ranch_ssl`），不是 `mqtt_transport`：ranch 对 TLS 只做 `transport_accept`，因此协议侧必须自己调 `Transport:handshake/2`（TCP 是 no-op、SSL 才真正完成 TLS 握手）后才能 arm，否则首个 `ssl:setopts` 报 `notsup_on_transport_accept_socket`。
 
 ---
 

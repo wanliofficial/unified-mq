@@ -24,6 +24,8 @@
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，六个协议 listener 同时切换。见 `docs/security.md` §9。
 
+`broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与后续的 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
+
 ---
 
 ## 2. 管理 API
