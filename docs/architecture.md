@@ -424,7 +424,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | 键 | 默认 | 作用 |
 |---|---|---|
 | `broker_storage.backend` | `broker_storage_wal` | 二选一：`broker_storage_wal` / `broker_storage_memory` |
-| `broker_storage.data_dir` | `.app.src` 未声明，代码兜底 `data` | WAL 根目录；**release 必须配绝对路径**（`config/sys.config.src` 就是），且必须在 release 树外（J8）、不能是 tmpfs/ramfs（J11）。留空则落到相对路径 `data`，即 release 树内 |
+| `broker_storage.data_dir` | `.app.src` 未声明，代码兜底 `data` | WAL 根目录；**release 必须配绝对路径**（`config/sys.config.src` 就是），且必须在 release 树外（J8）。tmpfs/ramfs 由 `wal_writer:check_filesystem/2` 在启动时**拒绝**（`{error, {volatile_filesystem, Dir}}`，`require_durable_fs` 默认 `true`，可显式关闭）；留空则落到相对路径 `data`，即 release 树内 |
 | `broker_storage.wal` | 见下 | `batch_size=32`、`max_batch_size=256`、`batch_delay_ms=#{os_buffer=>0, fsync=>1}`、`index_anchor_interval=256`、`segment_max_records=100000`、`max_pending_appends`（代码默认 `0` = 无界，release 配 4096，超限回 `{error, {overloaded, PartitionId}}` 且不分配 offset） |
 | `broker_storage.retention` | `#{max_bytes => 0, max_age_ms => 0, check_interval_ms => 60000}` | 整段回收的三项；`0` = 不设限（S2-F） |
 | `broker_router.backend` | `broker_router_hash` | 路由实现；未知值在 `broker_router_sup:init/1` 报 `{unknown_router_backend, _}`（不启动一个没有索引写入者的 app） |
