@@ -26,8 +26,6 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include_lib("broker_router/include/broker_router.hrl").
 
--define(GUID, <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>).
--define(MAX_HANDSHAKE, 16384).
 
 -record(st, {
     ref :: term(),
@@ -106,7 +104,7 @@ on_data(Data, #st{} = St) ->
         case St#st.handshake of
             pending ->
                 Buffer = <<(St#st.buffer)/binary, Data/binary>>,
-                case byte_size(Buffer) > ?MAX_HANDSHAKE of
+                case byte_size(Buffer) > ws_handshake:max_handshake() of
                     true ->
                         _ = raw_send(<<"HTTP/1.1 431 Request Header Fields Too Large\r\n"
                                        "Connection: close\r\n\r\n">>, St),
@@ -134,7 +132,7 @@ rearm(St) ->
 handshake(Buffer, St) ->
     case binary:split(Buffer, <<"\r\n\r\n">>) of
         [Head, Rest] ->
-            case accept(Head) of
+            case ws_handshake:accept(Head) of
                 {ok, Response} ->
                     _ = raw_send(Response, St),
                     St1 = St#st{handshake = done, buffer = <<>>},
@@ -146,67 +144,6 @@ handshake(Buffer, St) ->
         _ ->
             {noreply, St#st{buffer = Buffer}}
     end.
-
-accept(Head) ->
-    case binary:split(Head, <<"\r\n">>, [global]) of
-        [RequestLine | HeaderLines] ->
-            Headers = headers(HeaderLines),
-            case request_line(RequestLine) of
-                ok -> validate_upgrade(Headers);
-                error -> {error, bad_request()}
-            end;
-        _ ->
-            {error, bad_request()}
-    end.
-
-request_line(<<"GET ", _/binary>>) -> ok;
-request_line(_) -> error.
-
-validate_upgrade(Headers) ->
-    Upgrade = lower(maps:get(<<"upgrade">>, Headers, <<>>)),
-    Connection = lower(maps:get(<<"connection">>, Headers, <<>>)),
-    Version = maps:get(<<"sec-websocket-version">>, Headers, <<>>),
-    Key = maps:get(<<"sec-websocket-key">>, Headers, <<>>),
-    case {binary:match(Upgrade, <<"websocket">>), binary:match(Connection, <<"upgrade">>),
-          Version, Key} of
-        {nomatch, _, _, _} -> {error, upgrade_required()};
-        {_, nomatch, _, _} -> {error, upgrade_required()};
-        {_, _, <<"13">>, <<>>} -> {error, bad_request()};
-        {_, _, <<"13">>, _} ->
-            Accept = base64:encode(crypto:hash(sha, <<Key/binary, ?GUID/binary>>)),
-            {ok, [<<"HTTP/1.1 101 Switching Protocols\r\n"
-                    "Upgrade: websocket\r\n"
-                    "Connection: Upgrade\r\n"
-                    "Sec-WebSocket-Accept: ">>, Accept, <<"\r\n\r\n">>]};
-        {_, _, _, _} ->
-            {error, <<"HTTP/1.1 426 Upgrade Required\r\n"
-                      "Sec-WebSocket-Version: 13\r\n"
-                      "Connection: close\r\n\r\n">>}
-    end.
-
-headers(Lines) ->
-    lists:foldl(
-      fun(Line, Acc) ->
-              case binary:split(Line, <<":">>) of
-                  [K, V] ->
-                      Acc#{lower(trim(K)) => trim(V)};
-                  _ ->
-                      Acc
-              end
-      end, #{}, Lines).
-
-trim(B) ->
-    iolist_to_binary(string:trim(B, both, " \t")).
-
-lower(B) ->
-    << <<(if C >= $A, C =< $Z -> C + 32; true -> C end)>> || <<C>> <= B >>.
-
-bad_request() ->
-    <<"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n">>.
-
-upgrade_required() ->
-    <<"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n"
-      "Upgrade: websocket\r\n\r\n">>.
 
 %%%_* Frame loop -----------------------------------------------------------
 

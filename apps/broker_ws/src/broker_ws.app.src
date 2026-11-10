@@ -1,0 +1,8 @@
+{application, broker_ws, [
+    {description, "Pure RFC 6455: frame codec and handshake, no broker dependency"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_ws_app, []}},
+    {applications, [kernel, stdlib, crypto]},
+    {env, []}
+]}.
