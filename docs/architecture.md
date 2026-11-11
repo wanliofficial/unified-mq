@@ -24,7 +24,7 @@
 | 分区创建是带外动作，boot 只 recover | ADR-011 §11.2 | `create_partition/1` 是唯一 `create` 调用者；boot 缺分区即整体启动失败 |
 | 协议适配层之间互不引用 | ADR-001 | 各 `broker_proto_*` 只依赖内核门面，彼此没有依赖边。**ADR-001 的原文是「不得依赖其他 Adapter 的**内部**代码」**，S8-B/S8-D 依赖的是 `broker_proto_mqtt` 的**公开面**（`mqtt_conn_fsm` 与 `mqtt_transport` 行为——它们跑的就是那一份引擎），方向单向、无反向边，没有第二份 MQTT 实现 |
 
-**S7 及之后明确未实现**（免得把"还没做"误读成"没画出来"）：S7 的全部验收项已于 2026-11-10 结案——六协议统一身份表见 `docs/security.md` §2.1，各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1（结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」，逐协议差异已列明）。S7 之后明确未实现的是：跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志签名与外部 KMS、每条规则可配置的「未知扩展属性拒绝」、去重/隔离钩子推广到五协议、OTel 等可观测性导出层，以及 `require_auth` 接进 MQTT CONNECT、`broker_meta` 用户表与数据面认证接线、`topic_meta`/`queue_meta`/`binding_meta` 的运行时读取方。README §10.2 的 trace context **传播本身已实现**（2026-11-09，`broker_event_trace`，见 `docs/security.md` §5.1），未实现的是把指标导出到外部系统。清单与 `docs/security.md` §12、`progress.md` 一致。
+**S7 及之后明确未实现**（免得把"还没做"误读成"没画出来"）：S7 的全部验收项已于 2026-11-10 结案——六协议统一身份表见 `docs/security.md` §2.1，各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1（结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」，逐协议差异已列明）。S7 之后明确未实现的是：跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志签名与外部 KMS、每条规则可配置的「未知扩展属性拒绝」、去重/隔离钩子推广到其余协议（五协议 + S8-C 的 MQTT-SN）、OTel 等可观测性导出层，以及 `require_auth` 接进 MQTT CONNECT、`broker_meta` 用户表与数据面认证接线、`topic_meta`/`queue_meta`/`binding_meta` 的运行时读取方。README §10.2 的 trace context **传播本身已实现**（2026-11-09，`broker_event_trace`，见 `docs/security.md` §5.1），未实现的是把指标导出到外部系统。清单与 `docs/security.md` §12、`progress.md` 一致。
 
 ---
 
@@ -176,6 +176,21 @@ broker_proto_mqtt_sn_app ► broker_proto_mqtt_sn_sup                 one_for_al
                           ├── mqtt_sn_conn_sup                      simple_one_for_one, 10/1s
                           │   └── mqtt_sn_conn × 客户端             temporary
                           └── mqtt_sn_listener × N                  transient（一个 UDP socket）
+
+broker_proto_ws_app ────► broker_proto_ws_sup                       one_for_one, 1/5s
+                          └── ranch_embedded_sup → listener
+broker_proto_nats_app ──► broker_proto_nats_sup                     one_for_one, 1/5s
+                          └── ranch_embedded_sup → listener
+
+broker_proto_amqp_app ──► broker_proto_amqp_sup                     one_for_one, 5/10s
+                          ├── amqp_topo                             permanent（先起：会话期 exchange/queue/binding 表）
+                          └── ranch_embedded_sup → listener × N
+broker_proto_kafka_app ─► broker_proto_kafka_sup                    one_for_one, 5/10s
+                          ├── kafka_group                           permanent（先起：消费组协调）
+                          └── ranch_embedded_sup → listener × N
+broker_proto_pulsar_app ► broker_proto_pulsar_sup                   one_for_one, 5/10s
+                          ├── pulsar_subscriptions                  permanent（先起：游标与未 ack 集合）
+                          └── ranch_embedded_sup → listener × N
 ```
 
 20 个顶层 supervisor（`broker_core` 与 `broker_ws` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
@@ -187,6 +202,8 @@ broker_proto_mqtt_sn_app ► broker_proto_mqtt_sn_sup                 one_for_al
 | `broker_metrics_sup` / `broker_metrics_server` | `one_for_one`, 5 次/10 s | 上报进程崩溃不应连累任何数据面；指标数组在进程外，重启不丢计数 | 最多丢一个上报周期，计数继续累积 |
 | `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN 的 listener 一死，它背后的连接/会话就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
 | `broker_proto_mqtt_ws_sup` | `one_for_one`, 1 次/5 s | MQTT over WebSocket 只有 listener 一类子进程，没有需要一起重启的兄弟 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
+| `broker_proto_ws_sup` / `broker_proto_nats_sup` | `one_for_one`, 1 次/5 s | 同 `broker_proto_mqtt_ws_sup`：只有 listener 一类子进程 | 同上 |
+| `broker_proto_amqp_sup` / `broker_proto_kafka_sup` / `broker_proto_pulsar_sup` | `one_for_one`, 5 次/10 s | listener 之外还有 app 级的共享进程（`amqp_topo` 的拓扑表、`kafka_group` 的消费组协调、`pulsar_subscriptions` 的游标），它们与被 listen 的连接无关，不该跟着 listener 一起重启 | listener 或协调进程单独重启，另一类不受影响 |
 | `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` / `broker_event_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener、去重窗口彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建，`broker_event_dedup` 重启只丢窗口内状态 | 单个进程重启，其余不受影响 |
 | `broker_storage_wal_sup` | `one_for_one`, 4 次/30 s | 单分区崩溃必须自愈，但不能掩盖崩溃循环；与内存 store 隔离 | 该分区 `wal_writer` 重启并从磁盘 `recover`；旧句柄失效 |
 | `wal_writer` | `permanent` | 分区日志的写者是必需进程，不能"死了就算" | 重启后 offsets 从磁盘重建；重启前的批以 `{writer_stopped,_}` 失败 |
@@ -534,7 +551,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | Schema Registry 内容校验 | S7 之后 | `broker_event` 校验链新增校验器 | 五档策略与冻结的指标键不变 |
 | 审计日志签名与外部 KMS | S7 之后 | `broker_config_audit`、`broker_security` 的密钥来源 | 现有脱敏快照与 ACL 判定不变 |
 | 每条规则可配置的「未知扩展属性拒绝」 | S7 之后 | `broker_event` 策略链 | 五档策略与冻结的指标键不变 |
-| 去重/隔离钩子推广到五协议 | S7 之后 | WS/NATS/AMQP/Kafka/Pulsar 发布路径补 `broker_event:duplicate/1` / `quarantine/2` | 五档策略与 MQTT 现有行为不变；见 `docs/cloudevents-mapping.md` |
+| 去重/隔离钩子推广到其余协议 | S7 之后 | WS/NATS/AMQP/Kafka/Pulsar 发布路径与 `mqtt_sn_conn` 补 `broker_event:duplicate/1` / `quarantine/2` | 五档策略与 MQTT 现有行为不变；见 `docs/cloudevents-mapping.md` |
 | OTel 等可观测性导出层 | S7 之后 | 在 `broker_metrics:snapshot/0` 之上加 OTel 等导出 | 计数点与冻结的键集合不变；`broker_event_trace` 的校验与门控已实现，不因导出层而改动 |
 | `require_auth` 接进 MQTT CONNECT | S7 之后 | `mqtt_conn_fsm` 的私有 `authenticate/2` 增加 `auth_required(<<"mqtt">>)` 分支 | MQTT 现有的匿名 `client_id` 即 principal 语义（S1 冻结）不变；见 `docs/security.md` §2.2 现状边界 |
 | `broker_meta` 用户表接进数据面认证 | S7 之后 | `broker_security` 的私有 `users/0` 增加 mnesia 读取源 | `authenticate/2`、`authenticate_conn/1` 的对外形态与错误语义不变；ADR-021 §D7 冻结后补充 |

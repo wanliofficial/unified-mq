@@ -240,7 +240,7 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 2. Schema Registry 内容校验。
 3. 审计日志签名与防篡改、外部 KMS。
 4. 每条规则可配置的「未知扩展属性拒绝」策略。
-5. `broker_event:duplicate/1` / `quarantine/2` 仅接在 MQTT 发布路径，其余五协议未接（见 `docs/cloudevents-mapping.md` 的「接线范围」注）。
+5. `broker_event:duplicate/1` / `quarantine/2` 仅接在 MQTT 发布路径，其余五协议与 S8-C 的 MQTT-SN 都未接（见 `docs/cloudevents-mapping.md` 的「接线范围」注）。
 6. 可观测性导出层（OTel 等；`broker_metrics:snapshot/0` 之上）。
 7. `require_auth` 尚未接进 MQTT 的 CONNECT 路径（`mqtt_conn_fsm` 不调用 `auth_required/1`，见 §2.2 现状边界第 2 条）；`broker_meta` 的 `broker_user` 与数据面认证的接线（ADR-021 §D7 冻结后补充）；`topic_meta` / `queue_meta` / `binding_meta` 三张表的运行时读取方。
 8. **MQTT-SN over DTLS 未实现**（S8-C 只跑明文 UDP）：`broker_security.tls.enabled` 不作用于 1884，这是目前唯一**明文且没有 TLS 路径**的协议端口（QUIC 的 14567 也不受该开关当开关用，但它强制 TLS 1.3，见第 9 条）；DTLS 列为后续待办（`docs/design/s8-mqtt-sn-mqtt-over-quic-and-mqtt-over-ws.md` §1.2）。

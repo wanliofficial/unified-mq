@@ -104,7 +104,7 @@ QoS 1 回 PUBACK `NOT_SUPPORTED`，QoS 0/2/−1 静默丢弃（QoS 2 不发 PUBR
 
 ## 5. 去重与隔离
 
-> **接线范围**：这两条只在 **MQTT 发布路径**（`mqtt_conn_fsm` 的 `handle_publish1`）调用。其余五个协议目前只调用 `broker_event:apply_policy/1`，不调用 `broker_event:duplicate/1` 与 `broker_event:quarantine/2`——即使配了 `dedup` / `quarantine`，WS/NATS/AMQP/Kafka/Pulsar 也不会去重、也不会写隔离副本。把这两个钩子推广到其余五协议是 S7 之后的工作（已列入 `docs/security.md` §12 与 `docs/architecture.md` §9 的遗留清单）。
+> **接线范围**：这两条只在 **MQTT 发布路径**（`mqtt_conn_fsm` 的 `handle_publish1`）调用。其余五个协议与 S8-C 的 MQTT-SN（`mqtt_sn_conn`）目前只调用 `broker_event:apply_policy/1`，不调用 `broker_event:duplicate/1` 与 `broker_event:quarantine/2`——即使配了 `dedup` / `quarantine`，WS/NATS/AMQP/Kafka/Pulsar/MQTT-SN 也不会去重、也不会写隔离副本。把这两个钩子推广到其余协议是 S7 之后的工作（已列入 `docs/security.md` §12 与 `docs/architecture.md` §9 的遗留清单）。
 
 - **去重键**：`{Tenant, Destination, Source, Id}`，窗口由
   `broker_event.dedup` 的 `{Tenant, Destination, WindowMs}` 配置；
