@@ -1,0 +1,13 @@
+{application, broker_proto_agent_rpc, [
+    {description, "Agent RPC base: JSON-RPC 2.0, HTTP/1.1, SSE, version and auth helpers"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_proto_agent_rpc_app, []}},
+    %% `ranch' is here for `ranch_tcp' as the transport module handed to
+    %% `agent_rpc_http' -- the library never starts a listener. `broker_security'
+    %% supplies the identity table and ACL every agent adapter authenticates
+    %% against (ADR-026 §D4).
+    {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
+                    broker_core, broker_security]},
+    {env, []}
+]}.

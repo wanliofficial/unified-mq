@@ -1,0 +1,16 @@
+{application, broker_proto_a2a, [
+    {description, "A2A 1.0.0 JSON-RPC front end (S9-A: transport, auth, SendMessage echo)"},
+    {vsn, "0.1.0"},
+    {registered, [broker_proto_a2a_sup]},
+    {mod, {broker_proto_a2a_app, []}},
+    {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
+                    broker_core, broker_security, broker_proto_agent_rpc]},
+    {env, [{listeners, []},
+           {require_auth, true},
+           {max_body_bytes, 1048576},
+           {max_connections, 1024},
+           {request_timeout_ms, 30000},
+           {supported_versions, [<<"1.0">>]},
+           {sse_max_event_bytes, 1048576},
+           {sse_heartbeat_ms, 15000}]}
+]}.

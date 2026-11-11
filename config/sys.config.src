@@ -230,6 +230,29 @@
     {max_frame_bytes, 16777216}
   ]},
 
+  {broker_proto_a2a, [
+    %% S9-A: A2A 1.0.0 JSON-RPC front end. Empty by default (ADR-026 §D4):
+    %% the app ships, no port opens until a listener map is configured. A
+    %% release deployment adds e.g.
+    %%   #{port => 8081, ref => {a2a, 8081}, num_acceptors => 10,
+    %%     max_connections => 1024}
+    {listeners, []},
+    %% New surface, no legacy clients: authentication is on by default and
+    %% turns off only for a loopback bind (validated at boot).
+    {require_auth, true},
+    %% Effective body cap is min(this, broker_security:limits.max_message_bytes/0).
+    {max_body_bytes, 1048576},
+    {max_connections, 1024},
+    {request_timeout_ms, 30000},
+    %% A2A 1.0.0 JSON-RPC binding; "0.3" is only the missing-header reading,
+    %% not an offered version.
+    {supported_versions, [<<"1.0">>]},
+    %% SSE is not wired to a method until S9-C; the limits exist now so the
+    %% library and the eventual stream share one source.
+    {sse_max_event_bytes, 1048576},
+    {sse_heartbeat_ms, 15000}
+  ]},
+
   {broker_proto_mqtt_ws, [
     %% S8-B: MQTT over WebSocket. A separate app and port from the broker's own
     %% ws API above (8080) -- the two speak entirely different protocols, and
