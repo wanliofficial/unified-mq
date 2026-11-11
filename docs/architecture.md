@@ -319,11 +319,14 @@ broker_proto_mqtt_quic_sup (one_for_all, 1/5s)
 ```
 sasl → broker_core → broker_metrics → broker_storage
      → crypto/asn1/public_key/ssl/ranch
-     → broker_router → broker_queue → broker_subscription → broker_event
-     → broker_security → broker_proto_mqtt
+     → broker_router → broker_security → broker_queue → broker_subscription
+     → broker_event → broker_retain → broker_proto_mqtt
 ```
 
-顺序不是装饰：`broker_queue` 在 `init/1` 里 recover 分区，`broker_subscription` 在 `init/1` 里重建订阅并回填 Router，二者都必须早于 listener。`broker_metrics` 必须早于 `broker_storage`（后者是它的调用者），而它本身只起一个可选的上报进程，不参与任何 boot step。
+实测启动列表（`application:ensure_all_started(broker_proto_mqtt)`，storage 已先起）：
+`[crypto, asn1, public_key, ssl, ranch, broker_router, broker_security, broker_queue, broker_subscription, broker_event, broker_retain, broker_proto_mqtt]`。
+
+顺序不是装饰：`broker_queue` 在 `init/1` 里 recover 分区，`broker_subscription` 在 `init/1` 里重建订阅并回填 Router，二者都必须早于 listener。`broker_metrics` 必须早于 `broker_storage`（后者是它的调用者），而它本身只起一个可选的上报进程，不参与任何 boot step。`broker_security` 必须早于 `broker_queue`——后者的 `.app.src` 把它列进 `applications`（分区层要用 ACL 与租户判定）；`broker_retain` 同理必须早于 `broker_proto_mqtt`。`broker_router` 不依赖 `broker_security`，因此排在它前面。
 
 ### 4.2 四个 boot step
 
