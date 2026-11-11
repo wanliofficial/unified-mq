@@ -1,8 +1,10 @@
-%% @doc S4 control plane (ADR-021 §D1): the 11 metadata tables, password
+%% @doc S4 control plane (ADR-021 §D1): the metadata tables, password
 %% hashing, config version/notification/reconciliation and the outbox.
 %%
 %% The suite also pins the ADR-002 boundary mechanically: the table list is
-%% exactly the frozen 11 and no message/cursor table exists here.
+%% exactly the frozen set and no message/cursor table exists here. ADR-026 §D3
+%% amended that frozen set with exactly one table, `agent_card'; the assertion
+%% below is the place that notices if a second one appears.
 -module(broker_meta_SUITE).
 
 -compile([export_all, nowarn_export_all]).
@@ -17,6 +19,8 @@ all() ->
      authenticate_is_not_a_user_oracle,
      acl_rules_are_read_per_tenant,
      partition_and_node_metadata,
+     agent_card_crud_bumps_version,
+     agent_card_registration_is_serialized,
      version_bump_broadcasts,
      reconcile_notices_a_direct_table_write,
      outbox_stays_pending_without_a_publisher,
@@ -61,7 +65,8 @@ schema_has_the_frozen_tables(_Config) ->
     Names = [T || {T, _} <- broker_meta:tables()],
     ?assertEqual([tenant, broker_user, acl_rule, topic_meta, queue_meta,
                   binding_meta, subscription_meta, cluster_node,
-                  partition_meta, config_version, config_outbox], Names),
+                  partition_meta, config_version, config_outbox,
+                  agent_card], Names),
     %% ADR-002 boundary: no message body / ack / cursor table.
     lists:foreach(
       fun(Forbidden) ->
@@ -129,6 +134,55 @@ partition_and_node_metadata(_Config) ->
     ok = broker_meta:put_node('a@host', voter),
     [Node] = broker_meta:nodes(),
     {cluster_node, 'a@host', voter, up, _} = Node,
+    ok.
+
+%% Agent Cards (ADR-026 §D3): a monotonic per-agent version drives the ETag,
+%% so re-registering the same payload still changes the version. The row is
+%% tenant-keyed and tenant-filterable.
+agent_card_crud_bumps_version(_Config) ->
+    Card = #{name => <<"echo">>, url => <<"https://example.test/a2a">>},
+    {ok, 1} = broker_meta:put_agent_card(
+                #{tenant_id => <<"t1">>, agent_id => <<"echo">>, card => Card}),
+    {ok, {agent_card, {<<"t1">>, <<"echo">>}, <<"t1">>, 1, active, Card,
+          undefined, _}} = broker_meta:get_agent_card(<<"t1">>, <<"echo">>),
+    %% Same payload, new version: the ETag must move even on an idempotent upsert.
+    {ok, 2} = broker_meta:put_agent_card(
+                #{tenant_id => <<"t1">>, agent_id => <<"echo">>, card => Card}),
+    {ok, {agent_card, _, _, 2, active, _, _, _}} =
+        broker_meta:get_agent_card(<<"t1">>, <<"echo">>),
+    %% A disabled card keeps its version lineage but flips status.
+    {ok, 3} = broker_meta:put_agent_card(
+                #{tenant_id => <<"t1">>, agent_id => <<"echo">>, card => Card,
+                  status => disabled}),
+    {ok, {agent_card, _, _, 3, disabled, _, _, _}} =
+        broker_meta:get_agent_card(<<"t1">>, <<"echo">>),
+    %% A different tenant's identically named agent is a different row.
+    {ok, 1} = broker_meta:put_agent_card(
+                #{tenant_id => <<"t2">>, agent_id => <<"echo">>, card => Card}),
+    [Only] = broker_meta:agent_cards(<<"t1">>),
+    {agent_card, {<<"t1">>, <<"echo">>}, <<"t1">>, 3, _, _, _, _} = Only,
+    ok = broker_meta:delete_agent_card(<<"t2">>, <<"echo">>),
+    not_found = broker_meta:get_agent_card(<<"t2">>, <<"echo">>),
+    %% Malformed input is rejected, not stored.
+    {error, {invalid_agent_card, _}} = broker_meta:put_agent_card(#{foo => bar}),
+    ok.
+
+%% 10 concurrent registrations must produce versions 1..10 with no gaps and no
+%% duplicates: the write lock inside the transaction is what makes this hold.
+agent_card_registration_is_serialized(_Config) ->
+    Self = self(),
+    N = 10,
+    [spawn_link(fun() ->
+                        {ok, V} = broker_meta:put_agent_card(
+                                    #{tenant_id => <<"t1">>, agent_id => <<"race">>,
+                                      card => #{}}),
+                        Self ! {version, V}
+                end) || _ <- lists:seq(1, N)],
+    Versions = [receive {version, V} -> V after 5000 -> ct:fail(timeout) end
+                || _ <- lists:seq(1, N)],
+    ?assertEqual(lists:seq(1, N), lists:sort(Versions)),
+    {ok, {agent_card, _, _, N, _, _, _, _}} =
+        broker_meta:get_agent_card(<<"t1">>, <<"race">>),
     ok.
 
 %%%_* Version, notification, reconciliation --------------------------------

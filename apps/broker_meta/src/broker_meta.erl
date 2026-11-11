@@ -21,6 +21,7 @@
          put_acl/1, acls/1,
          put_partition/1, get_partition/1,
          put_node/2, nodes/0,
+         put_agent_card/1, get_agent_card/2, delete_agent_card/2, agent_cards/1,
          version/0, bump_version/1,
          enqueue/2, pending_outbox/0, mark_published/1]).
 
@@ -41,7 +42,16 @@ tables() ->
      {cluster_node,    [cluster_node, node, role, status, joined_at]},
      {partition_meta,  [partition_meta, partition_id, owner, epoch, replicas, state]},
      {config_version,  [config_version, key, version, updated_at]},
-     {config_outbox,   [config_outbox, seq, version, event, created_at, published_at]}].
+     {config_outbox,   [config_outbox, seq, version, event, created_at, published_at]},
+     %% S9-B (ADR-026 §D3, amends ADR-002's frozen table list): agent discovery
+     %% metadata. Low-frequency, cacheable, tenant-isolated control plane -- exactly
+     %% what Mnesia is for. The row keeps `agent_ref = {TenantId, AgentId}' as the
+     %% primary key and a separate `tenant_id' column so `all/1' can filter by
+     %% tenant without a match spec on the compound key. `version' is monotonic and
+     %% is the source of the Agent Card ETag. Cards carry no static secrets
+     %% (R-D6); `securitySchemes' may declare an external scheme/URL only.
+     {agent_card,     [agent_card, agent_ref, tenant_id, version, status,
+                       card, extended_card, updated_at]}].
 
 %% @doc Create the schema if this node has none, start Mnesia, create any
 %% missing table and wait for all of them. Returns an error instead of booting a
@@ -196,6 +206,53 @@ put_node(Node, Role) ->
 
 nodes() ->
     all(cluster_node).
+
+%% @doc Create or replace an Agent Card and bump its per-agent version.
+%%
+%% The version is monotonic per `{TenantId, AgentId}' and is what the
+%% well-known endpoint turns into an ETag: a card refresh must never look
+%% unchanged to an HTTP cache, so the version, not the payload hash, is the
+%% source of truth. The read-modify-write runs in one transaction with a write
+%% lock, so two concurrent registrations cannot both win a version.
+-spec put_agent_card(map()) -> {ok, non_neg_integer()} | {error, term()}.
+put_agent_card(#{tenant_id := Tenant, agent_id := Agent} = Spec)
+  when is_binary(Tenant), is_binary(Agent) ->
+    Card = maps:get(card, Spec, #{}),
+    Extended = maps:get(extended_card, Spec, undefined),
+    Status = maps:get(status, Spec, active),
+    Ref = {Tenant, Agent},
+    Transaction =
+        fun() ->
+                Prev = case mnesia:read(agent_card, Ref, write) of
+                           [{agent_card, _, _, V, _, _, _, _}] -> V;
+                           [] -> 0
+                       end,
+                Version = Prev + 1,
+                ok = mnesia:write(
+                       {agent_card, Ref, Tenant, Version, Status, Card, Extended,
+                        now_ms()}),
+                Version
+        end,
+    case mnesia:transaction(Transaction) of
+        {atomic, Version} -> {ok, Version};
+        {aborted, Reason} -> {error, Reason}
+    end;
+put_agent_card(Other) ->
+    {error, {invalid_agent_card, Other}}.
+
+-spec get_agent_card(binary(), binary()) -> {ok, tuple()} | not_found.
+get_agent_card(Tenant, Agent) when is_binary(Tenant), is_binary(Agent) ->
+    get(agent_card, {Tenant, Agent}).
+
+-spec delete_agent_card(binary(), binary()) -> ok | {error, term()}.
+delete_agent_card(Tenant, Agent) when is_binary(Tenant), is_binary(Agent) ->
+    delete(agent_card, {Tenant, Agent}).
+
+%% @doc All cards of one tenant, so a catalog listing never mixes tenants even
+%% if a future caller forgets to filter.
+-spec agent_cards(binary()) -> [tuple()].
+agent_cards(Tenant) ->
+    [R || R <- all(agent_card), element(3, R) =:= Tenant].
 
 %%%_* Config version and outbox -------------------------------------------
 

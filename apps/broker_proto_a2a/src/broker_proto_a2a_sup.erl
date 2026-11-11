@@ -1,8 +1,11 @@
-%% @doc Supervisor for the A2A listeners.
+%% @doc Supervisor for the task registry and the A2A listeners.
 %%
-%% `listeners' defaults to `[]' (ADR-026 §D4): an operator release ships the app
-%% but opens no port until a listener map is configured. The listener embeds in
-%% *our* supervisor (ranch 2.3 `ranch_embedded_sup'), so stopping the app stops
+%% Child order is the boot contract (ADR-026 §D4): the task-shard registry
+%% (which starts boot replay as its last child) exists before any listener can
+%% accept a request, so `SendMessage' never races the projection rebuild.
+%% `listeners' defaults to `[]': an operator release ships the app but opens no
+%% port until a listener map is configured. The listener embeds in *our*
+%% supervisor (ranch 2.3 `ranch_embedded_sup'), so stopping the app stops
 %% accepting and closes live connections -- the same posture as
 %% `broker_proto_ws_sup' / `broker_proto_mqtt_sup'.
 -module(broker_proto_a2a_sup).
@@ -14,8 +17,16 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Children = [listener_spec(Spec) || Spec <- listeners()],
+    Children = [registry_spec() | [listener_spec(Spec) || Spec <- listeners()]],
     {ok, {#{strategy => one_for_one, intensity => 1, period => 5}, Children}}.
+
+registry_spec() ->
+    #{id => a2a_task_registry,
+      start => {a2a_task_registry, start_link, []},
+      restart => permanent,
+      shutdown => 10000,
+      type => supervisor,
+      modules => [a2a_task_registry]}.
 
 listeners() ->
     application:get_env(broker_proto_a2a, listeners, []).

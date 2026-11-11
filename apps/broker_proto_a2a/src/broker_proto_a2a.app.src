@@ -1,16 +1,30 @@
 {application, broker_proto_a2a, [
-    {description, "A2A 1.0.0 JSON-RPC front end (S9-A: transport, auth, SendMessage echo)"},
-    {vsn, "0.1.0"},
-    {registered, [broker_proto_a2a_sup]},
+    {description, "A2A 1.0.0 JSON-RPC front end (S9-B: task lifecycle + agent card)"},
+    {vsn, "0.2.0"},
+    {registered, [broker_proto_a2a_sup, a2a_task_registry]},
     {mod, {broker_proto_a2a_app, []}},
     {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
-                    broker_core, broker_security, broker_proto_agent_rpc]},
+                    broker_core, broker_security, broker_meta,
+                    broker_router, broker_queue, broker_proto_agent_rpc]},
     {env, [{listeners, []},
            {require_auth, true},
            {max_body_bytes, 1048576},
            {max_connections, 1024},
            {request_timeout_ms, 30000},
            {supported_versions, [<<"1.0">>]},
+           %% ADR-025 §D4: creation and terminal events share one reliability.
+           {task_reliability, fsync},
+           %% ADR-025 §D2: shards default to schedulers_online.
+           {task_shards, undefined},
+           {task_timeout_ms, 30000},
+           %% S9-B ships a synchronous echo agent; async executors turn it off.
+           {task_auto_complete, true},
+           %% ADR-025 §D5: checkpoint evolution point; S9-B replays from 0.
+           {task_checkpoint_dir, undefined},
+           {task_checkpoint_interval_ms, 5000},
+           %% ADR-026 §D3: optional boot seed for the agent catalog.
+           {agent_cards, []},
+           {agent_card_max_age, 60},
            {sse_max_event_bytes, 1048576},
            {sse_heartbeat_ms, 15000}]}
 ]}.

@@ -1,8 +1,7 @@
-%% @doc A2A 1.0.0 front end (S9-A).
+%% @doc A2A 1.0.0 front end (S9-A transport, S9-B task lifecycle).
 %%
-%% Boot order matters only in that the listener is the last child of the
-%% supervisor: S9-B adds the task-shard registry in front of it, and the
-%% listener must not accept a request before the pieces it dispatches to exist
+%% The listener is the last child of the supervisor: the task-shard registry
+%% (and its boot replay) must exist before a request can dispatch to it
 %% (ADR-026 §D4).
 -module(broker_proto_a2a_app).
 -behaviour(application).
@@ -11,17 +10,30 @@
 
 start(_StartType, _StartArgs) ->
     case validate() of
-        ok -> broker_proto_a2a_sup:start_link();
-        {error, Reason} -> {error, Reason}
+        ok ->
+            case a2a_card:seed() of
+                ok -> broker_proto_a2a_sup:start_link();
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 stop(_State) ->
     ok.
 
-%% `require_auth => false' is a loopback-only posture: the whole point of the
-%% switch is "try it on this machine". Binding it wide would silently expose an
-%% unauthenticated task API, so the node refuses to boot instead.
+%% Two boot-time refusals, both loud:
+%%   * `require_auth => false' on a wide bind would expose an unauthenticated
+%%     task API;
+%%   * `task_reliability = replicated_commit' without a replicator would silently
+%%     degrade a durable promise to `fsync' (ADR-025 §D4).
 validate() ->
+    case a2a_event:validate_reliability() of
+        ok -> check_auth();
+        {error, Reason} -> {error, Reason}
+    end.
+
+check_auth() ->
     case require_auth() of
         true ->
             ok;
