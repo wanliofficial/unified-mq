@@ -57,14 +57,14 @@ apps/
 ├── broker_proto_kafka/   S5：Kafka wire（Produce/Fetch/Metadata + consumer group）
 ├── broker_proto_pulsar/  S5：Pulsar binary（produce/consume/ack/seek）
 ├── broker_proto_agent_rpc/ S9-A：agent 协议纯库（JSON-RPC 2.0 信封、HTTP/1.1 帧、SSE 帧、版本协商、凭据 helper），无进程、无 listener、无自有 env
-└── broker_proto_a2a/     S9-A：A2A 1.0.0 JSON-RPC 前端（`SendMessage` echo），默认 `listeners => []`
+└── broker_proto_a2a/     S9-A/B：A2A 1.0.0 JSON-RPC 前端（Task 生命周期 + Agent Card 发现），默认 `listeners => []`
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
 |---|---|---|---|---|
 | `broker_core` | kernel, stdlib | 无 | `broker_message.hrl` 的 `#broker_message{}`、`partition_id()`、`sync_mode()` | 无（纯类型） |
 | `broker_metrics` | kernel, stdlib, sasl | `broker_metrics_server`（仅 `report_interval_ms > 0`；指标本身不在进程里） | `inc/1,2`、`observe/2`、`gauge/2`、`gauge_add/2`、`snapshot/0`、`p99/1`、`keys/0` | `counters`/`atomics` 数组 + `persistent_term` 的 `Key → {Kind,Ref,Idx}` 索引（无 ETS） |
-| `broker_meta` | kernel, stdlib, sasl, mnesia | `broker_meta_config`（配置版本 gen_server）、`broker_meta_outbox`；表访问本身由调用方同步执行 | `ensure_schema/0`、`tables/0`、通用 `put/get/delete/all/clear` + 8 张表的类型化访问器（`put_tenant/get_tenant`、`put_user/get_user`、`put_acl/acls`、`put_partition/get_partition`、`put_node/nodes`、`version/bump_version`、`enqueue/pending_outbox/mark_published`）、`reset/0` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用。11 张表**全部建表并可有行**，但 `topic_meta` / `queue_meta` / `binding_meta` 目前**没有运行时消费者**（只有 `tables/0` 与套件引用，泛型 `put/get` 可写可读）——这三张表是控制面预留，接入路由/队列/binding 的读取方列为 S7 之后 |
+| `broker_meta` | kernel, stdlib, sasl, mnesia | `broker_meta_config`（配置版本 gen_server）、`broker_meta_outbox`；表访问本身由调用方同步执行 | `ensure_schema/0`、`tables/0`、通用 `put/get/delete/all/clear` + 12 张表的类型化访问器（`put_tenant/get_tenant`、`put_user/get_user`、`put_acl/acls`、`put_partition/get_partition`、`put_node/nodes`、`version/bump_version`、`enqueue/pending_outbox/mark_published`、`put_agent_card/1`、`get_agent_card/2`、`delete_agent_card/2`、`agent_cards/1`）、`reset/0` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用。12 张表**全部建表并可有行**，但 `topic_meta` / `queue_meta` / `binding_meta` 目前**没有运行时消费者**（只有 `tables/0` 与套件引用，泛型 `put/get` 可写可读）——这三张表是控制面预留，接入路由/队列/binding 的读取方列为 S7 之后。第 12 张 `agent_card`（S9-B，ADR-026 §D3 显式修订 ADR-002）有真实消费者：`broker_proto_a2a` 的 well-known/catalog/`GetExtendedAgentCard` 读它，`a2a_card:seed/0` 是唯一写入者 |
 | `broker_cluster` | kernel, stdlib, sasl, crypto, ra, broker_core, broker_meta, broker_metrics | `broker_cluster_cache`（归属/epoch 缓存 gen_server）与 ra server `{broker_cluster_meta, Node}`（模块 `broker_cluster_meta`，状态机 `broker_cluster_meta_machine`）；`broker_cluster_rep` 是纯函数模块，无进程 | `assign/4`、`migrate/4`、`finish_migration/2`、`remove/1`、`owner/1`、`epoch/1`、`replicas/1`、`authorize_append/2`、`guard_append/3`、`replicate/2`、`snapshot/0` | 本地 ETS 归属/epoch 缓存；ra 日志与快照；`persistent_term` 队列钩子 |
 | `broker_storage` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
@@ -85,7 +85,7 @@ apps/
 | `broker_proto_kafka` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `kafka_conn`、`kafka_group`（consumer group 协调） | `kafka_codec`、`kafka_conn`、`kafka_listener` | 每连接 topic/partition 游标、group 成员与 offset |
 | `broker_proto_pulsar` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `pulsar_conn`、`pulsar_subscriptions` | `pulsar_codec`、`pulsar_conn`、`pulsar_listener` | 每连接 producer/consumer 表、subscription 游标 |
 | `broker_proto_agent_rpc` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security | **无进程、无 listener、无自有 env**（空 application，照 `broker_ws`） | `agent_rpc_json`（JSON-RPC 2.0 信封）、`agent_rpc_error`（错误码/HTTP 映射）、`agent_rpc_version`（`A2A-Version` 解析与协商）、`agent_rpc_http`（HTTP/1.1 请求解析 + 响应/chunk 序列化）、`agent_rpc_sse`（SSE 帧）、`agent_rpc_auth`（Bearer/`X-API-Key` → `broker_security`） | 无（纯函数库；socket 由 adapter 持有） |
-| `broker_proto_a2a` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security, broker_proto_agent_rpc | `broker_proto_a2a_sup` + 每条配置的 listener（`ranch_embedded_sup`，默认零条）+ 每连接一个 `a2a_conn` 循环进程 | `a2a_listener`（ranch_protocol）、`a2a_conn`（keep-alive 循环）、`a2a_rpc:handle/1`（方法分派与全部门控） | 每连接的请求计数与 socket；**无跨连接状态**（S9-A 的 echo 不建 Task） |
+| `broker_proto_a2a` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_a2a_sup` + `a2a_task_registry`（`one_for_all` 监督 N 个 `a2a_task_shard` + `a2a_task_recovery`）+ 每条配置的 listener（`ranch_embedded_sup`，默认零条）+ 每连接一个 `a2a_conn` 循环进程 | `a2a_listener`（ranch_protocol）、`a2a_conn`（keep-alive 循环）、`a2a_rpc:handle/1`（方法分派与全部门控）、`a2a_task_registry`（`create/3`、`get/1`、`list/3`、`cancel/2`、`apply_event/4`）、`a2a_task`（纯状态机）、`a2a_event`（事件 → `#broker_message{}`）、`a2a_task_projection`（纯折叠）、`a2a_card`（well-known/catalog/ETag/seed） | 每连接的请求计数与 socket；**每 shard 一张 ETS 投影表**（Task 视图，evict 由 boot replay 重建）+ 注册表里的分片名单。Task 事件本身**不在**这里——它们是 `$a2a/task/<id>` 上的普通消息，归 `broker_storage`/`broker_queue`；无 cursor、无 Mnesia |
 
 ### 2.2 `broker_event` 的真实状态（S3 已实现）
 
@@ -213,7 +213,9 @@ broker_proto_a2a_app ───► broker_proto_a2a_sup                      one_
 | `broker_metrics_sup` / `broker_metrics_server` | `one_for_one`, 5 次/10 s | 上报进程崩溃不应连累任何数据面；指标数组在进程外，重启不丢计数 | 最多丢一个上报周期，计数继续累积 |
 | `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN 的 listener 一死，它背后的连接/会话就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
 | `broker_proto_mqtt_ws_sup` | `one_for_one`, 1 次/5 s | MQTT over WebSocket 只有 listener 一类子进程，没有需要一起重启的兄弟 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
-| `broker_proto_ws_sup` / `broker_proto_nats_sup` / `broker_proto_a2a_sup` | `one_for_one`, 1 次/5 s | 同 `broker_proto_mqtt_ws_sup`：只有 listener 一类子进程（`broker_proto_a2a_sup` 默认零条，S9-B 会在 listener **之前**插入 task 分片/registry，届时策略仍是 `one_for_one`，但顺序有意义） | 同上 |
+| `broker_proto_ws_sup` / `broker_proto_nats_sup` | `one_for_one`, 1 次/5 s | 同 `broker_proto_mqtt_ws_sup`：只有 listener 一类子进程 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
+| `broker_proto_a2a_sup` | `one_for_one`, 1 次/5 s | 只有两类子进程，且 registry 必须早于 listener（boot 契约，ADR-026 §D4）；registry 自己崩了由 `one_for_one` 单独重启整棵 registry 子树，不必连累 listener | listener 重启时 live 连接被收掉；registry 重启 = 全量重放重建投影，正在处理的 Task 请求收到 `internal_error` |
+| `a2a_task_registry` | **`one_for_all`, 3 次/10 s** | 分片的 ETS 投影是缓存，日志才是真相；单个分片崩了只有整组重启 + `a2a_task_recovery` 重放才能让"投影等于日志"重新成立。`3/10` 让崩溃循环仍然可见 | 全部 Task 投影重建（耗时 = 全量重放）；期间 `create/get/cancel` 调用方收到 `internal_error`；日志不丢，Task 语义不变 |
 | `broker_proto_amqp_sup` / `broker_proto_kafka_sup` / `broker_proto_pulsar_sup` | `one_for_one`, 5 次/10 s | listener 之外还有 app 级的共享进程（`amqp_topo` 的拓扑表、`kafka_group` 的消费组协调、`pulsar_subscriptions` 的游标），它们与被 listen 的连接无关，不该跟着 listener 一起重启 | listener 或协调进程单独重启，另一类不受影响 |
 | `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` / `broker_event_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener、去重窗口彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建，`broker_event_dedup` 重启只丢窗口内状态 | 单个进程重启，其余不受影响 |
 | `broker_storage_wal_sup` | `one_for_one`, 4 次/30 s | 单分区崩溃必须自愈，但不能掩盖崩溃循环；与内存 store 隔离 | 该分区 `wal_writer` 重启并从磁盘 `recover`；旧句柄失效 |
@@ -338,25 +340,60 @@ broker_proto_mqtt_quic_sup (one_for_all, 1/5s)
 
 **quicer 是 profile 门控依赖，不是默认依赖。** 默认 `rebar3 compile/ct/release` 完全不拉 `quicer`（`optional_applications => [quicer]`，listener 在缺 NIF 时以 `{error, quicer_not_available}` 干净拒绝）；`rebar3 as quic ...` 才把它编进来，`quic` profile 的 `relx` 因此复制了完整的 release app 列表——profile 的 `relx` 会**替换**顶层那份，漏掉就等于装出一个只有 QUIC 的 release。**`broker_proto_mqtt_quic` 本身在两个 release 的 app 列表里**（它不依赖 NIF 就能启动，只是 `listeners => []`），差别只是 `quic` release 多带 `quicer-0.4.12`；把该 app 从默认列表里去掉会让手工构建与 release 的启动行为不一致。所有 `quicer:` 调用集中在 `mqtt_quic_nif` 一个模块，`include` 也不越界：本 app 只通过裸消息元组与 quicer 交互，没有它的头文件依赖。
 
-### 3.13 A2A 前端的连接模型（S9-A）
+### 3.13 A2A 前端的连接模型与 Task 数据流（S9-A / S9-B）
 
 与 §3.9–§3.12 的 MQTT 传输抽象无关：A2A 是一条独立的 HTTP/1.1 前端，不经过 `mqtt_transport`，也不复用 `mqtt_conn_fsm`。
 
 ```
 broker_proto_a2a_sup (one_for_one, 1/5s)
-└── ranch_embedded_sup → listener × N        % 默认 N = 0（listeners => []）
-      └── a2a_conn                          % 每连接一个进程；循环处理多个请求（keep-alive）
-            ├── agent_rpc_http:read_request/3   % packet=http_bin 读头 → raw 读体
-            └── a2a_rpc:handle/1                % media type → 凭据 → 版本 → 信封 → 方法
+├── a2a_task_registry (one_for_all, 3/10s)         % S9-B：boot 契约的第一项
+│     ├── a2a_task_shard_1..N                      % phash2(TaskId, N) 定分片；每分片一张 ETS 投影
+│     └── a2a_task_recovery                        % 最后一项：全量重放，重建全部投影
+└── ranch_embedded_sup → listener × N              % 默认 N = 0（listeners => []）
+      └── a2a_conn                                 % 每连接一个进程；循环处理多个请求（keep-alive）
+            ├── agent_rpc_http:read_request/3      % packet=http_bin 读头 → raw 读体
+            └── a2a_rpc:handle/1                   % media type → 凭据 → 版本 → 信封 → 方法
 ```
 
 **一个连接一个进程，不是一请求一个进程。** `a2a_listener:start_link/3` 只 `spawn_link` 一个 `a2a_conn`，由它自己 `ranch:handshake/1` 接管 socket，然后在同一个进程里循环：读请求、分派、写响应、判断 `keep_alive`。这样 keep-alive 不额外耗进程，客户端掉线也只波及自己这条连接（`temporary` 由 `spawn_link` 的普通进程语义承担，不进监督树）。单连接上限 1000 个请求，防止长连接无限占用 ranch 槽位。
+
+**registry 排在 listener 之前是 boot 契约。** `a2a_task_recovery` 是 registry 的最后一个子进程，在 `init/1` 里完成全量重放，所以 supervisor 报告 registry 就绪时投影已经存在；listener 之后才起，`SendMessage` 不可能与投影重建竞争。恢复失败会 `{stop, {a2a_recovery_failed, _}}`——宁可让 app 起不来，也不带着空投影接请求（ADR-025 §D5）。
 
 **base 库不拥有 socket。** `agent_rpc_http` 收 `Transport` 模块 + `Socket`，内部用 `Transport:recv/3` / `setopts/2`。这让同一份解析代码既能服务 `ranch_tcp` 也能服务 `ranch_ssl`，还能在 CT 里被裸 `gen_tcp` 驱动；反过来，base 一旦持有 accept 循环，就会反向依赖 adapter 的 listener（违反 ADR-026 §D1 的依赖方向）。
 
 **`{packet, http_bin}` / `{active, false}` 由库自己设，不写进 listener 的 `socket_opts`。** ranch 对 `socket_opts` 做严格校验，把这两个（以及 `reuseaddr`）写进去会在每次启动时记 "Transport option ... unknown or invalid" 警告；正确位置是 `read_request/3` 的开头，那里本来就是 HTTP 帧契约的归属地（读完头再切 `{packet, raw}` 读体，与 `broker_admin_listener` 同一手法）。
 
 **boot 校验在 supervisor 之前。** `broker_proto_a2a_app:start/2` 先检查 `require_auth = false` 时是否所有 listener 都绑在回环地址；否则直接 `{error, {insecure_listener, Port, Ip}}` 拒绝启动整个 app。这是「失败关闭」：与其起一个无认证的公网任务 API，不如让节点起不来（`application:start` 返回嵌套的 `{error, {{insecure_listener, ...}, {broker_proto_a2a_app, start, ...}}}`）。
+
+#### 3.13.1 一次 `SendMessage` 的完整数据流（S9-B）
+
+```
+a2a_conn ──► a2a_rpc:handle/1            media type → 凭据 → 版本 → 信封（S9-A 的门控顺序不变）
+              └─► ACL(a2a publish, "$a2a/task/new")
+                    └─► a2a_task_registry:create/3
+                          └─► shard_for(NewTaskId)          phash2(TaskId, N) + 1
+                                └─► a2a_task_shard:create/5  该分片 gen_server 串行执行：
+                                      1. a2a_event:append(task, 快照)      → broker_router_hash:route/3 → broker_queue:append/3
+                                      2. a2a_event:append(status_update, WORKING)
+                                      3. a2a_event:append(message, agent 回包)
+                                      4. a2a_event:append(status_update, COMPLETED)
+                                      5. ETS 投影 ← 4 次纯折叠
+                                      └─► 回 {ok, Projection} ──► a2a_rpc 转成 result.task
+```
+
+**Task 事件与 MQTT 消息走同一条写路径。** 分区由 `broker_router_hash:route/3` 决定（ADR-010 是唯一分区真相），写入 `broker_queue:append/3`（唯一写路径，ADR-007 的 `fsync`/`os_buffer` 与限额原样生效），因此 ADR-013 retention、ADR-014 游标、ADR-011 committed 水位对 A2A 事件同样成立——**没有第二套消息内核**。
+
+**读路径不碰日志。** `GetTask` 只读 ETS 投影；`ListTasks` 扇出到所有分片再在 registry 合并分页（全局稳定页无法由各分片页拼出）。日志只在 boot replay 时被读。
+
+**Task 事件是 `$a2a/task/<id>` 上的普通消息**，因此：
+
+| 关注点 | A2A Task | 说明 |
+|---|---|---|
+| 分区 | `partition_id` 由 router 求得 | 同 Task 全部事件落同一分区，重放保序 |
+| 可靠性 | `task_reliability`（默认 `fsync`） | 创建与终态同档；不因"终态更重要"分档（ADR-025 §D4） |
+| retention | 与普通消息同一套 `broker_storage.retention` | 创建事件被 GC 后重放 → `history_lost` 补 `FAILED` |
+| cursor/订阅 | **不使用** | 投影是 folded view，不是订阅者；S9-C 的 SSE 才是瞬态读者 |
+| Mnesia | **不使用** | `broker_meta` 只存 Agent Card（控制面），Task 不落 Mnesia（ADR-002 边界） |
 
 ---
 
@@ -376,15 +413,16 @@ sasl → broker_core → broker_metrics → broker_storage
 
 顺序不是装饰：`broker_queue` 在 `init/1` 里 recover 分区，`broker_subscription` 在 `init/1` 里重建订阅并回填 Router，二者都必须早于 listener。`broker_metrics` 必须早于 `broker_storage`（后者是它的调用者），而它本身只起一个可选的上报进程，不参与任何 boot step。`broker_security` 必须早于 `broker_queue`——后者的 `.app.src` 把它列进 `applications`（分区层要用 ACL 与租户判定）；`broker_retain` 同理必须早于 `broker_proto_mqtt`。`broker_router` 不依赖 `broker_security`，因此排在它前面。
 
-**S9-A 的两个 app 不在这条链上。** `broker_proto_agent_rpc` 是纯库（无进程），`broker_proto_a2a` 的 `applications` 只有 `broker_core` / `broker_security` / `broker_proto_agent_rpc`，默认 `listeners => []` 时启动即空转，既不读数据目录也不参与 MQTT 的四个 boot step。因此单独起它只需要：
+**S9-A 的两个 app 不在这条链上。** `broker_proto_agent_rpc` 是纯库（无进程），`broker_proto_a2a` 的 `applications` 只有内核门面 + `broker_security` + `broker_meta` + `broker_router` + `broker_queue` + `broker_proto_agent_rpc`，默认 `listeners => []` 时启动即空转，既不读 MQTT 的数据目录也不参与 MQTT 的四个 boot step。**S9-B 起它多了一个自己的 boot step**：`a2a_task_registry` 的最后一项 `a2a_task_recovery` 在各分区 `read_from(P, 0, _)` 上重放 `$a2a/task/` 事件重建投影。这要求 `broker_queue` 已就绪，因此它必须排在 `broker_queue` 之后。单独起它需要：
 
 ```erlang
-%% 实测：application:ensure_all_started(broker_proto_a2a)
-[sasl, crypto, asn1, public_key, ssl, ranch,
- broker_core, broker_security, broker_proto_agent_rpc, broker_proto_a2a]
+%% 实测（分区已带外创建）：application:ensure_all_started(broker_proto_a2a)
+[sasl, broker_core, broker_metrics, broker_storage,
+ broker_router, crypto, asn1, public_key, ssl, broker_security, broker_queue,
+ ranch, mnesia, broker_meta, broker_proto_agent_rpc, broker_proto_a2a]
 ```
 
-它按需配置 listener 才开端口，与 MQTT 的 boot 顺序没有相互约束（互不引用）。
+它按需配置 listener 才开端口，与 MQTT 的 boot 顺序没有相互约束（互不引用）。**分区必须先存在**：干净数据目录下 `broker_queue` 会按 §4.2 的 step 1 失败，A2A 的 recovery 也就无从谈起——这与 MQTT 的"首启必须带外 `create_partition/1`"是同一条规则，不是 A2A 特有的。
 
 ### 4.2 四个 boot step
 
@@ -527,7 +565,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_subscription.cursor_max_regress` / `cursor_flush_interval_ms` / `inflight_flush_interval_ms` | 64 / 100 / 100 | 有界回退窗口；`1/0/0` 选择近零回退档 |
 | `broker_retain.data_dir` | `.app.src` 为 `data`；release 配与 storage 相同的绝对路径 | retained 快照 `retain/retain.v1` 的根目录（S2-C） |
 | `broker_meta.data_dir` | `.app.src` 未声明，代码兜底 `data`；release 配 `data/mnesia` 的绝对路径 | Mnesia 控制面根目录；Mnesia 在其下追加 `Mnesia.<node>`（S4） |
-| `broker_meta.table_storage` | `ram_copies` | 11 张控制面表的副本类型。默认 `ram_copies` = **重启即丢**，生产必须配 `disc_copies`（`maybe_set_dir/1` 也只在 `disc_copies` 时设置 `mnesia.dir`）；见 `docs/operations.md` §5 |
+| `broker_meta.table_storage` | `ram_copies` | 12 张控制面表的副本类型。默认 `ram_copies` = **重启即丢**，生产必须配 `disc_copies`（`maybe_set_dir/1` 也只在 `disc_copies` 时设置 `mnesia.dir`）；见 `docs/operations.md` §5。**`agent_card` 表在 `disc_copies` 下重启后仍在**，是 S9-B 重启证据的一部分 |
 | `broker_cluster.data_dir` | `data/ra`（release 配绝对路径） | Metadata Raft 根目录；ra 在其下追加 `<node>`（S4） |
 | `broker_security.users` / `acl` | `.app.src` 未声明（代码兜底 `[]` / `allow`）；release 配 `guest/guest`（tenant `t0`）、`allow` | 明文用户表与 allow-all ACL 桩；用户表为空时凭据认证一律失败，匿名连接仍可建立（principal 取 client_id） |
 | `broker_event.policy` | `pass_through` | 五档均已实现（S3，ADR-020）：`disabled` / `pass_through` / `validate_if_present` / `required` / `normalize`；未知值在 `apply_policy/2` 报 `{invalid_policy, _}` |
@@ -553,6 +591,13 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_a2a.max_connections` / `request_timeout_ms` | 1024 / 30000 | listener 未自带 `max_connections` 时的兜底值与单请求读超时 |
 | `broker_proto_a2a.supported_versions` | `[<<"1.0">>]` | 声明支持的 `A2A-Version`。缺失头按 `0.3` 读入，但 `0.3` 不在此列，故缺失 → `-32009` |
 | `broker_proto_a2a.sse_max_event_bytes` / `sse_heartbeat_ms` | 1048576 / 15000 | SSE 单事件上限与心跳间隔；S9-A 只有库原语，未接到任何方法（S9-C 启用） |
+| `broker_proto_a2a.task_reliability` | `fsync` | S9-B：Task 事件的 `#broker_message{}.reliability`。创建事件与终态事件**同档**（ADR-025 §D4）。`replicated_commit` 在没有复制器时于 boot 校验被拒（`{error, {task_reliability_requires_replicator, replicated_commit}}`），不静默降级 |
+| `broker_proto_a2a.task_shards` | `undefined` → `erlang:system_info(schedulers_online)` | S9-B：Task 分片数（ADR-025 §D2）。每分片一个 gen_server + 一张 ETS 投影；`phash2(TaskId, N)` 定分片。改这个值会改变 Task 的归属分片，**必须配合重启**（boot replay 本来就重建投影） |
+| `broker_proto_a2a.task_auto_complete` | `true` | S9-B：`true` 时 `SendMessage` 同步跑完 `SUBMITTED → WORKING → agent message → COMPLETED`（内建 echo agent）；`false` 时停在 `SUBMITTED`，交给外部执行器。不是"agent 推理"开关 |
+| `broker_proto_a2a.task_timeout_ms` | 30000 | 分片 gen_server 调用的超时；与 `request_timeout_ms` 独立（一个是分片内串行工作的时间预算，一个是客户端请求的读超时） |
+| `broker_proto_a2a.task_checkpoint_dir` / `task_checkpoint_interval_ms` | `undefined` / 5000 | S9-B **已声明但当前不读**：恢复用全量重放（正确性基线）。持久化 checkpoint 是 S9-F 的演进位 |
+| `broker_proto_a2a.agent_cards` | `[]` | S9-B：boot 种子卡列表（`#{tenant_id, agent_id, status, card, extended_card}`）。`a2a_card:seed/0` 在 app 启动时幂等写入 `broker_meta.agent_card`；内容未变不 bump version；格式不合法 → 启动失败 |
+| `broker_proto_a2a.agent_card_max_age` | 60 | S9-B：`/.well-known/agent-card.json` 与 `/agents` 的 `Cache-Control: max-age`。ETag 由行 `version` + 内容哈希组成，改卡即失效缓存 |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 
@@ -574,9 +619,9 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **908/908**，`apps/*/test/`（58 个套件）与 `test/integration/s1_e2e_SUITE` 共 **59 个套件全部被执行**（含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。S9-A 新增 7 个套件 85 例（基线 823/52）。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
-| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 175 条均为预期 unused-export（S9-A 两个新 app 零告警） | CI/本地 |
-| A2A 真实客户端 | `curl` 11 条：echo 200、401、403、415、413、`-32009`×2、`-32601`、`-32700`、health、keep-alive（证据端口 18091，默认不监听） | `docs/protocol-compatibility.md` §4.14 |
+| 单元/契约/集成 | `rebar3 ct` → **952/952、62 套件全部被执行**（`apps/*/test/` 61 个 + `test/integration/s1_e2e_SUITE` 1 个；含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。S9-A 新增 7 个套件 85 例（基线 823/52），S9-B 再新增 3 个套件 25 例并改写 1 个（`a2a_task_SUITE` 11 / `a2a_event_SUITE` 6 / `a2a_task_projection_SUITE` 8 / `a2a_listener_SUITE` 16→33，`broker_meta_SUITE` 10→12）。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
+| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 仅预期 unused-export（S9-A/B 两个新 app 零非预期告警） | CI/本地 |
+| A2A 真实客户端 | `curl` **25 条**（S9-B）：Task 生命周期、`GetTask` 404、`ListTasks` 过滤/分页、`CancelTask` 400、跨租户 404、well-known 匿名/认证 extended、ETag 304、catalog 三类过滤 + 分页 + 租户隔离、`GetExtendedAgentCard` 200 与 `-32007`、**重启后 boot replay 恢复同一 Task**、异步模式 SUBMITTED→CANCELED、401/health/`-32602`（证据端口 18093，默认不监听）。S9-A 的 11 条见 §4.14 | `docs/protocol-compatibility.md` §4.15 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |
 | 真实客户端 | paho-mqtt 2.x / mosquitto 2.1.2（MQTT）、websocket-client、nats.go、amqp091-go、kafka-clients、官方 Pulsar Java Client；六协议全绿；S8 另加 paho-mqtt `transport="websockets"`（8/8）、`mqtt-sn-tools` 0.0.7（10/10）、EMQX `emqtt` 1.16.1（8/8） | `test/protocol-compatibility/` |
@@ -607,8 +652,12 @@ broker_subscription_worker ──┘                              ├→ broker_
 | MQTT-SN over DTLS | S8 之后 | `broker_proto_mqtt_sn` 的 socket 换成 `ssl` 的 dtls 档 | MQTT-SN 1.2 报文与 topic id 模型不变；1884 目前是唯一**明文且无 TLS 路径**的端口（`docs/security.md` §12 第 8 条） |
 | QUIC 0-RTT early data 与多流模式 | 不做（CN 可选项 / EMQX 私有扩展） | — | 单流模式是 CN Draft 3 的全部内容；ADR-024 已冻结该边界 |
 | MQTT-SN 转发器封装与串口桥 | 不做（设计 §1.2） | — | 网关只终结，不做 bridge 到外部 MQTT Broker |
-| A2A Task 状态机与 `$a2a/task/<id>` 日志 | **S9-B** | `broker_proto_a2a` 新增 task 分片/registry（listener 之前的子进程）、`GetTask`/`ListTasks`/`CancelTask`；`broker_meta` 新增 `agent_card` 表（ADR-026 §D3 修订 ADR-002） | ADR-025：Task 事件就是普通 `#broker_message{}`，复用 ADR-007 可靠性 / ADR-014 游标 / ADR-013 retention，不引入第二套消息内核 |
-| A2A Agent Card、`/.well-known/agent-card.json`、ETag | **S9-B** | `broker_proto_a2a` 新增 well-known 路由；`broker_meta` 的 `agent_card` 表 | 不复活 `topic_meta`/`queue_meta`/`binding_meta`（ADR-026 §D3） |
+| A2A Task 状态机与 `$a2a/task/<id>` 日志 | **已交付（S9-B）** | `broker_proto_a2a` 新增 `a2a_task`（状态机）/`a2a_event`（事件 → `#broker_message{}`）/`a2a_task_projection`（纯折叠）/`a2a_task_shard` + `a2a_task_registry`（分片串行化，listener 之前的子进程）/`a2a_task_recovery`（boot 全量重放）；`GetTask`/`ListTasks`/`CancelTask` 落地 | ADR-025：Task 事件就是普通 `#broker_message{}`，复用 ADR-007 可靠性 / ADR-014 游标 / ADR-013 retention，不引入第二套消息内核（已实现） |
+| A2A Agent Card、`/.well-known/agent-card.json`、ETag | **已交付（S9-B）** | `broker_proto_a2a` 新增 `a2a_card`（well-known/catalog/ETag/seed）；`broker_meta` 第 12 表 `agent_card` + 4 个访问器 | 不复活 `topic_meta`/`queue_meta`/`binding_meta`（ADR-026 §D3，已实现） |
+| A2A 跨节点 Task 访问（非 owner 节点重定向/代理） | **S9-C 之后** | `a2a_task_registry` 的 `get/list/cancel` 增加跨节点路径，复用 ADR-021 的归属与 epoch | Task 事件与投影形状不变；单节点语义（本节点即 owner）不回退 |
+| A2A 持久化 replay checkpoint（`data/a2a/replay.idx`） | **S9-F** | `a2a_task_recovery` 从「分区 offset 0 全量」改为「checkpoint + 尾部增量」；`task_checkpoint_dir`/`task_checkpoint_interval_ms` 两个 env 已经声明 | 重放的**结果**不变（投影仍是日志的折叠）；`history_lost` 判定与 repair 幂等语义不变 |
+| A2A 失败路径计数器（`a2a_state_violation`/`a2a_task_history_lost`/`a2a_checkpoint_corrupt`） | **S9-F** | `broker_metrics` 冻结键集的一次统一变更 | 现有键集合与 `snapshot/0` 形状在 S9-F 之前不变；当前用 `logger` 记事件 |
+| A2A Agent Card 管理面 CRUD | **S9-F** | 在 `broker_admin` 之上加卡的增删改查；`a2a_card:seed/0` 仍是 boot 期写入者 | 卡表形状、ETag 生成规则、租户隔离语义不变 |
 | A2A 流式（SSE）、`SubscribeToTask`、Push Notification / 出站 webhook | **S9-C** | `agent_rpc_sse` 接到方法；`$a2a/push/dlq/<tenant>` | SSE 是瞬态读者：不建 cursor、不 pin retention，落后即发 Task 快照 resync；出站默认关闭、只 `https`、host allowlist + pin IP、禁重定向（ADR-026 §D6/§D7） |
 | MCP 2026-07-28 前端 | **S9-D** | 新 app `broker_proto_mcp`，监听 8082 | 与 A2A 共享 `broker_proto_agent_rpc`，两个 adapter 互不引用 |
 | ACP v1 前端（stdio，Broker 扮 Client） | **S9-E** | 新 app `broker_proto_acp`，无端口 | 只 stdio；`fs/*`、`terminal/*`、elicitation 不广告；`session/request_permission` 默认拒绝 + allowlist；v2 不实现 |

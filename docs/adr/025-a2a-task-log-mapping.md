@@ -139,3 +139,21 @@ S9-B/S9-C 的 Gate 证据必须覆盖：
 ## 冻结后补充
 
 （暂无。S9-A 起若发现本 ADR 与实现冲突，按项目惯例在此追加批注，不改冻结正文。）
+
+### 落地批注（S9-B，2026-11-12）
+
+本节只记录**实现与冻结正文的差异/细化**，D1~D9 正文一字未改。代码见 `apps/broker_proto_a2a/src/`（`a2a_task` / `a2a_event` / `a2a_task_projection` / `a2a_task_shard` / `a2a_task_registry` / `a2a_task_recovery`），证据见 `docs/protocol-compatibility.md` §4.15。
+
+| 决策 | 落地情况 | 差异 |
+|---|---|---|
+| D1 事件 = 普通 `broker_message` | 完全照做：`$a2a/task/<TaskId>`、`payload_encoding = json`、`persistence = durable`、`reliability = task_reliability`、分区走 `broker_router_hash:route/3`、写入走 `broker_queue:append/3`；`_meta.unified-mq` 带 `seq` + `kind` | 无。`_meta` 的两个键落地为 `<<"_meta">> => #{<<"unified-mq">> => #{<<"seq">>, <<"kind">>}}`，`kind` 用 proto 的 `statusUpdate`/`artifactUpdate` 驼峰名 |
+| D2 投影在 adapter 内存（ETS + 分片 gen_server） | 完全照做：每分片一张 ETS `a2a_task_shard_<I>`（`set` + `read_concurrency`）+ 一个 `gen_server`，`phash2(TaskId, N)` 路由，`task_shards` 默认 `schedulers_online` | **`ListTasks` 的分页在 registry 汇总**：全局稳定页无法由各分片各自分页拼出，故 `list/3` 扇出到全部分片、由 registry 合并排序再切页；`page_size` 默认 50 上限 100 按 D2 执行 |
+| D3 终态不可变三层（串行化 + 追加前校验 + 重放复核） | 三层都在：分片串行、append 前 `a2a_task:legal_transition/2`、重放复核。非法迁移在**活路径**返回错误码，在**重放路径**只记日志并保留最后一个合法状态 | **`a2a_state_violation` 计数器未加**（`broker_metrics` 键集冻结，统一在 S9-F 动），S9-B 用 `logger:warning`；`WORKING → WORKING` 显式允许（进度上报），已作为迁移表的一行落地 |
+| D4 可靠性档 `fsync` 默认、创建与终态同档 | 完全照做：`a2a_event:reliability/0` 读 `task_reliability`（默认 `fsync`），创建事件与终态事件用同一档；`replicated_commit` 且 `broker_queue:reliability() =/= replicated_commit` 时 **boot 拒绝**（`{error, {task_reliability_requires_replicator, _}}`，`a2a_event:validate_reliability/0`） | 无 |
+| D5 崩溃恢复 = checkpoint + 增量重放 | **只做了增量重放的退化版：全量重放**。`a2a_task_recovery` 在 `init/1` 里从各分区 offset 0 读起、过滤 `$a2a/task/` 前缀折叠 | **checkpoint 未实现**：`data/a2a/replay.idx` 不存在，`task_checkpoint_dir` / `task_checkpoint_interval_ms` 两个 env 已声明但**不读**。全量重放先作为正确性基线（ADR §D5 的「无 checkpoint 时从 0 请求」分支即本条），checkpoint 优化列 S9-F 演进位 |
+| D6 retention 契约 + `history_lost` 响亮失败 | `history_lost` 照做：首条可见事件不是创建快照 → 补一条服务端生成的 `TASK_STATE_FAILED` 终态事件（`metadata.reason = history_lost`），且该补写事件自身在下次重放时可被识别，重复 boot 幂等 | **`a2a_task_history_lost` 计数器与 `config/alerts.yml` 的 `a2a_task_beyond_retention` 未加**（同上，归 S9-F）；`docs/operations.md` §5.1 已给容量估算与日志特征对照表作为过渡 |
+| D7 SSE 是瞬态读者 | **未落地**（S9-C）：`SendStreamingMessage` / `SubscribeToTask` 仍回 `-32601` | 本 ADR 关于 SSE 的所有约束（不建 SubRef、不 pin retention、resync 快照、`sse_max_pending_bytes`）在 S9-C 生效，S9-B 不产生任何 SSE 路径 |
+| D8 大小上限 | `max_body_bytes` 与 `broker_security.limits.max_message_bytes` 取 min；`413` 不读体直接关连接；`Part.url` 不取回 | 无 |
+| D9 `contextId` 只做索引 | 完全照做：`ListTasks` 按 `contextId` 过滤（投影字段），无跨任务外键；`referenceTaskIds` 原样保留不校验 | 无 |
+
+**同时给 S9-C 的提醒**：D5 的 checkpoint、D6 的两个计数器、D7 的全部内容目前都是「文档承诺、代码未到位」的状态，已在本表和 `docs/roadmap.md` §11.1 的 S9-C/S9-F 行留痕，避免被读成现状。

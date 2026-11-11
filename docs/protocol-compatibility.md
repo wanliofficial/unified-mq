@@ -815,6 +815,166 @@ content-type: application/json
 
 ---
 
+## 4.15 S9-B 追加（2026-11-12）：A2A Task 生命周期与 Agent Card 发现
+
+**是什么**：S9-B 把 S9-A 的 `SendMessage` echo 换成真正的 **Task 生命周期**，并按 ADR-026 §D3 落地 **Agent Card 发现面**。能力分三块：
+
+1. **Task 状态机 + 事件溯源日志**：Task 的每次状态变化都是一条普通 `#broker_message{}`，destination = `$a2a/task/<TaskId>`，分区由 `broker_router_hash:route/3` 求得（ADR-010 是唯一分区真相），写入走 `broker_queue:append/3`（唯一写路径，ADR-007 的可靠性档与限额原样生效）。**没有第二套日志、没有第二套消息模型、不用 cursor**。
+2. **投影是事件的折叠**：`a2a_task_projection` 是纯函数，把 `$a2a/task/<id>` 的事件按序折叠成 Task；投影放在该 Task 所属 shard 的 ETS 里（每 shard 一个 gen_server 串行化），Mnesia 完全不参与。boot 时 `a2a_task_recovery` 全量重放每个分区，把投影重建出来——**"投影等于日志"是可验证的，不是口号**。
+3. **Agent Card 与控制面**：`broker_meta` 新增第 12 张表 `agent_card`（ADR-026 §D3 显式修订 ADR-002 的冻结表清单），`/.well-known/agent-card.json`（ETag/`If-None-Match` 304/`Cache-Control`）+ 项目私有 catalog `GET /agents` + JSON-RPC `GetExtendedAgentCard`。
+
+> **对 §4.14 阶段快照的说明**：§4.14 里「`GetTask` 等一律 `-32601`」「echo 不建 Task」「destination 固定 `$a2a/task/echo`」等说法是 **S9-A 完成态**的记录，保留原文不动。S9-B 之后这些都被取代，当前事实以下面各表为准。
+
+### 4.15.1 方法能力矩阵（S9-B 完成态）
+
+| 方法 | 状态 | 语义要点 |
+|---|---|---|
+| `SendMessage` | **已支持（建 Task）** | 返回 `result.task`（不再走 `result.message` 分支）。`task_auto_complete = true`（默认）时同步推进 `SUBMITTED → WORKING → agent message → COMPLETED` 后才回包，即 ADR-025 §D4 的 `return_immediately = false` 语义 |
+| `GetTask` | 已支持 | `params.id` 必填。本租户存在 → 200 + Task；不存在 / 跨租户 → **404 + `-32001`**（跨租户与不存在同码，id 不是存在性预言机） |
+| `ListTasks` | 已支持 | `contextId` / `status`（单个或数组，按 proto 枚举名解析）过滤；`pageSize` 默认 50、上限 100；`pageToken` = 下一页起点 TaskId（不透明）。不合法状态 → `-32602` |
+| `CancelTask` | 已支持 | 非终态 → 200 + `TASK_STATE_CANCELED`；终态 → **400 + `-32002`**（终态不可变） |
+| `GetExtendedAgentCard` | 已支持 | 该 card 有 `extended_card` → 200；无 → **400 + `-32007`**（`extended_agent_card_not_configured`） |
+| `SendStreamingMessage` / `SubscribeToTask` / Push config 三件套 | **仍未实现** | 一律 `-32601`（HTTP 200）。S9-C |
+
+**Task 状态机**（`a2a_task.erl`，proto 9 值）：`TASK_STATE_UNSPECIFIED` / `SUBMITTED` / `WORKING` / `INPUT_REQUIRED` / `AUTH_REQUIRED` / `COMPLETED` / `FAILED` / `CANCELED` / `REJECTED`。终态四个（`COMPLETED`/`FAILED`/`CANCELED`/`REJECTED`）**无出边**；中断态两个（`INPUT_REQUIRED`/`AUTH_REQUIRED`）可回到 `WORKING`；`WORKING → WORKING` 允许（进度上报）。迁移表就是 ADR-025 §D3 那一张，`a2a_task_SUITE` 穷举 81 对状态逐对断言。
+
+### 4.15.2 事件日志的形状
+
+一条 Task 事件 = 一条普通消息：
+
+| 字段 | 值 |
+|---|---|
+| `destination` | `<<"$a2a/task/", TaskId/binary>>` |
+| `payload` | A2A `StreamResponse` 分支的线上 JSON（`task` / `statusUpdate` / `artifactUpdate` / `message`），外加项目私有 `_meta.unified-mq = {seq, kind}` |
+| `payload_encoding` | `json` |
+| `persistence` | `durable` |
+| `reliability` | `broker_proto_a2a.task_reliability`（默认 `fsync`）；创建事件与终态事件**同档**（ADR-025 §D4） |
+| `partition_id` | `broker_router_hash:route/3` 求出的分区，同 Task 全部事件落同一分区，重放保序 |
+
+`_meta.unified-mq` 是**加法字段**：标准 A2A 客户端忽略它；恢复路径用它区分「创建快照」与「增量」，不用猜 JSON 形状。
+
+**恢复语义**（ADR-025 §D5/§D6）：
+
+- boot 全量重放（从各分区 offset 0 折叠 `$a2a/task/` 前缀事件），**不做增量 checkpoint**（checkpoint 是 S9-F 的演进位，`task_checkpoint_dir`/`task_checkpoint_interval_ms` 两个 env 已声明但当前不读）。
+- 首条可见事件不是创建快照（创建事件已被 retention GC）→ 补一条服务端生成的 `FAILED` + `metadata.reason = history_lost` 终态事件，**不返回半截 Task**；补写事件自身可被下一次重放识别，因此重复 boot 幂等。
+- 分片串行化：`phash2(TaskId, N)` 定 shard，`create`/`cancel`/`apply_event` 都经该 shard 的 gen_server，"读状态→校验迁移→追加事件→更新投影" 对所有同 Task 请求原子。不同 Task 不同 shard 互不等待。
+- 一个 shard 崩了 → registry 是 `one_for_all`，整组重启并由 recovery 重放（ETS 缓存本就是缓存）。
+
+### 4.15.3 Agent Card 发现面
+
+| 端点 | 行为 |
+|---|---|
+| `GET /.well-known/agent-card.json` | RFC 8615 公开卡。`?agent=<id>` 选择；无参取**字母序首个 active** card（确定性，不依赖 Mnesia 行序）。有效凭据且有 extended 变体 → 返回 extended；匿名 → 只回公开卡。`ETag: "<version>-<content hash>"`，`If-None-Match` 命中 → `304` 空体；`Cache-Control: max-age=<agent_card_max_age>`（默认 60）。未知 agent → `404 {"error":"agent_card_not_found"}` |
+| `GET /agents` | **项目私有** catalog（A2A spec 未定义注册 API，R-D4）。支持 `skill`（id/name/tags 任一匹配）、`tag`、`provider`、`capability`（`capabilities.<name> === true` 或 `extensions[].uri`）过滤；`pageSize` 默认 50 / 上限 100；`pageToken` = 上一页最后一张卡的 agent id。响应 `{"agents":[...], "nextPageToken"?}` |
+| JSON-RPC `GetExtendedAgentCard` | `params.agent` 选择 card；无 extended 变体 → `-32007` |
+
+**身份解析（安全边界）**：`/.well-known/agent-card.json` 与 `/agents` 都**不需要凭据**，但**不是跨租户的**——无凭据时身份是 `agent_rpc_auth:anonymous()`，其 tenant 为 `broker_security:default_tenant()`（默认 `t0`）。所以「匿名可读」= **在默认租户内可读**，看不到 `t1`/`t2` 的卡。带凭据但凭据无效 → `401`（不是降级成匿名）。CT 与 `curl` 证据都按这条断言。
+
+**boot 种子**：`broker_proto_a2a.agent_cards` 是配置里的初始卡列表，`a2a_card:seed/0` 在 app 启动时幂等写入 `broker_meta`——内容与状态未变则**不 bump version**（否则每次重启都让所有客户端缓存失效）；格式不合法（缺 `name`/`description`/`supportedInterfaces`/`version`/`capabilities`/`defaultInputModes`/`defaultOutputModes`/`skills`）→ **启动失败**，不静默跳过。管理面 CRUD 留 S9-F。
+
+### 4.15.4 错误映射（新增部分）
+
+| 情形 | HTTP | JSON-RPC code |
+|---|---|---|
+| Task 不存在 / 跨租户 | **404** | `-32001` `task_not_found` |
+| 终态再取消 | **400** | `-32002` `task_not_cancelable` |
+| card 无 extended 变体 | **400** | `-32007` `extended_agent_card_not_configured` |
+| `GetTask`/`CancelTask` 的 `id` 缺失或非字符串 | 200 | `-32602` |
+| `ListTasks` 的 `status` 不是合法枚举 | 200 | `-32602` |
+| 其余（信封/版本/凭据/media type） | 同 §4.14 | 同 §4.14 |
+
+注意 `task_not_found` 与 `task_not_cancelable` **不再**是 200：A2A §5.4 把它们放在 404/400，只有信封类错误（`-32600`/`-32601`/`-32602`）保持 200。
+
+### 4.15.5 证据
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT（控制面） | `apps/broker_meta/test/broker_meta_SUITE.erl` | **12 例**（基线 10 + 2：`agent_card_crud_bumps_version`、`agent_card_registration_is_serialized`（version 1..10 无缺口）；`schema_has_the_frozen_tables` 断言改为 12 表） |
+| CT（状态机） | `apps/broker_proto_a2a/test/a2a_task_SUITE.erl` | **11 例**（9 状态、81 对迁移穷举、终态无出边、wire 短名往返） |
+| CT（日志） | `apps/broker_proto_a2a/test/a2a_event_SUITE.erl` | **6 例**（destination 往返、payload 是 JSON binary、`_meta` 内容、可靠性档校验） |
+| CT（投影） | `apps/broker_proto_a2a/test/a2a_task_projection_SUITE.erl` | **8 例**（折叠、非法迁移、`history_lost` 检测、repair 幂等） |
+| CT（端到端） | `apps/broker_proto_a2a/test/a2a_listener_SUITE.erl` | **33 例**（S9-A 16 例改写 + 新增 17：Task 生命周期 11 + Agent Card 6；全部 `port => 0`） |
+| 全量回归 | `rebar3 ct` | **952/952、62 套件**（基线 908/59，零 FAILED） |
+| 真实客户端 | `curl`（下节原文） | **25 条**请求/响应原文 |
+
+### 4.15.6 `curl` 实测（2026-11-12，证据节点 127.0.0.1:18093）
+
+节点配置：`task_shards => 4`、`task_reliability => fsync`、`require_auth => true`，用户 `agent-s9b`（tenant `t1`）与 `agent-s9b-two`（tenant `t2`），三张种子卡（t1 的 `echo` 带 extended、t1 的 `summarizer` 无 extended、t2 的 `echo`）。
+
+```
+$ curl -sS -X POST http://127.0.0.1:18093/ \
+    -H 'Content-Type: application/json' -H 'A2A-Version: 1.0' \
+    -H 'Authorization: Bearer s9b-evidence-token' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
+         "messageId":"m1","role":"ROLE_USER","contextId":"ctx-s9b",
+         "parts":[{"text":"hello agent"}]}}}'
+{"id":1,"jsonrpc":"2.0","result":{"task":{
+  "contextId":"ctx-s9b",
+  "history":[{"contextId":"ctx-s9b","messageId":"m1","parts":[{"text":"hello agent"}],
+              "role":"ROLE_USER","taskId":"7SkevM2cFaECEmgbiPa59Q"},
+             {"contextId":"ctx-s9b","messageId":"HeJM02ADIKX4B1xOJXNiEw",
+              "parts":[{"text":"hello agent"}],"role":"ROLE_AGENT",
+              "taskId":"7SkevM2cFaECEmgbiPa59Q"}],
+  "id":"7SkevM2cFaECEmgbiPa59Q",
+  "status":{"state":"TASK_STATE_COMPLETED","timestamp":"2026-11-11T17:49:34.640Z"}}}}
+```
+
+| # | 请求 | 响应 |
+|---|---|---|
+| 1 | `SendMessage`（`task_auto_complete=true`） | `200`，`result.task.status.state = TASK_STATE_COMPLETED`，`history` 含用户消息 + agent 消息（上） |
+| 2 | `GetTask` 同一 id | `200`，与 1 的 task 完全一致（投影不是缓存副本，是同一折叠结果） |
+| 3 | `GetTask` 不存在的 id | **`404`** `{"error":{"code":-32001,"message":"Task not found"},"id":3}` |
+| 4 | `ListTasks` `{"contextId":"ctx-s9b"}` | `200`，`result.tasks` 含该 context 全部 Task |
+| 5 | `ListTasks` `pageSize=1` → 用 `nextPageToken` 取第二页 | 两页各一条，**不重不漏**；单条时不返回 `nextPageToken`（下节分页示例） |
+| 6 | `CancelTask` 已 COMPLETED 的 Task | **`400`** `{"error":{"code":-32002,"message":"Task cannot be canceled"},"id":7}` |
+| 7 | 用 t2 凭据 `GetTask` t1 的 Task | **`404`** + `-32001`，与 #3 逐字相同（不泄露存在性） |
+| 8 | `GET /.well-known/agent-card.json`（匿名） | **`404`** `{"error":"agent_card_not_found"}`——匿名 = 默认租户 `t0`，那里面没有种子卡 |
+| 9 | `GET /.well-known/agent-card.json?agent=echo` + t1 凭据 | `200`，返回 extended 卡（`name = "Echo Agent (extended)"`、`description = "internal view"`），带 `etag`/`cache-control: max-age=60` |
+| 10 | 同上 + `If-None-Match: <上一步 ETag>` | **`304`**，空体，`etag` 原样返回 |
+| 11 | `GET /agents`（t1） | `200`，两张卡（`Echo Agent`、`Summarizer`），`cache-control: max-age=60` |
+| 12 | `GET /agents?tag=nlp` | `200`，只剩 `Summarizer` |
+| 13 | `GET /agents?capability=streaming` | `200`，只剩 `Summarizer`（唯一 `capabilities.streaming = true`） |
+| 14 | `GET /agents?pageSize=1` → `nextPageToken=echo` | 第一页 `Echo Agent` + `nextPageToken`；带 token 的第二页是 `Summarizer` |
+| 15 | `GET /agents` + t2 凭据 | `200`，只有 `Tenant Two Echo`（catalog 按租户隔离） |
+| 16 | JSON-RPC `GetExtendedAgentCard` `{"agent":"echo"}` | `200`，`result` 是 extended 卡 |
+| 17 | `GetExtendedAgentCard` `{"agent":"summarizer"}` | **`400`** `{"error":{"code":-32007,"message":"Extended agent card is not configured"},"id":10}` |
+| 18 | 停节点 → 用同一数据目录重启 → `GetTask` 同一 id | `200`，Task 与重启前**逐字段相同**（boot replay 从 WAL 重建投影） |
+| 19 | 重启后 `ListTasks` | `200`，任务数 1（只有 WAL 里的真任务，没有重复投影） |
+| 20 | `task_auto_complete=false` 下 `SendMessage` | `200`，`status.state = TASK_STATE_SUBMITTED`（留给异步执行器） |
+| 21 | `CancelTask` 该非终态 Task | `200`，`status.state = TASK_STATE_CANCELED` |
+| 22 | 再 `CancelTask` 同一 Task | **`400`** + `-32002`（终态不可变） |
+| 23 | `GetTask` 无凭据 | **`401`**，`www-authenticate: Bearer realm="a2a"`，空体（在解析 body 之前拒） |
+| 24 | `GET /health` 无凭据 | `200` `{"status":"ok"}` |
+| 25 | `ListTasks` `{"status":"TASK_STATE_BOGUS"}` | `200` `{"error":{"code":-32602,...}}`（未知状态是参数错误，不静默放宽成"全部"） |
+
+分页实测（`pageSize=1` 两页，`ctx-page` 下两个 Task）：
+
+```
+$ curl -sS -X POST .../ -d '{"jsonrpc":"2.0","id":3,"method":"ListTasks",
+      "params":{"contextId":"ctx-page","pageSize":1}}'
+{"id":3,"jsonrpc":"2.0","result":{
+  "nextPageToken":"FPQMK-dMUU-bOUpp-IDDrg",
+  "tasks":[{"id":"FPQMK-dMUU-bOUpp-IDDrg", ...}]}}
+
+$ curl -sS -X POST .../ -d '{"jsonrpc":"2.0","id":4,"method":"ListTasks",
+      "params":{"contextId":"ctx-page","pageSize":1,
+                "pageToken":"FPQMK-dMUU-bOUpp-IDDrg"}}'
+{"id":4,"jsonrpc":"2.0","result":{
+  "tasks":[{"id":"woXcwqJB52z5nsM_8lleXA", ...}]}}
+```
+
+### 4.15.7 已声明的限制 / 边界
+
+- **单节点**：投影在本地 shard 的 ETS；跨节点访问同一 Task（非 owner 节点 `GetTask`）没有重定向/代理，是 S9-C+ 的演进位。
+- **全量重放是可扩展性上界**：每次 boot 扫全部分区。`task_checkpoint_dir` / `task_checkpoint_interval_ms` 已声明但当前**不读**；持久化 checkpoint 留 S9-F。
+- **无真实 agent 执行器**：`task_auto_complete=true` 时内建 echo agent 同步跑完；`false` 时 Task 停在 `SUBMITTED`，需要外部执行器调 `a2a_task_registry:apply_event/4`。两者都不是"agent 推理"。
+- **失败路径计数器未加**：`a2a_state_violation`/`a2a_task_history_lost`/`a2a_checkpoint_corrupt` 三个键推迟到 S9-F 统一动 `broker_metrics` 冻结键集时一并加。S9-B 用 `logger` 记事件，`snapshot/0` 的键集合不变。
+- **`/agents` 是项目私有接口**：A2A spec 没有注册 API；客户端不能假设别家 A2A 服务有这个端点。
+- **Agent Card 无签名**：`securitySchemes` 只能声明外部 scheme/URL，不做 JWS/PKI（收敛报告 §13 非目标）。card 里不放静态密钥（R-D6）。
+- **默认仍不监听**：`listeners => []`。18093 只是本次证据端口。
+
+---
+
 ## 5. 冻结契约一致性（T17 签认，2026-11-06）
 
 > 本节是 **Gate S1 的签认记录**，不是 S5 的兼容性结论。它回答一个问题：上表 MQTT 行的语义边界，是否真的由三份冻结 ADR 决定，而不是由实现细节偶然决定。复核对象是 T2~T15 的最终代码（commit `a8608d9` 前的实现状态，文档改动不触及代码）。

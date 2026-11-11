@@ -147,9 +147,9 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 - 客户端在同一 QUIC 连接上重连超过 `max_streams_per_conn` 次后新流不再到达：日志里会有 `quic: stream credit exhausted`，让客户端新建 QUIC 连接（或调大该值）。
 - 真实客户端对照：`test/protocol-compatibility/mqtt_quic/` 用 EMQX 的 `emqtt` 1.16.1 跑 8 个用例，见 `docs/protocol-compatibility.md` §4.12。
 
-### 1.3 A2A JSON-RPC 前端（默认关闭，S9-A）
+### 1.3 A2A JSON-RPC 前端（默认关闭，S9-A / S9-B）
 
-`broker_proto_a2a` 是 A2A 1.0.0 的 JSON-RPC 传输绑定前端。**S9-A 只有一条方法 `SendMessage`（echo），没有 Task**；`GetTask` 等方法一律回 `-32601`。它**默认不监听**（ADR-026 §D4）：app 装进 release、随节点启动，但 `listeners => []` 时不开任何端口。
+`broker_proto_a2a` 是 A2A 1.0.0 的 JSON-RPC 传输绑定前端。**S9-B 起是完整的 Task 生命周期**（`SendMessage` 建 Task、`GetTask`/`ListTasks`/`CancelTask` 读投影）**加 Agent Card 发现面**（`/.well-known/agent-card.json`、`/agents`、`GetExtendedAgentCard`）。它**默认不监听**（ADR-026 §D4）：app 装进 release、随节点启动，但 `listeners => []` 时不开任何端口。
 
 **配置**（`config/sys.config.src`，出厂值）：
 
@@ -161,6 +161,12 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
   {max_connections, 1024},
   {request_timeout_ms, 30000},
   {supported_versions, [<<"1.0">>]},
+  {task_reliability, fsync},             % Task 事件的可靠性档（ADR-025 §D4）
+  {task_shards, undefined},              % undefined => schedulers_online
+  {task_timeout_ms, 30000},
+  {task_auto_complete, true},            % 内建 echo agent 同步跑完；外部执行器设 false
+  {agent_cards, []},                     % boot 种子卡（写 broker_meta.agent_card）
+  {agent_card_max_age, 60},              % Cache-Control: max-age
   {sse_max_event_bytes, 1048576},        % S9-C 才接到方法
   {sse_heartbeat_ms, 15000}
 ]}.
@@ -168,10 +174,11 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 
 **启用顺序**：
 
-1. 在 `broker_security.users` 里给调用方建一条带 `token` 的用户记录（`{<<"agent">>, #{token => <<"...">>, tenant_id => <<"t0">>}}`）——A2A 只接受 `broker_user` 里的**不透明 bearer token**，不验 JWT、不取 JWKS。
-2. 如需按主体限制，配 `broker_security.acl` 的 `publish` 规则（S9-A 的 destination 固定为 `$a2a/task/echo`；ACL 拒绝回裸 `403`）。
-3. 把 `listeners` 改成 `[#{port => 8081, ref => {a2a, 8081}, num_acceptors => 10, max_connections => 1024}]`（`ip` 默认 `{127,0,0,1}`）再重启。
-4. 探活：`curl -sS http://127.0.0.1:8081/health` → `{"status":"ok"}`，不需要凭据。
+1. 在 `broker_security.users` 里给调用方建一条带 `token` 的用户记录（`{<<"agent">>, #{token => <<"...">>, tenant_id => <<"t1">>}}`）——A2A 只接受 `broker_user` 里的**不透明 bearer token**，不验 JWT、不取 JWKS。**租户决定可见范围**：t1 的调用方看不到 t2 的 Task 与 Agent Card。
+2. 如需按主体限制，配 `broker_security.acl` 的 `publish`（`SendMessage`/`CancelTask`）与 `subscribe`（`GetTask`/`ListTasks`/`GetExtendedAgentCard`）规则——resource 是真实 destination `$a2a/task/<id>`（`SendMessage` 用 `$a2a/task/new`）；ACL 拒绝回裸 `403`。
+3. 要暴露 Agent Card，配 `agent_cards` 种子（或先让 `broker_meta.table_storage = disc_copies` 再用管理面/直接写表）。种子在 app 启动时幂等写入；内容不变不会 bump `version`（ETag 稳定）。
+4. 把 `listeners` 改成 `[#{port => 8081, ref => {a2a, 8081}, num_acceptors => 10, max_connections => 1024}]`（`ip` 默认 `{127,0,0,1}`）再重启。
+5. 探活：`curl -sS http://127.0.0.1:8081/health` → `{"status":"ok"}`，不需要凭据。
 
 **`require_auth => false` 只在回环绑定下允许**：boot 时校验所有 listener 的 `ip`，非回环直接 `{error, {insecure_listener, Port, Ip}}`，整个 app 起不来。这是刻意的——与其起一个无认证的任务 API，不如让节点起不来。
 
@@ -183,12 +190,16 @@ curl -sS -X POST http://127.0.0.1:8081/ \
   -H 'A2A-Version: 1.0' \
   -H 'Authorization: Bearer <token>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
-        "messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}}'
+        "messageId":"m1","role":"ROLE_USER","contextId":"ctx-1",
+        "parts":[{"text":"hi"}]}}}'
 ```
+
+返回 `result.task`（含 `id`/`contextId`/`status.state`/`history`）。`task_auto_complete=true` 时 `status.state` 直接是 `TASK_STATE_COMPLETED`。
 
 - `A2A-Version` **必须带**：缺失时按 `0.3` 读入，而服务端只声明支持 `1.0`，所以缺失会回 `-32009`（HTTP 400）。这是 spec 要求客户端带版本头的直接结果。
 - `Content-Type` 必须是 `application/json` 或 `application/a2a+json`，否则 `415`。
 - 请求体上限 = `min(max_body_bytes, broker_security.limits.max_message_bytes)`；`Content-Length` 超限时**不读体**直接 `413` + `Connection: close`。
+- **Agent Card 发现端点不需要 `A2A-Version`**：`GET /.well-known/agent-card.json` 与 `GET /agents` 走独立的 GET 路由（浏览器/缓存不会带版本头）。它们也不需要凭据，但**匿名身份是默认租户**（`broker_security.default_tenant`，默认 `t0`）——「匿名可读」不等于"跨租户可读"。
 
 **排查**：
 
@@ -196,8 +207,15 @@ curl -sS -X POST http://127.0.0.1:8081/ \
 - 全部请求 `401`：`Authorization: Bearer` 的 token 与 `broker_security.users` 里的 `token` 不一致，或用户表为空（用户表为空时任何凭据都失败）。
 - 全部请求 `-32009`：客户端没带 `A2A-Version: 1.0`（或带了 `2.0`）。
 - `SendMessage` 回 `-32602`：`params.message` 缺 `messageId`/`role`/`parts`，或某个 Part 不是「恰好一个内容键」（`text`/`raw`/`url`/`data` 选一）。
-- `-32601`：S9-A 只实现 `SendMessage`；其余方法要等 S9-B/S9-C。
-- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.14。
+- `GetTask` 回 `404` + `-32001`：Task id 不存在，**或属于别的租户**（两者故意同码，不暴露存在性）。
+- `CancelTask` 回 `400` + `-32002`：Task 已进入终态（`COMPLETED`/`FAILED`/`CANCELED`/`REJECTED`），终态不可变。
+- `GetExtendedAgentCard` 回 `400` + `-32007`：该卡没有 `extended_card`。
+- `GET /.well-known/agent-card.json` 回 `404 {"error":"agent_card_not_found"}`：当前租户下没有 active 卡。**匿名请求看的是 `default_tenant`**，所以「配了卡但匿名拿不到」通常是卡配在 t1 而匿名是 t0。
+- Agent Card 改了但客户端还拿旧的：`If-None-Match` 命中会回 `304`；ETag 由 `version` + 内容哈希组成，所以只有**真改**才会变。`ram_copies` 下重启会让 `version` 从头开始。
+- 重启后任务"没了"：先确认 `broker_queue` 的 WAL 目录是同一个（`broker_storage.data_dir`），再看日志里 `a2a_recovery_failed`。A2A 的投影完全来自日志，日志换了目录就等于换了一个节点。
+- 重启后任务变 `FAILED` 且带 `history_lost`：创建事件已被 retention 回收。调大 `broker_storage.retention` 或按 §5.1 的估算预留容量。
+- `-32601`：`SendStreamingMessage`/`SubscribeToTask`/Push config 三件套还没实现（S9-C）。
+- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.14（S9-A）与 §4.15（S9-B）。
 
 
 
@@ -335,13 +353,36 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 - 数据目录必须在 release 树外、ext4（tmpfs/ramfs 被存储层拒绝）。
 - 目录布局与恢复算法见 `docs/storage-and-recovery.md`。
 
-**控制面持久性（必须显式配置）**：`broker_meta` 的 11 张控制面表（用户、ACL、schema 版本、outbox）默认建为 **`ram_copies`**——`sys.config.src` 没有覆盖 `table_storage`，代码默认即 `ram_copies`，此时节点重启**全部丢失**（`maybe_set_dir` 也只在 `disc_copies` 时设置 `mnesia.dir`）。ADR-021 §D1 要求生产配置：
+**控制面持久性（必须显式配置）**：`broker_meta` 的 12 张控制面表（用户、ACL、schema 版本、outbox、Agent Card）默认建为 **`ram_copies`**——`sys.config.src` 没有覆盖 `table_storage`，代码默认即 `ram_copies`，此时节点重启**全部丢失**（`maybe_set_dir` 也只在 `disc_copies` 时设置 `mnesia.dir`）。ADR-021 §D1 要求生产配置：
 
 ```erlang
 {broker_meta, [{data_dir, "<abs>/data/mnesia"}, {table_storage, disc_copies}]}
 ```
 
-未设置时请按「重启后用户/ACL 需重新建立」理解现状。
+未设置时请按「重启后用户/ACL/Agent Card 需重新建立」理解现状。若代理卡来自 `broker_proto_a2a.agent_cards` 种子，则重启后会被重新写回（但 `version` 会从 1 重新开始，客户端缓存的 ETag 因此失效一次）；管理面写入的卡在 `ram_copies` 下会丢失——这正是 `disc_copies` 要解决的问题。
+
+---
+
+## 5.1 A2A Task 数据的量与保留（S9-B）
+
+**每个 Task 写 4 条事件**（`task` 创建快照 / `status_update` WORKING / 一条 `message` / `status_update` 终态）。`task_auto_complete=false` 时创建只有 1 条（`task`），取消再加 1 条（`status_update` CANCELED）。事件是**普通消息**，落在 `$a2a/task/<TaskId>`，因此：
+
+| 关注点 | 事实 |
+|---|---|
+| 存储位置 | 与 MQTT 消息同一批分区、同一套 WAL 段；没有单独的 A2A 数据目录 |
+| retention | 完全由 `broker_storage.retention`（`max_bytes` / `max_age_ms`）决定，**没有 A2A 专用保留策略**。按 §9 的同一公式估算 |
+| 容量估算 | `每任务字节 ≈ 4 × (payload + ~200 B 消息头)`；一个 1 KiB 回包的任务约 5 KiB。100 万任务 ≈ 5 GB，需按 `max_bytes` 预留 |
+| 投影 | 在 shard 的 ETS 里（Task 数 × 约 1–2 KiB，含 history）。随 retention 一起被约束——创建事件被 GC 后，下次 boot replay 会把该 Task 判为 `history_lost` 并补 `FAILED` |
+| 重启成本 | boot 全量重放扫全部分区（S9-B 的正确性基线）。节点上有 N GB 日志时启动时间是分钟级，**不是秒级**；`task_checkpoint_dir` 相关 env 已声明但当前不读（S9-F 演进位） |
+| 删除 | 没有单独的"删任务"接口：靠 retention 覆盖。删除 `$a2a/` 前缀数据只能走运维侧的 retention 配置 |
+
+**告警占位（S9-F 落地）**：S9-B 没有新增 `broker_metrics` 键——`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt` 三个计数器推迟到 S9-F 统一动冻结键集时一并加。当前这些事件只进日志，运维侧按下面的日志特征盯：
+
+| 现象 | 日志特征 | 含义 / 处置 |
+|---|---|---|
+| Task 被补成 `FAILED` | `history_lost`（`a2a_task_projection` / `a2a_task_recovery`） | 创建事件被 retention GC 掉了。要么调大 `max_bytes`/`max_age_ms`，要么接受"客户端应尽早读终态" |
+| 投影与日志不一致的嫌疑 | `a2a_task_recovery` 的重放耗时异常增长 | 日志变大而 checkpoint 未做（S9-F）；短期靠增加 `task_shards` 分摊，长期等 checkpoint |
+| 状态机拒绝 | `a2a_state_violation` 语义的日志行（`illegal_transition`） | 客户端在终态上重发/重取消；属客户端错误，`-32002`/`-32004` 是正常答复，不是故障 |
 
 ---
 

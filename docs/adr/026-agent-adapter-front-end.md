@@ -171,3 +171,25 @@ S9-A/S9-B/S9-D/S9-E 的 Gate 证据必须覆盖：
 ## 冻结后补充
 
 （暂无。S9-A 起若发现本 ADR 与实现冲突，按项目惯例在此追加批注，不改冻结正文。）
+
+### 落地批注（S9-B，2026-11-12）
+
+本节只记录**实现与冻结正文的差异/细化**，D1~D8 正文一字未改。代码见 `apps/broker_meta/src/broker_meta.erl`、`apps/broker_proto_a2a/src/a2a_card.erl`、`a2a_rpc.erl`；证据见 `docs/protocol-compatibility.md` §4.15。
+
+| 决策 | 落地情况 | 差异 |
+|---|---|---|
+| D3 表形状 `{agent_card, agent_ref, tenant_id, version, status, card, extended_card, updated_at}` | 完全照做：`tables/0` 第 12 表逐列一致，主键 `{TenantId, AgentId}`，`status ∈ active | disabled`，`version` 单调 | 无 |
+| D3 读 `broker_meta:get/2`、`all/1` | 落地为**四个具名 helper**，不复用 `get/2`/`all/1`（它们是控制面的通用入口，会让 A2A 的形状泄漏到调用方）：`put_agent_card/1`（唯一写入口，`/1` 因为 card 自带 tenant）、`get_agent_card/2`、`delete_agent_card/2`、`agent_cards/1` | 命名与计划不同（计划写的是 `get_agent_card/2` + `all/1` 组合），但**语义一致且更窄**；读路径一律带 tenant 是租户隔离的必要条件 |
+| D3 `version` 单调递增是 ETag 来源 | 照做，且**并发安全**：`put_agent_card/1` 在**同一 `mnesia:transaction`** 里 `read(..., write)` 取旧版本再 `+1` 写入，两个并发注册不会都赢（`broker_meta_SUITE` 的 `agent_card_registration_is_serialized` 用并发写验证 `version` 从 1..10 无缺口） | 计划里没有明说事务边界；落地把它写进注释与用例，避免后来者拆成「先读后写」 |
+| D3 ETag = `version` + 内容哈希；`If-None-Match` → 304；`Cache-Control: max-age=60` | 照做：`"<version>-<base64url(sha256(card))[:12]>"`；`matches_etag/2` 处理逗号分隔列表、`W/` 弱前缀与 `*`；`agent_card_max_age` 可配（默认 60） | 无。混入内容哈希的理由是「手改表行也能失效缓存」，已写进代码注释 |
+| D3 catalog 过滤在 adapter 内做，`page_size` 默认 50 上限 100 | 照做，落在 `GET /agents`：`skill`（匹配 `skill.id` / `skill.name` / `skill.tags` 成员）、`tag`（`skill.tags` 成员）、`provider`（`provider.organization`）、`capability`（`capabilities` 里该键为 `true`，或命中 `capabilities.extensions[].uri`）四类过滤 + 分页 | **`/agents` 是项目私有接口**：A2A spec 未定义注册/检索 API（R-D4 悬置），故在文档与代码注释里显式标注「不是 spec 的一部分」，避免被当成标准端点 |
+| D3 写前校验必需字段；boot 期配置种子 | 照做：`a2a_card:validate/1` 校验 `name`/`description`/`supportedInterfaces`/`version`/`capabilities`/`defaultInputModes`/`defaultOutputModes`/`skills`；`agent_cards` env 在 app 启动时 `a2a_card:seed/0` 幂等写入，**内容不变不 bump version**（ETag 稳定），格式不合法则启动失败 | 管理 API 的完整 CRUD 未做（计划写 S9-F）：当前写入路径只有「boot 种子」与「直接操作 Mnesia/管理面脚本」 |
+| D3 S9-B **不**加 ETS 缓存 | 照做：每次读都是 Mnesia `dirty_read`；ETag 内容哈希每次重算（card 小，实测 25 条 curl 无压力） | 无 |
+| D4 端口：A2A `8081`、MCP `8082`、ACP 无端口；`listeners => []` 默认 | 照做：`broker_proto_a2a.listeners` 出厂 `[]`，CT 与两个 release 的默认配置都**不监听**；端口只在 `curl` 证据节点上临时起（18093），不动 8081/8082 | 无 |
+| D4 boot 顺序：listener 是 supervisor 最后一项 | **细化**：`broker_proto_a2a_sup` 的子进程顺序是 `a2a_task_registry` → listener。registry 必须在 listener 之前，否则第一个请求可能落到没有投影的节点上；registry 内部又是 N 个 shard → `a2a_task_recovery`（恢复最后跑，保证「投影 = 日志」在接请求前成立） | 计划只写了「registry + recovery 在 listener 之前」，落地明确为**两级顺序**（sup 级 + registry 级），并写进 `docs/architecture.md` §2.x 监督树表 |
+| D4 认证接线：`authenticate_conn/1` + `authorize/2` + `default_tenant/0`，不改 `broker_security` | 照做；`config/sys.config.src` 的 `{require_auth, []}` 与 `credential_capable/0` 白名单**一字未改** | 无。ACL 的 resource 是**真实 destination**（`SendMessage` → `$a2a/task/new`，其余用 `$a2a/task/<id>`），不是方法名；`Get*` 用 `subscribe`、`SendMessage`/`CancelTask` 用 `publish` |
+| D4 `require_auth=false` 只在回环绑定下允许 | 照做：boot 时校验所有 listener 的 `ip`，非回环直接 `{error, {insecure_listener, Port, Ip}}`，整个 app 起不来；CT 有 `anonymous_listener_on_wide_bind_is_refused` | 无 |
+| D4 401/403 语义 | 照做：无/错凭据 → `401` + `WWW-Authenticate`；ACL 拒绝 → **裸 `403`**（不带 JSON-RPC 信封）；跨租户 `GetTask` → **`404` + `-32001`**（不泄露存在性） | 计划没写跨租户用哪个码；落地选「与不存在同码」，与收敛报告 §3 的「id 不是存在性预言机」一致 |
+| D5 / D6 / D7 / D8 | **本阶段未落地**，分别在 S9-E（ACP）、S9-C（webhook/SSRF）、S9-C（SSE）、S9-D（MCP） | D8 的非目标边界（无 HTTP/2、无第三方 HTTP 框架、无 gRPC/REST 绑定、无 card 验签、无 OAuth AS）在 S9-B 一仍其旧：依赖面仍是 `ranch 2.3.0` + 内置 `ra 3.2.0` + OTP 28 `json` |
+
+**与 D3 计划文本的一处口径统一**：计划写「管理 API（S9-B）与 boot 期配置种子」都能写卡；落地只有 boot 种子（+ 直接操作 Mnesia）。管理面 CRUD 的公开 HTTP 接口未做，`docs/roadmap.md` §11.1 的 S9-F 行已记。
