@@ -67,17 +67,19 @@ apps/broker_proto_agent_rpc/
 
 ### 1b. `agent_rpc_json`：信封与校验
 
+> **落地后修正（2026-11-11）**：实际导出为 `decode/1, encode/1, request/1, response_ok/2, response_error/3, response_error/4`——`notification/2` 未实现（S9 全部方法都是请求-响应），`response_error/4` 额外提供显式 message 覆盖。`request/1` 返回 `#{id, method, params}`，不带 `jsonrpc` 键（值恒为 `"2.0"`，已在入口校验，回传无意义）。
+
 ```erlang
--export([decode/1, encode/1, request/1, response_ok/2, response_error/3,
-         notification/2]).
--export_type([envelope/0, error/0]).
+-export([decode/1, encode/1, request/1, response_ok/2,
+         response_error/3, response_error/4]).
+-export_type([request/0]).
 ```
 
 语义（逐条对齐 JSON-RPC 2.0 + A2A §9.3）：
 
 | 输入 | 结果 |
 |---|---|
-| 合法对象 `{"jsonrpc":"2.0","id":I,"method":M,"params":P}` | `{ok, #{jsonrpc := <<"2.0">>, id := I, method := M, params := P}}` |
+| 合法对象 `{"jsonrpc":"2.0","id":I,"method":M,"params":P}` | `{ok, #{id := I, method := M, params := P}}` |
 | `params` 缺失 | `params => #{}`（统一成 map，方法自己校验） |
 | `params` 是数组 | `{ok, ...}` 保留 `params => List`，由方法决定接受与否 |
 | `jsonrpc` 不是 `"2.0"` / 缺失 | `{error, invalid_request}` |
@@ -93,8 +95,10 @@ apps/broker_proto_agent_rpc/
 
 ### 1c. `agent_rpc_error`：错误码与 HTTP 映射
 
+> **落地后修正（2026-11-11）**：实际导出为 `code/1, http_status/1, message/1, jsonrpc_error/2, jsonrpc_error/3`（无 `known/1`）。表中新增 `unsupported_media_type`（415，非 JSON-RPC）。`http_status/1` 对**表外**原子回 500 而非 400——未知原因属于编程错误，不能伪装成客户端错误。
+
 ```erlang
--export([code/1, http_status/1, message/1, known/1, jsonrpc_error/2]).
+-export([code/1, http_status/1, message/1, jsonrpc_error/2, jsonrpc_error/3]).
 ```
 
 | 原子 | JSON-RPC code | HTTP | 说明 |
@@ -113,35 +117,41 @@ apps/broker_proto_agent_rpc/
 | `extended_agent_card_not_configured` | `-32007` | 400 | |
 | `extension_support_required` | `-32008` | 400 | |
 | `version_not_supported` | `-32009` | 400 | |
-| `unauthorized` / `forbidden` / `payload_too_large` | —（非 JSON-RPC） | 401/403/413 | 传输层直接回 HTTP，不包 JSON-RPC 信封 |
+| `unauthorized` / `forbidden` / `payload_too_large` / `unsupported_media_type` | —（非 JSON-RPC） | 401/403/413/415 | 传输层直接回 HTTP，不包 JSON-RPC 信封 |
+| 表外原子 | `-32603` | 500 | 编程错误，不伪装成 4xx |
 
 **依据**：A2A §5.4 的映射表（`-32001`→404、`-32006`→500、其余 A2A 专用错误→400）；JSON-RPC 标准码的 HTTP 映射按 A2A §9.5 的「方法级错误仍 200」处理。
 
 ### 1d. `agent_rpc_version`：`A2A-Version` 协商
 
+> **落地后修正（2026-11-11）**：实际导出为 `parse/1, negotiate/2, to_binary/1`。支持版本列表配置为二进制字符串 `[<<"1.0">>]`（`sys.config` 里无需 Erlang 元组语法），`negotiate/2` 内部解析，解析失败的条目跳过而不崩请求路径。
+
 ```erlang
--export([parse/1, negotiate/2]).
+-export([parse/1, negotiate/2, to_binary/1]).
 %% parse(undefined) -> {ok, {0,3}}      ; 缺失/空按 0.3（proto/spec 原文）
 %% parse(<<"1.0">>) -> {ok, {1,0}}
 %% parse(<<"1">>)   -> {error, version_not_supported}   ; 只接受 Major.Minor
-%% negotiate({1,0}, [{1,0}]) -> ok
-%% negotiate({1,0}, [{0,3}]) -> {error, version_not_supported}
+%% negotiate({1,0}, [<<"1.0">>]) -> ok
+%% negotiate({0,3}, [<<"1.0">>]) -> {error, version_not_supported}
 ```
 
 - 只做**头字段**形式，`?A2A-Version=1.0` 这类 query 参数形式**不实现**（收敛报告 §13 第 3 条）。
-- 支持版本列表来自 adapter env（默认 `[{1,0}, {0,3}]`），但 S9-A 只**声明**支持 `1.0`；0.3 只用于「缺失头」的兼容读法，不承诺 0.3 的全部字段。
+- 支持版本列表来自 adapter env（默认 `[<<"1.0">>]`），S9-A 只**声明**支持 `1.0`；0.3 只用于「缺失头」的兼容读法，不承诺 0.3 的全部字段。
 - 返回 `-32009` 时 HTTP 400，`data` 带 `supported: ["1.0"]`（字符串数组，非枚举）。
 
 ### 1e. `agent_rpc_http`：HTTP/1.1 请求解析（传输无关）
 
+> **落地后修正（2026-11-11）**：签名落地为 `read_request(Transport, Socket, Limits)`（直接收 ranch transport 模块 + socket，内部走 `Transport:recv/3` + `Transport:setopts/2`，不注入 recv fun）；额外导出 `content_type/1`、`keep_alive/2`、`normalize_headers/1`。库仍不拥有 accept 循环，socket 生命周期由 adapter 决定。
+
 不重新实现 socket 循环，只提供「从 `{packet, http_bin}` 读到的片段组装成请求」的纯函数 + 响应序列化，供 `a2a_listener` 与后续 MCP 前端共用：
 
 ```erlang
--export([read_request/2, header/2, accepts_json/1, keep_alive/1,
-         response/3, response/4, chunk/1, last_chunk/0]).
+-export([read_request/3, header/2, content_type/1, accepts_json/1,
+         keep_alive/1, keep_alive/2, response/3, response/4,
+         chunk/1, last_chunk/0, normalize_headers/1]).
 ```
 
-- `read_request(RecvFun, Limits)`：`RecvFun(0, Timeout)` 由 adapter 注入（内层是 `Transport:recv/3`），因此库本身不持有 socket。
+- `read_request(Transport, Socket, Limits)`：`Limits` 键为 `body_bytes`（默认 1 MiB）与 `request_timeout_ms`（默认 30 s）；库本身不持有 accept 循环。
 - 必需规则：
   - `Content-Length` 优先；`Transfer-Encoding: chunked` 支持（S9-A 只用于读请求体，且有 `max_body_bytes` 上限）。
   - `Expect: 100-continue` → 先回 `HTTP/1.1 100 Continue\r\n\r\n` 再读体。
@@ -167,8 +177,10 @@ apps/broker_proto_agent_rpc/
 
 ### 1g. `agent_rpc_auth`：凭据提取与 `broker_security` 接线
 
+> **落地后修正（2026-11-11）**：额外导出 `anonymous/0`（`require_auth=false` 时的合成身份，principal `<<"anonymous">>` + `broker_security:default_tenant()`）。Bearer scheme 大小写不敏感。
+
 ```erlang
--export([credential/1, authenticate/1, authorize/3, challenge/1]).
+-export([credential/1, authenticate/1, authorize/3, anonymous/0, challenge/0]).
 ```
 
 - `credential(Headers)`：
@@ -183,14 +195,16 @@ apps/broker_proto_agent_rpc/
 
 ### 1h. 套件
 
-| 套件 | 覆盖 |
-|---|---|
-| `agent_rpc_json_SUITE` | 合法/非法信封 14 例、batch 拒绝、params 数组与缺失、id 类型、encode 往返 |
-| `agent_rpc_error_SUITE` | 14 个错误码的 code/HTTP/message 三列一致；未知原子回 `internal_error` |
-| `agent_rpc_version_SUITE` | 缺失/空/`1.0`/`1`/`1.0.0`/`2.0`/非 ASCII；协商成功/失败 |
-| `agent_rpc_http_SUITE` | 纯函数级：CL/chunked/100-continue/超限/重复头/keep-alive 判定；`response/3` 字节 |
-| `agent_rpc_sse_SUITE` | `data:` 帧、event 名、comment/心跳、chunk 包装、1 MiB 边界 |
-| `agent_rpc_auth_SUITE` | Bearer / X-API-Key / 同时存在 / 缺失；真实 `broker_security` 用户表 401/403 |
+> **落地回填（2026-11-11）**：用例数由各套件 `all/0` 实数得出（全部无 `groups/0`），合计 **69 例**。
+
+| 套件 | 用例数 | 覆盖 |
+|---|---|---|
+| `agent_rpc_json_SUITE` | 16 | 合法/非法信封、batch 拒绝、params 数组/缺失/标量、id 类型、`response_ok`/`response_error` 形状与 `data` 省略 |
+| `agent_rpc_error_SUITE` | 8 | JSON-RPC 五码 + A2A 九码、HTTP 状态（含 `-32001`→404、`-32006`→500、方法级 200）、传输层四码无 JSON-RPC code、表外原子回 500 |
+| `agent_rpc_version_SUITE` | 12 | 缺失/空/`1.0`/`0.3`/`12.34`/`1`/`1.0.0`/非数字/负数/空白；协商成功/失败/跳过坏条目；`to_binary/1` |
+| `agent_rpc_http_SUITE` | 13 | 真实 socket：CL 体、chunked 体、`100-continue`、CL 超限（不读体）、chunked 超限、`Connection: close`、重复头逗号合并、方法与路径归一、响应字节、keep-alive 判定、`accepts_json/1`、chunked 响应不加 CL |
+| `agent_rpc_sse_SUITE` | 7 | `data:` 帧、命名帧、comment、心跳、头、chunk 包装、末块 |
+| `agent_rpc_auth_SUITE` | 13 | Bearer（scheme 大小写不敏感）、`X-API-Key`、两者一致/冲突、缺失；真实 `broker_security` 用户表的认证成功/失败、ACL 放行与跨租户拒绝、`anonymous/0`、挑战头 |
 
 **本 Task 不新建 listener，因此不占用任何端口。**
 
@@ -303,22 +317,26 @@ a2a_conn:loop(Socket, Transport, Opts).
 
 ### 2e. `a2a_listener_SUITE`（真实 socket，`port => 0`）
 
+> **落地后修正（2026-11-11）**：`version_missing_is_0_3` 与 `unknown_method` 两行的断言按实际严格行为修正——`A2A-Version` 缺失按 `0.3` **读**，但服务端只声明支持 `1.0`，因此回 `-32009`（HTTP 400），而不是 200；`unknown_method` 实际请求的是 `GetTask`。用例名同步改为 `version_missing_is_read_as_0_3`。用例数由 `all/0` 实数得出：**16 例**。
+
 | 用例 | 断言 |
 |---|---|
-| `echo_roundtrip` | `POST /` + 合法 `SendMessage` + Bearer → 200，`result.message.role = "ROLE_AGENT"`，`parts` 原样，`messageId` 与请求不同 |
-| `version_missing_is_0_3` | 不带头 → 仍走 0.3 读法，200（不报错） |
+| `echo_roundtrip` | `POST /` + 合法 `SendMessage` + Bearer + `A2A-Version: 1.0` → 200，`result.message.role = "ROLE_AGENT"`，`parts` 原样，`messageId` 与请求不同 |
+| `version_missing_is_read_as_0_3` | 不带头 → 按 0.3 读入，但 0.3 不在 `supported_versions` → 400，`error.code = -32009` |
 | `version_unsupported` | `A2A-Version: 2.0` → 400，`error.code = -32009` |
 | `no_credential_401` | 无 `Authorization` → 401 + `WWW-Authenticate: Bearer` |
-| `bad_credential_401` | 错 token → 401，错误体与「无凭据」不可区分 |
+| `bad_credential_401` | 错 token → 401，错误体与「无凭据」不可区分（空体） |
 | `acl_denied_403` | 用户存在但 ACL 拒绝 `publish` → 403 |
-| `unknown_method` | `method: "Nope"` → 200 + `-32601` |
+| `unknown_method` | `method: "GetTask"` → 200 + `-32601`（S9-A 只有 `SendMessage`） |
 | `parse_error` | 非 JSON 体 → 400 + `-32700`，`id = null` |
-| `invalid_params` | `message` 缺 `parts` → `-32602` |
+| `invalid_params` | `message` 缺 `parts` → 200 + `-32602` |
 | `payload_too_large_413` | `Content-Length` > 上限 → 413 + `Connection: close`，**不读体** |
+| `unsupported_media_type_415` | `Content-Type: text/plain` → 415 |
 | `keep_alive_two_requests` | 同一 socket 连发两个请求，两次都 200 |
 | `connection_close_honored` | `Connection: close` 后服务端关连接 |
 | `health` | `GET /health` → 200 `{"status":"ok"}`，不需要认证 |
-| `require_auth_false_loopback_only` | 非回环 + `require_auth=false` → `application:start` 失败（boot 校验） |
+| `anonymous_listener_on_loopback_is_allowed` | 回环 + `require_auth=false` → 正常启动 |
+| `anonymous_listener_on_wide_bind_is_refused` | `ip => {0,0,0,0}` + `require_auth=false` → `application:start` 失败（boot 校验） |
 
 **真实客户端证据**：除 CT 外，用 `curl` 落一条命令与输出到 `docs/protocol-compatibility.md` 的 S9 草稿段（S9-F 再整理成矩阵行）。
 
@@ -326,41 +344,46 @@ a2a_conn:loop(Socket, Transport, Opts).
 
 ## Task 3 — 全量验证与文档回填
 
-### 3a. 门禁
+### 3a. 门禁（2026-11-11 实测结果）
 
-```bash
-export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"
-rm -rf _build/test/extras
-rebar3 ct
-rebar3 dialyzer
-rebar3 xref
-rebar3 release
-rebar3 as quic release
-```
+| 命令 | 结果 |
+|---|---|
+| `rebar3 ct`（全量，`_build/test/extras` 先删） | **All 908 tests passed** |
+| `rebar3 dialyzer` | 无告警（过程中修掉 `a2a_conn` 一处 `{error,_}` 不可达模式——`ranch:handshake/1` 只返回 `{ok,_} \| {continue,_}`） |
+| `rebar3 xref` | 仅既有 `is-unused-export`（`broker_storage` / `broker_ws` / `broker_proto_pulsar`）；两个新 app 零告警 |
+| `rebar3 release` | 成功，`lib/` 含 `broker_proto_agent_rpc-0.1.0` + `broker_proto_a2a-0.1.0` |
+| `rebar3 as quic release` | 成功，同上两个 app 也在 |
 
-### 3b. 用例数回填（强制）
+### 3b. 用例数（实测）
 
-```bash
-export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"
-erl -noshell -pa _build/test/lib/*/ebin -eval '
-  Suites = [agent_rpc_json_SUITE, agent_rpc_error_SUITE, agent_rpc_version_SUITE,
-            agent_rpc_http_SUITE, agent_rpc_sse_SUITE, agent_rpc_auth_SUITE,
-            a2a_listener_SUITE],
-  [io:format("~s ~p~n", [S, length(S:all())]) || S <- Suites],
-  halt().'
-```
+`all/0` 逐套件实数（均无 `groups/0`）：
 
-基线 823 + 本阶段新增，两个数都写，并区分「基线」与「S9-A 新增」。
+| 套件 | 用例 |
+|---|---|
+| `agent_rpc_json_SUITE` | 16 |
+| `agent_rpc_error_SUITE` | 8 |
+| `agent_rpc_version_SUITE` | 12 |
+| `agent_rpc_http_SUITE` | 13 |
+| `agent_rpc_sse_SUITE` | 7 |
+| `agent_rpc_auth_SUITE` | 13 |
+| `a2a_listener_SUITE` | 16 |
+| **S9-A 新增合计** | **85** |
 
-### 3c. 文档同步（本阶段只动 3 个文件）
+- **基线（S9-0 之后）**：823 例 / 52 套件
+- **当前**：908 例 / 59 套件
+- 差值 = 新增 7 个套件共 85 例；既有 823 例零回归
+
+### 3c. 文档同步（实际改动）
 
 | 文件 | 变更 |
 |---|---|
-| `docs/architecture.md` | app 列表加 `broker_proto_agent_rpc` / `broker_proto_a2a`；boot 顺序；端口表加 8081（默认不监听） |
-| `docs/operations.md` | 依赖图；`broker_proto_a2a` 的 env 与「默认 `listeners => []`」；`require_auth` 默认 `true` |
-| `progress.md` | S9-A 进展 + 用例数 + 下一步（S9-B） |
+| `docs/architecture.md` | app 列表 + boot 顺序 + 端口表（18091 仅证据端口，默认不监听） |
+| `docs/operations.md` | 依赖图 + `broker_proto_a2a` env 表 + `require_auth` 默认 `true` |
+| `progress.md` | S9-A 进展、用例数、下一步（S9-B） |
+| `docs/roadmap.md` | §11.1 S9-A 行改「✅ 已交付」并回填证据 |
+| `docs/protocol-compatibility.md` | 新增 S9-A 段：11 条 `curl` 实测（含 `403`） |
 
-`docs/roadmap.md` 的 S9-A 行改「✅ 已交付」并回填证据；`docs/security.md` §12、`README.md`、ADR **不动**（S9-F 统一收口，避免把计划读成现状）。
+`docs/security.md` §12、`README.md`、ADR **未动**（S9-F 统一收口，避免把计划读成现状）。
 
 ### 3d. 提交
 
@@ -373,16 +396,16 @@ git commit -m "docs(s9-a): record agent rpc and a2a listener in architecture and
 
 ## 完成判据（Definition of Done）
 
-- [ ] `broker_proto_agent_rpc` 纯库建立：无 supervisor、无 listener、无自有 env；6 个模块 + 6 个套件通过
-- [ ] `agent_rpc_json` 拒绝 batch，错误码严格按 JSON-RPC 2.0；`agent_rpc_error` 的 code/HTTP/message 三列与 A2A §5.4 一致
-- [ ] `agent_rpc_version` 缺失按 `0.3`，不支持回 `-32009`（只实现头形式）
-- [ ] `agent_rpc_http` 覆盖 CL/chunked/100-continue/超限/重复头/keep-alive 纯函数级用例
-- [ ] `agent_rpc_sse` 帧格式与 chunk 包装通过，未接业务流
-- [ ] `broker_proto_a2a` 起 listener，`SendMessage` echo 返回符合 `SendMessageResponse.message` 形状
-- [ ] `401`/`403`/`413`/`415`/`-32009`/`-32601`/`-32602`/`-32700` 各一条用例
-- [ ] `require_auth=false` + 非回环 → 拒绝启动
-- [ ] `rebar3 ct` 总例数 = 823 + 新增，零 FAILED；dialyzer/xref 干净；两种 release 都含新 app
-- [ ] `curl` 证据落盘；`architecture.md` / `operations.md` / `progress.md` / `roadmap.md` 回填
+- [x] `broker_proto_agent_rpc` 纯库建立：无 supervisor、无 listener、无自有 env；6 个模块 + 6 个套件（69 例）通过
+- [x] `agent_rpc_json` 拒绝 batch，错误码严格按 JSON-RPC 2.0；`agent_rpc_error` 的 code/HTTP/message 三列与 A2A §5.4 一致
+- [x] `agent_rpc_version` 缺失按 `0.3` 读、不支持回 `-32009`（只实现头形式）
+- [x] `agent_rpc_http` 覆盖 CL/chunked/100-continue/超限/重复头/keep-alive（真实 socket）
+- [x] `agent_rpc_sse` 帧格式与 chunk 包装通过，未接业务流
+- [x] `broker_proto_a2a` 起 listener，`SendMessage` echo 返回符合 `SendMessageResponse.message` 形状
+- [x] `401`/`403`/`413`/`415`/`-32009`/`-32601`/`-32602`/`-32700` 各一条用例
+- [x] `require_auth=false` + 非回环 → 拒绝启动
+- [x] `rebar3 ct` 总例数 908 = 823 + 85，零 FAILED；dialyzer/xref 干净；两种 release 都含新 app
+- [x] `curl` 证据落盘（11 条）；`architecture.md` / `operations.md` / `progress.md` / `roadmap.md` 回填
 
 ## 风险与对策
 
@@ -393,6 +416,26 @@ git commit -m "docs(s9-a): record agent rpc and a2a listener in architecture and
 | ranch 2.3 的 `ranch:handshake/1` 时机 | `a2a_listener:start_link/3` 里 `spawn_link` 后由子进程 `handshake`，与 ranch 文档一致；CT 起真实 listener 验证 |
 | echo 方法被误读成「A2A 已实现」 | 文档与能力矩阵写「S9-A 只有 `SendMessage` echo，无 Task」；`GetTask` 等一律 `-32601` |
 | 默认 `require_auth=true` 影响既有部署 | 新 app 默认 `listeners => []`，不监听即无影响；既有 823 例不启动该 app |
+
+## 落地偏差记录（2026-11-11）
+
+实现过程中有 5 处与计划不同，均为**收窄或校正**，无一放宽安全边界：
+
+| # | 计划 | 落地 | 原因 |
+|---|---|---|---|
+| 1 | `version_missing_is_0_3` → 200 | 改名 `version_missing_is_read_as_0_3` → 400 + `-32009` | 缺失头按 0.3 读，但只声明支持 1.0，诚实做法是回 `-32009`；对 0.3 客户端回 1.0 形状的响才是错的 |
+| 2 | `agent_rpc_http:read_request/2`（注入 recv fun） | `read_request/3`（直接收 `Transport` + `Socket`） | 注入 fun 在测试与 adapter 两处都是同一实现，参数化 transport 模块更直白，且照样不拥有 accept 循环 |
+| 3 | 错误表外原子回 400 | 回 500 | 表外原子是编程错误，不能伪装成客户端错误 |
+| 4 | `socket_opts` 带 `{packet, http_bin}`、`{active, false}`、`{reuseaddr, true}` | 只留 `{port, _}`、`{ip, _}` + TLS | ranch 对 `socket_opts` 严格校验，三者都报 "unknown or invalid"；`packet`/`active` 由 `agent_rpc_http:read_request/3` 自己设置，`reuseaddr` 是 ranch listen 默认 |
+| 5 | `agent_rpc_json` 导出 `notification/2`、`agent_rpc_error` 导出 `known/1` | 均未实现 | S9 全是请求-响应方法，notification 无消费者；`known/1` 无调用点 |
+
+另：`a2a_conn` 的 `ranch:handshake/1` 分支按真实规格收窄为 `{ok, _}` / `{continue, _}`（后者 `handshake_cancel/1` 后退出），dialyzer 原报的 `{error, _}` 分支不可达已消除。
+
+## 证据快照
+
+证据节点：`erl -noshell -pa _build/default/lib/*/ebin -config <evidence sys.config>`，`broker_proto_a2a` 单 app + `listeners => [#{port => 18091}]`、`require_auth => true`、一个 `token` 用户 `agent-s9a`。数据目录指向 `/home/wanli/workspace/unified-mq-evidence-data`（ext4，release 树外），跑完即停、端口释放。
+
+完整 `curl` 输出见 [`docs/protocol-compatibility.md`](../protocol-compatibility.md) 的 S9-A 段（11 条：echo 200 / 无凭据 401 / 版本 2.0 与缺失均 `-32009` / `GetTask` `-32601` / 415 / 413 / `-32700` / health 200 / keep-alive 复用 / ACL 403）。
 
 ## 不在本阶段（明确留给后续阶段）
 

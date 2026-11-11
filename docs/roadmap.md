@@ -32,9 +32,11 @@ flowchart LR
     S6 --> S7[S7 身份统一与事件绑定]
     S7 --> S8[S8 MQTT 传输扩展]
     S8 --> S9[S9 Agent 互操作协议接入层]
+    S9 --> S10[S10 WebRTC 信令与 ICE 接入]
+    S10 --> S11[S11 协议候选池]
 ```
 
-S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。S9 承接 S8 之后新增 A2A / MCP / ACP 三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的承载与网关；**这是立项规划、未开工**，需求与计划见 §11 与 [`docs/design/s9-agent-protocols.md`](design/s9-agent-protocols.md)。
+S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。S9 承接 S8 之后新增 A2A / MCP / ACP 三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的承载与网关；**S9-0 已结项、S9-A（协议底座 + A2A JSON-RPC echo 前端）已交付（2026-11-11），S9-B~S9-F 未开工**，需求与计划见 §11 与 [`docs/design/s9-agent-protocols.md`](design/s9-agent-protocols.md)。S10 是更后一阶段的立项建议：调研 [`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server) 后，把 WebRTC 的**信令面（WSS 房间中继）与 ICE 面（STUN/TURN）**作为新的接入前端纳入规划，媒体面明确不做；**同为立项规划、未开工**，需求与计划见 §12 与 [`docs/design/s10-webrtc-signaling.md`](design/s10-webrtc-signaling.md)。S10 排在 S9 之后但不阻塞 S9，两者都复用 S6/S7 的身份表与前端经验。S11 是**协议候选池 / 筛选阶段**而非「14 个协议一起实现」：调研 14 个 Erlang 网络协议仓库（CoAP / LoRaWAN / STUN / DNS / mDNS / DNS-SD / DHT / beacon / SIP ×3 / MTProto Proxy / APNs），9 个 IoT/UDP 类深挖、5 个索引级，各写一份三段式立项稿；**同为立项规划、未开工**，总览与筛选结论见 §13 与 [`docs/design/s11-protocol-candidates.md`](design/s11-protocol-candidates.md)。S11 排在 S10 之后但不阻塞 S10；当前建议仅 CoAP 进入实现评审，其余按「归并 S9/S10 / 参考 / 明确不做」收口。
 
 ---
 
@@ -51,7 +53,9 @@ S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面�
 | **S6** | 生产化 | 安全 / 可观测 / 运维 / 容量 | 压测报告 + 故障演练 + 运维手册 |
 | **S7** | 身份统一与事件绑定 | 六协议共用身份表（已完成）+ 标准 CloudEvents Binding 逐字结论（已完成） | 租户来自用户记录 + 每个协议的 Binding 有明确结论 |
 | **S8** | MQTT 传输扩展 | MQTT-SN 1.2 / MQTT over QUIC / MQTT over WebSocket（三条复用同一 MQTT 引擎的传输） | 三种传输各有一份真实第三方客户端证据 + 能力矩阵与限制清单 |
-| **S9** | Agent 互操作协议接入层 | A2A 1.0.0 / MCP 2026-07-28 / ACP v1 三个 `broker_proto_*` adapter，以 A2A 为主线；复用统一消息内核、CloudEvents `ce-*` 通道、`broker_security` 身份表与 ACL | 三协议各一份真实第三方客户端证据 + 能力矩阵与限制清单；Task 状态机与终态不可变、认证与 SSRF 防护专项用例；既有 823/823 零回归（**立项规划，未开工，见 §11**） |
+| **S9** | Agent 互操作协议接入层 | A2A 1.0.0 / MCP 2026-07-28 / ACP v1 三个 `broker_proto_*` adapter，以 A2A 为主线；复用统一消息内核、CloudEvents `ce-*` 通道、`broker_security` 身份表与 ACL | 三协议各一份真实第三方客户端证据 + 能力矩阵与限制清单；Task 状态机与终态不可变、认证与 SSRF 防护专项用例；既有 908/908 零回归（**S9-0/S9-A 已交付，S9-B~S9-F 未开工，见 §11**） |
+| **S10** | WebRTC 信令与 ICE 接入 | `broker_proto_webrtc` 信令前端 + STUN/TURN ICE 组件；调研 [`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server)，复用 `broker_ws` / `broker_security` / 统一消息内核；**媒体面（SFU/MCU/转码）不做** | 浏览器 `RTCPeerConnection` + STUN/TURN 真实客户端证据 + 能力矩阵与限制清单；信令「瞬时转发、不落盘」由 ADR 冻结并有测试证明；跨房间/未知 peer 拒绝不崩溃、认证接身份表专项用例；既有 823/823 零回归（**立项规划，未开工，见 §12**） |
+| **S11** | 协议候选池（14 个 Erlang 协议仓库） | 9 深挖 + 5 索引级三段式立项稿 + 总览；筛选结论「立项 / 归并 / 参考 / 不做」由 ADR 冻结；**不写第二套消息内核、不替代 S4 Membership** | 14 个候选各有一份立项稿与明确结论；发现面 / DHT / SIP 三组完成统一裁决；经 Gate 通过的候选有真实第三方客户端证据 + 能力矩阵与限制清单；既有 823/823 零回归（**立项规划，未开工，见 §13**） |
 
 ---
 
@@ -399,7 +403,7 @@ S7 有两项交付：
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
 | S9-0 不确定性收敛 | ✅ 已收敛（2026-11-11，文档结项，无代码） | 《S9-0 收敛报告》+ [ADR-025](adr/025-a2a-task-log-mapping.md)（Task → 内核映射）+ [ADR-026](adr/026-agent-adapter-front-end.md)（前端/控制面/边界）；OQ-1~OQ-10 全部收敛 | 收敛报告 §0 结论速览、§2 协议事实、§14 S9-A 入口条件 |
-| S9-A 协议底座 | ⬜ 未开工 | JSON-RPC 2.0 + HTTP/SSE 前端 + 版本/能力协商 + 错误模型 + `broker_security` 接线；配置门控 | 单方法 echo + 协商 + `401`/`403`；既有 823/823 零回归 |
+| S9-A 协议底座 | ✅ 已交付（2026-11-11） | 新建 `broker_proto_agent_rpc`（纯库：JSON-RPC 2.0 信封 / 错误码表 / `A2A-Version` 协商 / HTTP/1.1 帧 / SSE 帧 / 凭据 helper）与 `broker_proto_a2a`（app + 监督树，**默认 `listeners => []` 零端口**）；`SendMessage` echo、认证/ACL/版本/限额/错误模型全跑通；`require_auth` 默认 `true`、`false` 只允许回环绑定 | **CT 85 例 / 7 套件**（`agent_rpc_*` 6 套件 + `a2a_listener_SUITE` 16，全部 `port => 0`）；全量 **908/908、59 套件**（基线 823/52 零回归）；`dialyzer` 0 warning、`xref` 仅既有 unused-export；两种 release 均含新 app；`curl` **11 条**真实请求/响应见 [`docs/protocol-compatibility.md`](protocol-compatibility.md) §4.14 |
 | S9-B A2A 核心 | ⬜ 未开工 | Agent Card + 发现（well-known / catalog / 缓存）+ Task 状态机 + `SendMessage`/`GetTask`/`CancelTask` + `broker_message`/CloudEvents 映射 | 官方 A2A SDK 真实客户端跑通 Task 全生命周期；终态不可变 + 崩溃恢复 |
 | S9-C 流式与异步 | ⬜ 未开工 | SSE 流 + `SubscribeToTask` + Push Notification Config + 出站 webhook + SSRF/签名/防重放 + 重试/DLQ/TTL | 断线重连 + webhook 端到端；SSRF 拒绝 / 伪造签名拒绝专项用例 |
 | S9-D MCP 承载 | ⬜ 未开工 | Streamable HTTP / stdio 前端 + `initialize`/`server/discover` + 原语透传（不解释工具语义） | MCP Inspector / 官方 SDK 真实客户端兼容矩阵 |
@@ -412,18 +416,91 @@ S7 有两项交付：
 - [ ] Task 状态机与终态不可变有自动化测试，含崩溃恢复与可靠性等级逐档证明
 - [ ] 认证接六协议统一身份表；`401`/`403` 与 ACL 越权专项用例通过
 - [ ] Push Notification 的 SSRF 防护、签名验真、防重放专项用例通过
-- [ ] 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功
+- [ ] 既有 `rebar3 ct` 零回归（**S9-A 后基线 908/908、59 套件**）；dialyzer / xref 干净；`rebar3 release` 装配成功
 - [ ] 压测 / 容量报告落盘，数字全部来自实测
 - [ ] S9 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
 - [ ] 非目标与裁剪项在能力矩阵中逐行留痕
 
-**状态口径**：**S9-0 已以文档形式结项（2026-11-11），S9 代码仍未开工**——`docs/design/s9-agent-protocols.md` §4.4 的 OQ-1~OQ-10 已收敛，结论落在[《S9-0 收敛报告》](design/s9-0-convergence-report.md) 与 ADR-025/026；**S9-A~S9-F 全部「⬜ 未开工」，Gate S9 全未勾选，无任何「已实测」数字**。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——S9-0 只改文档，没有新增 app、端口或代码路径，待 S9-A 有首个代码交付时统一同步，避免把计划读成现状。
+**状态口径**：**S9-0 已以文档形式结项（2026-11-11），S9-A 已交付（2026-11-11）**——`docs/design/s9-agent-protocols.md` §4.4 的 OQ-1~OQ-10 已收敛，结论落在[《S9-0 收敛报告》](design/s9-0-convergence-report.md) 与 ADR-025/026；S9-A 的代码与证据记录在 [`docs/design/s9-a-execution-plan.md`](design/s9-a-execution-plan.md)（DoD 全勾选 + 5 条落地偏差 + 证据快照）。**S9-B~S9-F 仍「⬜ 未开工」，Gate S9 全未勾选**。`docs/security.md` §12 清单与 README 状态行待 S9-F 统一收口。
 
 ---
 
-## 12. 附录
+## 12. S10 — WebRTC 信令与 ICE 接入（下一阶段，立项规划）
 
-### 12.1 关键 ADR 索引
+**目标**：在既有统一消息内核之上，新增 WebRTC **信令接入前端**与 **STUN/TURN ICE 辅助服务**，把 Broker 扩展为实时媒体会话的可信信令中继与 NAT 穿越辅助；**媒体面不做**。协议整理（调研事实）、需求提炼与完整开发计划见 [`docs/design/s10-webrtc-signaling.md`](design/s10-webrtc-signaling.md)（§2 / §3 / §4）。
+
+**调研来源**：[`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server)（`master`，Erlang/OTP；Cowboy WSS 信令 + `processone/stun` STUN/TURN）。该仓库只覆盖**信令面**（房间 + JSON 事件转发）与 **ICE 面**（UDP 3478 / TURN），媒体（RTP/RTCP/DataChannel）为浏览器 P2P，不经服务端。设计文档 §2 逐字整理了其报文、配置、源码缺陷（README 与源码不一致、跨房间 `to` 会令 handler 崩溃等 14 条），§3 把它们映射为候选需求。
+
+**定位**：与 S5 / S8 / S9 同构，按 ADR-001「协议适配与消息内核解耦」——一个 `broker_proto_*` adapter + 一个与内核解耦的 ICE 组件，只依赖内核门面与既有门面能力，**不写第二套消息内核**；复用 S8-B 的 `broker_ws`（RFC 6455）/ ranch 装配、S6/S7 的 `broker_security` 身份表与 ACL、S3 的 CloudEvents `ce-*` 通道、ADR-016 可观测最小集与 W3C Trace Context 门控。
+
+**来源与边界**：首期对齐仓库的 **1:1 房间**假设；信令为**瞬时转发、默认不落盘**（持久化边界由 S10-0 以 ADR 冻结），不建 SubRef cursor。非目标：SFU/MCU/转码/录制、DataChannel Broker 内终结、TURN over TLS 5349 全套 / TURN over TCP / ICE-lite / Trickle ICE 全套优化、多人房间规模化选路、引入 Cowboy 替换 ranch、各协议官方 CloudEvents Binding 逐字实现（S7 已结案「不立项」）。
+
+### 12.1 阶段表
+
+| 子阶段 | 状态 | 产出 | 证据 |
+|---|---|---|---|
+| S10-0 不确定性收敛 | ⬜ 未开工 | 收敛报告 + ADR（信令→内核映射与不落盘边界、前端/依赖选型、ICE 组件归属、注册表与集群口径）；OQ-1~OQ-10 收敛 | spike 代码 + 评审签认；不新增 app / 端口 / 代码路径 |
+| S10-A 信令前端底座 | ⬜ 未开工 | WSS 前端 + `broker_ws` 复用 + `ping`/`pong` + 认证窗口 + `broker_security` 接线 + 配置门控（默认关闭） | 单连接认证 / 拒绝 / 保活用例；既有 823/823 零回归 |
+| S10-B 房间与信令内核 | ⬜ 未开工 | `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left` 事件集 + `peer_id` + `to`/`from` 转发 + 房间隔离与 ACL + 服务端 API | 两浏览器客户端 1:1 信令贯通；跨房间 / 未知 peer 拒绝不崩溃专项用例 |
+| S10-C ICE / STUN / TURN | ⬜ 未开工 | UDP 3478 + TURN 长期凭据接身份表 + `turn_ip` / 端口矩阵 + 监督树 + 限流与上限 | STUN/TURN 客户端 + 浏览器 `RTCPeerConnection` 连通性证据 |
+| S10-D 安全与一致性收口 | ⬜ 未开工 | 凭据脱敏 / 审计 / 可观测 / 能力矩阵与限制清单 / 压测与容量 / 文档同步 / ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 + 安全专项用例 |
+
+### 12.2 Gate S10（与设计文档 §4.3 同一份清单）
+
+- [ ] 一份**真实第三方客户端**证据落盘 `test/protocol-compatibility/`：浏览器 `RTCPeerConnection` 完成 offer/answer/candidate 全时序 + STUN/TURN 连通性；一行能力矩阵 + 逐项限制清单
+- [ ] 信令「瞬时转发、不落盘」口径由 ADR 冻结并有测试证明（无 SubRef cursor、不写 `.cursors`）
+- [ ] 五类服务器事件的广播集合与线格式有自动化测试钉死
+- [ ] 认证接六协议统一身份表；`unauthorized` / ACL 越权 / 跨房间 `to` / 未知 `peer_id` 专项用例通过且 handler 不崩溃
+- [ ] STUN/TURN 认证接身份表、凭据轮换、日志脱敏专项用例通过；端口矩阵与防火墙要求写入运维文档
+- [ ] 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功
+- [ ] 压测 / 容量报告落盘，数字全部来自实测
+- [ ] S10 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
+- [ ] 非目标与裁剪项在能力矩阵中逐行留痕
+
+**状态口径**：**S10 全部「⬜ 未开工」，Gate S10 全未勾选，无任何「已实测」数字**；S10 排在 S9 之后但不阻塞 S9。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——本阶段只新增文档，没有新增 app、端口或代码路径，待 S10-A 有首个代码交付时统一同步，避免把计划读成现状。
+
+---
+
+## 13. S11 — 协议候选池（下一阶段，立项规划）
+
+**目标**：对 14 个 Erlang/OTP 网络协议仓库做筛选，**不是把 14 个协议一起实现**。按「协议整理（调研事实）→ 需求提炼（推导）→ 开发计划（建议）」三段式，每个仓库一份立项稿（9 份深挖 + 5 份索引级），加一份总览；S11-0 收敛出「立项 / 归并 / 参考 / 不做」四类结论并以 ADR 冻结。总览与全表见 [`docs/design/s11-protocol-candidates.md`](design/s11-protocol-candidates.md)（§1 候选池全表、§3 优先级结论、§4.4 OQ-1~OQ-9）。
+
+**调研范围**：CoAP、LoRaWAN、STUN/TURN、DNS 权威、mDNS、DNS-SD/Bonjour、DHT ×2、LAN beacon、SIP ×3、MTProto Proxy、APNs。**深挖 9 个 IoT/UDP 类**（源码级：依赖版本、behaviour、配置、线格式、缺陷清单）；**索引级 5 个**（SIP 三仓与代理 / 出站类，§2 明确标「仅索引级、待深挖」）。
+
+**定位**：与 S5 / S8 / S9 / S10 同构，按 ADR-001「协议适配与消息内核解耦」——**14 个候选没有一个需要新的消息内核抽象**。统一复用 S3（`ce-*` 通道）、S4（Metadata Raft / Membership / Fencing，**不得被 DHT / mDNS / DNS 发现替代**）、S6/S7（`broker_security` 身份表 / ACL / TLS）、S8（UDP 前端与 `broker_ws` 装配）、ADR-007/013/014/015（可靠性 / 游标 / retention / 重投递）。
+
+**边界与非目标**：不写第二套消息内核；不替代 S4 成员管理；不把完整服务器（`lorawan-server` / `nksip` / `yxa` / `erldns` / `dhtcrawler`）照搬成 `broker_proto_*`；不把 CoAP CON/ACK、LoRaWAN FCnt、MQTT-SN QoS 混为同一可靠性等级；不引入 `avahi-daemon` 等外部守护进程（ADR-016 取舍）；不引入 `gproc` 作 Broker pub/sub；不开 `MDNS_CAN_MESH` 自动组网；不把 beacon 载荷当业务消息；各协议官方 CloudEvents Binding 逐字实现（S7 已结案「不立项」）；不预先承诺任何性能 / 容量数字。
+
+### 13.1 阶段表
+
+| 子阶段 | 状态 | 产出 | 证据 |
+|---|---|---|---|
+| S11-0 候选池筛选 | ⬜ 未开工 | 14 仓「立项 / 归并 / 参考 / 不做」结论 + ADR；发现面 / DHT / SIP 三组统一裁决；5 份索引级稿的深挖去向 | 本总览 + 14 份立项稿 + 评审签认；**不新增 app / 端口 / 代码路径** |
+| S11-A CoAP 前端与编解码 | ⬜ 未开工 | 仅当 S11-0 通过：UDP/DTLS 前端 + 报文编解码 + 资源路由 + `.well-known/core` | libcoap 真实客户端 GET/PUT 用例；既有 823/823 零回归 |
+| S11-B CoAP Observe 与内核映射 | ⬜ 未开工 | Observe 订阅 / 通知 / 取消 + `broker_message` 映射 + 可靠性分档 | Observe 全流程 + 崩溃恢复用例；映射 ADR |
+| S11-C CoAP 安全与一致性收口 | ⬜ 未开工 | 身份表 / ACL / 限流 / 能力矩阵 / 压测 / 文档同步 / ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 + 安全专项用例 |
+
+> 子阶段命名与粒度是**建议**；实际以 S11-0 评审后冻结的 ADR 为准。归并到 S9 / S10 的候选不产生 S11 子阶段：`processone/stun` 归并 S10 ICE 组件，`apns4erl` 出站推送归并 S9 webhook，`lorawan-server` 收窄为桥接。
+
+### 13.2 Gate S11（与总览文档 §4.3 同一份清单）
+
+- [ ] 14 个候选全部有「立项 / 归并 / 参考 / 不做」四选一的明确结论，并由 ADR 冻结
+- [ ] 「发现面一组」「DHT 一组」「SIP 一组」完成统一裁决；总览 §3.2「明确不做清单」逐行留痕
+- [ ] 5 份索引级稿的「待深挖」项有明确去向（升级 / 移除 / 保留）
+- [ ] 经 Gate 通过的候选有真实第三方客户端证据落盘 `test/protocol-compatibility/` + 能力矩阵与限制清单
+- [ ] 无第二套消息内核、无替代 S4 Membership、无外部守护进程依赖（除非 ADR 显式推翻）
+- [ ] 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功
+- [ ] 压测 / 容量报告落盘，数字全部来自实测
+- [ ] S11 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
+- [ ] 非目标与裁剪项在能力矩阵中逐行留痕
+
+**状态口径**：**S11 全部「⬜ 未开工」，Gate S11 全未勾选，无任何「已实测」数字**；S11 排在 S10 之后但不阻塞 S10。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——本阶段只新增文档，没有新增 app、端口或代码路径，待 S11-0 通过且有首个代码交付时统一同步，避免把计划读成现状。**当前建议仅 CoAP 进入实现评审**（总览 §3.1 A 档），其余按「归并 / 参考 / 明确不做」收口。
+
+---
+
+## 14. 附录
+
+### 14.1 关键 ADR 索引
 
 | ADR | 主题 | 定稿阶段 |
 |---|---|---|
@@ -454,7 +531,7 @@ S7 有两项交付：
 | ADR-025 | A2A Task 状态机到统一消息内核的映射（事件溯源、可靠性档、retention 契约） | S9-0（已采纳） |
 | ADR-026 | Agent 接入前端：应用拆分、HTTP/SSE 选型、Agent Card 落点与边界 | S9-0（已采纳） |
 
-### 12.2 文档产出物
+### 14.2 文档产出物
 
 | 文档 | 阶段 | 对应 README 章节 |
 |---|---|---|
@@ -477,7 +554,23 @@ S7 有两项交付：
 | `docs/design/s8-d-mqtt-over-quic-execution-plan.md` | S8-D（已完成 2026-11-11） | 4.1、11.1 |
 | `docs/design/s9-agent-protocols.md` | S9（立项规划稿，2026-11-11；协议整理 + 需求 + 计划） | 4.1、11.1 |
 | `docs/design/s9-0-convergence-report.md` | S9-0（已完成 2026-11-11，文档；OQ-1~OQ-10 收敛） | 11.1 |
-| `docs/design/s9-a-execution-plan.md` | S9-A（执行计划，2026-11-11；代码未开工） | 11.1 |
+| `docs/design/s9-a-execution-plan.md` | S9-A（已完成 2026-11-11；代码 + 证据 + 落地偏差） | 11.1 |
+| `docs/design/s10-webrtc-signaling.md` | S10（下一阶段需求 / 立项规划稿，2026-11-11；调研 `lambdaclass/webrtc-server` + 协议整理 + 需求 + 计划） | 4.1、11.1 |
+| `docs/design/s11-protocol-candidates.md` | S11（总览 / 立项规划稿，2026-11-11；14 仓候选池全表 + 优先级结论 + Gate + OQ-1~OQ-9） | 4.1、11.1 |
+| `docs/design/s11-coap.md` | S11（深挖立项稿，2026-11-11；CoAP / `gen_coap`；**A 档建议立项**） | 4.1、11.1 |
+| `docs/design/s11-lorawan.md` | S11（深挖立项稿；LoRaWAN / `lorawan-server`，收窄为桥接） | 4.1、11.1 |
+| `docs/design/s11-stun.md` | S11（深挖 / 依赖级复核；`processone/stun` 归并 S10 ICE 组件，不重复立项） | 4.1、11.1 |
+| `docs/design/s11-erldns.md` | S11（深挖立项稿；DNS 权威 / `erldns`，P2 参考） | 4.1、11.1 |
+| `docs/design/s11-dht.md` | S11（深挖立项稿；Kademlia DHT / `jlouis/dht`，P2 参考、明确不做为接入协议） | 4.1、11.1 |
+| `docs/design/s11-dhtcrawler.md` | S11（深挖 / 裁剪结论；`dhtcrawler` 应用非协议栈，明确不做） | 4.1、11.1 |
+| `docs/design/s11-mdns.md` | S11（深挖立项稿；mDNS / `shortishly/mdns`，发现面一组） | 4.1、11.1 |
+| `docs/design/s11-dnssd.md` | S11（深挖立项稿；DNS-SD / `dnssd_erlang`，发现面一组） | 4.1、11.1 |
+| `docs/design/s11-rbeacon.md` | S11（深挖立项稿；LAN beacon / `rbeacon`，发现面一组） | 4.1、11.1 |
+| `docs/design/s11-ersip.md` | S11（索引级立项稿；SIP/SDP 纯函数库 / `ersip`，若做 SIP 选它） | 4.1、11.1 |
+| `docs/design/s11-nksip.md` | S11（索引级立项稿；SIP 应用服务器 / `nksip`） | 4.1、11.1 |
+| `docs/design/s11-yxa.md` | S11（索引级立项稿；历史 SIP 套件 / `yxa`） | 4.1、11.1 |
+| `docs/design/s11-mtproto-proxy.md` | S11（索引级立项稿；MTProto Proxy，明确不做） | 4.1、11.1 |
+| `docs/design/s11-apns4erl.md` | S11（索引级立项稿；APNs 出站客户端 / `apns4erl`，归并 S9 webhook） | 4.1、11.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/protocol-conformance-validation.md` | S6 之后（2026-11-10 起草；外部 conformance 资源接入规划，S8 三协议不在范围） | 11.1、11.2 |

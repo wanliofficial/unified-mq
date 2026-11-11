@@ -712,6 +712,109 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 ---
 
+## 4.14 S9-A 追加（2026-11-11）：A2A 1.0.0 JSON-RPC 前端（`broker_proto_a2a`）
+
+**是什么**：A2A `1.0.0` 的 JSON-RPC 传输绑定（spec §9）在统一消息内核之上的一层 adapters。S9-A 只交付**协议底座**：JSON-RPC 2.0 信封、`A2A-Version` 协商、`broker_security` 认证/ACL 接线、HTTP/1.1 与 SSE 的出站原语，以及**一个真实方法** `SendMessage` 的 echo 实现。**没有 Task 状态机、没有 Agent Card、没有流式业务**——那些是 S9-B/S9-C。
+
+**两个 app**（ADR-026 §D1 的依赖方向 `adapter → base → kernel`）：
+
+| app | 形态 | 内容 |
+|---|---|---|
+| `broker_proto_agent_rpc` | 纯库：无 supervisor、无 listener、无自有 env | `agent_rpc_json`（信封）、`agent_rpc_error`（错误码表）、`agent_rpc_version`（版本协商）、`agent_rpc_http`（HTTP/1.1 帧）、`agent_rpc_sse`（SSE 帧）、`agent_rpc_auth`（凭据 → `broker_security`） |
+| `broker_proto_a2a` | app + 监督树，**默认零 listener** | `broker_proto_a2a_app`（boot 校验）、`..._sup`（listener 为最后一项）、`a2a_listener`（ranch_protocol）、`a2a_conn`（每连接 keep-alive 循环）、`a2a_rpc`（方法分派 + 全部门控） |
+
+**能力矩阵（S9-A 完成态）**：
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| JSON-RPC 2.0 信封 | 已支持 | `jsonrpc` 必须 `"2.0"`、`method` 非空字符串、`id` 为 string/number/null、`params` 缺省为 `{}` |
+| batch（顶层数组） | **不支持** | 回 `-32600`。A2A 绑定只定义单请求，而「部分成功」在会创建 Task 的方法上没有可解释语义 |
+| notification（无 `id`） | **不支持** | 回 `-32600`。A2A 全部方法是请求-响应 |
+| `SendMessage` | 已支持（**echo**） | 返回 `SendMessageResponse.message` 分支：`role = "ROLE_AGENT"`、**新的** `messageId`（base64url 128 bit）、沿用或生成 `contextId`、原样带回 `parts`/`metadata`。**不创建 Task、不写日志** |
+| 其余 10 个方法（`GetTask`/`ListTasks`/`CancelTask`/`SendStreamingMessage`/`SubscribeToTask`/Push config 三件套/`GetExtendedAgentCard`） | **未实现** | 一律 `-32601`（HTTP 200）。S9-B/S9-C 逐个落地 |
+| `A2A-Version` 协商 | 已支持（仅头形式） | 只接受 `Major.Minor`；缺失/空按 `0.3` **读入**，但服务端只声明 `["1.0"]`，因此缺失头 → `-32009`（HTTP 400）。query 参数形式不实现 |
+| 认证 | 已支持 | `Authorization: Bearer <token>` 或 `X-API-Key`，解析为 `{token, T}` 交给 `broker_security:authenticate_conn/1`。两头同时存在且不同 → 拒绝。**不做 JWT/JWKS**（ADR-026 §D8） |
+| `require_auth` | 默认 `true` | adapter 自有 env，`false` 只在**回环绑定**下允许（boot 校验拒绝宽绑定）；不动 `broker_security` 的 `{require_auth, []}` |
+| ACL | 已支持 | `publish` + destination `$a2a/task/echo`（S9-A 固定值，S9-B 换成真实 task id）；拒绝回裸 `403`，不包 JSON-RPC 信封 |
+| 请求体上限 | 已支持 | `min(max_body_bytes, broker_limits:max_message_bytes())`，默认 1 MiB；`Content-Length` 超限**不读体**直接 `413` + `Connection: close` |
+| chunked 请求体 | 已支持 | 同上限，逐块累加校验 |
+| `Expect: 100-continue` | 已支持 | 先回 `HTTP/1.1 100 Continue\r\n\r\n` 再读体 |
+| keep-alive | 已支持 | 每连接一个进程循环处理，`Connection: close` 或超时退出；单连接上限 1000 请求 |
+| `/health` | 已支持 | `GET /health` → `200 {"status":"ok"}`，不需认证，仅供探活 |
+| SSE 出站原语 | 库就绪，**未接方法** | `agent_rpc_sse` 产帧、`agent_rpc_http:chunk/1` 包 chunked；S9-C 才接到流式方法 |
+| HTTP/2、gRPC/REST 绑定 | **不支持** | 非目标（ADR-026 §D8） |
+| TLS | 随 `broker_security.tls` | enabled 时用 `ranch_ssl`，否则 `ranch_tcp` |
+| 默认监听 | **不监听** | `listeners => []`（ADR-026 §D4）。8180/8081/8082 都不由本阶段占用 |
+
+**错误映射**（A2A §5.4 + JSON-RPC 2.0）：
+
+| 情形 | HTTP | JSON-RPC code |
+|---|---|---|
+| 非 JSON 体 | 400 | `-32700`（`id = null`） |
+| 信封不合法 / batch / 无 `id` | 400 | `-32600`（`id = null`） |
+| 未知方法 | **200** | `-32601` |
+| 方法参数不合法 | **200** | `-32602` |
+| `A2A-Version` 不支持（含缺失） | 400 | `-32009`，`data.supported = ["1.0"]`，`id = null` |
+| 无/错凭据 | 401 | 裸 HTTP，`WWW-Authenticate: Bearer realm="a2a"` |
+| ACL 拒绝 | 403 | 裸 HTTP，空体 |
+| 请求体超限 | 413 | 裸 HTTP，`Connection: close` |
+| 非 JSON media type | 415 | 裸 HTTP |
+
+**验证顺序即安全边界**：media type → 凭据 → 版本 → JSON-RPC 信封 → 方法分派。无凭据的请求在解析 body 之前就被拒，版本不支持的请求不会走到方法分派。
+
+**证据**：
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT 套件（底座） | `apps/broker_proto_agent_rpc/test/` | 6 套件 **69 例**：`json` 16、`error` 8、`version` 12、`http` 13（真实 socket）、`sse` 7、`auth` 13（真实 `broker_security`） |
+| CT 套件（listener） | `apps/broker_proto_a2a/test/a2a_listener_SUITE.erl` | **16 例**：echo、版本缺失/不支持、401×2、403、`-32601`、`-32700`、`-32602`、413、415、keep-alive、close、health、匿名回环放行、匿名宽绑定拒绝启动。全部 `port => 0` |
+| 全量回归 | `rebar3 ct` | **908 例全通过**（基线 823 + 新增 85，59 套件） |
+| 真实客户端 | `curl`（下节原文） | **11 条**请求/响应原文 |
+
+**`curl` 实测（2026-11-11，证据节点 127.0.0.1:18091，`require_auth => true`，用户 `agent-s9a` 持 token）**：
+
+```
+$ curl -sS -i -X POST http://127.0.0.1:18091/ \
+    -H 'Content-Type: application/json' -H 'A2A-Version: 1.0' \
+    -H 'Authorization: Bearer s9a-evidence-token' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
+         "messageId":"m1","role":"ROLE_USER","contextId":"ctx-1",
+         "parts":[{"text":"hello agent"}]}}}'
+HTTP/1.1 200 OK
+connection: keep-alive
+content-length: 157
+content-type: application/json
+
+{"id":1,"jsonrpc":"2.0","result":{"message":{"contextId":"ctx-1",
+ "messageId":"jUvJeI6F5f8-rOBRz4Zc8Q","parts":[{"text":"hello agent"}],
+ "role":"ROLE_AGENT"}}}
+```
+
+| # | 请求 | 响应 |
+|---|---|---|
+| 1 | `SendMessage` + Bearer + `A2A-Version: 1.0` | `200`，`result.message.role = "ROLE_AGENT"`，`messageId` 与请求不同（上） |
+| 2 | 同上，去掉 `Authorization` | `401`，`www-authenticate: Bearer realm="a2a"`，空体 |
+| 3 | `A2A-Version: 2.0` | `400`，`{"error":{"code":-32009,...,"data":{"supported":["1.0"]}},"id":null}` |
+| 4 | 不带 `A2A-Version` | `400`，同上 `-32009`（按 0.3 读入，但 0.3 不在支持列表） |
+| 5 | `method: "GetTask"` | `200`，`{"error":{"code":-32601,"message":"Method not found"},"id":2}` |
+| 6 | `Content-Type: text/plain` | `415`，空体 |
+| 7 | `Content-Length: 2000000` | `413`，`connection: close`，空体 |
+| 8 | body 为 `not json` | `400`，`{"error":{"code":-32700,"message":"Parse error"},"id":null}` |
+| 9 | `GET /health`（无凭据） | `200`，`{"status":"ok"}` |
+| 10 | 同一连接连发两次（`curl` 复用） | 两次 `200`，`Connection #0 left intact` / `Re-using existing connection` |
+| 11 | ACL 配 `deny $a2a/#`（另一端口 18092） | `403`，空体 |
+
+**已声明的限制 / 边界**：
+
+- **echo 不是 A2A 实现**：`SendMessage` 只回一条消息，不产生 `Task`。任何依赖 `result.task` 的客户端在 S9-A 上拿不到 task，会走 `result.message` 分支。`GetTask` 等一律 `-32601`。
+- **无状态**：进程不保留任何会话状态，重启即遗忘；`contextId` 只是回显，S9-B 才有 context 语义。
+- **默认不监听**：`listeners => []`，运维显式配置 `#{port => 8081, ref => {a2a, 8081}}` 才开端口；18091 只是本次证据端口。
+- **不做 JWT**：只接受 `broker_user` 表里的不透明 token，不验签、不取 JWKS、不实现 OAuth AS。
+- **只 HTTP/1.1**：无 HTTP/2、无 gRPC、无 REST 绑定。
+- **SSE 未接业务**：库有帧与 chunk 原语，但没有任何方法返回 `text/event-stream`；S9-C 才有流。
+
+---
+
 ## 5. 冻结契约一致性（T17 签认，2026-11-06）
 
 > 本节是 **Gate S1 的签认记录**，不是 S5 的兼容性结论。它回答一个问题：上表 MQTT 行的语义边界，是否真的由三份冻结 ADR 决定，而不是由实现细节偶然决定。复核对象是 T2~T15 的最终代码（commit `a8608d9` 前的实现状态，文档改动不触及代码）。

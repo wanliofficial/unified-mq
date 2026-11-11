@@ -23,6 +23,7 @@
 | AMQP | 5673 | 明文（可 TLS） | `broker_proto_amqp` |
 | Kafka | 9093 | 明文（可 TLS） | `broker_proto_kafka` |
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
+| A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A）。示例部署端口 8081，`listeners => []` 是出厂值 |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前九个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
@@ -32,6 +33,8 @@ TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 li
 **QUIC 是另一个方向的例外**：它**没有明文模式**，握手本身就是 TLS 1.3，所以 `broker_security.tls.enabled` 对它不是「开关」而是「证书来源」——关掉这个开关不会让 14567 变明文，只会让 listener 找不到证书而**拒绝启动**（`{quic_requires_tls, Key}`，只影响这一个 app）。
 
 `broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
+
+`broker_proto_agent_rpc`（S9-A 起）同样是**纯库 app**：无进程、无端口、无自有 env，只提供 JSON-RPC 2.0 信封、HTTP/1.1 帧、SSE 帧、`A2A-Version` 协商与凭据 helper，供将来的 A2A/MCP/ACP 三个前端共用。运维上无需配置，也不出现在上表。
 
 **两个 WebSocket 端口不是一件事**。`8080` 是 Broker 自己的 JSON/binary 消息 API（S5），`8083` 是标准 MQTT over WebSocket（S8-B）：同一个 `mqtt_conn_fsm` 跑在 RFC 6455 binary 帧里，客户端是普通 MQTT 库（如 paho-mqtt 的 `transport="websockets"`）。端口内容互不兼容，**不要**把 MQTT 客户端指向 8080。
 
@@ -143,6 +146,59 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 - `rebar3 as quic release` 出来的 release 起不来且日志里有 `{quic_requires_tls, _}`：证书没配，见上面的启用顺序。
 - 客户端在同一 QUIC 连接上重连超过 `max_streams_per_conn` 次后新流不再到达：日志里会有 `quic: stream credit exhausted`，让客户端新建 QUIC 连接（或调大该值）。
 - 真实客户端对照：`test/protocol-compatibility/mqtt_quic/` 用 EMQX 的 `emqtt` 1.16.1 跑 8 个用例，见 `docs/protocol-compatibility.md` §4.12。
+
+### 1.3 A2A JSON-RPC 前端（默认关闭，S9-A）
+
+`broker_proto_a2a` 是 A2A 1.0.0 的 JSON-RPC 传输绑定前端。**S9-A 只有一条方法 `SendMessage`（echo），没有 Task**；`GetTask` 等方法一律回 `-32601`。它**默认不监听**（ADR-026 §D4）：app 装进 release、随节点启动，但 `listeners => []` 时不开任何端口。
+
+**配置**（`config/sys.config.src`，出厂值）：
+
+```erlang
+{broker_proto_a2a, [
+  {listeners, []},                       % 默认零 listener
+  {require_auth, true},                  % 新面没有历史包袱，失败关闭
+  {max_body_bytes, 1048576},             % 与 max_message_bytes 取 min
+  {max_connections, 1024},
+  {request_timeout_ms, 30000},
+  {supported_versions, [<<"1.0">>]},
+  {sse_max_event_bytes, 1048576},        % S9-C 才接到方法
+  {sse_heartbeat_ms, 15000}
+]}.
+```
+
+**启用顺序**：
+
+1. 在 `broker_security.users` 里给调用方建一条带 `token` 的用户记录（`{<<"agent">>, #{token => <<"...">>, tenant_id => <<"t0">>}}`）——A2A 只接受 `broker_user` 里的**不透明 bearer token**，不验 JWT、不取 JWKS。
+2. 如需按主体限制，配 `broker_security.acl` 的 `publish` 规则（S9-A 的 destination 固定为 `$a2a/task/echo`；ACL 拒绝回裸 `403`）。
+3. 把 `listeners` 改成 `[#{port => 8081, ref => {a2a, 8081}, num_acceptors => 10, max_connections => 1024}]`（`ip` 默认 `{127,0,0,1}`）再重启。
+4. 探活：`curl -sS http://127.0.0.1:8081/health` → `{"status":"ok"}`，不需要凭据。
+
+**`require_auth => false` 只在回环绑定下允许**：boot 时校验所有 listener 的 `ip`，非回环直接 `{error, {insecure_listener, Port, Ip}}`，整个 app 起不来。这是刻意的——与其起一个无认证的任务 API，不如让节点起不来。
+
+**客户端调用形态**：
+
+```sh
+curl -sS -X POST http://127.0.0.1:8081/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
+        "messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}}'
+```
+
+- `A2A-Version` **必须带**：缺失时按 `0.3` 读入，而服务端只声明支持 `1.0`，所以缺失会回 `-32009`（HTTP 400）。这是 spec 要求客户端带版本头的直接结果。
+- `Content-Type` 必须是 `application/json` 或 `application/a2a+json`，否则 `415`。
+- 请求体上限 = `min(max_body_bytes, broker_security.limits.max_message_bytes)`；`Content-Length` 超限时**不读体**直接 `413` + `Connection: close`。
+
+**排查**：
+
+- 端口没起来：先看 `listeners` 是不是还是 `[]`；再看日志里有没有 `insecure_listener`（`require_auth=false` + 非回环）。
+- 全部请求 `401`：`Authorization: Bearer` 的 token 与 `broker_security.users` 里的 `token` 不一致，或用户表为空（用户表为空时任何凭据都失败）。
+- 全部请求 `-32009`：客户端没带 `A2A-Version: 1.0`（或带了 `2.0`）。
+- `SendMessage` 回 `-32602`：`params.message` 缺 `messageId`/`role`/`parts`，或某个 Part 不是「恰好一个内容键」（`text`/`raw`/`url`/`data` 选一）。
+- `-32601`：S9-A 只实现 `SendMessage`；其余方法要等 S9-B/S9-C。
+- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.14。
+
 
 
 ---
