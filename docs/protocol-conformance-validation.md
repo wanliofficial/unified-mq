@@ -12,7 +12,7 @@
 
 ## 0. 背景与目标
 
-本 Broker（`unified-mq`）是一个支持 **MQTT 3.1.1/5.0、WebSocket、NATS、AMQP 0-9-1、Kafka、Pulsar** 六协议的 Erlang/OTP 实现，协议适配层为 `apps/broker_proto_*`（`broker_proto_mqtt` / `broker_proto_ws` / `broker_proto_nats` / `broker_proto_amqp` / `broker_proto_kafka` / `broker_proto_pulsar`）。
+本 Broker（`unified-mq`）是一个支持 **MQTT 3.1.1/5.0、WebSocket、NATS、AMQP 0-9-1、Kafka、Pulsar** 六协议的 Erlang/OTP 实现，协议适配层为 `apps/broker_proto_*`（`broker_proto_mqtt` / `broker_proto_ws` / `broker_proto_nats` / `broker_proto_amqp` / `broker_proto_kafka` / `broker_proto_pulsar`）。（S8 之后另有 `broker_proto_mqtt_ws` / `broker_proto_mqtt_sn` / `broker_proto_mqtt_quic` 三条传输，不在本文规划范围内。）
 
 > **范围（2026-11-11 补注）**：本文只规划上面这六个 S5 协议的**外部** conformance 资源接入。S8 新增的 MQTT-SN、MQTT over QUIC、MQTT over WebSocket 不在本文范围内——它们的第三方客户端证据（`mqtt-sn-tools`、EMQX `emqtt`、paho websocket）已在 `docs/protocol-compatibility.md` §4.11~§4.13 记录，外部 conformance suite 的规划同样未立项。
 
@@ -37,8 +37,8 @@ S5 已通过「真实第三方客户端集成测试」建立协议兼容基线�
 | Pulsar | `ruststream-pulsar` `conformance_pulsar.rs` | 客户端库**内部**测试 | 非官方，验证客户端自身 | 低——非服务端 | **P3（仅参考）** |
 | NATS | `@nats-io/nst` | 官方 nats.js 内部测试工具 | 官方声明「**not a supported public API**」 | 低——不稳定 | **P3（仅参考）** |
 | NATS | 官方 `nats-server` `test/test.go` | 官方服务端集成测试工具包 | 官方但**不对外**作符合性套件 | 低——参考改写 | **P3（仅参考）** |
-| MQTT-SN | `com.mobius-software.mqttsn:mqttsn-testsuite` | 7 年前 Maven 性能包 | 非官方，无服务端验证证据 | **不建议** | 不投入 |
-| MQTT-QUIC | （无公开套件） | — | — | — | 不投入（本 Broker 未实现） |
+| MQTT-SN | `com.mobius-software.mqttsn:mqttsn-testsuite` | 7 年前 Maven 性能包 | 非官方，无服务端验证证据 | **不建议** | 不投入（S8-C 已实现协议本体，第三方客户端证据见 §4.11） |
+| MQTT-QUIC | （无公开套件） | — | — | — | 不投入（S8-D 已实现协议本体的第三方客户端证据，见 `docs/protocol-compatibility.md` §4.12；外部套件仍未立项） |
 
 **实操优先级（与上文一致）**：
 
@@ -291,8 +291,8 @@ S5 用 `nats.go v1.48.0` 实测 11/11 用例，已实现 core NATS：PUB/SUB/UNS
 
 ## 8. MQTT-SN / MQTT-QUIC（不投入）
 
-- **MQTT-SN**：仅找到一个近 7 年前的 Maven 包 `com.mobius-software.mqttsn:mqttsn-testsuite`，标注为「Performance Testsuite」，且无证据表明可用于服务端协议验证。**不建议使用**，且本 Broker 未实现 MQTT-SN。
-- **MQTT-QUIC**：没有找到任何公开测试套件；本 Broker 未实现。
+- **MQTT-SN**：仅找到一个近 7 年前的 Maven 包 `com.mobius-software.mqttsn:mqttsn-testsuite`，标注为「Performance Testsuite」，且无证据表明可用于服务端协议验证。**不建议使用**。~~且本 Broker 未实现 MQTT-SN。~~ **落地后修正（2026-11-11）**：本 Broker 已于 S8-C 实现 MQTT-SN 1.2（`apps/broker_proto_mqtt_sn`，见 `docs/protocol-compatibility.md` §4.11），但**外部 conformance 套件仍未立项**——已交付的证据是自编 CT 套件 + `mqtt-sn-tools` 真实客户端。
+- **MQTT-QUIC**：没有找到任何公开测试套件。~~本 Broker 未实现。~~ **落地后修正（2026-11-11）**：已于 S8-D 实现（`apps/broker_proto_mqtt_quic`，见 §4.12），第三方证据为 EMQX `emqtt` 1.16.1；外部套件同样未立项。
 - 结论：这两项仅记录于本文，不进入 `test/conformance/`，不与本 Broker 现状混淆。
 
 ---
