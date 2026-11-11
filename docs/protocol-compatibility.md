@@ -311,7 +311,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | WS 帧编解码（`ws_frame_SUITE`） | 9 例：握手 accept、掩码/分片、控制帧、close 载荷 |
-| WS 连接/应用协议（`ws_conn_SUITE`） | **22 例（当前）**：S5 时点 14 例（connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack、明文 HTTP 拒绝）；S6 追加 `cloudevent_headers_roundtrip`（15）；S7 追加凭据解析、错误凭据拒绝、客户端自带租户被忽略、`require_auth` 四例（19）；trace context 追加往返、`off` 时剥离、非法 `traceparent` 不传播三例（22） |
+| WS 连接/应用协议（`ws_conn_SUITE`） | **23 例（当前）**：S5 时点 14 例（connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack、明文 HTTP 拒绝）；S6 追加 `cloudevent_headers_roundtrip`（15）；S7 追加凭据解析、错误凭据拒绝、客户端自带租户被忽略、`require_auth` 四例（19）；trace context 追加往返、`off` 时剥离、非法 `traceparent` 不传播三例（22）；S8-B 追加 `wss_is_served_when_tls_is_enabled`（23，`mqtt_ws` 与自有 `ws` 同端口同 TLS 开关的回归用例） |
 | 真实第三方客户端（`ws_compat.py`） | 10/10 PASS（见上） |
 | 全量 | `rebar3 ct` **470/470**；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 
