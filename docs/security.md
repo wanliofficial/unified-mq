@@ -68,7 +68,7 @@ NATS 的 `auth_token`（`broker_proto_nats.auth_token`）是 NATS 协议原生�
 
 **现状边界（必须如实说明）**：
 
-1. **MQTT 不走 `authenticate_conn/1`**：`mqtt_conn_fsm:authenticate/2` 直接调 `broker_security:authenticate/2`（`mqtt_conn_fsm.erl:429`）。代码路径不同、语义等价——两者读同一张 `users` 表、比对同一 `password` 字段、失败回同一个 `bad_username_or_password`；MQTT 的凭据形态只有 user/pass 一种，归一化没有增益，因此没有为统一而统一。
+1. **MQTT 不走 `authenticate_conn/1`**：`mqtt_conn_fsm` 的私有函数 `authenticate/2` 直接调 `broker_security:authenticate/2`（`mqtt_conn_fsm.erl:429`）。代码路径不同、语义等价——两者读同一张 `users` 表、比对同一 `password` 字段、失败回同一个 `bad_username_or_password`；MQTT 的凭据形态只有 user/pass 一种，归一化没有增益，因此没有为统一而统一。
 2. **`require_auth` 对 MQTT 无声无效**：`mqtt_conn_fsm` 从不调用 `broker_security:auth_required/1`，所以配置 `{require_auth, [<<"mqtt">>]}` **不会**拒绝匿名 CONNECT（`credential_capable/0` 里含 `<<"mqtt">>` 只是为将来接线性留位）。当前 MQTT 的匿名放行由 CONNECT 里「无用户名/无密码即匿名」这条分支决定。把 `auth_required/1` 接进 CONNECT 路径列为 S7 之后。
 3. **MQTT 的匿名 CONNECT 仍把 `client_id` 当作 principal**（S1 冻结的语义，`docs/design/s1-mqtt-vertical-slice.md` §13 L10）。这个 principal 不在身份表里，因此它的租户是 `default` 而不是任何用户记录的租户——这是 S1 的既有行为，本次未改。
 4. **MQTT-SN 的 `require_auth` 是显式拒绝启动，不是静默失效**（S8-C）：MQTT-SN 1.2 的 CONNECT **没有用户名/密码字段**，协议上无法承载凭据。`credential_capable/0` 不含 `<<"mqtt_sn">>`，所以 `broker_security:auth_required(mqtt_sn)` 恒为 `false` —— 这对**认证**是对的（要求一个协议出示它没有的东西只会锁死所有客户端），对**配置**是错的：一个要求「所有 listener 必须出示凭据」的部署，必须被告知这个 listener 给不了。`broker_proto_mqtt_sn_app` 因此不经过 `auth_required/1`，直接读 `require_auth` 原始 app env；一旦列表里出现 `mqtt_sn`，app **拒绝启动监听器**并返回 `{require_auth_unsupported, mqtt_sn}`。与第 2 条形成对照：MQTT 是「配了但无声无效」（历史遗留，仍待修），MQTT-SN 是「配了就不启动」（新代码不接受这种配置形态）。注意这里的拒绝粒度是整个 `broker_proto_mqtt_sn` app，而不是单个 listener —— MQTT-SN 的网关只有一个 socket 服务全部客户端，没有「只对某些客户端要求凭据」的表达力，也没有单 listener 的失败隔离可言。

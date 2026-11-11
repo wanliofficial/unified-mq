@@ -93,7 +93,7 @@ S3（ADR-020）把 T11 的恒等桩补成完整的 CloudEvents 1.0 层：
 - `broker_event_dedup`：受监督的有界去重窗口，默认关闭；键 `{Tenant, Destination, source, id}`，进程重启即清空（不承诺跨重启）。
 - `quarantine/2`：可选的隔离副本，把原始消息以 `fsync` 追加到可配置 destination，拒绝本身不受隔离成败影响。
 
-**数据路径**：`mqtt_conn_fsm:handle_publish1/7` 在路由之后、存储之前调用 `broker_event:apply_policy/1`；拒绝不 ACK（v5 QoS1 PUBACK `0x83`、QoS2 PUBREC `0x83`，3.1.1 关闭连接），去重命中只 ACK 不二次存储。默认策略是 `pass_through`，因此 MQTT 3.1.1 出站字节与 S2 行为完全不变；CloudEvents 是按租户/目的地显式开启的能力，不是全局强制（ADR-004）。
+**数据路径**：`mqtt_conn_fsm` 的私有函数 `handle_publish1/7` 在路由之后、存储之前调用 `broker_event:apply_policy/1`；拒绝不 ACK（v5 QoS1 PUBACK `0x83`、QoS2 PUBREC `0x83`，3.1.1 关闭连接），去重命中只 ACK 不二次存储。默认策略是 `pass_through`，因此 MQTT 3.1.1 出站字节与 S2 行为完全不变；CloudEvents 是按租户/目的地显式开启的能力，不是全局强制（ADR-004）。
 
 ### 2.3 依赖方向
 
@@ -485,7 +485,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_mqtt_quic.listeners` | release 配 `[]`（示例 `#{port => 14567}` 注释掉）；`.app.src` 默认 `[]` | S8-D：每条一个 QUIC listener。**默认关闭是刻意的**：QUIC 无证书必然拒绝启动，而拒绝启动是该 app 的启动失败，默认开会让不带证书的 release 起不来 |
 | `broker_proto_mqtt_quic.alpn` | `[<<"mqtt">>]` | CN Draft 3 §2.1 的唯一 ALPN；客户端不带它就握手失败 |
 | `broker_proto_mqtt_quic.handshake_timeout_ms` / `idle_timeout_ms` | 5000 / 30000 | TLS 1.3 握手超时与 QUIC idle timeout |
-| `broker_proto_mqtt_quic.max_streams_per_conn` | 4 | 每条 QUIC 连接**建连时**授予的双向流信用 = 同一连接上的重连次数（不是并发流数；见 `mqtt_quic_listener:open/2`） |
+| `broker_proto_mqtt_quic.max_streams_per_conn` | 4 | 每条 QUIC 连接**建连时**授予的双向流信用 = 同一连接上的重连次数（不是并发流数；理由见 `mqtt_quic_listener` 内部 `open/2` 的注释） |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 
@@ -533,8 +533,8 @@ broker_subscription_worker ──┘                              ├→ broker_
 | 每条规则可配置的「未知扩展属性拒绝」 | S7 之后 | `broker_event` 策略链 | 五档策略与冻结的指标键不变 |
 | 去重/隔离钩子推广到五协议 | S7 之后 | WS/NATS/AMQP/Kafka/Pulsar 发布路径补 `broker_event:duplicate/1` / `quarantine/2` | 五档策略与 MQTT 现有行为不变；见 `docs/cloudevents-mapping.md` |
 | OTel 等可观测性导出层 | S7 之后 | 在 `broker_metrics:snapshot/0` 之上加 OTel 等导出 | 计数点与冻结的键集合不变；`broker_event_trace` 的校验与门控已实现，不因导出层而改动 |
-| `require_auth` 接进 MQTT CONNECT | S7 之后 | `mqtt_conn_fsm:authenticate/2` 增加 `auth_required(<<"mqtt">>)` 分支 | MQTT 现有的匿名 `client_id` 即 principal 语义（S1 冻结）不变；见 `docs/security.md` §2.2 现状边界 |
-| `broker_meta` 用户表接进数据面认证 | S7 之后 | `broker_security:users/0` 增加 mnesia 读取源 | `authenticate/2`、`authenticate_conn/1` 的对外形态与错误语义不变；ADR-021 §D7 冻结后补充 |
+| `require_auth` 接进 MQTT CONNECT | S7 之后 | `mqtt_conn_fsm` 的私有 `authenticate/2` 增加 `auth_required(<<"mqtt">>)` 分支 | MQTT 现有的匿名 `client_id` 即 principal 语义（S1 冻结）不变；见 `docs/security.md` §2.2 现状边界 |
+| `broker_meta` 用户表接进数据面认证 | S7 之后 | `broker_security` 的私有 `users/0` 增加 mnesia 读取源 | `authenticate/2`、`authenticate_conn/1` 的对外形态与错误语义不变；ADR-021 §D7 冻结后补充 |
 | `topic_meta` / `queue_meta` / `binding_meta` 的运行时读取方 | S7 之后 | 路由/队列/Topic-Binding 管理路径 | 三张表已建表、有泛型 CRUD；接入读取方不改变现有路由与队列语义 |
 | MQTT-SN over DTLS | S8 之后 | `broker_proto_mqtt_sn` 的 socket 换成 `ssl` 的 dtls 档 | MQTT-SN 1.2 报文与 topic id 模型不变；1884 目前是唯一**明文且无 TLS 路径**的端口（`docs/security.md` §12 第 8 条） |
 | QUIC 0-RTT early data 与多流模式 | 不做（CN 可选项 / EMQX 私有扩展） | — | 单流模式是 CN Draft 3 的全部内容；ADR-024 已冻结该边界 |
