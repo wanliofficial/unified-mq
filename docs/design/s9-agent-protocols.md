@@ -59,6 +59,8 @@
 | MCP `tools/resources/prompts`、ACP agent 侧推理 | **不在 Broker 内实现**：Broker 只承载传输，语义由外部 server / agent 提供 | README §1.2 非目标 |
 | 可观测 | `broker_metrics:snapshot/0` + ADR-016 最小集；OTel 导出层仍是 `docs/security.md` §12 待办 | ADR-016 |
 
+> **落地后修正（S9-0，2026-11-11）**：本表第 1 行「A2A `Task`」的落点**不是订阅游标**。S9-0 收敛为**事件溯源**：Task 事件是普通 `#broker_message{}`（`destination = $a2a/task/<id>`），Task 状态是 adapter 内的 ETS 投影；**不建 SubRef cursor、不写 `.cursors`、不参与 `min(live cursor)`**。依据 [ADR-025](../adr/025-a2a-task-log-mapping.md) §D6 与[收敛报告](s9-0-convergence-report.md) OQ-2/OQ-5。第 4 行「Agent Card」的落点收敛为 `broker_meta` **新增 `agent_card` 表**（[ADR-026](../adr/026-agent-adapter-front-end.md) §D3），不复活 `topic_meta`/`queue_meta`/`binding_meta`。
+
 ### 1.3 定位结论与非目标边界
 
 **结论**：S9 = 在既有统一消息内核之上，新增 A2A / MCP / ACP 三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的可靠承载与网关；**首期以 A2A 为主线**（唯一真正的 agent↔agent 协议），MCP / ACP 作为配套承载面。
@@ -82,6 +84,8 @@
 ## 2. 协议整理
 
 ### 2.1 A2A Protocol 1.0.0
+
+> **落地后修正（S9-0，2026-11-11）**：本节按 `latest/specification/` 页面整理，该页在 §3 后被截断，故多处按 `0.3.0` 风格书写。S9-0 已以 `specification/a2a.proto` @ `main` 逐字复核，与本节有 **8 处偏差**（Agent Card 改 `supportedInterfaces[]`、状态改 `TASK_STATE_*`、补 `ListTasks`、补 `A2A-Version`、错误码 `-32001`~`-32009`、`mediaType` 命名、`capabilities.extendedAgentCard`、`TaskPushNotificationConfig` 名称；逐条见[报告 §2.4](s9-0-convergence-report.md)）。**以[收敛报告 §2](s9-0-convergence-report.md) 与 [ADR-025](../adr/025-a2a-task-log-mapping.md) 为准**；本节原文保留作「规划期读法」的记录，不逐条改写。同理，MCP 的 `initialize`/`server/discover` 取舍与 ACP v2 草案项见收敛报告 §13（S9-D/S9-E 开工前再核）。
 
 **目标与原则**：让不同框架/厂商的、彼此**不透明**的 agent 系统能互相发现能力、协商交互模态（文本/文件/结构化数据）、管理协作任务、安全交换信息，**无需访问对方内部状态、内存或工具**。指导原则：`Simple`（复用 HTTP / JSON-RPC 2.0 / SSE）、`Enterprise Ready`、`Async First`、`Modality Agnostic`、`Opaque Execution`。
 
@@ -397,6 +401,8 @@ S9 承接 S8 之后；它**不引入新的内核抽象**，而是复用 S3（Clo
 | OQ-8 | OAuth 授权服务器 / JWKS 端点是否纳入 Broker | 倾向「不纳入，凭据带外」（A2A 规范建议），但需冻结 | ADR 边界声明 |
 | OQ-9 | 大 `Artifact`（内联 `raw` 字节）与 Broker 消息大小上限的冲突 | 决定 R-M5 的上限口径 | 容量 spike + 限制清单 |
 | OQ-10 | 三协议与六协议既有端口 / listener / `broker_security` 认证路径的装配顺序 | 避免破坏既有 823 用例与 boot 顺序 | 参照 `docs/architecture.md` §3.1 boot step 给出顺序 |
+
+> **状态（S9-0，2026-11-11）：OQ-1~OQ-10 已全部收敛，本阶段结项**。结论与证据在[《S9-0 收敛报告》](s9-0-convergence-report.md)（§2 协议事实、§3~§11 逐条、§13 未决复核项），冻结决策落在 [ADR-025](../adr/025-a2a-task-log-mapping.md)（Task → 内核映射）与 [ADR-026](../adr/026-agent-adapter-front-end.md)（前端选型、Agent Card 落点、装配、ACP 侧别、egress、OAuth 边界）。**代码仍未开工**：S9-A 起的 Gate 项全未勾选，基线仍是 `rebar3 ct` 823/823、52 套件。
 
 ### 4.5 口径说明
 

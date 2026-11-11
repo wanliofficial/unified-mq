@@ -44,6 +44,15 @@
 | [023](023-mqtt-over-websocket-two-processes.md) | MQTT over WebSocket 的两进程分层；帧解码不进 `decode_msg/2` | MQTT 3.1.1 §6 / 5.0 §6；RFC 6455；ADR-001 |
 | [024](024-mqtt-over-quic.md) | MQTT over QUIC：连接/流两层、profile 门控依赖、流信用与 `active, once` | OASIS MQTT TC《Single Stream Mode》CN Draft 3 §2.1；ADR-001/022/023 |
 
+### S9 决策（已采纳，2026-11-11 冻结）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [025](025-a2a-task-log-mapping.md) | A2A Task 状态机到统一消息内核的映射：Task 事件 = 普通 `broker_message`（事件溯源），Task = adapter 投影，不用订阅游标；可靠性档绑定 ADR-007；retention 为运维契约 | A2A 1.0.0 `specification/a2a.proto`（`Task`/`TaskState`/`StreamResponse`）、`docs/specification.md` §5.4/§9；ADR-001/002/007/009/013/014/015/026 |
+| [026](026-agent-adapter-front-end.md) | Agent 接入前端：四 app 拆分（纯库底座 + 三 adapter）、ranch + `{packet, http_bin}` + OTP 28 `json` 自建 HTTP/1.1/SSE、Agent Card 落 `broker_meta.agent_card`（amends ADR-002）、端口/boot/relx 双清单、ACP 只做 stdio 且 Broker 扮 Client、egress pin IP 与 OAuth 不纳入 | A2A 1.0.0 §5.3/§5.5/§9、MCP 2026-07-28 architecture、ACP v1 overview；ADR-001/002/015/016/021/023/024/025 |
+
+> S9 决策只冻结抽象与边界，S9-A~S9-F 的代码与 Gate 证据尚未产出（roadmap §11.1）；结论与证据汇总见 [`docs/design/s9-0-convergence-report.md`](../design/s9-0-convergence-report.md)。
+
 ## Gate S0 验收清单（roadmap §2）
 
 - [x] S0.1（ra 评估）与 S0.3（WAL）产出明确结论（采用 ra / 采用方案 A 自研 WAL）

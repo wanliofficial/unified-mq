@@ -398,7 +398,7 @@ S7 有两项交付：
 
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
-| S9-0 不确定性收敛 | ⬜ 未开工 | spike 报告 + 新增 ADR（设计文档 §4.4 的 OQ-1~OQ-10，首项是以 `spec/a2a.proto` 复核状态/字段/方法名） | 评审签认 |
+| S9-0 不确定性收敛 | ✅ 已收敛（2026-11-11，文档结项，无代码） | 《S9-0 收敛报告》+ [ADR-025](adr/025-a2a-task-log-mapping.md)（Task → 内核映射）+ [ADR-026](adr/026-agent-adapter-front-end.md)（前端/控制面/边界）；OQ-1~OQ-10 全部收敛 | 收敛报告 §0 结论速览、§2 协议事实、§14 S9-A 入口条件 |
 | S9-A 协议底座 | ⬜ 未开工 | JSON-RPC 2.0 + HTTP/SSE 前端 + 版本/能力协商 + 错误模型 + `broker_security` 接线；配置门控 | 单方法 echo + 协商 + `401`/`403`；既有 823/823 零回归 |
 | S9-B A2A 核心 | ⬜ 未开工 | Agent Card + 发现（well-known / catalog / 缓存）+ Task 状态机 + `SendMessage`/`GetTask`/`CancelTask` + `broker_message`/CloudEvents 映射 | 官方 A2A SDK 真实客户端跑通 Task 全生命周期；终态不可变 + 崩溃恢复 |
 | S9-C 流式与异步 | ⬜ 未开工 | SSE 流 + `SubscribeToTask` + Push Notification Config + 出站 webhook + SSRF/签名/防重放 + 重试/DLQ/TTL | 断线重连 + webhook 端到端；SSRF 拒绝 / 伪造签名拒绝专项用例 |
@@ -406,7 +406,7 @@ S7 有两项交付：
 | S9-E ACP 前端 | ⬜ 未开工 | stdio 前端 + `initialize`/`session/*`/`session/update` + 权限回调 + `stopReason` | 官方 ACP SDK / 兼容编辑器真实 agent 客户端证据 |
 | S9-F 一致性收口 | ⬜ 未开工 | 能力矩阵与限制清单、安全审计、压测与容量、运维/告警、文档同步、ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 |
 
-### 11.2 Gate S9（与设计文档 §4.3 同一份清单；逐项验收细节在 S9-0 后补齐）
+### 11.2 Gate S9（与设计文档 §4.3 同一份清单；逐项验收细节随 S9-A 落地补齐，S9-0 已冻结 Entry 条件见[收敛报告](design/s9-0-convergence-report.md) §14）
 
 - [ ] 三协议各一份真实第三方客户端证据落盘 `test/protocol-compatibility/`，并各有一行能力矩阵 + 逐协议限制清单
 - [ ] Task 状态机与终态不可变有自动化测试，含崩溃恢复与可靠性等级逐档证明
@@ -417,7 +417,7 @@ S7 有两项交付：
 - [ ] S9 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
 - [ ] 非目标与裁剪项在能力矩阵中逐行留痕
 
-**状态口径**：本阶段为**立项规划、未开工**，无任何「已实测」数字，Gate 项全部未勾选。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**暂不改动**，待 S9-A 有首个代码交付时统一同步，避免把计划读成现状。
+**状态口径**：**S9-0 已以文档形式结项（2026-11-11），S9 代码仍未开工**——`docs/design/s9-agent-protocols.md` §4.4 的 OQ-1~OQ-10 已收敛，结论落在[《S9-0 收敛报告》](design/s9-0-convergence-report.md) 与 ADR-025/026；**S9-A~S9-F 全部「⬜ 未开工」，Gate S9 全未勾选，无任何「已实测」数字**。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——S9-0 只改文档，没有新增 app、端口或代码路径，待 S9-A 有首个代码交付时统一同步，避免把计划读成现状。
 
 ---
 
@@ -451,6 +451,8 @@ S7 有两项交付：
 | ADR-022 | MQTT-SN 网关：单 socket / 多会话、topic id 三表与休眠语义 | S8-C（已采纳） |
 | ADR-023 | MQTT over WebSocket 的两进程分层 | S8-B（已采纳） |
 | ADR-024 | MQTT over QUIC：连接/流两层、profile 门控依赖与流信用 | S8-D（已采纳） |
+| ADR-025 | A2A Task 状态机到统一消息内核的映射（事件溯源、可靠性档、retention 契约） | S9-0（已采纳） |
+| ADR-026 | Agent 接入前端：应用拆分、HTTP/SSE 选型、Agent Card 落点与边界 | S9-0（已采纳） |
 
 ### 12.2 文档产出物
 
@@ -474,6 +476,7 @@ S7 有两项交付：
 | `docs/design/s8-c-mqtt-sn-execution-plan.md` | S8-C（已完成 2026-11-10） | 4.1、11.1 |
 | `docs/design/s8-d-mqtt-over-quic-execution-plan.md` | S8-D（已完成 2026-11-11） | 4.1、11.1 |
 | `docs/design/s9-agent-protocols.md` | S9（立项规划稿，2026-11-11；协议整理 + 需求 + 计划） | 4.1、11.1 |
+| `docs/design/s9-0-convergence-report.md` | S9-0（已完成 2026-11-11，文档；OQ-1~OQ-10 收敛） | 11.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/protocol-conformance-validation.md` | S6 之后（2026-11-10 起草；外部 conformance 资源接入规划，S8 三协议不在范围） | 11.1、11.2 |
