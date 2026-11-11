@@ -214,7 +214,7 @@ Server 必须在 Agent Card 声明 `capabilities.streaming` / `capabilities.push
 | 传输 | HTTP(S) + JSON-RPC 2.0 / SSE / webhook；gRPC、REST 绑定 | stdio / Streamable HTTP(POST+SSE) | stdio 子进程；远程 HTTP/WS 未定稿 |
 | 流式 | SSE `SendStreamingMessage` + `SubscribeToTask` | 可选 SSE + `notifications` / `progress` | `session/update` 通知 |
 | 异步 | `GetTask` 轮询 + Push Notification | 长操作 progress | `stopReason` + `session/cancel` |
-| 发现 | Agent Card（well-known / registry / 配置） | `server/discover` + `tools|resources|prompts/list` | `initialize` 能力协商 |
+| 发现 | Agent Card（well-known / registry / 配置） | `server/discover` + `tools\|resources\|prompts/list` | `initialize` 能力协商 |
 | 认证 | Agent Card `securitySchemes`，HTTP 头，带外凭据，401/403 | 标准 HTTP 认证，推荐 OAuth | `authMethods` / `authenticate` |
 | 扩展 | `Extension` + Agent Card 声明 | `_meta` + capability | `_meta` + 下划线前缀方法 |
 | 对 S9 的意义 | **主线**：任务总线 / 事件承载 / 出站推送 | 配套：工具面传输承载 | 配套：会话面传输承载 |
@@ -314,7 +314,7 @@ Server 必须在 Agent Card 声明 `capabilities.streaming` / `capabilities.push
 
 | 编号 | 需求 | 来源 | 优先级 | 子阶段 |
 |---|---|---|---|---|
-| R-B1 | 应透传 MCP 原语（`server/discover`、`tools/list|call`、`resources/list|read`、`prompts/*`、`notifications`、`progress`）；**Broker 不解释 / 不执行工具语义** | §2.2 + §1.3 非目标 | P1 | S9-D |
+| R-B1 | 应透传 MCP 原语（`server/discover`、`tools/list\|call`、`resources/list\|read`、`prompts/*`、`notifications`、`progress`）；**Broker 不解释 / 不执行工具语义** | §2.2 + §1.3 非目标 | P1 | S9-D |
 | R-B2 | **不得**实现 `sampling`（`2026-07-28` 已弃用） | §2.2 | P0 | S9-D |
 | R-B3 | 必须明确 Broker 在 ACP 中扮演哪一侧；`fs/*` / `terminal/*` / `session/request_permission` 回调面若不由 Broker 提供，须在能力矩阵中写明 | §2.3 | P0 | S9-E |
 | R-B4 | ACP 远程 HTTP/WS **不得**按规范实现（未定稿）；版本必须可协商门控，v2 草案特性不进默认路径 | §2.3 版本风险 | P0 | S9-E |
