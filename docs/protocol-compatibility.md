@@ -141,8 +141,8 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 | 层 | 用例 |
 |---|---|
-| 帧（`mqtt_frame_SUITE`） | 27 例，含 PUBREC/PUBREL/PUBCOMP 双向、QoS2 PUBLISH/Will、reserved flags |
-| 连接（`mqtt_conn_SUITE`） | 50 例，其中 QoS2/Retain/Will 共 20 例：四步双向、DUP 去重、重连重发两半、未知帧幂等、状态超限、补发/清除/持久化/上限、Will 四种触发 + 重启不补发 |
+| 帧（`mqtt_frame_SUITE`） | 27 例（S2-C 时点；S2.5 扩 v5 属性/原因码后共 31 例），含 PUBREC/PUBREL/PUBCOMP 双向、QoS2 PUBLISH/Will、reserved flags |
+| 连接（`mqtt_conn_SUITE`） | 50 例（S2-C 时点；S2.5/S3/S8-A 追加后共 70 例），其中 QoS2/Retain/Will 共 20 例：四步双向、DUP 去重、重连重发两半、未知帧幂等、状态超限、补发/清除/持久化/上限、Will 四种触发 + 重启不补发 |
 | retain app（`broker_retain_SUITE`） | 17 例：可见性、覆盖、清除、排序、同步/异步落盘、三个上限、损坏文件 |
 | 崩溃（T14 R8） | QoS2 收 `PUBREC` 后 `kill -9`；重启后客户端重发 `PUBREL`，broker 幂等回 `PUBCOMP`；消息至少投递一次、cursor 最终推进。**默认档与零回退档都 PASS** |
 | 真实客户端（T15） | `paho-qos2`（双向四步 + 字节一致）、`paho-retain`（补发 retain=1 / 转发 retain=0 / 空 payload 清除）、`paho-will`（异常断连发布）、`paho-will-skipped`（DISCONNECT 抑制）、`mosq-qos2`（mosquitto 2.1.2 双向） |
@@ -230,7 +230,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | 层 | 用例 |
 |---|---|
 | codec / 策略 / binding（`broker_event_SUITE`） | 31 例（S3 时点；S5/S6 追加头通道往返后共 35 例）：必需属性缺失、类型错误、非法版本/时间/base64、`data`/`data_base64` 互斥、扩展保留与上限、Structured/Binary 正反向、3.1.1 损失清单、跨协议往返、事件 ID 与 Broker ID 分离、策略解析、去重开/关/过期、隔离副本、ACL 不信任事件属性 |
-| 连接（`mqtt_conn_SUITE`） | 2 例：v5 `required` 拒绝回 `0x83` 且连接继续可用；3.1.1 拒绝关闭且不发 ACK |
+| 连接（`mqtt_conn_SUITE`） | 2 例（S3 新增）：v5 `required` 拒绝回 `0x83` 且连接继续可用；3.1.1 拒绝关闭且不发 ACK |
 | 全量 | `rebar3 ct` **422/422**；`dialyzer` 0 warnings；`xref` 76 条均为预期 unused-export（S3 新增 13 条公开 API/测试入口） |
 
 ---
