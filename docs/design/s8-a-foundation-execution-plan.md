@@ -307,14 +307,14 @@ git commit -m "docs(s8-a): record broker_ws and mqtt_transport in architecture a
 
 ## 完成判据（Definition of Done）
 
-- [ ] `broker_ws` app 建立，`ws_frame` 原样迁入，`ws_frame_SUITE` 9 例零回归
-- [ ] `ws_handshake:accept/1,2` 实现并通过 `ws_handshake_SUITE`（7 行语义 + 大小写 + 多 token）
-- [ ] `broker_proto_ws` 握手字节与改造前一致（`ws_conn_SUITE` 一例不少）
-- [ ] `mqtt_transport` 行为落地，`mqtt_conn_fsm` 5 处 + 1 条事件路径改造完成
-- [ ] `mqtt_tls_SUITE` 通过：TLS 上的 MQTT 握手与 QoS1 往返**真实成功**（修复设计 §2 指出的既有缺陷）
-- [ ] `rebar3 ct` 总例数 = 673 + 新增，零 FAILED，零新增 Skipped
-- [ ] dialyzer / xref 干净，release 装配成功
-- [ ] `docs/architecture.md` / `operations.md` / `progress.md` 同步，用例数回填
+- [x] `broker_ws` app 建立，`ws_frame` 原样迁入，`ws_frame_SUITE` 9 例零回归
+- [x] `ws_handshake:accept/1,2` 实现并通过 `ws_handshake_SUITE`（7 行语义 + 大小写 + 多 token）
+- [x] `broker_proto_ws` 握手字节与改造前一致（`ws_conn_SUITE` 一例不少）
+- [x] `mqtt_transport` 行为落地，`mqtt_conn_fsm` 5 处 + 1 条事件路径改造完成
+- [x] `mqtt_tls_SUITE` 通过：TLS 上的 MQTT 握手与 QoS1 往返**真实成功**（修复设计 §2 指出的既有缺陷）
+- [x] `rebar3 ct` 总例数 = 673 + 新增，零 FAILED，零新增 Skipped（**702/702**，46 套件）
+- [x] dialyzer / xref 干净，release 装配成功
+- [x] `docs/architecture.md` / `operations.md` / `progress.md` 同步，用例数回填
 
 ## 不在本阶段（明确留给后续阶段）
 
