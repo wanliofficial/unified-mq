@@ -1,4 +1,4 @@
-# CloudEvents 映射（S3 起，S6 补齐六协议）
+# CloudEvents 映射（S3 起，S6 补齐六协议；S8 的三条 MQTT 传输见 §3 末注）
 
 本文只写**已实现**的行为：CloudEvents 1.0 JSON Format 的内部模型、五种策略、
 去重与隔离、六个协议的 Binding 及非无损点。设计依据是
@@ -73,11 +73,14 @@ S6 的统一头通道扩展（[`protocol-compatibility.md`](protocol-compatibili
 正反向映射统一走 `broker_event_binding:to_headers/2,3` 与 `from_headers/3`；
 五个头通道目标在 `header_binding_roundtrip_for_all_targets` 里逐一往返。
 
+**S8 的三条新传输不在本节范围内**：MQTT over WebSocket 与 MQTT over QUIC 复用同一份 `mqtt_conn_fsm`，因此继承上表 MQTT 行（5.0 的 User Properties 通道、3.1.1 的损失报告）**一字不改**；MQTT-SN 例外——1.2 的 PUBLISH 没有任何用户元数据槽位，`mqtt_sn_conn` 构造的消息 `headers` 恒为 `#{}`，**只有 Structured Mode、没有 Binary Mode 通道**。详见 [`protocol-compatibility.md`](protocol-compatibility.md) §4.10 的 S8-C 行与 §4.11。
+
 ---
 
 ## 4. 策略
 
-`broker_event:apply_policy/1` 在执行存储前运行，六个协议发布路径都调用它；
+`broker_event:apply_policy/1` 在执行存储前运行，六个协议发布路径都调用它
+（S8-C 的 MQTT-SN 也调用同一个 seam，`mqtt_sn_conn.erl:1027`）；
 默认 `pass_through` 是恒等变换（不解析、不改字节）。
 
 | 策略 | 行为 |
@@ -94,7 +97,8 @@ S6 的统一头通道扩展（[`protocol-compatibility.md`](protocol-compatibili
 
 **拒绝路径**按协议语义表达：MQTT 5 `0x83`；WS `cloudevent_rejected` 错误帧；
 NATS `-ERR` 并断开；AMQP channel 406；Kafka `INVALID_RECORD`（87）；
-Pulsar `SendError`。拒绝的消息不写 WAL、不 ACK。
+Pulsar `SendError`。拒绝的消息不写 WAL、不 ACK。MQTT-SN 没有通用错误通道：
+QoS 1 回 PUBACK `NOT_SUPPORTED`，QoS 0/2/−1 静默丢弃（QoS 2 不发 PUBREC，客户端重试）。
 
 ---
 

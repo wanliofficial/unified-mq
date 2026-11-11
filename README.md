@@ -2,7 +2,7 @@
 ## Erlang/OTP + Raft + 多协议接入 + Pulsar + CloudEvents
 
 - **文档版本**：v1.2
-- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S8 已实现并验证（`rebar3 ct` 823/823、52 套件；六协议真实客户端套件 + MQTT-SN / MQTT over QUIC / MQTT over WebSocket 三套真实客户端证据），S8 及之后仍未实现的方向列在 [`docs/security.md`](docs/security.md) §12。本文 §8 的目录结构与 §12 的分阶段表是**设计建议**，实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1。
+- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S8 已实现并验证（`rebar3 ct` 823/823、52 套件；六协议真实客户端套件 + MQTT-SN / MQTT over QUIC / MQTT over WebSocket 三套真实客户端证据），S8 及之后仍未实现的方向列在 [`docs/security.md`](docs/security.md) §12。本文 §7.3 的监督树示意、§8 的目录结构与 §12 的分阶段表是**设计建议**（S0 阶段写下的规划，模块名与分阶段粒度都不是现状），实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1，实际监督树见其 §3.1，实际阶段与证据见 [`docs/roadmap.md`](docs/roadmap.md) §10。
 - **目标**：构建一个以 Erlang/OTP 为核心、支持多消息协议、分布式一致性、持久化消息和标准化事件的统一消息 Broker。
 - **核心原则**：协议适配与消息内核解耦；控制面与数据面分离；共识层不替代消息语义；CloudEvents 是事件表达标准，不是传输协议。
 
@@ -522,6 +522,8 @@ CloudEvents `source + id` 可作为业务事件去重的候选键，但 Broker �
 ---
 
 ## 12. 分阶段路线图
+
+> 本节的 Phase 0–6 是 S0 阶段的设计粒度划分，与仓库实际的 S0–S8 阶段不是一一对应关系（例如 Phase 5「协议扩展」在本仓库拆成 S1–S8，Phase 6「生产化」的安全与观测部分落在 S6/S7）。实际阶段、完成状态与用例证据见 [`docs/roadmap.md`](docs/roadmap.md) §10。
 
 ### Phase 0：架构验证
 

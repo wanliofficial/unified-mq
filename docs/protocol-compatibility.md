@@ -533,9 +533,9 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-### 4.10 CloudEvents Binding 现状（S5–S7 口径）
+### 4.10 CloudEvents Binding 现状（S5–S7 口径，S8-C 追加 MQTT-SN 行）
 
-ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S6 补齐其余五个协议的 **Binary Mode**，统一采用协议中立的头通道：
+ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S6 补齐其余五个协议的 **Binary Mode**，统一采用协议中立的头通道（S8-C 的 MQTT-SN 只能走 Structured，见下表的 S8-C 行）：
 
 > payload = 事件数据字节；上下文写传输协议的元数据字段，键名统一为 `ce-<属性名>`
 > （`ce-specversion`、`ce-id`、`ce-source`、`ce-type`、可选属性与 `ce-<扩展名>`），
@@ -550,8 +550,9 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 | AMQP | ✅ payload 逐字节透传 | ✅ basic properties 的 `headers` table 放 `ce-*`，`content_type` 放 `content-type`；投递写回 properties | AMQP 0-9-1 |
 | Kafka | ✅ payload 逐字节透传 | ✅ Record Headers 放 `ce-*`；投递写回 Record Headers | Kafka 0.11+ record batch |
 | Pulsar | ✅ payload 逐字节透传 | ✅ Message properties 放 `ce-*`；投递写回 properties | Pulsar 2.10+ |
+| MQTT-SN（S8-C） | ✅ payload 逐字节透传（payload 原样进 `broker_message.payload`） | **❌ 不可表达**：1.2 的 PUBLISH 只有 flags / topicIdType / topicId / msgId / data，没有任何用户元数据槽位，`mqtt_sn_conn` 构造的消息 `headers` 恒为 `#{}` | `mqtt_sn_conn.erl:1087`；与 MQTT 3.1.1 的区别是后者还能返回损失清单，MQTT-SN 连承载损失的字段都没有 |
 
-**统一策略执行**：六个协议在写入前都调用 `broker_event:apply_policy/1`（默认 `pass_through` 为 no-op）。拒绝路径按协议各自的错误语义表达：MQTT 5 → `0x83`；WS → `{"op":"error","code":"cloudevent_rejected","reason":"…"}`；NATS → `-ERR` 并断开；AMQP → channel error 406；Kafka → `INVALID_RECORD`（87）；Pulsar → SendError（`ERROR_UNKNOWN`）。
+**统一策略执行**：六个协议在写入前都调用 `broker_event:apply_policy/1`（默认 `pass_through` 为 no-op）。S8-C 的 MQTT-SN 也调用同一个 seam（`mqtt_sn_conn.erl:1027`），因此 `required` / `validate_if_present` 策略对它是生效的——但 MQTT-SN 表达不了 Binary Mode，只能靠 Structured Mode（payload 自描述）判定；拒绝按 MQTT-SN 自己的「无通用错误通道」语义表达：QoS 1 回 PUBACK `NOT_SUPPORTED`，QoS 0/2/−1 静默丢弃（QoS 2 不发 PUBREC 迫使客户端重试）。拒绝路径按协议各自的错误语义表达：MQTT 5 → `0x83`；WS → `{"op":"error","code":"cloudevent_rejected","reason":"…"}`；NATS → `-ERR` 并断开；AMQP → channel error 406；Kafka → `INVALID_RECORD`（87）；Pulsar → SendError（`ERROR_UNKNOWN`）。
 
 **已声明的非无损点**（`report/5` 的 `losses` 必须被调用方读取）：
 
@@ -559,7 +560,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 - NATS 客户端未声明 `headers` 时，`ce-*` 全部丢失；这是协议能力限制，不是静默丢弃（适配器在 CONNECT 后按 `headers_cap` 决定 MSG/HMSG）。
 - AMQP 0-9-1 的 `basic.publish` 没有逐消息否认；策略拒绝表现为 channel error 406，客户端必须重新打开 channel。
 
-「逐字节透传」意味着：一个合法的 Structured CloudEvents JSON 通过这五个协议发布再消费，**字节不变**（因此 `id`/`source`/`type`/扩展都保留）。
+「逐字节透传」意味着：一个合法的 Structured CloudEvents JSON 通过这五个协议（加上 MQTT-SN）发布再消费，**字节不变**（因此 `id`/`source`/`type`/扩展都保留）。
 
 > **S7 结案（2026-11-10）**：上面是统一 `ce-*` 头通道的现状，**不是**各协议官方 Binding 的逐字实现。逐协议的官方条文核对结论已写入 `docs/roadmap.md` §9.1（Gate S7 第 3 项已勾选），要点：
 
