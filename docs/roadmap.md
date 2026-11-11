@@ -31,9 +31,10 @@ flowchart LR
     S4 --> S6
     S6 --> S7[S7 身份统一与事件绑定]
     S7 --> S8[S8 MQTT 传输扩展]
+    S8 --> S9[S9 Agent 互操作协议接入层]
 ```
 
-S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。
+S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。S9 承接 S8 之后新增 A2A / MCP / ACP 三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的承载与网关；**这是立项规划、未开工**，需求与计划见 §11 与 [`docs/design/s9-agent-protocols.md`](design/s9-agent-protocols.md)。
 
 ---
 
@@ -50,6 +51,7 @@ S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面�
 | **S6** | 生产化 | 安全 / 可观测 / 运维 / 容量 | 压测报告 + 故障演练 + 运维手册 |
 | **S7** | 身份统一与事件绑定 | 六协议共用身份表（已完成）+ 标准 CloudEvents Binding 逐字结论（已完成） | 租户来自用户记录 + 每个协议的 Binding 有明确结论 |
 | **S8** | MQTT 传输扩展 | MQTT-SN 1.2 / MQTT over QUIC / MQTT over WebSocket（三条复用同一 MQTT 引擎的传输） | 三种传输各有一份真实第三方客户端证据 + 能力矩阵与限制清单 |
+| **S9** | Agent 互操作协议接入层 | A2A 1.0.0 / MCP 2026-07-28 / ACP v1 三个 `broker_proto_*` adapter，以 A2A 为主线；复用统一消息内核、CloudEvents `ce-*` 通道、`broker_security` 身份表与 ACL | 三协议各一份真实第三方客户端证据 + 能力矩阵与限制清单；Task 状态机与终态不可变、认证与 SSRF 防护专项用例；既有 823/823 零回归（**立项规划，未开工，见 §11**） |
 
 ---
 
@@ -384,9 +386,44 @@ S7 有两项交付：
 
 ---
 
-## 11. 附录
+## 11. S9 — Agent 互操作协议接入层（A2A / MCP / ACP）
 
-### 11.1 关键 ADR 索引
+**目标**：在既有统一消息内核之上新增三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的可靠承载与网关；**首期以 A2A 为主线**（唯一真正的 agent↔agent 协议），MCP / ACP 作为配套承载面。协议整理、需求提炼与完整开发计划见 [`docs/design/s9-agent-protocols.md`](design/s9-agent-protocols.md)（§2 / §3 / §4）。
+
+**定位**：与 S5 / S8 同构，按 ADR-001「协议适配与消息内核解耦」——各协议一个 `broker_proto_*` adapter，只依赖内核门面、彼此不引用，**不写第二套消息内核**；复用 S3 的 CloudEvents `ce-*` 通道、S6/S7 的 `broker_security` 身份表与 ACL、可观测最小集与 W3C Trace Context 门控，以及 ADR-007/013/014/015 的可靠性 / 游标 / retention / 重投递-DLQ-TTL。
+
+**来源与边界**：A2A `1.0.0`、MCP `2026-07-28`、ACP v1 stable（v2 为草案）。严格说三者不都是「agent 之间」——A2A 是 agent↔agent，MCP 是 agent↔工具/数据，ACP 是编辑器↔编码 agent；共同底座是 JSON-RPC 2.0、版本/能力协商、传输层认证（payload 不带身份）、流式与异步长任务。agent 推理 / 工具执行、A2A gRPC/REST 绑定、ACP 远程传输（未定稿）、MCP `sampling`（已弃用）、各协议官方 CloudEvents Binding 逐字实现（S7 已结案「不立项」）均为非目标。
+
+### 11.1 阶段表
+
+| 子阶段 | 状态 | 产出 | 证据 |
+|---|---|---|---|
+| S9-0 不确定性收敛 | ⬜ 未开工 | spike 报告 + 新增 ADR（设计文档 §4.4 的 OQ-1~OQ-10，首项是以 `spec/a2a.proto` 复核状态/字段/方法名） | 评审签认 |
+| S9-A 协议底座 | ⬜ 未开工 | JSON-RPC 2.0 + HTTP/SSE 前端 + 版本/能力协商 + 错误模型 + `broker_security` 接线；配置门控 | 单方法 echo + 协商 + `401`/`403`；既有 823/823 零回归 |
+| S9-B A2A 核心 | ⬜ 未开工 | Agent Card + 发现（well-known / catalog / 缓存）+ Task 状态机 + `SendMessage`/`GetTask`/`CancelTask` + `broker_message`/CloudEvents 映射 | 官方 A2A SDK 真实客户端跑通 Task 全生命周期；终态不可变 + 崩溃恢复 |
+| S9-C 流式与异步 | ⬜ 未开工 | SSE 流 + `SubscribeToTask` + Push Notification Config + 出站 webhook + SSRF/签名/防重放 + 重试/DLQ/TTL | 断线重连 + webhook 端到端；SSRF 拒绝 / 伪造签名拒绝专项用例 |
+| S9-D MCP 承载 | ⬜ 未开工 | Streamable HTTP / stdio 前端 + `initialize`/`server/discover` + 原语透传（不解释工具语义） | MCP Inspector / 官方 SDK 真实客户端兼容矩阵 |
+| S9-E ACP 前端 | ⬜ 未开工 | stdio 前端 + `initialize`/`session/*`/`session/update` + 权限回调 + `stopReason` | 官方 ACP SDK / 兼容编辑器真实 agent 客户端证据 |
+| S9-F 一致性收口 | ⬜ 未开工 | 能力矩阵与限制清单、安全审计、压测与容量、运维/告警、文档同步、ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 |
+
+### 11.2 Gate S9（与设计文档 §4.3 同一份清单；逐项验收细节在 S9-0 后补齐）
+
+- [ ] 三协议各一份真实第三方客户端证据落盘 `test/protocol-compatibility/`，并各有一行能力矩阵 + 逐协议限制清单
+- [ ] Task 状态机与终态不可变有自动化测试，含崩溃恢复与可靠性等级逐档证明
+- [ ] 认证接六协议统一身份表；`401`/`403` 与 ACL 越权专项用例通过
+- [ ] Push Notification 的 SSRF 防护、签名验真、防重放专项用例通过
+- [ ] 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功
+- [ ] 压测 / 容量报告落盘，数字全部来自实测
+- [ ] S9 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
+- [ ] 非目标与裁剪项在能力矩阵中逐行留痕
+
+**状态口径**：本阶段为**立项规划、未开工**，无任何「已实测」数字，Gate 项全部未勾选。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**暂不改动**，待 S9-A 有首个代码交付时统一同步，避免把计划读成现状。
+
+---
+
+## 12. 附录
+
+### 12.1 关键 ADR 索引
 
 | ADR | 主题 | 定稿阶段 |
 |---|---|---|
@@ -415,7 +452,7 @@ S7 有两项交付：
 | ADR-023 | MQTT over WebSocket 的两进程分层 | S8-B（已采纳） |
 | ADR-024 | MQTT over QUIC：连接/流两层、profile 门控依赖与流信用 | S8-D（已采纳） |
 
-### 11.2 文档产出物
+### 12.2 文档产出物
 
 | 文档 | 阶段 | 对应 README 章节 |
 |---|---|---|
@@ -436,6 +473,7 @@ S7 有两项交付：
 | `docs/design/s8-b-mqtt-over-ws-execution-plan.md` | S8-B（已完成 2026-11-10） | 4.1、11.1 |
 | `docs/design/s8-c-mqtt-sn-execution-plan.md` | S8-C（已完成 2026-11-10） | 4.1、11.1 |
 | `docs/design/s8-d-mqtt-over-quic-execution-plan.md` | S8-D（已完成 2026-11-11） | 4.1、11.1 |
+| `docs/design/s9-agent-protocols.md` | S9（立项规划稿，2026-11-11；协议整理 + 需求 + 计划） | 4.1、11.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/benchmarks/` | S2 起 | 11.4 |
