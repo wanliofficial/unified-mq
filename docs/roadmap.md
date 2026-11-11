@@ -476,4 +476,5 @@ S7 有两项交付：
 | `docs/design/s9-agent-protocols.md` | S9（立项规划稿，2026-11-11；协议整理 + 需求 + 计划） | 4.1、11.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
+| `docs/protocol-conformance-validation.md` | S6 之后（2026-11-10 起草；外部 conformance 资源接入规划，S8 三协议不在范围） | 11.1、11.2 |
 | `docs/benchmarks/` | S2 起 | 11.4 |
