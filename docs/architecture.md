@@ -67,7 +67,7 @@ apps/
 | `broker_storage` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
 | `broker_queue` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_security | `broker_queue_store` + 每分区 `broker_queue_partition` | `append/3`、`read_from/3`、`watermarks/1`、`capability/1`、`subscribe/2`、`create_partition/1` | 分区句柄注册表、每分区订阅者集合 |
-| `broker_subscription` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_queue | `broker_subscription_worker` | `subscribe/3`、`unsubscribe/2`、`ack/3`、`inflight/2`、`attach/3`、`detach/2`、`dispatch/2`、`cursor/2`、`subscriptions/1`、`session/1` | 五张 ETS（实体 / client→SubRef 成员索引 / 游标 / 连接绑定 / in-flight）+ `data/sessions/*` 三件套 |
+| `broker_subscription` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_queue | `broker_subscription_worker` | `subscribe/3,4`、`unsubscribe/2`、`ack/4`、`claim/4`、`release/4`、`retry/4`、`inflight/2`、`attach/3`、`detach/2`、`dispatch/2`、`cursor/2`、`subscriptions/1`、`session/1`、`role/2` | 五张 ETS（实体 / client→SubRef 成员索引 / 游标 / 连接绑定 / in-flight）+ `data/sessions/*` 三件套 |
 | `broker_event` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_router, broker_queue | `broker_event_dedup`（去重窗口 gen_server + ETS） | `policy/0`、`policy_for/1`、`apply_policy/1,2`、`dedup_window/1`、`duplicate/1`、`quarantine/2`、`broker_event_codec`（CE 1.0 JSON / Binary）、`broker_event_binding`（MQTT Binding + 损失报告） | 去重 ETS（`{Tenant,Destination,source,id} → 过期时刻`，默认关闭） |
 | `broker_security` | kernel, stdlib, sasl, ssl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
 | `broker_retain` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_retain`（gen_server） | `put/2`、`delete/2`、`lookup/1`、`entries/0`、`stats/0`、`flush/0` | 每 topic 一条 retained 消息（ETS/内存树）+ `retain/retain.v1` 快照 |
@@ -405,7 +405,7 @@ SUBSCRIBE(Filter, QoS)
 3. `broker_queue:read_from/3` 按 offset 顺序拉一页（`pull_page_limit`，默认 32）。
 4. 命中集合的投递 QoS = `min(1, max(命中订阅的 QoS))`；由于只有 QoS1 发布进日志，纯 QoS0 命中就是 QoS0 直投、不欠 ack。
 5. 不命中任何 filter 的消息也要 **read-and-skip** 推进 cursor，否则 `committed = min(活 cursor)-1` 会被第一条不相关消息永久钉住。
-6. QoS1 发出后进 in-flight 集合；收到 PUBACK → `broker_subscription:ack/3` → 游标按连续前缀前进 → 周期性 `advance_committed`。
+6. QoS1 发出后进 in-flight 集合；收到 PUBACK → `broker_subscription:ack/4`（带 consumer 做归属校验，ADR-019）→ 游标按连续前缀前进 → 周期性 `advance_committed`。
 7. 窗满（`max_inflight`）不烧下一轮（`stalled`），等 PUBACK 或哨兵 tick；纯 DUP 重发是 `idle`。这是防重发风暴的机制。
 
 **离线积压（clean_session=false）**：没有 broker 侧内存离线队列，积压就是该订阅 cursor 滞后；重连从 cursor 起 `read_from` 追赶，按 offset 顺序统一投递。
