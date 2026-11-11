@@ -3,8 +3,8 @@
 - **文档版本**：v1.0（S6，2026-11-09：补 §2 的 Mnesia/ra 目录、更新证据口径）
 - **状态**：已实现并实测的磁盘格式、刷盘策略与恢复语义；S6 之后明确未实现的方向单列于 §14
 - **对应**：ADR-007（可靠性等级）、ADR-011（`broker_storage` 冻结契约）、ADR-018（retain 树与 `.inflight` v2）、ADR-019（会话文件按 SubRef 与 v1→v2 迁移）、ADR-021（Metadata Raft 与复制提交）、设计文档 §5.3/§7/§8
-- **代码**：`apps/broker_storage/src/`（WAL 七个模块 + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`、`apps/broker_retain/src/broker_retain_files.erl`、`apps/broker_meta/src/broker_meta.erl`、`apps/broker_cluster/src/broker_cluster_meta.erl`
-- **证据**：`rebar3 ct` **673/673**；T14 真实容器 `kill -9` 矩阵（R1a~R9 × 双档）；S2-B 掉电/OS 缓冲注入（`tools/fault/`、`tools/docker/s2_powerloss.py`）；T15 真实客户端 10/10
+- **代码**：`apps/broker_storage/src/`（WAL 八个模块：`wal_codec`/`wal_gc`/`wal_group_committer`/`wal_index`/`wal_meta`/`wal_recovery`/`wal_segment`/`wal_writer` + 两后端）、`apps/broker_subscription/src/broker_subscription_files.erl`、`apps/broker_retain/src/broker_retain_files.erl`、`apps/broker_meta/src/broker_meta.erl`、`apps/broker_cluster/src/broker_cluster_meta.erl`
+- **证据**：`rebar3 ct` **823/823（52 套件，2026-11-11 当前值；本节写作时为 673/673）**；T14 真实容器 `kill -9` 矩阵（R1a~R9 × 双档）；S2-B 掉电/OS 缓冲注入（`tools/fault/`、`tools/docker/s2_powerloss.py`）；T15 真实客户端 10/10
 
 > 本文回答三个问题：**盘上有什么、什么时候真正落盘、崩溃后哪些字节会被信任**。架构分层与进程归属见 [`architecture.md`](architecture.md)。
 

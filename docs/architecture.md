@@ -38,7 +38,7 @@ apps/
 ├── broker_metrics/       S2-A：counters/atomics 指标 + snapshot/0 + 周期单行日志（无热路径进程）
 ├── broker_meta/          S4：Mnesia 控制面 11 表、版本/对账、outbox、用户哈希与 ACL（不含消息正文）
 ├── broker_cluster/       S4：ra Metadata Raft Group、归属缓存、Epoch Fencing、复制与 quorum
-├── broker_storage/       broker_storage behavior + 内存/WAL 两实现 + WAL 内部七个模块
+├── broker_storage/       broker_storage behavior + 内存/WAL 两实现 + WAL 内部八个模块（`wal_codec`/`wal_gc`/`wal_group_committer`/`wal_index`/`wal_meta`/`wal_recovery`/`wal_segment`/`wal_writer`）
 ├── broker_router/        broker_router behavior + broker_router_hash 实现（内存索引）
 ├── broker_queue/         分区层：存储句柄生命周期、append/read 编排、{new_messages} 扇出
 ├── broker_subscription/  订阅、per-sub cursor、投递唤醒、三层会话持久化
@@ -72,11 +72,12 @@ apps/
 | `broker_security` | kernel, stdlib, sasl, ssl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
 | `broker_retain` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_retain`（gen_server） | `put/2`、`delete/2`、`lookup/1`、`entries/0`、`stats/0`、`flush/0` | 每 topic 一条 retained 消息（ETS/内存树）+ `retain/retain.v1` 快照 |
 | `broker_admin` | kernel, stdlib, sasl, crypto, broker_core, broker_metrics, broker_security | `broker_admin_listener`（HTTP accept） | `broker_admin_http:handle/4`、`metrics_text/0`、`broker_backup`、`broker_config_audit`、`broker_version:info/0` | 只读快照；备份清单文件 |
-| `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 其余 6 个 broker app | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener`、`mqtt_transport`（行为）与 `mqtt_transport_tcp`（TCP/TLS 实现） | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器）+ 传输 handle |
+| `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics, broker_storage, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener`、`mqtt_transport`（行为）与 `mqtt_transport_tcp`（TCP/TLS 实现） | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器）+ 传输 handle |
 | `broker_ws` | kernel, stdlib, crypto | **无进程、无配置** | `ws_frame`（RFC 6455 帧编解码）、`ws_handshake`（`accept/1,2` 握手 + 子协议协商）、`max_handshake/0` | 无（纯函数库） |
 | `broker_proto_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_core, broker_metrics + 内核 6 app | 每连接 `ws_conn` + ranch listener | `ws_conn`、`ws_listener`（帧编解码已委托给 `broker_ws` 的 `ws_frame`） | 每连接分片缓冲、订阅集合 |
-| `broker_proto_mqtt_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_proto_mqtt, broker_core, broker_metrics + 内核 6 app | 每连接 `mqtt_ws_conn` + ranch listener；MQTT 引擎 `mqtt_conn_fsm` 由 `broker_proto_mqtt` 的 `mqtt_conn_sup` 托管 | `mqtt_ws_conn`、`mqtt_ws_listener`、`mqtt_transport_ws`（`mqtt_transport` 的 WS 实现） | 每连接 HTTP 升级缓冲、帧分片缓冲；MQTT 状态全在 FSM 里 |
+| `broker_proto_mqtt_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_proto_mqtt, broker_core, broker_metrics, broker_retain + 内核 6 app | 每连接 `mqtt_ws_conn` + ranch listener；MQTT 引擎 `mqtt_conn_fsm` 由 `broker_proto_mqtt` 的 `mqtt_conn_sup` 托管 | `mqtt_ws_conn`、`mqtt_ws_listener`、`mqtt_transport_ws`（`mqtt_transport` 的 WS 实现） | 每连接 HTTP 升级缓冲、帧分片缓冲；MQTT 状态全在 FSM 里 |
 | `broker_proto_mqtt_sn` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_storage, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain | `mqtt_sn_listener`（一个 UDP socket + 一个 reader）、`mqtt_sn_conn_sup` + 每客户端 `mqtt_sn_conn` | `mqtt_sn_codec`（27 种报文）、`mqtt_sn_topics`（三种 topic id 表）、`mqtt_sn_filter`（本地 filter 校验，不依赖 `broker_proto_mqtt`）、`mqtt_sn_listener`、`mqtt_sn_conn` | `{IP,Port}`→会话、`client_id`→会话、休眠登记三张表在 listener；每会话 topic id 表、in-flight 窗口、两个 timer；订阅/游标/retain 都在下层 app |
+| `broker_proto_mqtt_quic` | kernel, stdlib, sasl, broker_proto_mqtt, broker_core, broker_metrics, broker_storage, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain；`optional_applications: [quicer]` | `mqtt_quic_listener` + 每 listener 一个 acceptor 进程 + 每 QUIC 连接 `mqtt_quic_conn`；MQTT 引擎 `mqtt_conn_fsm` 由 `broker_proto_mqtt` 的 `mqtt_conn_sup` 托管 | `mqtt_quic_listener`、`mqtt_quic_conn`、`mqtt_transport_quic`（`mqtt_transport` 的 QUIC 实现）、`mqtt_quic_nif`（唯一触碰 `quicer` 的模块） | 每 listener 的连接表与配置；每 QUIC 连接的流信用计数；MQTT 状态全在 FSM 里。`quicer` 缺失时整个 app 仍能启动，只是没有 listener |
 | `broker_proto_nats` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `nats_conn` + 订阅投递进程 + ranch listener | `nats_conn`、`nats_listener` | 每连接 sid 表、queue group 成员关系 |
 | `broker_proto_amqp` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `amqp_conn`、`amqp_topo`（exchange/queue/binding 注册表） | `amqp_codec`、`amqp_conn`、`amqp_listener` | exchange/queue/binding 拓扑、delivery tag、unacked 集合 |
 | `broker_proto_kafka` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics + 内核 6 app | 每连接 `kafka_conn`、`kafka_group`（consumer group 协调） | `kafka_codec`、`kafka_conn`、`kafka_listener` | 每连接 topic/partition 游标、group 成员与 offset |
@@ -116,11 +117,19 @@ broker_cluster ──→ broker_queue（仅通过 persistent_term 钩子，未�
 
 ### 3.1 顶层结构
 
-系统**没有伞形 `broker_app_sup`**：除 `broker_core` 外的 17 个 app 各有自己的顶层 supervisor，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
+系统**没有伞形 `broker_app_sup`**：除 `broker_core`（纯类型）与 `broker_ws`（纯库）外的 **20 个 app 各有自己的顶层 supervisor**，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
 
 ```
 broker_metrics_app ────► broker_metrics_sup                        one_for_one, 5/10s
                           └── broker_metrics_server                 permanent（仅 report_interval_ms > 0）
+
+broker_meta_app ───────► broker_meta_sup                           one_for_one, 5/10s
+                          ├── broker_meta_config                    permanent
+                          └── broker_meta_outbox                    permanent
+
+broker_cluster_app ────► broker_cluster_sup                        one_for_one, 5/10s
+                          ├── broker_cluster_cache                  permanent
+                          └── {broker_cluster_meta, Node}           （ra server）
 
 broker_storage_app ─────► broker_storage_sup                        one_for_all, 1/5s
                           └── broker_storage_wal_sup                 one_for_one, 4/30s
@@ -137,8 +146,14 @@ broker_queue_app ───────► broker_queue_sup                      
 broker_subscription_app ► broker_subscription_sup                   one_for_one, 5/10s
                           └── broker_subscription_worker            permanent（boot step 2+3）
 
+broker_retain_app ──────► broker_retain_sup                         one_for_one, 5/10s
+                          └── broker_retain                         permanent
+
 broker_event_app ───────► broker_event_sup                          one_for_all（空）
 broker_security_app ────► broker_security_sup                       one_for_all（空）
+
+broker_admin_app ───────► broker_admin_sup                          one_for_one, 5/10s
+                          └── broker_admin_listener                 permanent
 
 broker_proto_mqtt_app ──► broker_proto_mqtt_sup                     one_for_all, 1/5s
                           ├── mqtt_conn_sup                         simple_one_for_one
@@ -146,16 +161,32 @@ broker_proto_mqtt_app ──► broker_proto_mqtt_sup                     one_fo
                           └── ranch_embedded_sup                    （ranch:child_spec/5）
                               └── ranch_listener_sup → acceptors / conns sup
                                  （listener child spec restart=transient）
+
+broker_proto_mqtt_ws_app ► broker_proto_mqtt_ws_sup                 one_for_one, 1/5s
+                          └── ranch_embedded_sup → listener（同 broker_proto_mqtt）
+
+broker_proto_mqtt_quic_app ► broker_proto_mqtt_quic_sup             one_for_all, 1/5s
+                          └── mqtt_quic_listener × N                transient
+                              ├── acceptor（spawn_link，accept 循环）
+                              └── mqtt_quic_conn × 连接（start_link）  link 到 listener，非监督子进程
+                                  └── mqtt_conn_fsm × 流              （mqtt_conn_sup 的子进程）
+
+broker_proto_mqtt_sn_app ► broker_proto_mqtt_sn_sup                 one_for_all, 1/5s
+                          ├── mqtt_sn_conn_sup                      simple_one_for_one, 10/1s
+                          │   └── mqtt_sn_conn × 客户端             temporary
+                          └── mqtt_sn_listener × N                  transient（一个 UDP socket）
 ```
 
-8 个顶层 supervisor（`broker_core` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
+20 个顶层 supervisor（`broker_core` 与 `broker_ws` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
 
 ### 3.2 重启策略与理由
 
 | 进程 | 策略 | 理由 | 崩溃后的可见行为 |
 |---|---|---|---|
 | `broker_metrics_sup` / `broker_metrics_server` | `one_for_one`, 5 次/10 s | 上报进程崩溃不应连累任何数据面；指标数组在进程外，重启不丢计数 | 最多丢一个上报周期，计数继续累积 |
-| `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_event_sup`、`broker_security_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
+| `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_event_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN 的 listener 一死，它背后的连接/会话就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
+| `broker_proto_mqtt_ws_sup` | `one_for_one`, 1 次/5 s | MQTT over WebSocket 只有 listener 一类子进程，没有需要一起重启的兄弟 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
+| `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener 彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建 | 单个进程重启，其余不受影响 |
 | `broker_storage_wal_sup` | `one_for_one`, 4 次/30 s | 单分区崩溃必须自愈，但不能掩盖崩溃循环；与内存 store 隔离 | 该分区 `wal_writer` 重启并从磁盘 `recover`；旧句柄失效 |
 | `wal_writer` | `permanent` | 分区日志的写者是必需进程，不能"死了就算" | 重启后 offsets 从磁盘重建；重启前的批以 `{writer_stopped,_}` 失败 |
 | `broker_queue_sup` / `broker_subscription_sup` | `one_for_one`, 5 次/10 s | 分区 worker 与订阅 worker 相互独立，单点故障不扩散 | worker `init/1` 重新 recover/rebuild |

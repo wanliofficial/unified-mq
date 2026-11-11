@@ -1,10 +1,10 @@
 # 协议服务端符合性测试验证方案
 
 - **文档版本**：v1.0（2026-11-10 起草，待代码落地）
-- **状态**：**设计 / 落地规划**——本文件描述「如何借助第三方测试资源验证自研 Broker 六个协议的服务端实现」，本身不是已完成的测试套件，后续由 `test/conformance/` 下的代码实现
+- **状态**：**设计 / 落地规划**——本文件描述「如何借助第三方测试资源验证自研 Broker 六个协议的服务端实现」，本身不是已完成的测试套件，后续由 `test/conformance/` 下的代码实现（S8 的三个新协议不在本文范围，见 §0 补注）
 - **读者**：负责协议层、CI 与质量保障的工程师；需要判断「某个协议该用什么外部资源做符合性验证」的评审人
 - **对应**：`docs/protocol-compatibility.md`（六协议能力矩阵与已实现证据）、`docs/architecture.md` §1、`docs/roadmap.md` §9、`docs/security.md` §2.1/§5.1
-- **证据口径**：本文中的「已实测能力」引用自 `docs/protocol-compatibility.md` 的基线（**673/673、43 套件**）；「外部资源」为本文开头汇总的公开仓库，未经本仓库本地验证，**不可直接当作官方标准认证**
+- **证据口径**：本文中的「已实测能力」引用自 `docs/protocol-compatibility.md` 的基线（起草时为 **673/673、43 套件**；**当前为 823/823、52 套件**，S8-D 收尾，2026-11-11）；「外部资源」为本文开头汇总的公开仓库，未经本仓库本地验证，**不可直接当作官方标准认证**
 
 > **最重要的前置声明（贯穿全文）**：以下整理的所有外部资源，**都不是「官方标准符合性认证套件」**。其中 Kafka 的第三方套件最接近本 Broker 的验证场景，其余多为「可借鉴思路」或「客户端/内部工具」。任何对外表述都不得把它们说成标准认证；它们提供的是**结构化反馈、互操作证据、异常路径思路**，而非合规背书。
 
@@ -13,6 +13,8 @@
 ## 0. 背景与目标
 
 本 Broker（`unified-mq`）是一个支持 **MQTT 3.1.1/5.0、WebSocket、NATS、AMQP 0-9-1、Kafka、Pulsar** 六协议的 Erlang/OTP 实现，协议适配层为 `apps/broker_proto_*`（`broker_proto_mqtt` / `broker_proto_ws` / `broker_proto_nats` / `broker_proto_amqp` / `broker_proto_kafka` / `broker_proto_pulsar`）。
+
+> **范围（2026-11-11 补注）**：本文只规划上面这六个 S5 协议的**外部** conformance 资源接入。S8 新增的 MQTT-SN、MQTT over QUIC、MQTT over WebSocket 不在本文范围内——它们的第三方客户端证据（`mqtt-sn-tools`、EMQX `emqtt`、paho websocket）已在 `docs/protocol-compatibility.md` §4.11~§4.13 记录，外部 conformance suite 的规划同样未立项。
 
 S5 已通过「真实第三方客户端集成测试」建立协议兼容基线（见 `docs/protocol-compatibility.md` §0 客户端矩阵），但那是**自编断言 + 真实客户端**，缺少以下两类外部验证：
 
@@ -55,7 +57,7 @@ S5 已通过「真实第三方客户端集成测试」建立协议兼容基线�
 
 | 层 | 验证对象 | 工具 | 现状 | 本文增量 |
 |---|---|---|---|---|
-| L1 帧/单元层 | 编解码、状态机 | Erlang CT（`apps/broker_proto_*/test/`） | 已建（673/673 含帧层） | 不变 |
+| L1 帧/单元层 | 编解码、状态机 | Erlang CT（`apps/broker_proto_*/test/`） | 已建（823/823 含帧层） | 不变 |
 | L2 真实客户端 e2e | 端到端语义 | `test/protocol-compatibility/`（paho / nats.go / kafka-clients / pulsar-client 等） | 已建（S5 基线） | 不变，作为对照基准 |
 | **L3 外部 conformance** | 第三方断言集 | `kafkatest` / Paho 互操作 / 客户端交叉 | **未建** | **本文核心** |
 | L4 异常/混沌路径 | 畸形包、故障注入 | `tools/docker/`（T14/S2）、`wire.rs` 思路 | MQTT 已有 T15 字节级 | 扩展畸形包专项 |
