@@ -113,7 +113,7 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 ]}.
 ```
 
-**listener map 的 key**（`mqtt_quic_listener:open/1`；`port` 必需，其余可省）：
+**listener map 的 key**（`mqtt_quic_listener` 的 `init/1` 读；`port` 必需，其余可省）：
 
 | key | 缺省 | 说明 |
 |---|---|---|

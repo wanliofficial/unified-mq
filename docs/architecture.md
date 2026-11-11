@@ -128,8 +128,8 @@ broker_meta_app ───────► broker_meta_sup                        
                           └── broker_meta_outbox                    permanent
 
 broker_cluster_app ────► broker_cluster_sup                        one_for_one, 5/10s
-                          ├── broker_cluster_cache                  permanent
-                          └── {broker_cluster_meta, Node}           （ra server）
+                          ├── broker_cluster_cache                  permanent（先起）
+                          └── broker_cluster_meta                   permanent（ra 进程包装）
 
 broker_storage_app ─────► broker_storage_sup                        one_for_all, 1/5s
                           └── broker_storage_wal_sup                 one_for_one, 4/30s
@@ -149,7 +149,8 @@ broker_subscription_app ► broker_subscription_sup                   one_for_on
 broker_retain_app ──────► broker_retain_sup                         one_for_one, 5/10s
                           └── broker_retain                         permanent
 
-broker_event_app ───────► broker_event_sup                          one_for_all（空）
+broker_event_app ───────► broker_event_sup                          one_for_one, 5/10s
+                          └── broker_event_dedup                    permanent
 broker_security_app ────► broker_security_sup                       one_for_all（空）
 
 broker_admin_app ───────► broker_admin_sup                          one_for_one, 5/10s
@@ -184,9 +185,9 @@ broker_proto_mqtt_sn_app ► broker_proto_mqtt_sn_sup                 one_for_al
 | 进程 | 策略 | 理由 | 崩溃后的可见行为 |
 |---|---|---|---|
 | `broker_metrics_sup` / `broker_metrics_server` | `one_for_one`, 5 次/10 s | 上报进程崩溃不应连累任何数据面；指标数组在进程外，重启不丢计数 | 最多丢一个上报周期，计数继续累积 |
-| `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_event_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN 的 listener 一死，它背后的连接/会话就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
+| `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN 的 listener 一死，它背后的连接/会话就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
 | `broker_proto_mqtt_ws_sup` | `one_for_one`, 1 次/5 s | MQTT over WebSocket 只有 listener 一类子进程，没有需要一起重启的兄弟 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
-| `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener 彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建 | 单个进程重启，其余不受影响 |
+| `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` / `broker_event_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener、去重窗口彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建，`broker_event_dedup` 重启只丢窗口内状态 | 单个进程重启，其余不受影响 |
 | `broker_storage_wal_sup` | `one_for_one`, 4 次/30 s | 单分区崩溃必须自愈，但不能掩盖崩溃循环；与内存 store 隔离 | 该分区 `wal_writer` 重启并从磁盘 `recover`；旧句柄失效 |
 | `wal_writer` | `permanent` | 分区日志的写者是必需进程，不能"死了就算" | 重启后 offsets 从磁盘重建；重启前的批以 `{writer_stopped,_}` 失败 |
 | `broker_queue_sup` / `broker_subscription_sup` | `one_for_one`, 5 次/10 s | 分区 worker 与订阅 worker 相互独立，单点故障不扩散 | worker `init/1` 重新 recover/rebuild |
@@ -454,13 +455,13 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `broker_storage.backend` | `broker_storage_wal` | 二选一：`broker_storage_wal` / `broker_storage_memory` |
+| `broker_storage.backend` | 代码兜底 `broker_storage_wal`（`.app.src` 未声明；release 同为该值） | 二选一：`broker_storage_wal` / `broker_storage_memory` |
 | `broker_storage.data_dir` | `.app.src` 未声明，代码兜底 `data` | WAL 根目录；**release 必须配绝对路径**（`config/sys.config.src` 就是），且必须在 release 树外（J8）。tmpfs/ramfs 由 `wal_writer:check_filesystem/2` 在启动时**拒绝**（`{error, {volatile_filesystem, Dir}}`，`require_durable_fs` 默认 `true`，可显式关闭）；留空则落到相对路径 `data`，即 release 树内 |
-| `broker_storage.wal` | 见下 | `batch_size=32`、`max_batch_size=256`、`batch_delay_ms=#{os_buffer=>0, fsync=>1}`、`index_anchor_interval=256`、`segment_max_records=100000`、`max_pending_appends`（代码默认 `0` = 无界，release 配 4096，超限回 `{error, {overloaded, PartitionId}}` 且不分配 offset） |
+| `broker_storage.wal` | `.app.src` 未声明；release 配 `batch_size=32`、`max_batch_size=256`、`batch_delay_ms=#{os_buffer=>0, fsync=>1}`、`index_anchor_interval=256`、`segment_max_records=100000`、`max_pending_appends=4096`（代码兜底整体为 `#{}`，即上述各项取各自代码默认，`max_pending_appends` 默认 `0` = 无界；超限回 `{error, {overloaded, PartitionId}}` 且不分配 offset） | WAL 批处理与段参数 |
 | `broker_storage.retention` | `#{max_bytes => 0, max_age_ms => 0, check_interval_ms => 60000}` | 整段回收的三项；`0` = 不设限（S2-F） |
-| `broker_router.backend` | `broker_router_hash` | 路由实现；未知值在 `broker_router_sup:init/1` 报 `{unknown_router_backend, _}`（不启动一个没有索引写入者的 app） |
-| `broker_router.partitions` | **无默认，必填**（release 配 4） | 分区数。`.app.src` 的 `env` 为空，缺失时 `broker_router_hash:current_env/0` 回 `{error, {invalid_partitions, undefined}}`；必须与 `broker_queue.partitions` 一致 |
-| `broker_queue.partitions` | 4 | 与 `broker_router.partitions` 必须一致；boot 的 recover 清单来源（非正整数报 `{invalid_partition_count, _}`） |
+| `broker_router.backend` | 代码兜底 `broker_router_hash`（`.app.src` 未声明；release 同为该值） | 路由实现；未知值在 `broker_router_sup:init/1` 报 `{unknown_router_backend, _}`（不启动一个没有索引写入者的 app） |
+| `broker_router.partitions` | **无默认，必填**（`.app.src` 的 `env` 为空，代码取 `undefined`；release 配 4） | 分区数。缺失时 `broker_router_hash:current_env/0` 回 `{error, {invalid_partitions, undefined}}`；必须与 `broker_queue.partitions` 一致 |
+| `broker_queue.partitions` | 4（`.app.src` 与代码兜底一致） | 与 `broker_router.partitions` 必须一致；boot 的 recover 清单来源（非正整数报 `{invalid_partition_count, _}`） |
 | `broker_subscription.data_dir` | `.app.src` 为 `data`；release 配与 storage 相同的绝对路径 | `.subs`/`.cursors`/`.inflight` 根目录 |
 | `broker_subscription.cursor_max_regress` / `cursor_flush_interval_ms` / `inflight_flush_interval_ms` | 64 / 100 / 100 | 有界回退窗口；`1/0/0` 选择近零回退档 |
 | `broker_retain.data_dir` | `.app.src` 为 `data`；release 配与 storage 相同的绝对路径 | retained 快照 `retain/retain.v1` 的根目录（S2-C） |
@@ -470,7 +471,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_security.users` / `acl` | `.app.src` 未声明（代码兜底 `[]` / `allow`）；release 配 `guest/guest`（tenant `t0`）、`allow` | 明文用户表与 allow-all ACL 桩；用户表为空时凭据认证一律失败，匿名连接仍可建立（principal 取 client_id） |
 | `broker_event.policy` | `pass_through` | 五档均已实现（S3，ADR-020）：`disabled` / `pass_through` / `validate_if_present` / `required` / `normalize`；未知值在 `apply_policy/2` 报 `{invalid_policy, _}` |
 | `broker_event.policies` | `[]` | 按 `{Tenant, Destination, Policy}` 的首次匹配覆盖全局策略；`<<"*">>` 为租户通配，Destination 支持 MQTT `+`/`#` |
-| `broker_metrics.enabled` / `report_interval_ms` | `true` / `60000` | 指标总开关；`0` 不启动上报进程，非正整数使 app 启动失败（响亮失败，不静默关掉可观测性） |
+| `broker_metrics.enabled` / `report_interval_ms` | 代码兜底 `true` / `60000`（`.app.src` 未声明；release 同为该值） | 指标总开关；`0` 不启动上报进程，非正整数使 app 启动失败（响亮失败，不静默关掉可观测性） |
 | `broker_proto_mqtt.listeners` | release 配 1883；`.app.src` 默认 `[]` | 每个 map 一个 listener；连接级 knob 随 map 下发（L20 seam） |
 | `broker_proto_mqtt.mqtt_max_qos` | 2 | S2-C 起默认允许 QoS2（ADR-018 §18.4），仍受后端 capability 约束；内存档必须为 0 |
 | `broker_proto_mqtt.max_inflight` / `pull_page_limit` / `pull_poll_interval_ms` / `inflight_snapshot_ms` / `max_keepalive_ms` | 64 / 32 / 1000 / 20 / 60000 | 投递循环与 keepalive 上限 |
