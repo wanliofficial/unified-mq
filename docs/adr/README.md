@@ -29,6 +29,13 @@
 | [018](018-retain-will-and-qos2-amendments.md) | Retain/Will 语义与持久化边界；QoS 2 握手幂等与 `.inflight` v2 形状修订 | MQTT 3.1.1 §3.1.2.5/§3.3.1.3/§3.6.1；ADR-007/012；S2 设计 §4.3 |
 | [019](019-shared-assignment-ack-ownership-and-session-layout.md) | Shared 的 worker 原子 claim、`ack/4` 归属校验与会话文件按 SubRef 布局 | README §5.2；ADR-010/**013（修订 §13.2/§13.3/§13.5）**/015；S2 设计 §4.4 |
 
+### S3 / S4 决策（已采纳，2026-11-08 冻结）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [020](020-cloudevents-codec-policy-binding.md) | CloudEvents 1.0 Codec、五档策略与 MQTT Binding 边界 | README §3/§4/§10.1/§11.2；ADR-004/005/009/015；替代 ADR-004 的 pass_through-only 过渡口径 |
+| [021](021-cluster-control-plane-raft-and-fencing.md) | 集群控制面、Metadata Raft 与 Epoch/Fencing | README §6/§11.3；ADR-002/003/007/008/010 |
+
 ### S8 决策（已采纳，2026-11-10 / 2026-11-11）
 
 | ADR | 主题 | 关键依据 |
