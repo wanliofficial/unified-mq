@@ -2,7 +2,7 @@
 
 - **文档版本**：v1.2
 - **最近一次追加**：2026-11-11——新增 §4.12：MQTT over QUIC（S8-D，EMQX `emqtt` 1.16.1 真实客户端 8/8 + CT 17 例）。此前一次：2026-11-10——§4.11 MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）；再此前：§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。§4/§4.1~§4.10 原文保留为当时事实
-- **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定
+- **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定、§10 S8 三条 MQTT 传输（MQTT-SN / MQTT over QUIC / MQTT over WebSocket）
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
 
