@@ -289,6 +289,8 @@ recover(P, Dir):
 
 ## 9. 会话持久化（`broker_subscription_files`）
 
+> **协议范围**：本节是**协议中立**的会话状态描述。MQTT / MQTT over WebSocket / MQTT over QUIC 都跑同一份 `mqtt_conn_fsm`，它们的会话就是这里描述的 `.subs` / `.cursors` / `.inflight` 三件套。MQTT-SN（S8-C）也复用同一订阅层——`.subs` / `.cursors` 由 `broker_subscription` 落盘、cursor 追赶语义不变——但它的休眠是「detach + 保留订阅/cursor」，QoS 1/2 的未确认消息只存在 `mqtt_sn_conn` 的进程内 `pending` map 里，**不写 `.inflight`**（文件仍是 MQTT FSM 的形状）；唤醒后从 cursor 重放，与 §9.4 的恢复规则等价。
+
 ### 9.1 三个文件（v2：按 SubRef）
 
 | 文件 | 内容 | 何时写 | fsync |
