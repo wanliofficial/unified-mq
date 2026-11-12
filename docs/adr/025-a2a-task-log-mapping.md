@@ -156,4 +156,15 @@ S9-B/S9-C 的 Gate 证据必须覆盖：
 | D8 大小上限 | `max_body_bytes` 与 `broker_security.limits.max_message_bytes` 取 min；`413` 不读体直接关连接；`Part.url` 不取回 | 无 |
 | D9 `contextId` 只做索引 | 完全照做：`ListTasks` 按 `contextId` 过滤（投影字段），无跨任务外键；`referenceTaskIds` 原样保留不校验 | 无 |
 
-**同时给 S9-C 的提醒**：D5 的 checkpoint、D6 的两个计数器、D7 的全部内容目前都是「文档承诺、代码未到位」的状态，已在本表和 `docs/roadmap.md` §11.1 的 S9-C/S9-F 行留痕，避免被读成现状。
+### 落地批注（S9-C，2026-11-12）
+
+D7 的 SSE 在 S9-C 落地，代码见 `apps/broker_proto_a2a/src/a2a_stream.erl`（配合 `a2a_rpc:a2a_stream_plan/3`），证据见 `docs/protocol-compatibility.md` §4.16。
+
+| 决策 | 落地情况 | 差异 |
+|---|---|---|
+| D7 SSE 是瞬态读者、不建 SubRef、不 pin retention | **照做**：连接进程只 `broker_queue:subscribe/2` 挂一个分区邮箱钩子（唤醒用，不是 SubRef），自己按 cursor `read_from/3`；不写 `.cursors`、不进 `min(live cursor)`、不参 `broker_router` 的 `Filter → [SubRef]` 索引 | 无 |
+| D7 心跳每 15 s 一行 SSE 注释 | 照做：`sse_heartbeat_ms`（默认 15000）到点发 `: ping` | 无 |
+| D7 出站有界 `sse_max_pending_bytes`（1 MiB）+ `sse_send_timeout_ms`（30 s） | **改用时间上限**：`sse_max_duration_ms`（模块默认 600000，出厂 `sys.config` 配 1800000）到点关流；单帧上限 `sse_max_event_bytes`（1 MiB）另算 | `sse_max_pending_bytes` / `sse_send_timeout_ms` **两个 env 未落地也没读**——SSE 写是同一连接进程内的同步 `send`，pending 由 socket 发送缓冲自然反压，不堆 mailbox，故没另设字节水位；真实的上界来自「一条流活多久」。这是对正文的**收窄**（更简单、可测），不是放宽 |
+| D7 落后于 `committed` 时发**当前 Task 快照**（`metadata._a2a.resync = true`）再续 | **改为响亮失败**：历史 offset 越界时发一个 `status: failed` 事件后**关流**，客户端自行重连（`SubscribeToTask` 从当前可读起点重放） | **没有 resync 快照那一步**：发快照要求连接进程能读投影（跨到 shard ETS），会把 SSE 与分片耦合；关流+重订阅用同一条「offset 0 重放」路径达成等价可用性，且不新增私有 `_a2a.resync` 元数据键 |
+
+**收尾说明**：D7 已落地（上表）；D5 的 checkpoint、D6 的 `a2a_task_history_lost` 计数器仍「文档承诺、代码未到位」，与 S9-C 新增的 Push/Stream 失败计数器一并归 S9-F，`docs/roadmap.md` §11.1 与 `docs/operations.md` §5.2 已留痕。**S9-C 未落地 D7 的两个 env（`sse_max_pending_bytes` / `sse_send_timeout_ms`）已在 `config/sys.config.src` 中不存在**（不保留「声明但不读」的死配置）。

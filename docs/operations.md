@@ -23,7 +23,7 @@
 | AMQP | 5673 | 明文（可 TLS） | `broker_proto_amqp` |
 | Kafka | 9093 | 明文（可 TLS） | `broker_proto_kafka` |
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
-| A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A）。示例部署端口 8081，`listeners => []` 是出厂值 |
+| A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A/B/C）。示例部署端口 8081，`listeners => []` 是出厂值；出站 Push webhook 单独由 `push_enabled` 门控（默认关） |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前九个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
@@ -147,9 +147,9 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 - 客户端在同一 QUIC 连接上重连超过 `max_streams_per_conn` 次后新流不再到达：日志里会有 `quic: stream credit exhausted`，让客户端新建 QUIC 连接（或调大该值）。
 - 真实客户端对照：`test/protocol-compatibility/mqtt_quic/` 用 EMQX 的 `emqtt` 1.16.1 跑 8 个用例，见 `docs/protocol-compatibility.md` §4.12。
 
-### 1.3 A2A JSON-RPC 前端（默认关闭，S9-A / S9-B）
+### 1.3 A2A JSON-RPC 前端（默认关闭，S9-A / S9-B / S9-C）
 
-`broker_proto_a2a` 是 A2A 1.0.0 的 JSON-RPC 传输绑定前端。**S9-B 起是完整的 Task 生命周期**（`SendMessage` 建 Task、`GetTask`/`ListTasks`/`CancelTask` 读投影）**加 Agent Card 发现面**（`/.well-known/agent-card.json`、`/agents`、`GetExtendedAgentCard`）。它**默认不监听**（ADR-026 §D4）：app 装进 release、随节点启动，但 `listeners => []` 时不开任何端口。
+`broker_proto_a2a` 是 A2A 1.0.0 的 JSON-RPC 传输绑定前端。**S9-C 起**它有一整套：**Task 生命周期**（`SendMessage` 建 Task、`GetTask`/`ListTasks`/`CancelTask` 读投影）、**Agent Card 发现面**（`/.well-known/agent-card.json`、`/agents`、`GetExtendedAgentCard`）、**SSE 流式**（`SendStreamingMessage`/`SubscribeToTask` 回 `text/event-stream`）、**出站 Push webhook**（Push 四方法 + 终态投递/重试/DLQ，默认关闭）。它**默认不监听**（ADR-026 §D4）：app 装进 release、随节点启动，但 `listeners => []` 时不开任何端口。
 
 **配置**（`config/sys.config.src`，出厂值）：
 
@@ -167,8 +167,21 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
   {task_auto_complete, true},            % 内建 echo agent 同步跑完；外部执行器设 false
   {agent_cards, []},                     % boot 种子卡（写 broker_meta.agent_card）
   {agent_card_max_age, 60},              % Cache-Control: max-age
-  {sse_max_event_bytes, 1048576},        % S9-C 才接到方法
-  {sse_heartbeat_ms, 15000}
+  {sse_max_event_bytes, 1048576},        % 单帧上限（S9-C 已接到方法）
+  {sse_heartbeat_ms, 15000},             % 空闲心跳（SSE 注释行）
+  {sse_max_duration_ms, 1800000},        % 一条流的硬上限（模块默认 600000）
+  {push_enabled, false},                 % 出厂关闭：worker 不进监督树，Push 四方法回 -32003
+  {egress_allowlist, []},                % 全局出站白名单（空 = 全部拒绝）
+  {push_tenant_allowlist, #{}},          % 租户级白名单；与全局取交
+  {push_auth_secrets, #{}},              % 按 scheme 名放 HMAC 密钥（不在 broker_meta 里）
+  {push_allow_http, false},              % 明文 webhook 默认拒绝（只给本地测试开）
+  {push_max_attempts, 5},                % 重试上限
+  {push_base_backoff_ms, 500},           % 指数退避基数
+  {push_max_backoff_ms, 30000},          % 退避封顶
+  {push_ttl_ms, 900000},                 % 一条投递的总时限（模块默认 300000）
+  {push_timeouts, #{connect_ms => 5000, recv_ms => 10000}},
+  {push_max_response_bytes, 65536},      % 只读状态行，但仍给响应体一个上限
+  {push_inet_family, inet}
 ]}.
 ```
 
@@ -177,8 +190,9 @@ rebar3 as quic compile      # 或 rebar3 as quic ct / release
 1. 在 `broker_security.users` 里给调用方建一条带 `token` 的用户记录（`{<<"agent">>, #{token => <<"...">>, tenant_id => <<"t1">>}}`）——A2A 只接受 `broker_user` 里的**不透明 bearer token**，不验 JWT、不取 JWKS。**租户决定可见范围**：t1 的调用方看不到 t2 的 Task 与 Agent Card。
 2. 如需按主体限制，配 `broker_security.acl` 的 `publish`（`SendMessage`/`CancelTask`）与 `subscribe`（`GetTask`/`ListTasks`/`GetExtendedAgentCard`）规则——resource 是真实 destination `$a2a/task/<id>`（`SendMessage` 用 `$a2a/task/new`）；ACL 拒绝回裸 `403`。
 3. 要暴露 Agent Card，配 `agent_cards` 种子（或先让 `broker_meta.table_storage = disc_copies` 再用管理面/直接写表）。种子在 app 启动时幂等写入；内容不变不会 bump `version`（ETag 稳定）。
-4. 把 `listeners` 改成 `[#{port => 8081, ref => {a2a, 8081}, num_acceptors => 10, max_connections => 1024}]`（`ip` 默认 `{127,0,0,1}`）再重启。
-5. 探活：`curl -sS http://127.0.0.1:8081/health` → `{"status":"ok"}`，不需要凭据。
+4. **要开 Push**（默认关）：`push_enabled => true` + 非空 `egress_allowlist`（否则所有出站都被拒），需要私网/loopback 目标时在该条目上显式 `allow_private => true`；按需在 `push_tenant_allowlist` 里对租户再收窄。客户端声明的 `authentication.scheme` **必须在 `push_auth_secrets` 里有同名条目**，否则该条投递被跳过（`auth_not_configured`）——不会降级为明文投递。
+5. 把 `listeners` 改成 `[#{port => 8081, ref => {a2a, 8081}, num_acceptors => 10, max_connections => 1024}]`（`ip` 默认 `{127,0,0,1}`）再重启。
+6. 探活：`curl -sS http://127.0.0.1:8081/health` → `{"status":"ok"}`，不需要凭据。
 
 **`require_auth => false` 只在回环绑定下允许**：boot 时校验所有 listener 的 `ip`，非回环直接 `{error, {insecure_listener, Port, Ip}}`，整个 app 起不来。这是刻意的——与其起一个无认证的任务 API，不如让节点起不来。
 
@@ -214,8 +228,12 @@ curl -sS -X POST http://127.0.0.1:8081/ \
 - Agent Card 改了但客户端还拿旧的：`If-None-Match` 命中会回 `304`；ETag 由 `version` + 内容哈希组成，所以只有**真改**才会变。`ram_copies` 下重启会让 `version` 从头开始。
 - 重启后任务"没了"：先确认 `broker_queue` 的 WAL 目录是同一个（`broker_storage.data_dir`），再看日志里 `a2a_recovery_failed`。A2A 的投影完全来自日志，日志换了目录就等于换了一个节点。
 - 重启后任务变 `FAILED` 且带 `history_lost`：创建事件已被 retention 回收。调大 `broker_storage.retention` 或按 §5.1 的估算预留容量。
-- `-32601`：`SendStreamingMessage`/`SubscribeToTask`/Push config 三件套还没实现（S9-C）。
-- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.14（S9-A）与 §4.15（S9-B）。
+- `-32601`：方法名不在 A2A 1.0 的方法集里（S9-C 之后 `SendStreamingMessage`/`SubscribeToTask`/Push 四方法都已实现，不再回 `-32601`）。
+- **SSE 流没有 `data:` 帧**：`SubscribeToTask` 传的 id 存在但事件都已被 retention 回收（`history_lost` 会先发一帧 `status=failed` 再关流）；或 Task 从未产生过新事件，只看到 `: ping` 心跳。
+- **webhook 没收到 POST**：按顺序看——`push_enabled` 是否 `true`；`egress_allowlist` 是否非空且 host 后缀匹配（日志 `{guard_refused, host_not_allowlisted}` / `empty_tenant_allowlist`）；`push_allow_http` 是否允许明文（`https` 不需要）；客户端声明的 `authentication.scheme` 是否在 `push_auth_secrets` 里有同名条目（日志 `{auth_not_configured, not_configured}`——**这是跳过，不是失败投递**）。
+- **webhook 收到多次 POST**：按 `push_max_attempts` 的指数退避重试，正常现象；端点幂等靠 `X-A2A-Task-Id` + `X-A2A-Config-Id` + `X-A2A-Nonce` 去重。
+- **投递耗尽后消息去哪了**：写进 `$a2a/push/dlq/<tenant>`（租户名替换）。它是普通消息——用任一前端订阅该 destination 即可审计；payload 里有 `taskId`/`configId`/`url`/`attempts`/`reason`。
+- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.14（S9-A）、§4.15（S9-B）与 §4.16（S9-C）。
 
 
 
@@ -376,7 +394,25 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | 重启成本 | boot 全量重放扫全部分区（S9-B 的正确性基线）。节点上有 N GB 日志时启动时间是分钟级，**不是秒级**；`task_checkpoint_dir` 相关 env 已声明但当前不读（S9-F 演进位） |
 | 删除 | 没有单独的"删任务"接口：靠 retention 覆盖。删除 `$a2a/` 前缀数据只能走运维侧的 retention 配置 |
 
-**告警占位（S9-F 落地）**：S9-B 没有新增 `broker_metrics` 键——`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt` 三个计数器推迟到 S9-F 统一动冻结键集时一并加。当前这些事件只进日志，运维侧按下面的日志特征盯：
+### 5.2 A2A 出站 Push 的运维面（S9-C）
+
+**这是唯一由 Broker 主动发起的出站连接。** 数据面/控制面其余部分都是被动接受连接；Push 是例外，因此它的边界要单独看：
+
+| 关注点 | 事实 / 处置 |
+|---|---|
+| 默认状态 | `push_enabled => false`：worker 不在监督树，Push 四方法回 `400` + `-32003`。**不配不生效**，也不会偷偷往外发 |
+| 两层白名单 | `egress_allowlist`（全局）× `push_tenant_allowlist[Tenant]`，host 后缀匹配；任一为空则全拒。私网/loopback 目标必须在该条目上显式 `allow_private => true` |
+| 出站目标 | 只连**已解析并校验过的 IP**（pin），带 `Host` 头；`https` 为默认，明文要 `push_allow_http => true` |
+| 重定向 | 3xx 一律当失败（不跟随），杜绝"白名单 host 把我们 302 到内网" |
+| 响应处理 | 只读状态行判成败，不解析响应体；响应体上限 `push_max_response_bytes`（64 KiB） |
+| 重试语义 | `push_max_attempts` 次指数退避（`push_base_backoff_ms × 2^attempt`，封顶 `push_max_backoff_ms`）；超过 `push_ttl_ms` 放弃。端点的幂等性由它自己按 `X-A2A-Task-Id`/`X-A2A-Config-Id`/`X-A2A-Nonce` 保证 |
+| 签名 | 客户端声明 `authentication.scheme`，服务端用 `push_auth_secrets[scheme]` 的密钥签 `X-A2A-Signature: sha256=HMAC(timestamp "." nonce "." body)`；声明了未配置的 scheme → **跳过投递**（不降级明文） |
+| DLQ | 耗尽/过期写 `$a2a/push/dlq/<tenant>`（一条普通消息，`message_id` = taskId）。**没有自动重投**：谁订阅谁负责。它的 retention 与 §5.1 同一套 |
+| 容量 | DLQ 每条约几百字节；失败率高的部署要盯它，别让它悄悄占满分区 |
+| 阻塞性 | 投递**从不阻塞任务终态**：分片只 `cast` 一次。worker 崩溃丢的是在途通知，不是任务状态 |
+| 告警占位（S9-F 落地） | 失败路径计数器（`a2a_push_dlq` / `a2a_stream_*`）推迟到 S9-F 统一动冻结键集；当前盯日志 `a2a push skipped` / `a2a push dlq` |
+
+**告警占位（S9-F 落地）**：S9-B/C 没有新增 `broker_metrics` 键——`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt`（S9-B）与 Push/Stream 失败计数器（S9-C）都推迟到 S9-F 统一动冻结键集时一并加。当前这些事件只进日志，运维侧按下面的日志特征盯：
 
 | 现象 | 日志特征 | 含义 / 处置 |
 |---|---|---|

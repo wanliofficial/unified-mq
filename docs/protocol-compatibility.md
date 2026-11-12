@@ -975,6 +975,156 @@ $ curl -sS -X POST .../ -d '{"jsonrpc":"2.0","id":4,"method":"ListTasks",
 
 ---
 
+## 4.16 S9-C 追加（2026-11-12）：SSE 流式任务事件 + 出站 Push Webhook
+
+**是什么**：S9-C 给 S9-B 的 Task 接上两个**都不阻塞**的交互面——SSE 流式只占用客户端一条连接、出站 Push 完全异步：
+
+1. **SSE 流式**（`a2a_stream`）：`SendStreamingMessage` / `SubscribeToTask` 的响应体是 `text/event-stream`；每个 `data:` 帧是一个**完整 JSON-RPC 2.0 Response**（`task` / `statusUpdate` / `artifactUpdate` / `message` 分支，照 R-T2），帧内带项目私有 `_meta.unified-mq = {seq, kind}`。流在**终态/中断态**事件转发后关闭，到达 `sse_max_duration_ms` 同样关闭（响亮失败，不无限挂连接）；空闲期发 SSE 注释行 `: ping`（`sse_heartbeat_ms`）保活。
+2. **出站 Push**（`a2a_push` / `a2a_push_auth` / `a2a_push_worker`）：Task 到终态/中断态时，分片把该 Task 的 push config 以 `cast` 交给 worker（**任务终态不等投递**）；worker 侧 `guard`（全局 `egress_allowlist` ∩ 租户 `push_tenant_allowlist`）→ 手写 HTTP/1.1 `POST` 到**已解析并校验过的 IP**（带 `Host` 头）→ 只读状态行、禁 3xx、响应体上限 `push_max_response_bytes`（64 KiB）。失败按 `push_max_attempts` 次指数退避（`push_base_backoff_ms × 2^attempt`，封顶 `push_max_backoff_ms`），超过 `push_ttl_ms` 放弃，耗尽/过期把失败写成 `$a2a/push/dlq/<tenant>` 上的**一条普通消息**。
+3. **控制面**：`broker_meta` 新增**第 13 张表 `push_config`**（ADR-026 §D6 amends ADR-002），行内**不存密钥**——密钥只在 `broker_proto_a2a.push_auth_secrets` env，按 scheme 名取用（ADR-026 §D6 第 6 条「不接受客户端明文密钥」）。
+
+> **对 §4.15.1 阶段快照的说明**：§4.15.1 里「`SendStreamingMessage` / `SubscribeToTask` / Push config 三件套 **仍未实现**，一律 `-32601`」是 **S9-B 完成态**的记录，保留原文不动。S9-C 之后这 6 个方法都已接线，当前事实以下面各表为准。
+
+### 4.16.1 方法能力矩阵（S9-C 对 §4.15.1 的增量）
+
+| 方法 | 状态 | 语义要点 |
+|---|---|---|
+| `SendStreamingMessage` | **已支持（SSE）** | 建 Task 后返回 `{stream, Plan}`，`a2a_conn` 识别后接管 socket 写 `text/event-stream`。`task_auto_complete=true` 时同步推进到终态，事件**逐条**以 `data:` 帧流出，随后关流 |
+| `SubscribeToTask` | **已支持（SSE）** | `params.id` 必填，校验 Task 属于本租户。**从 offset 0 重放历史事件**再跟随；未知/跨租户 Task → **404 + `-32001`**（与 `GetTask` 同码） |
+| `CreateTaskPushNotificationConfig` | **已支持** | `push_enabled=false` → **400 + `-32003`**（`push_notification_not_supported`）；启用时 upsert 配置，`config.id` **由服务端生成**（`base64url(sha256(Tenant‖0‖Task‖0‖Url))[:9]`，防枚举） |
+| `GetTaskPushNotificationConfig` | **已支持** | 按 `{taskId, configId}` 读；跨租户/不存在 → **404 + `-32001`** |
+| `ListTaskPushNotificationConfigs` | **已支持** | 按 `taskId` 列出，只含本租户行 |
+| `DeleteTaskPushNotificationConfig` | **已支持** | 幂等删除，成功 `result = {}` |
+
+**SSRF 校验在投递路径上，不在配置写入路径上。** `CreateTaskPushNotificationConfig` 只校验「`url` 是 `http`/`https` 且 host 非空」，**不**在写入时拒绝非白名单 host（`curl` 证据 §4.16.6 #11 实测 `http://10.0.0.5/hook` 写入成功）。真正的白名单交集、私网判定、pin IP 都在 worker 的 `prepare` 里做，失败时该条投递被跳过并记日志（`a2a push skipped ... {guard_refused, host_not_allowlisted}`），**不影响任务终态**。这是有意的：配置是声明，投递才是出站动作。
+
+### 4.16.2 SSE 帧与关流语义
+
+| 关注点 | 行为 |
+|---|---|
+| 响应头 | `content-type: text/event-stream`、`transfer-encoding: chunked`、`cache-control: no-cache`、`connection: keep-alive` |
+| 数据帧 | 每事件一帧 `data: <json-rpc-response>\n\n`；`json` 是完整 JSON-RPC 2.0 Response（含 `id`），`result` 里是 `task`/`statusUpdate`/`artifactUpdate`/`message` 分支 |
+| 心跳 | 空闲超过 `sse_heartbeat_ms`（默认 15000，证据节点 3000）发一行 `: ping`（SSE 注释，客户端忽略） |
+| 关流条件 | ①转发完终态/中断态事件；②到达 `sse_max_duration_ms`（模块默认 600000，出厂 `sys.config` 配 1800000）；③历史 offset 越界（被 retention GC）→ 先发一个 `status=failed` 事件再关 |
+| 订阅语义 | **不建 SubRef、不 pin retention**（ADR-025 §D7）。跟随走分区邮箱钩子，落后靠「重订阅从 offset 0 重放」达成等价可用性，不让永不结束的订阅抬高分区水位 |
+| 重放 | `SubscribeToTask` 先 `drain` `From` 起的历史事件（`seq` 单调），再 `await` 新事件 |
+
+### 4.16.3 Push 配置行与投递链路
+
+`push_config` 行（10 元组，主键 `{TenantId, TaskId, ConfigId}`）：
+
+| 列 | 值 |
+|---|---|
+| `{TenantId, TaskId, ConfigId}` | 主键；`ConfigId` 服务端生成 |
+| `Url` | binary，`http`/`https` |
+| `AuthScheme` | `undefined`（不带认证）或 scheme 名（须在 `push_auth_secrets` 里有对应密钥） |
+| `AllowPrivate` | 该配置是否允许连接私网/loopback（`push_tenant_allowlist` 的条目决定） |
+| `UpdatedAt` / `Version` | upsert 时刷新、`Version` 单调 +1 |
+
+投递链：
+
+```
+a2a_task_shard:maybe_push/2（终态/中断态挂点，cast，不等）
+  └─► a2a_push_worker:prepare/4
+        ├─► a2a_push:guard/3        allowlist 交集 → validate_url → resolve → is_private_address
+        ├─► a2a_push_auth:headers/3 X-A2A-Timestamp / X-A2A-Nonce / X-A2A-Task-Id / X-A2A-Config-Id
+        │                           + 声明 scheme 时：Authorization: Bearer … 或 X-A2A-Signature: sha256=<hex>
+        └─► a2a_push:deliver/3      连已校验 IP；只读状态行；3xx 即失败；体 ≤ 64 KiB
+              └─► 失败 → 退避重试 → 耗尽/过期 → write_dlq → $a2a/push/dlq/<tenant>（普通 #broker_message{}）
+```
+
+- **签名口径**：`X-A2A-Signature: sha256=<hex>` 是 HMAC-SHA256(secret, `timestamp ‖ "." ‖ nonce ‖ "." ‖ body`)，`secret` 取 `push_auth_secrets[scheme].secret`。
+- **scheme 是配置键名，不是自由字符串**：客户端声明了一个 `push_auth_secrets` 里没有的 scheme → 该条投递被跳过（`{auth_not_configured, not_configured}`），**不是**回落到无签名投递（`curl` 证据 §4.16.6 前的诊断即此行为）。
+- **DLQ 消息形状**：`destination = <<"$a2a/push/dlq/", Tenant/binary>>`、`message_id = TaskId`（任务即失败主体）、`payload_encoding = json`、`reliability = fsync`，payload 是 `{taskId, configId, url, attempts, reason, _meta.unified-mq.kind = pushDlq}`。它是**可订阅、可审计的普通消息**，与 `$dlq/...` 同一手法；写失败只 `logger`，不抛。
+
+### 4.16.4 错误映射（新增部分）
+
+| 情形 | HTTP | JSON-RPC code |
+|---|---|---|
+| `push_enabled=false` 时的 Push 四方法 | **400** | `-32003` `push_notification_not_supported` |
+| `SubscribeToTask` / Push 读删的 Task/config 不存在或跨租户 | **404** | `-32001` `task_not_found` |
+| 其余（信封/版本/凭据/media type/`-32602`） | 同 §4.14 / §4.15 | 同 §4.14 / §4.15 |
+
+### 4.16.5 证据
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT（流式 + Push + guard） | `apps/broker_proto_a2a/test/a2a_stream_push_SUITE.erl` | **20 例**（新套件）：`stream` 7（流式建 Task + 终态关流 / 帧是 JSON-RPC Response / `SubscribeToTask` offset 0 重放 / 未知任务 404 / 心跳保活 / 中断态关流 / 慢读者不 pin retention）、`push` 5（禁用回 `-32003` / CRUD 往返 / 配置租户隔离 / 终态事件投递 / 重试后写 DLQ）、`guard` 8（私网拒绝 / 空 allowlist 拒绝 / 越权 host 拒绝 / 非 https 拒绝 / 重定向拒绝 / 显式 `allow_private` 放行 / 签名头存在且 HMAC 正确 / 未配置 auth scheme 拒绝） |
+| CT（控制面） | `apps/broker_meta/test/broker_meta_SUITE.erl` | **12 → 13 例**：冻结表断言改为 13 表；新增 `push_config_crud_and_tenant_isolation`（CRUD + version 单调 + 跨租户不可见） |
+| 全量回归 | `rebar3 ct` | **973/973、63 套件**（基线 952/62，零 FAILED；净增 = 新套件 20 + `broker_meta_SUITE` +1） |
+| 静态门禁 | `rebar3 dialyzer` / `rebar3 xref` / 两种 release | dialyzer **0 warning**；xref 除既有 unused-export 外无新告警；`rebar3 release` 与 `rebar3 as quic release` 均成功，`lib/` 含 `a2a_push`/`a2a_push_auth`/`a2a_push_worker`/`a2a_stream` |
+| 真实客户端 | `curl`（下节原文） | **15 条**请求/响应原文 + 1 个本地 webhook receiver 收到的 POST |
+
+### 4.16.6 `curl` 实测（2026-11-12，证据节点 127.0.0.1:18094 + webhook receiver 127.0.0.1:18095/18096）
+
+节点配置：`task_shards => 4`、`task_reliability => fsync`、`task_auto_complete => false`、`sse_heartbeat_ms => 3000`、`push_enabled => true`、`push_allow_http => true`、`egress_allowlist => [#{host => <<"127.0.0.1">>, allow_private => true}]`、`push_tenant_allowlist => #{<<"t1">> => [#{host => <<"127.0.0.1">>, allow_private => true}]}`、`push_auth_secrets => #{<<"hmac-sha256">> => #{secret => <<"evidence-secret">>, header => none}}`、`push_max_attempts => 2`、`push_base_backoff_ms => 50`、`push_ttl_ms => 30000`，用户 `s9c-evidence`（tenant `t1`）。receiver 1 固定回 200、receiver 2 固定回 500。
+
+```
+$ curl -sS -N -D - -X POST http://127.0.0.1:18094/ \
+    -H 'Content-Type: application/json' -H 'A2A-Version: 1.0' \
+    -H 'Authorization: Bearer s9c-evidence-token' \
+    -d '{"jsonrpc":"2.0","id":2,"method":"SendStreamingMessage","params":{"message":{
+         "messageId":"m-sse","role":"ROLE_USER","contextId":"ctx-sse",
+         "parts":[{"text":"stream me"}]}}}'
+HTTP/1.1 200 OK
+transfer-encoding: chunked
+connection: keep-alive
+content-type: text/event-stream
+cache-control: no-cache
+
+data: {"id":2,"jsonrpc":"2.0","result":{"_meta":{"unified-mq":{"kind":"task","seq":1}},
+  "task":{"contextId":"ctx-sse","history":[{"contextId":"ctx-sse","messageId":"m-sse",
+  "parts":[{"text":"stream me"}],"role":"ROLE_USER","taskId":"aFs2j6HItBT957-tSHelsA"}],
+  "id":"aFs2j6HItBT957-tSHelsA","status":{"state":"TASK_STATE_SUBMITTED",
+  "timestamp":"2026-11-12T03:23:24.993Z"}}}}
+
+: ping
+
+: ping
+```
+
+```
+$ 本地 webhook receiver 在 CancelTask 后收到的 POST（receiver 1，200）：
+POST /hook-ok
+x-a2a-config-id: TxPb2ANVDxDx
+x-a2a-nonce: +1z0xuCxhY3G4chNaCfcfw==
+x-a2a-signature: sha256=1cec33692259a207ce0fcfc6b93829afed2e302be91cc1168864e9760dfc2eb0
+x-a2a-task-id: UV-BCkhOYdHpPkCTYmkkZA
+x-a2a-timestamp: 1794453819547
+body: {"_meta":{"unified-mq":{"kind":"statusUpdate","seq":2}},"statusUpdate":{"contextId":"ctx-s9c",
+       "final":true,"status":{"state":"TASK_STATE_CANCELED","timestamp":"..."},"taskId":"..."}}
+```
+
+| # | 请求 | 响应 / 观测 |
+|---|---|---|
+| 1 | `SendMessage`（`task_auto_complete=false`） | `200`，`result.task.status.state = TASK_STATE_SUBMITTED` |
+| 2 | `SendStreamingMessage` | `200` + `text/event-stream`，一帧 `data:`（`kind=task`、`seq=1`）后跟 `: ping` 心跳（上） |
+| 3 | `SubscribeToTask <id>`（已终态/无新事件） | 首帧 `data:` 是 offset 0 的**历史重放**（与 #1 的 Task 逐字段一致），随后 `: ping` |
+| 4 | `SubscribeToTask` 未知 id | **`404`** `{"error":{"code":-32001,"message":"Task not found"}}` |
+| 5 | `CreateTaskPushNotificationConfig`（`url=…:18095/hook-ok`、`scheme=hmac-sha256`） | `200`，服务端生成 `id = TxPb2ANVDxDx`，回显 `taskId`/`tenant`/`url`/`authentication` |
+| 6 | `GetTaskPushNotificationConfig` | `200`，与 #5 的 config 逐字段相同 |
+| 7 | `ListTaskPushNotificationConfigs` | `200`，`result.configs` 含该条 |
+| 8 | `CancelTask` | `200`，`status.state = TASK_STATE_CANCELED` |
+| 9 | （异步）webhook POST | receiver 收到 `POST /hook-ok`：`x-a2a-*` 头齐全（含 HMAC 签名），body 是 `statusUpdate`，`final=true`（上） |
+| 10 | `DeleteTaskPushNotificationConfig` | `200`，`result = {}` |
+| 11 | `CreateTaskPushNotificationConfig`（`url=http://10.0.0.5/hook`，不在白名单） | `200` —— **配置写入不校验**，SSRF 校验在投递路径（§4.16.1） |
+| 12 | `CancelTask` 该 Task | `200`；节点日志 `a2a push skipped t1/…: {guard_refused,host_not_allowlisted}`——**从未拨号** |
+| 13 | `CreateTaskPushNotificationConfig`（`url=…:18096/hook-fail`，receiver 固定回 500）→ `CancelTask` | `200`；receiver 收到 **2** 次 `POST /hook-fail`（`push_max_attempts=2`），两次签名头相同 |
+| 14 | `a2a_push_worker:stats/0`（同节点 rpc） | `#{pending => 0, dropped => 1, failed => 1, delivered => 0}`（1 次失败 + 1 次耗尽丢弃） |
+| 15 | 同节点读取 `$a2a/push/dlq/t1` | 恰一条，`partition=2 offset=3`，`message_id = <taskId>`，payload `{"_meta":{"unified-mq":{"kind":"pushDlq"}},"attempts":2,"configId":"02RdUqVf_l88","reason":"{unexpected_status,500}","taskId":"…","url":"127.0.0.1"}` |
+
+### 4.16.7 已声明的限制 / 边界
+
+- **Push 默认关闭**：`push_enabled => false` 是出厂值；关闭时推送四方法回 `-32003`。`push_allow_http => true` 只为本地 receiver 证据，生产应保持 `https` 且 `egress_allowlist` 非空。
+- **scheme 必须是运维配好的键**：客户端声明未配置的 scheme 会被**跳过**（`auth_not_configured`），不降级为明文投递。
+- **DLQ 无消费者进程**：耗尽后写进 `$a2a/push/dlq/<tenant>` 即结束；谁订阅谁负责，Broker 不自动重投。
+- **SSE 无中间快照 resync**：目前靠「重订阅 offset 0 重放」；`sse_max_duration_ms` 到点关流，客户端自行重连。
+- **仍是单节点**：`SubscribeToTask`/Push 都在 Task 的 owner 节点（本地 shard ETS）；跨节点访问是 S9-C+ 演进位。
+- **失败路径计数器仍未加**：`a2a_push_dlq` / `a2a_stream_*` 等键推迟到 S9-F 统一动 `broker_metrics` 冻结键集；S9-C 只 `logger`。
+- **默认仍不监听**：`listeners => []`。18094/18095/18096 只是本次证据端口。
+
+---
+
 ## 5. 冻结契约一致性（T17 签认，2026-11-06）
 
 > 本节是 **Gate S1 的签认记录**，不是 S5 的兼容性结论。它回答一个问题：上表 MQTT 行的语义边界，是否真的由三份冻结 ADR 决定，而不是由实现细节偶然决定。复核对象是 T2~T15 的最终代码（commit `a8608d9` 前的实现状态，文档改动不触及代码）。

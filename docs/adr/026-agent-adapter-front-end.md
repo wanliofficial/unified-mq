@@ -123,6 +123,14 @@ broker_proto_a2a_sup (one_for_all)
 7. **失败语义**：按 ADR-015 的参数（`max_attempts`、指数退避、TTL）重试；耗尽后写 `$a2a/push/dlq/<tenant>`（普通 destination，可订阅、可审计），**不阻塞任务终态**。
 8. **部署边界**：Broker 只保证自身 egress；集群网络策略、NAT、代理由部署方负责，写进 `docs/operations.md`。
 
+> **落地注记（S9-C，2026-11-12；冻结文本不改，偏差在此逐条对照）**
+>
+> - **第 1 条「空 allowlist 等于拒绝一切 push 配置创建」**：落地为**配置写入不校验 egress**——`CreateTaskPushNotificationConfig` 只校验 `url` 形态（`http`/`https` + host 非空），空 allowlist 时**配置照样写入成功**，真正的拒绝发生在**投递期**：`a2a_push:guard/3` 回 `{guard_refused, empty_allowlist | empty_tenant_allowlist | host_not_allowlisted}`，该条投递被跳过并记日志（`a2a push skipped ...`），**任务终态不受影响**。`-32003` 只用于 `push_enabled => false`。理由：白名单是出站策略，配置是声明；把策略判定放在投递期才能让「先配后开」与配置重载自然工作，也避免把 egress 细节泄进控制面错误码。证据：`docs/protocol-compatibility.md` §4.16.6 #11/#12。
+> - **第 6 条「Bearer/API key 来自配置」**：落地为密钥**不在配置行里**——`push_config` 表只有 `{url, auth_scheme, allow_private, updated_at, version}`，密钥单独放 `broker_proto_a2a.push_auth_secrets`，**按 scheme 名取**（`a2a_push_auth:secret_for/1`，键即客户端声明的 `authentication.scheme`，如 `"hmac-sha256"`）。客户端声明了未配置的 scheme → 跳过投递（`{auth_not_configured, not_configured}`），**不降级为无签名投递**。这比原文更严：`broker_meta` 的持久化/备份里不会出现任何密钥。
+> - **第 6 条「HMAC 可选」**：落地为「有 scheme 才签」；无 scheme（`undefined`）时仍带 `X-A2A-Timestamp`/`X-A2A-Nonce`/`X-A2A-Task-Id`/`X-A2A-Config-Id` 四个头，防重放材料齐全。
+> - **第 7 条「耗尽后写 `$a2a/push/dlq/<tenant>`」**：落地一致，另记两点实现细节——DLQ 消息的 `message_id` 取 **task id**（失败主体），`config_id` 在 payload 里；写入走 `broker_router:env/0` 解包 `{ok, Env}` → `Backend:route/3` → `broker_queue:append/3`（`fsync`），与业务消息同一写路径，写失败只 `logger` 不抛。
+> - **第 3 条「先解析域名再 pin IP」**：落地一致；`allow_private => true` 的条目是 loopback/私网目标唯一合法通路（`push_allow_http => true` 只解开明文限制，不解开私网限制）。
+
 ### D7. OAuth 授权服务器 / JWKS **不纳入** Broker
 
 - Broker 不是 OAuth AS：不签发 token、不提供 `/.well-known/oauth-authorization-server`、不托管 JWKS。

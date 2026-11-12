@@ -57,14 +57,14 @@ apps/
 ├── broker_proto_kafka/   S5：Kafka wire（Produce/Fetch/Metadata + consumer group）
 ├── broker_proto_pulsar/  S5：Pulsar binary（produce/consume/ack/seek）
 ├── broker_proto_agent_rpc/ S9-A：agent 协议纯库（JSON-RPC 2.0 信封、HTTP/1.1 帧、SSE 帧、版本协商、凭据 helper），无进程、无 listener、无自有 env
-└── broker_proto_a2a/     S9-A/B：A2A 1.0.0 JSON-RPC 前端（Task 生命周期 + Agent Card 发现），默认 `listeners => []`
+└── broker_proto_a2a/     S9-A/B/C：A2A 1.0.0 JSON-RPC 前端（Task 生命周期 + Agent Card 发现 + SSE 流式 + 出站 Push webhook），默认 `listeners => []`
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
 |---|---|---|---|---|
 | `broker_core` | kernel, stdlib | 无 | `broker_message.hrl` 的 `#broker_message{}`、`partition_id()`、`sync_mode()` | 无（纯类型） |
 | `broker_metrics` | kernel, stdlib, sasl | `broker_metrics_server`（仅 `report_interval_ms > 0`；指标本身不在进程里） | `inc/1,2`、`observe/2`、`gauge/2`、`gauge_add/2`、`snapshot/0`、`p99/1`、`keys/0` | `counters`/`atomics` 数组 + `persistent_term` 的 `Key → {Kind,Ref,Idx}` 索引（无 ETS） |
-| `broker_meta` | kernel, stdlib, sasl, mnesia | `broker_meta_config`（配置版本 gen_server）、`broker_meta_outbox`；表访问本身由调用方同步执行 | `ensure_schema/0`、`tables/0`、通用 `put/get/delete/all/clear` + 12 张表的类型化访问器（`put_tenant/get_tenant`、`put_user/get_user`、`put_acl/acls`、`put_partition/get_partition`、`put_node/nodes`、`version/bump_version`、`enqueue/pending_outbox/mark_published`、`put_agent_card/1`、`get_agent_card/2`、`delete_agent_card/2`、`agent_cards/1`）、`reset/0` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用。12 张表**全部建表并可有行**，但 `topic_meta` / `queue_meta` / `binding_meta` 目前**没有运行时消费者**（只有 `tables/0` 与套件引用，泛型 `put/get` 可写可读）——这三张表是控制面预留，接入路由/队列/binding 的读取方列为 S7 之后。第 12 张 `agent_card`（S9-B，ADR-026 §D3 显式修订 ADR-002）有真实消费者：`broker_proto_a2a` 的 well-known/catalog/`GetExtendedAgentCard` 读它，`a2a_card:seed/0` 是唯一写入者 |
+| `broker_meta` | kernel, stdlib, sasl, mnesia | `broker_meta_config`（配置版本 gen_server）、`broker_meta_outbox`；表访问本身由调用方同步执行 | `ensure_schema/0`、`tables/0`、通用 `put/get/delete/all/clear` + **13 张表**的类型化访问器（`put_tenant/get_tenant`、`put_user/get_user`、`put_acl/acls`、`put_partition/get_partition`、`put_node/nodes`、`version/bump_version`、`enqueue/pending_outbox/mark_published`、`put_agent_card/1`、`get_agent_card/2`、`delete_agent_card/2`、`agent_cards/1`、`put_push_config/1`、`get_push_config/3`、`push_configs/2`、`delete_push_config/3`、`delete_push_configs/1`）、`reset/0` | Mnesia 表（控制面）；schema 不存在时创建，存在时复用。13 张表**全部建表并可有行**，但 `topic_meta` / `queue_meta` / `binding_meta` 目前**没有运行时消费者**（只有 `tables/0` 与套件引用，泛型 `put/get` 可写可读）——这三张表是控制面预留，接入路由/队列/binding 的读取方列为 S7 之后。第 12 张 `agent_card`（S9-B，ADR-026 §D3 显式修订 ADR-002）有真实消费者：`broker_proto_a2a` 的 well-known/catalog/`GetExtendedAgentCard` 读它，`a2a_card:seed/0` 是唯一写入者。第 13 张 `push_config`（S9-C，ADR-026 §D6 显式修订 ADR-002）由 `broker_proto_a2a` 的 Push 四方法读写，**行内不存密钥**（密钥在 `push_auth_secrets` env，按 scheme 名取） |
 | `broker_cluster` | kernel, stdlib, sasl, crypto, ra, broker_core, broker_meta, broker_metrics | `broker_cluster_cache`（归属/epoch 缓存 gen_server）与 ra server `{broker_cluster_meta, Node}`（模块 `broker_cluster_meta`，状态机 `broker_cluster_meta_machine`）；`broker_cluster_rep` 是纯函数模块，无进程 | `assign/4`、`migrate/4`、`finish_migration/2`、`remove/1`、`owner/1`、`epoch/1`、`replicas/1`、`authorize_append/2`、`guard_append/3`、`replicate/2`、`snapshot/0` | 本地 ETS 归属/epoch 缓存；ra 日志与快照；`persistent_term` 队列钩子 |
 | `broker_storage` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_storage_wal_sup` + 每分区 `wal_writer`（WAL 档）／`broker_storage_memory_store`（内存档） | `broker_storage` behavior：`create/recover/close/append/read_from/advance_committed/truncate/capability` | WAL 段与 `meta.log`；内存表 |
 | `broker_router` | kernel, stdlib, sasl, broker_core | `broker_router_hash_store` | `route/3`（`broker_router` behavior 回调，由 `broker_router_hash` 实现）、`broker_router:env/0`、`register/3`、`unregister/1` | `Filter → [SubRef]` 内存索引（**不持久化**） |
@@ -340,7 +340,7 @@ broker_proto_mqtt_quic_sup (one_for_all, 1/5s)
 
 **quicer 是 profile 门控依赖，不是默认依赖。** 默认 `rebar3 compile/ct/release` 完全不拉 `quicer`（`optional_applications => [quicer]`，listener 在缺 NIF 时以 `{error, quicer_not_available}` 干净拒绝）；`rebar3 as quic ...` 才把它编进来，`quic` profile 的 `relx` 因此复制了完整的 release app 列表——profile 的 `relx` 会**替换**顶层那份，漏掉就等于装出一个只有 QUIC 的 release。**`broker_proto_mqtt_quic` 本身在两个 release 的 app 列表里**（它不依赖 NIF 就能启动，只是 `listeners => []`），差别只是 `quic` release 多带 `quicer-0.4.12`；把该 app 从默认列表里去掉会让手工构建与 release 的启动行为不一致。所有 `quicer:` 调用集中在 `mqtt_quic_nif` 一个模块，`include` 也不越界：本 app 只通过裸消息元组与 quicer 交互，没有它的头文件依赖。
 
-### 3.13 A2A 前端的连接模型与 Task 数据流（S9-A / S9-B）
+### 3.13 A2A 前端的连接模型与 Task 数据流（S9-A / S9-B / S9-C）
 
 与 §3.9–§3.12 的 MQTT 传输抽象无关：A2A 是一条独立的 HTTP/1.1 前端，不经过 `mqtt_transport`，也不复用 `mqtt_conn_fsm`。
 
@@ -349,10 +349,12 @@ broker_proto_a2a_sup (one_for_one, 1/5s)
 ├── a2a_task_registry (one_for_all, 3/10s)         % S9-B：boot 契约的第一项
 │     ├── a2a_task_shard_1..N                      % phash2(TaskId, N) 定分片；每分片一张 ETS 投影
 │     └── a2a_task_recovery                        % 最后一项：全量重放，重建全部投影
+├── a2a_push_worker                                % S9-C：仅 push_enabled => true 时挂载；出站投递/重试/DLQ
 └── ranch_embedded_sup → listener × N              % 默认 N = 0（listeners => []）
       └── a2a_conn                                 % 每连接一个进程；循环处理多个请求（keep-alive）
             ├── agent_rpc_http:read_request/3      % packet=http_bin 读头 → raw 读体
-            └── a2a_rpc:handle/1                   % media type → 凭据 → 版本 → 信封 → 方法
+            ├── a2a_rpc:handle/1                   % media type → 凭据 → 版本 → 信封 → 方法
+            └── a2a_stream:run/3                    % S9-C：{stream, Plan} 时接管 socket 走 SSE
 ```
 
 **一个连接一个进程，不是一请求一个进程。** `a2a_listener:start_link/3` 只 `spawn_link` 一个 `a2a_conn`，由它自己 `ranch:handshake/1` 接管 socket，然后在同一个进程里循环：读请求、分派、写响应、判断 `keep_alive`。这样 keep-alive 不额外耗进程，客户端掉线也只波及自己这条连接（`temporary` 由 `spawn_link` 的普通进程语义承担，不进监督树）。单连接上限 1000 个请求，防止长连接无限占用 ranch 槽位。
@@ -392,8 +394,36 @@ a2a_conn ──► a2a_rpc:handle/1            media type → 凭据 → 版本 
 | 分区 | `partition_id` 由 router 求得 | 同 Task 全部事件落同一分区，重放保序 |
 | 可靠性 | `task_reliability`（默认 `fsync`） | 创建与终态同档；不因"终态更重要"分档（ADR-025 §D4） |
 | retention | 与普通消息同一套 `broker_storage.retention` | 创建事件被 GC 后重放 → `history_lost` 补 `FAILED` |
-| cursor/订阅 | **不使用** | 投影是 folded view，不是订阅者；S9-C 的 SSE 才是瞬态读者 |
-| Mnesia | **不使用** | `broker_meta` 只存 Agent Card（控制面），Task 不落 Mnesia（ADR-002 边界） |
+| cursor/订阅 | **SSE 时才用** | 投影是 folded view，不是订阅者；S9-C 的 `a2a_stream` 才订阅分区邮箱钩子（**不建 SubRef、不 pin retention**，ADR-025 §D7） |
+| Mnesia | **不使用** | `broker_meta` 只存 Agent Card 与 Push 配置（控制面），Task 不落 Mnesia（ADR-002 边界） |
+
+#### 3.13.2 一次 `SendStreamingMessage` 的数据流（S9-C）
+
+```
+a2a_conn ──► a2a_rpc:handle/1
+              └─► a2a_task_registry:create/3        （同 §3.13.1：事件落 $a2a/task/<id>）
+              └─► {stream, Plan}  ──► a2a_conn 识别，交出 socket 给 a2a_stream:run/3
+                    ├─ 写响应头 text/event-stream / chunked / no-cache
+                    ├─ 订阅分区邮箱钩子（broker_queue:subscribe/2，钩子不是 SubRef，不 pin）
+                    ├─ drain：From 起的历史事件逐个 → data: <json-rpc-response>
+                    └─ await：等新事件；空闲发 ": ping"；终态/中断态转发后关流
+```
+
+**SSE 是瞬态读者，不是订阅者。** `a2a_stream` 只挂分区邮箱钩子（拿到"有新事件"的唤醒），自己按 cursor 读 `broker_queue:read_from/3`；它是队列层的普通读者，不进入 `broker_router` 的 `Filter → [SubRef]` 索引，也不产生 retention pin。因此「一个客户端挂住一条流」不会抬高任何分区水位——代价是重连只能**从 offset 0 重放**（`SubscribeToTask` 语义），不是从上次位置续传。
+
+#### 3.13.3 Task 终态后的出站 Push 链路（S9-C）
+
+```
+a2a_task_shard:create/… 追加终态事件（已 fsync）
+  └─ 追加成功 → a2a_task_shard:maybe_push/2 → a2a_push_worker:enqueue/4   （gen_server:cast，不阻塞终态）
+        └─ a2a_push_worker（单进程串行所有投递）
+              ├─ prepare：a2a_push:guard/3（allowlist ∩ → validate_url → resolve → is_private_address）
+              │           a2a_push_auth:headers/3（timestamp/nonce/task-id/config-id + 可选签名）
+              ├─ deliver：a2a_push:deliver/3（gen_tcp/ssl 手写 POST，连已校验 IP，禁 3xx，体 ≤ 64 KiB）
+              └─ 失败 → 指数退避重试 → 耗尽/过期 → write_dlq → $a2a/push/dlq/<tenant>（普通消息）
+```
+
+**出站是"任务终态已定，投递只是副作用"。** 分片对 worker 只有一次 `cast`，绝不等待返回值；worker 崩溃只由 supervisor 重启（在途投递随队列丢失，代价是漏一次通知，不是任务状态错误）。`push_enabled => false` 时 worker 根本不在监督树里，四个 Push 方法回 `-32003`——**关闭态下连队列都没有**。DLQ 走的是 `broker_router:env/0` + `Backend:route/3` + `broker_queue:append/3`，与业务消息同一条写路径，因此它可被普通订阅消费、被同一套 retention 约束。
 
 ---
 

@@ -263,9 +263,11 @@
     %% on a matching entry is the only way a loopback/private target is legal.
     {egress_allowlist, []},
     {push_tenant_allowlist, #{}},
-    %% HMAC secrets for the `hmac-sha256' auth scheme, keyed by config id. Kept
-    %% out of `broker_meta' on purpose: the row names the scheme, never the
-    %% secret.
+    %% HMAC secrets for push auth schemes, keyed by *scheme name* (the value a
+    %% client names in `authentication.scheme', e.g. "hmac-sha256"). Kept out
+    %% of `broker_meta' on purpose: the row names the scheme, never the secret.
+    %% A client-named scheme with no entry here is skipped (auth_not_configured)
+    %% rather than delivered unsigned.
     {push_auth_secrets, #{}},
     %% Cleartext webhooks are refused unless this is true (TLS is the default).
     {push_allow_http, false},

@@ -65,7 +65,7 @@
   - `validate_url/2`：scheme 必须 `https`（`http` 需 `push_allow_http => true`，仅供本地测试）；host 后缀匹配；`resolve` 后逐个 IP 过 `is_private_address/1`（loopback/私有/链路本地/组播/保留），除非该条目 `allow_private => true`。
   - 返回 `#{scheme, host, port, path, addresses, allow_private}`（含已解析地址，供 pin）。
 - `a2a_push:deliver/3`：`gen_tcp`/`ssl` 手写 HTTP/1.1 `POST`，**连到已校验 IP**（带 `Host` 头），禁 3xx（收到即失败），只读状态行，响应体上限 `push_max_response_bytes`（64 KiB）；超时用 `push_timeouts`。
-- `a2a_push_auth:headers/3`：`X-A2A-Timestamp`（ms）+ `X-A2A-Nonce`（随机）+ 按 scheme 出 `Authorization: Bearer <token>` 或 `X-A2A-Signature: sha256=<hex>`（HMAC 对 `timestamp.nonce.body`，密钥取 `push_auth_secrets[ConfigId]`）。
+- `a2a_push_auth:headers/3`：`X-A2A-Timestamp`（ms）+ `X-A2A-Nonce`（随机）+ 按 scheme 出 `Authorization: Bearer <token>` 或 `X-A2A-Signature: sha256=<hex>`（HMAC 对 `timestamp.nonce.body`，密钥取 `push_auth_secrets[Scheme]`——**scheme 名是配置键名**，不是自由字符串；客户端命名了未配置的 scheme 就跳过投递，不降级为明发）。
 
 ## Task 4 — `a2a_push_worker`：重试/退避/TTL/DLQ（不阻塞终态）
 
@@ -125,8 +125,10 @@
 
 | # | 计划原文 | 实际落地 | 原因 |
 |---|---|---|---|
-| 1 | Task 1：配置行含密钥（`TaskPushNotificationConfig.token`） | 配置行**不存密钥**：`push_config` 表列是 `url`/`auth_scheme`/`allow_private` 等 10 列，HMAC 密钥单独放 `push_auth_secrets` env（按 `config_id` 取） | ADR-026 §D6 第 6 条明令「不接受客户端明文密钥」；密钥落库会把 SSRF 之外的第二类敏感面引入 `broker_meta`（Mnesia 持久化 + 备份外泄），env 隔离更安全 |
+| 1 | Task 1：配置行含密钥（`TaskPushNotificationConfig.token`） | 配置行**不存密钥**：`push_config` 表列是 `url`/`auth_scheme`/`allow_private` 等 10 列，HMAC 密钥单独放 `push_auth_secrets` env（**按 scheme 名取**，即客户端命名的 `authentication.scheme`） | ADR-026 §D6 第 6 条明令「不接受客户端明文密钥」；密钥落库会把 SSRF 之外的第二类敏感面引入 `broker_meta`（Mnesia 持久化 + 备份外泄），env 隔离更安全 |
 | 2 | Task 1：`config_id` 用客户端传入 | 服务端 `push_config_id/2` 生成（`base64url(sha256(Tenant0Task0Url))[:9]`） | 防枚举：客户端自选 id 可被遍历探测他人 webhook |
 | 3 | Task 2：`a2a_conn` 为 SSE 建 SubRef 并 pin retention | 照 ADR-025 §D7 **不建 SubRef、不 pin**；只订阅分区邮箱钩子 + 回放 + 跟随；终态/中断态关流 | retention pin 会让一个永不结束的订阅永久抬高分区水位；S9-C 用「重订阅从 offset 0 重放」达成等价可用性，不引入 pin |
 | 4 | Task 4：DLQ 消息 id 用 `config_id` | 用 **task id** 作 `message_id`（DLQ destination 是 `$a2a/push/dlq/<tenant>`，单条 destination 容纳所有失败，payload 里标 `taskId`） | task id 全局唯一且即失败主体，便于按任务关联；`config_id` 在 payload 内 |
 | 5 | Task 4：`write_dlq` 直接 `broker_queue:append` | 先 `broker_router:env()` 解包 `{ok, Env}` 再 `Backend:route/3` + `append` | `broker_router:env()` 返回 `{ok, Env}` 元组，不解包会 `function_clause`；照 `broker_event:write_quarantine/2` 范式 |
+| 6 | Task 3/5：SSRF 校验在**配置写入**时拒绝越权 host | SSRF 校验只在**投递期**（`a2a_push:guard/3`）生效；`CreateTaskPushNotificationConfig` 只校验 `url` 形态，越权 host 写入成功、投递被 `guard_refused` 跳过且从不拨号 | 白名单是出站策略、配置是声明；投递期判定才能让「先配后开」与配置重载自然工作。ADR-026 §D6 第 1 条「空 allowlist 拒绝配置创建」同样按此落地（已在 ADR-026 加落地注记） |
+| 7 | Task 2：D7 的 `sse_max_pending_bytes`（1 MiB）/ `sse_send_timeout_ms`（30 s）与 `metadata._a2a.resync` 快照 | **未落地**：改以 `sse_max_duration_ms` 作出一条流的时间上界 + 单帧 `sse_max_event_bytes`；历史越界时发 `status: failed` 后关流（不搭 resync 快照） | SSE 写在同一连接进程内同步 `send`，socket 发送缓冲自然反压、不堆 mailbox，字节水位无落点；resync 要求连接进程读投影（耦合 shard ETS），关流+重订阅用同一路径达成等价可用性。两个 env 已从 `config/sys.config.src` 移除（不留「声明但不读」的死配置） |
