@@ -30,7 +30,7 @@
 
 ## 2. 应用划分
 
-### 2.1 24 个应用
+### 2.1 25 个应用
 
 ```
 apps/
@@ -58,7 +58,8 @@ apps/
 ├── broker_proto_pulsar/  S5：Pulsar binary（produce/consume/ack/seek）
 ├── broker_proto_agent_rpc/ S9-A：agent 协议纯库（JSON-RPC 2.0 信封、HTTP/1.1 帧、SSE 帧、版本协商、凭据 helper），无进程、无 listener、无自有 env
 ├── broker_proto_a2a/     S9-A/B/C：A2A 1.0.0 JSON-RPC 前端（Task 生命周期 + Agent Card 发现 + SSE 流式 + 出站 Push webhook），默认 `listeners => []`
-└── broker_proto_mcp/     S9-D：MCP 2026-07-28 前端（Streamable HTTP + stdio，工具/资源/提示原语透传到 `$mcp/<method>`，本地实现发现与订阅），默认 `listeners => []`
+├── broker_proto_mcp/     S9-D：MCP 2026-07-28 前端（Streamable HTTP + stdio，工具/资源/提示原语透传到 `$mcp/<method>`，本地实现发现与订阅），默认 `listeners => []`
+└── broker_proto_acp/     S9-E：ACP v1 前端（仅 stdio，Broker 作 Client、agent 是本地子进程；主动发 initialize/session/new/session/prompt，实装 session/request_permission 权限策略），出厂 `agents => []`
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
@@ -88,6 +89,7 @@ apps/
 | `broker_proto_agent_rpc` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security | **无进程、无 listener、无自有 env**（空 application，照 `broker_ws`） | `agent_rpc_json`（JSON-RPC 2.0 信封）、`agent_rpc_error`（错误码/HTTP 映射）、`agent_rpc_version`（`A2A-Version` 解析与协商）、`agent_rpc_http`（HTTP/1.1 请求解析 + 响应/chunk 序列化）、`agent_rpc_sse`（SSE 帧）、`agent_rpc_auth`（Bearer/`X-API-Key` → `broker_security`） | 无（纯函数库；socket 由 adapter 持有） |
 | `broker_proto_a2a` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_a2a_sup` + `a2a_task_registry`（`one_for_all` 监督 N 个 `a2a_task_shard` + `a2a_task_recovery`）+ 每条配置的 listener（`ranch_embedded_sup`，默认零条）+ 每连接一个 `a2a_conn` 循环进程 | `a2a_listener`（ranch_protocol）、`a2a_conn`（keep-alive 循环）、`a2a_rpc:handle/1`（方法分派与全部门控）、`a2a_task_registry`（`create/3`、`get/1`、`list/3`、`cancel/2`、`apply_event/4`）、`a2a_task`（纯状态机）、`a2a_event`（事件 → `#broker_message{}`）、`a2a_task_projection`（纯折叠）、`a2a_card`（well-known/catalog/ETag/seed） | 每连接的请求计数与 socket；**每 shard 一张 ETS 投影表**（Task 视图，evict 由 boot replay 重建）+ 注册表里的分片名单。Task 事件本身**不在**这里——它们是 `$a2a/task/<id>` 上的普通消息，归 `broker_storage`/`broker_queue`；无 cursor、无 Mnesia |
 | `broker_proto_mcp` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_mcp_sup` + 每条配置的 listener（`ranch_embedded_sup`，默认零条）+ 每 HTTP 连接一个 `mcp_conn` 循环进程 + stdio 前端一个 `mcp_stdio` 主循环进程（订阅以 `spawn_link` 子进程运行） | `mcp_listener`（ranch_protocol）、`mcp_conn`（per-conn HTTP loop）、`mcp_route`（method → capability 门控）、`mcp_discover`（能力发现）、`mcp_dispatch`（传输无关协议层）、`mcp_rpc`（HTTP 门禁 + 分派）、`mcp_stream`（SSE/stdio 双 sink）、`mcp_stdio`（newline 成帧 + 订阅子进程） | 每连接的请求计数与 socket；MCP 原语**不在**这里——它们是 `$mcp/<method>` 上的普通消息，归 `broker_storage`/`broker_queue`；无会话、无 Mnesia 表（发现结果动态计算）；stdio 无状态、无会话（2026-07-28） |
+| `broker_proto_acp` | kernel, stdlib, sasl, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_acp_sup`（`one_for_one`）+ 每个配置的 agent 一个 `acp_agent` gen_server（spawn 并扮演 ACP Client） | `acp_transport`（行为）+ `acp_port`（生产子进程传输，`spawn_executable`）+ `acp_fake_transport`（测试态内存传输）+ `acp_frame`（newline 分帧 + JSON-RPC 信封）+ `acp_policy`（权限裁决）+ `acp_turn`（turn 折叠）+ `acp_session`（纯状态机）+ `acp_event`（`$acp/*` 目的地）+ `acp_agent`（每连接主循环） | 每个 agent 子进程的 stdin/stdout 句柄与握手/会话状态（进程内，不持久化）；`$acp/in/<agent>`、`$acp/session/<id>`、`$acp/permission` 上的消息是普通 `#broker_message{}`，归 `broker_storage`/`broker_queue`；无 Mnesia 表、无 listener |
 
 ### 2.2 `broker_event` 的真实状态（S3 已实现）
 
@@ -127,7 +129,7 @@ S9 的额外约束：三个 agent 前端（A2A / MCP / ACP）**彼此不引用**
 
 ### 3.1 顶层结构
 
-系统**没有伞形 `broker_app_sup`**：除 `broker_core`（纯类型）、`broker_ws`（纯库）与 `broker_proto_agent_rpc`（纯库，S9-A）外的 **23 个 app 各有自己的顶层 supervisor**，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
+系统**没有伞形 `broker_app_sup`**：除 `broker_core`（纯类型）、`broker_ws`（纯库）与 `broker_proto_agent_rpc`（纯库，S9-A）外的 **24 个 app 各有自己的顶层 supervisor**，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
 
 ```
 broker_metrics_app ────► broker_metrics_sup                        one_for_one, 5/10s
@@ -211,7 +213,10 @@ broker_proto_mcp_app ───► broker_proto_mcp_sup                      one_
                            └── mcp_stdio（stdio 前端主循环，默认关闭）
 ```
 
-23 个顶层 supervisor（`broker_core` / `broker_ws` / `broker_proto_agent_rpc` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
+broker_proto_acp_app ───► broker_proto_acp_sup                      one_for_one, 1/5s
+                           └── acp_agent × N（每个配置的 agent 一个，默认 0 个，`agents => []`）
+
+24 个顶层 supervisor（`broker_core` / `broker_ws` / `broker_proto_agent_rpc` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。
 
 ### 3.2 重启策略与理由
 
@@ -223,6 +228,7 @@ broker_proto_mcp_app ───► broker_proto_mcp_sup                      one_
 | `broker_proto_ws_sup` / `broker_proto_nats_sup` | `one_for_one`, 1 次/5 s | 同 `broker_proto_mqtt_ws_sup`：只有 listener 一类子进程 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
 | `broker_proto_a2a_sup` | `one_for_one`, 1 次/5 s | 只有两类子进程，且 registry 必须早于 listener（boot 契约，ADR-026 §D4）；registry 自己崩了由 `one_for_one` 单独重启整棵 registry 子树，不必连累 listener | listener 重启时 live 连接被收掉；registry 重启 = 全量重放重建投影，正在处理的 Task 请求收到 `internal_error` |
 | `broker_proto_mcp_sup` | `one_for_one`, 1 次/5 s | 只有两类子进程（listener + stdio 主循环），彼此无关，各自独立重启 | listener 重启时 live SSE/HTTP 连接被收掉；stdio 主循环重启 = 新进程接管 stdin/stdout，订阅子进程随 `spawn_link` 一并重启 |
+| `broker_proto_acp_sup` | `one_for_one`, 1 次/5 s | 每个 agent 一个 `acp_agent` 子进程，彼此无关；一个 agent 崩溃（`temporary`）不重启、也不该连累其他 agent | 单个 agent 崩溃只收掉它自己（`agent_exited` 日志）；其他 agent 与内核不受影响 |
 | `a2a_task_registry` | **`one_for_all`, 3 次/10 s** | 分片的 ETS 投影是缓存，日志才是真相；单个分片崩了只有整组重启 + `a2a_task_recovery` 重放才能让"投影等于日志"重新成立。`3/10` 让崩溃循环仍然可见 | 全部 Task 投影重建（耗时 = 全量重放）；期间 `create/get/cancel` 调用方收到 `internal_error`；日志不丢，Task 语义不变 |
 | `broker_proto_amqp_sup` / `broker_proto_kafka_sup` / `broker_proto_pulsar_sup` | `one_for_one`, 5 次/10 s | listener 之外还有 app 级的共享进程（`amqp_topo` 的拓扑表、`kafka_group` 的消费组协调、`pulsar_subscriptions` 的游标），它们与被 listen 的连接无关，不该跟着 listener 一起重启 | listener 或协调进程单独重启，另一类不受影响 |
 | `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` / `broker_event_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener、去重窗口彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建，`broker_event_dedup` 重启只丢窗口内状态 | 单个进程重启，其余不受影响 |
@@ -454,6 +460,36 @@ mcp_conn ──► mcp_rpc:request/2                 （HTTP 门禁链 + 分派�
 
 **能力发现是本地实现的，无状态。** `server/discover` 动态计算 `DiscoverResult`（`ttlMs` + `cacheScope:"public"` + `serverInfo`），不缓存、不建表；未启用的 capability（如 `features => []`）返回空对象。这与 2026-07-28 的「无状态、无会话」语义一致。
 
+### 3.15 ACP 前端的连接模型与数据流（S9-E）
+
+```
+broker_proto_acp_sup ──► acp_agent（每个配置的 agent 一个 gen_server）
+                            │  acp_port:open/1 = open_port({spawn_executable, Cmd}, …)
+                            │    不经 shell；binary/args/env 经 to_str/1 转 string
+                            ▼
+                        agent 子进程（stdio：stdin 收 Client→Agent，stdout 回 Agent→Client）
+                            │
+  acp_agent 主循环（喂字节 + 发请求 + 裁决回调）：
+    ① initialize  ─────────────────────────────────────────────► agent（校验 protocolVersion）
+    ② session/new（cwd + mcpServers=[]）─────────────────────► agent（取 sessionId）
+    ③ session/prompt：写 $acp/in/<agent> ──► broker_queue ──► 瞬态读者回读 ──► 异步发 agent
+    ④ session/request_permission ◄──────────── agent ──► acp_policy 裁决 ──► $acp/permission（审计）
+    ⑤ session/update ◄──────────── agent ──► acp_turn 折叠 ──► $acp/session/<id>（turn 投影，含 stopReason）
+    ⑥ session/cancel 转发；fs/* / terminal/* / elicitation/* 回 -32601（保持会话）
+```
+
+**Broker 是 Client，agent 是本地子进程。** 与 MCP（Broker 作网关、原语透传给远程 server）相反，ACP 里 Broker 主动发起 `initialize` / `session/new` / `session/prompt`（convergence report §7.1 ACP 侧：who spawns is the Client）。每个 `agents` 条目对应监督树里的一个 `acp_agent` gen_server，它 `spawn_executable` 起 agent 并独占其 stdin/stdout；agent 崩溃（`temporary`，不重启）只收掉这一个子进程。
+
+**传输可插拔。** `acp_transport` 行为把「开/发/关」抽象成 `{Mod, Inner}` 句柄：生产用 `acp_port`（`open_port({spawn_executable,_})`，`{line, 1048576}`，**不设** `stderr_to_stdout`——agent 的 stderr 与 Broker 协议流隔离），测试用 `acp_fake_transport`（内存 `{acc…}`）。字节统一经 `feed_bytes/2` 这一个入口分帧（`acp_frame:split/2`），port 的 `{data,{eol,Line}}`/`{data,{noeol,Chunk}}` 与 in-process cast 走同一条路径。
+
+**prompt 是异步的，且读者按 destination 过滤。** `prompt/3` 写完 `$acp/in/<agent>` 即返回；`acp_agent` 用 `broker_queue:subscribe/2` + `read_from/3` 作瞬态读者（承 ADR-025 §D7，无 SubRef、无 retention pin），只把 `in_destination(name)` 当 prompt——**绝不回读自身发布的 `$acp/session/*` / `$acp/permission`**（它们可能与入站同分区，回读会形成自激 prompt 循环）。结果异步从 `$acp/session/<id>` 的 turn 投影（`acp_turn` 折叠 `session/update`，含 `stopReason`）送达。
+
+**权限回合是唯一的同步回调。** `session/request_permission` 交 `acp_policy`：默认拒绝 + allowlist（`#{tool,title}` 两轴精确匹配、`any` 通配、不做子串/正则）+ 超时（`ElapsedMs > timeout_ms`）。授权选 `allow_once` 优先、其次 `allow_always`、否则首个 `optionId`；拒绝 → `outcome=cancelled`、会话置 `gone`、`stop=refusal`。每次决策（含拒绝）都写 `$acp/permission`（transient/os_buffer），写失败只 `logger:error`。即使 `default => allow` 也拒绝（冻结姿态）。
+
+**会话状态机（`acp_session`，纯函数）**：`initializing`（发 `initialize`）→ `ready`（校验通过）→ `+ session_id`（`session/new` 完成）→ `prompting`（发 `session/prompt`）→ `ready`（响应/cancel）→ `gone`（拒绝或致命错误）。`prompt/2` 要求会话已协商 `session_id` 且与请求携带的相等，否则 `{error, {not_promptable, no_session_id}}` / `{error, {session_mismatch, _, _}}`。
+
+**无认证、无 listener。** 信任边界是「谁能启动这个进程」，身份固定为匿名本地身份（同 MCP stdio）；agent 由运维在 `agents` 里静态声明，绝不由远程请求指定。`agents` 非良构 map 列表或 allowlist 条目命名非 binary 时，`broker_proto_acp_app:start/2` 启动即拒绝。
+
 ---
 
 ## 4. 启动顺序与 boot steps
@@ -657,6 +693,9 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_a2a.task_checkpoint_dir` / `task_checkpoint_interval_ms` | `undefined` / 5000 | S9-B **已声明但当前不读**：恢复用全量重放（正确性基线）。持久化 checkpoint 是 S9-F 的演进位 |
 | `broker_proto_a2a.agent_cards` | `[]` | S9-B：boot 种子卡列表（`#{tenant_id, agent_id, status, card, extended_card}`）。`a2a_card:seed/0` 在 app 启动时幂等写入 `broker_meta.agent_card`；内容未变不 bump version；格式不合法 → 启动失败 |
 | `broker_proto_a2a.agent_card_max_age` | 60 | S9-B：`/.well-known/agent-card.json` 与 `/agents` 的 `Cache-Control: max-age`。ETag 由行 `version` + 内容哈希组成，改卡即失效缓存 |
+| `broker_proto_acp.agents` | `[]` | S9-E：每个条目是 `broker_proto_acp_sup` 启动的一个 `acp_agent` 子进程 spec（`#{name, command, args, env, cwd, restart}`）。`command` 必须绝对路径、无 shell。空列表 = 干净启动但不跑 agent。非良构 map 列表 → 启动失败 |
+| `broker_proto_acp.permission_policy` | `#{default => deny, allow => [], timeout_ms => 30000, notify_dest => <<"$acp/permission">>}` | S9-E：`session/request_permission` 的裁决策略。allowlist 条目 `#{tool, title}`（两轴精确匹配、`any` 通配）；`ElapsedMs > timeout_ms` 判超时拒绝；即使 `default => allow` 也拒绝（冻结姿态）。`notify_dest` 是审计目的地（transient/os_buffer） |
+| `broker_proto_acp.supported_protocol_version` | 1 | S9-E：只接受 `protocolVersion 1`；不匹配记 `stop=unsupported_protocol_version` 且不发 `session/new` |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 
@@ -678,10 +717,11 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **1015/1015、65 套件全部被执行**（`apps/*/test/` 64 个 + `test/integration/s1_e2e_SUITE` 1 个；含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。S9-A 新增 7 个套件 85 例（基线 823/52），S9-B 再新增 3 个套件 25 例并改写 1 个（`a2a_task_SUITE` 11 / `a2a_event_SUITE` 6 / `a2a_task_projection_SUITE` 8 / `a2a_listener_SUITE` 16→33，`broker_meta_SUITE` 10→12），S9-C 新增 1 个套件 20 例（`a2a_stream_push_SUITE`），S9-D 新增 2 个套件 42 例（`mcp_listener_SUITE` 32 + `mcp_stdio_SUITE` 10）。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
-| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 仅预期 unused-export（S9-A/B/D 三个新 app 零非预期告警） | CI/本地 |
+| 单元/契约/集成 | `rebar3 ct` → **1062/1062、68 套件全部被执行**（`apps/*/test/` 67 个 + `test/integration/s1_e2e_SUITE` 1 个；含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。S9-A 新增 7 个套件 85 例（基线 823/52），S9-B 再新增 3 个套件 25 例并改写 1 个（`a2a_task_SUITE` 11 / `a2a_event_SUITE` 6 / `a2a_task_projection_SUITE` 8 / `a2a_listener_SUITE` 16→33，`broker_meta_SUITE` 10→12），S9-C 新增 1 个套件 20 例（`a2a_stream_push_SUITE`），S9-D 新增 2 个套件 42 例（`mcp_listener_SUITE` 32 + `mcp_stdio_SUITE` 10），**S9-E 新增 3 个套件 47 例**（`acp_frame_SUITE` 14 + `acp_policy_SUITE` 16 + `acp_agent_SUITE` 17）。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
+| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 仅预期 unused-export（S9-A/B/D/E 四个新 app 零非预期告警） | CI/本地 |
 | A2A 真实客户端 | `curl` **25 条**（S9-B）：Task 生命周期、`GetTask` 404、`ListTasks` 过滤/分页、`CancelTask` 400、跨租户 404、well-known 匿名/认证 extended、ETag 304、catalog 三类过滤 + 分页 + 租户隔离、`GetExtendedAgentCard` 200 与 `-32007`、**重启后 boot replay 恢复同一 Task**、异步模式 SUBMITTED→CANCELED、401/health/`-32602`（证据端口 18093，默认不监听）。S9-A 的 11 条见 §4.14 | `docs/protocol-compatibility.md` §4.15 |
 | MCP 真实客户端 | `curl` **24 条**（S9-D，证据端口 18096）：HTTP 门禁矩阵（Origin 403、Accept 406、GET 405、text/plain 415、坏 JSON -32700、缺/错版本头 -32020、版本不支持 -3220、Mcp-Name 不匹配 -32020、缺 clientCapabilities -32602、null id -32600、无 auth/错 token 401）、tools/call SSE（progress + result）、未知方法/initialize/sampling 404、`tools/list` 404（feature 未通告）、listen ack + 通知 + `: ping` + 到点 Graceful Closure、`features => []` discover 空能力；stdio 6 帧驱动（stdout 恰 6 协议帧、日志全 stderr） | `docs/protocol-compatibility.md` §4.17 |
+| ACP 真实路径 | 假 ACP agent 走**生产 `acp_port` 传输**六场景（S9-E）：handshake（`initialize` 空 caps + `_meta.unified-mq` + `session/new` 得 sessionId）、plain（2×message_chunk + thought + turn `end_turn`）、permission-allow（`selected` + `$acp/permission` 审计）、fs probe（`fs/read_text_file` → `-32601` 保持会话）、cancel（turn `cancelled`）、permission-deny（`cancelled` + 会话 `gone` + turn `refusal`）；捕获 **11 帧** client→agent 原文 | `docs/protocol-compatibility.md` §4.18.5 |
 | 指标端到端 | `broker_metrics_SUITE` + `s1_e2e_SUITE` 的 `metrics_count_publish_deliver_and_connections`（wal/memory 各一次） | `apps/broker_metrics/test/`、`test/integration/` |
 | 崩溃恢复 | 真实容器 + 宿主 ext4 + `docker kill -s KILL`：R1a~R7 × 默认/零回退两档；S2 电源/OS 缓冲注入 | `tools/docker/`、`tools/fault/` |
 | 真实客户端 | paho-mqtt 2.x / mosquitto 2.1.2（MQTT）、websocket-client、nats.go、amqp091-go、kafka-clients、官方 Pulsar Java Client；六协议全绿；S8 另加 paho-mqtt `transport="websockets"`（8/8）、`mqtt-sn-tools` 0.0.7（10/10）、EMQX `emqtt` 1.16.1（8/8）；S9-D 另加 MCP Streamable HTTP + stdio 前端（`curl` 24 条 + stdio 6 帧，MCP Inspector 留 S9-F） | `test/protocol-compatibility/` |
@@ -720,7 +760,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | A2A Agent Card 管理面 CRUD | **S9-F** | 在 `broker_admin` 之上加卡的增删改查；`a2a_card:seed/0` 仍是 boot 期写入者 | 卡表形状、ETag 生成规则、租户隔离语义不变 |
 | A2A 流式（SSE）、`SubscribeToTask`、Push Notification / 出站 webhook | **S9-C** | `agent_rpc_sse` 接到方法；`$a2a/push/dlq/<tenant>` | SSE 是瞬态读者：不建 cursor、不 pin retention，落后即发 Task 快照 resync；出站默认关闭、只 `https`、host allowlist + pin IP、禁重定向（ADR-026 §D6/§D7） |
 | MCP 2026-07-28 前端 | **S9-D** | 新 app `broker_proto_mcp`，监听 8082 | 与 A2A 共享 `broker_proto_agent_rpc`，两个 adapter 互不引用 |
-| ACP v1 前端（stdio，Broker 扮 Client） | **S9-E** | 新 app `broker_proto_acp`，无端口 | 只 stdio；`fs/*`、`terminal/*`、elicitation 不广告；`session/request_permission` 默认拒绝 + allowlist；v2 不实现 |
+| ACP v1 前端（stdio，Broker 扮 Client） | **已交付（S9-E）** | 新 app `broker_proto_acp`，无端口；`acp_agent`/`acp_port`/`acp_policy`/`acp_session`/`acp_turn`/`acp_event`/`acp_frame`/`acp_transport`；`$acp/in/<agent>`、`$acp/session/<id>`、`$acp/permission` | 只 stdio；`fs/*`、`terminal/*`、elicitation 不广告（回 `-32601` 但保持会话）；`session/request_permission` 默认拒绝 + allowlist + 超时 + 每次审计；v2 不实现 |
 | A2A gRPC / REST 绑定、HTTP/2 | 非目标（ADR-026 §D8） | — | 只 HTTP/1.1 + JSON-RPC binding |
 | JWT / OIDC / JWKS 验签、OAuth AS | 非目标（ADR-026 §D8） | — | 只接受 `broker_user` 里的不透明 bearer token |
 | ACP 远程传输、Agent Card JWS/PKI | 非目标 | — | 见收敛报告 §13 |

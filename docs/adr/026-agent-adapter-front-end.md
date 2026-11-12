@@ -112,6 +112,17 @@ broker_proto_a2a_sup (one_for_all)
 - **版本**：只接受 `protocolVersion 1`；不匹配回 ACP 错误。v2 草案特性（`auth/login`、`session/resume` 必需化、`fs/*`/`terminal/*` 移除、ID-keyed upsert）不实现，只做版本门控。
 - **stdio 约束**：newline-delimited JSON（一行一条 JSON-RPC，UTF-8）；**stdout 只允许协议帧**，所有 logger handler 必须写 stderr，启动时校验，不满足即拒绝启用 stdio 前端。
 
+> **落地注记（S9-E，2026-11-12；冻结文本不改，偏差在此逐条对照）**
+>
+> - **第 1 条「只做 stdio」**：落地一致。`broker_proto_acp` 没有任何 listener、没有 `listeners` 配置项；agent 由 `agents` 里的 `command` 经 `acp_port:open/1`（`spawn_executable`，**不经 shell**）作为本地子进程启动。
+> - **第 2 条「Broker 是 Client」**：落地一致。`initialize` / `session/new` / `session/prompt` 都由 Broker 主动发；`stopReason` 折叠进 `$acp/session/<id>` 的 turn 投影。
+> - **第 3 条「`session/request_permission` 必须实现；默认拒绝 + allowlist（按 tool kind / 标题正则）+ 超时拒绝」**：落地为**默认拒绝 + allowlist 精确匹配**——`acp_policy` 用 `#{tool, title}` 两轴**精确匹配**（`any` 是通配，**不做正则、不做子串**），理由是正则/子串让「放过一个本该拒绝的 tool」成为可能，与「绝不自动放行」冲突。超时判定是 `ElapsedMs > timeout_ms`（等于不算）。即使 `default => allow` 也拒绝（冻结姿态）。每次决策（含拒绝）写 `$acp/permission`（transient/os_buffer），写失败只 `logger:error`。
+> - **第 3 条「把请求作为事件暴露到运维通道」**：落地为 `$acp/permission` 目的地上的普通 `#broker_message{}`（与 `$mcp/*` / `$a2a/*` 同一内核消息面），不是单独的管理 API。
+> - **第 4 条「`fs/*`、`terminal/*`、`elicitation/create` 不广告；Agent 强依赖则回 ACP 错误并结束会话」**：落地为**回 `-32601` 但保持会话**——单个未支持能力不应销毁一个已协商的会话。`clientCapabilities` 恒为 `{}`，`_meta.unified-mq` 显式注明 `fs/terminal/elicitation=false`。能力矩阵 §4.18.1 已逐行留痕。
+> - **第 5 条「agent 只能由运维配置声明；默认关闭；不做沙箱」**：落地一致。出厂 `agents => []`；`command` 必须绝对路径；`restart => temporary`（崩溃不重启）。Broker 不做 uid/gid/资源限制，写进 `docs/operations.md` §1.5 与 `docs/security.md` §12。
+> - **第 6 条「只接受 `protocolVersion 1`；不匹配回 ACP 错误」**：落地为不匹配时记 `stop=unsupported_protocol_version` 且**不发** `session/new`（会话无从建立）；v2 草案特性不实现。
+> - **第 7 条「stdio 约束：stdout 只允许协议帧；启动时校验 logger 不满足即拒绝」**：**校验未落地**——ACP 的协议帧走**agent 子进程管道**（`acp_port` 的 stdin/stdout），不占 Broker 自身 stdout，因此不存在 MCP stdio 那种「日志污染协议流」的风险。`acp_port` 也**不设** `stderr_to_stdout`，agent 的 stderr 与协议数据隔离。故本条在 ACP 侧的适用性被结构性消解，而非实现了一个校验器。
+
 ### D6. 出站 webhook：默认关闭、pin IP、禁重定向
 
 1. **默认关闭**：`push.enabled => false`、`egress_allowlist => []`；空 allowlist 等于拒绝一切 push 配置创建（回 `PushNotificationNotSupportedError` / `-32003`），不是「先接受后丢弃」。
@@ -198,6 +209,6 @@ S9-A/S9-B/S9-D/S9-E 的 Gate 证据必须覆盖：
 | D4 认证接线：`authenticate_conn/1` + `authorize/2` + `default_tenant/0`，不改 `broker_security` | 照做；`config/sys.config.src` 的 `{require_auth, []}` 与 `credential_capable/0` 白名单**一字未改** | 无。ACL 的 resource 是**真实 destination**（`SendMessage` → `$a2a/task/new`，其余用 `$a2a/task/<id>`），不是方法名；`Get*` 用 `subscribe`、`SendMessage`/`CancelTask` 用 `publish` |
 | D4 `require_auth=false` 只在回环绑定下允许 | 照做：boot 时校验所有 listener 的 `ip`，非回环直接 `{error, {insecure_listener, Port, Ip}}`，整个 app 起不来；CT 有 `anonymous_listener_on_wide_bind_is_refused` | 无 |
 | D4 401/403 语义 | 照做：无/错凭据 → `401` + `WWW-Authenticate`；ACL 拒绝 → **裸 `403`**（不带 JSON-RPC 信封）；跨租户 `GetTask` → **`404` + `-32001`**（不泄露存在性） | 计划没写跨租户用哪个码；落地选「与不存在同码」，与收敛报告 §3 的「id 不是存在性预言机」一致 |
-| D5 / D6 / D7 / D8 | **本阶段未落地**，分别在 S9-E（ACP）、S9-C（webhook/SSRF）、S9-C（SSE）、S9-D（MCP） | D8 的非目标边界（无 HTTP/2、无第三方 HTTP 框架、无 gRPC/REST 绑定、无 card 验签、无 OAuth AS）在 S9-B 一仍其旧：依赖面仍是 `ranch 2.3.0` + 内置 `ra 3.2.0` + OTP 28 `json` |
+| D5 / D6 / D7 / D8 | **全部已落地**：D5 → S9-E（ACP Client，`broker_proto_acp`）；D6 → S9-C（webhook/SSRF）；D7 → S9-C（SSE）；D8 → S9-D（MCP） | D8 的非目标边界（无 HTTP/2、无第三方 HTTP 框架、无 gRPC/REST 绑定、无 card 验签、无 OAuth AS）在 S9-E 一仍其旧：依赖面仍是 `ranch 2.3.0` + 内置 `ra 3.2.0` + OTP 28 `json`。D5 的落地偏差见 §D5「落地注记（S9-E）」 |
 
 **与 D3 计划文本的一处口径统一**：计划写「管理 API（S9-B）与 boot 期配置种子」都能写卡；落地只有 boot 种子（+ 直接操作 Mnesia）。管理面 CRUD 的公开 HTTP 接口未做，`docs/roadmap.md` §11.1 的 S9-F 行已记。

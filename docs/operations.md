@@ -25,6 +25,7 @@
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
 | A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A/B/C）。示例部署端口 8081，`listeners => []` 是出厂值；出站 Push webhook 单独由 `push_enabled` 门控（默认关） |
 | MCP (Streamable HTTP) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_mcp`（S9-D）。示例部署端口 8082，`listeners => []` 是出厂值；stdio 前端另由 `stdio_enabled` 门控（默认关） |
+| ACP (v1) | **无（仅 stdio，无 listener）** | 子进程管道（无网络） | `broker_proto_acp`（S9-E）。出厂 `agents => []`，不跑任何 agent；语义是 Broker 作 Client、agent 是本地子进程。见 §1.5 |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前九个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
@@ -314,6 +315,69 @@ ok = logger:add_handler(default, logger_std_h,
 - `406`：`Accept` 必须**同时**含 `application/json` 与 `text/event-stream`（或 `*/*`）。`415`：`Content-Type` 必须是 `application/json`。`403`：`Origin` 存在但不在 `allowed_origins` 且不是 loopback。
 - stdio 的 stdout 混进日志：按上面的 logger 配置把 `default` handler 换到 `standard_error`；本 app 不会自动改。
 - 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.17。**官方 MCP SDK / Inspector 的客户端矩阵留 S9-F。**
+
+
+
+---
+
+### 1.5 ACP 前端（仅 stdio，默认不跑 agent，S9-E）
+
+`broker_proto_acp` 是 ACP v1 的前端，语义是 **Broker 作 Client**：Broker 启动并扮演一个本地 ACP agent 子进程，主动发 `initialize` / `session/new` / `session/prompt`，只接一个强制回调 `session/request_permission`（交 `acp_policy` 裁决），并处理 Agent 发来的 `session/update`（折叠成 turn 投影写内核）与 `session/cancel`。**仅 stdio**——没有 HTTP/WebSocket listener、没有 `listeners` 配置项。出厂 `agents => []`，即干净启动但**不跑任何 agent**；要跑就显式声明 agent 子进程。
+
+**配置**（`config/sys.config.src`，出厂值）：
+
+```erlang
+{broker_proto_acp, [
+  %% 空 = 干净启动但不跑 agent；每条是 broker_proto_acp_sup 启动的一个子进程
+  {agents, []},
+  %% session/request_permission 策略：默认拒绝 + allowlist + 无等待
+  {permission_policy, #{
+      default      => deny,             %% 未匹配即拒（即使写 allow 也拒，冻结姿态）
+      allow        => [],               %% allowlist：#{tool, title}，两轴都须匹配
+      timeout_ms   => 30000,            %% ElapsedMs > timeout_ms 判超时拒绝
+      notify_dest  => <<"$acp/permission">>  %% 每次决策的审计目的地
+  }},
+  {supported_protocol_version, 1}       %% 只接受 protocolVersion 1
+]}.
+```
+
+每个 `agents` 条目是一个子进程 spec：
+
+```erlang
+#{name    => my-agent,          %% supervisor child id
+  command => "/abs/path/agent", %% 绝对路径、无 shell（spawn_executable 直接起）
+  args    => ["--stdio"],        %% argv 尾
+  env     => [{"KEY","VALUE"}],  %% 环境变量 allowlist
+  cwd     => undefined,          %% 工作目录（缺省继承 broker）
+  restart => temporary}          %% 一个崩溃的 agent 永不重启
+```
+
+- `command` **必须绝对路径、无 shell**：`acp_port` 用 `spawn_executable` 不经 `/bin/sh`，路径/元字符无法变成命令注入。
+- `agents` 非良构 map 列表、或 allowlist 条目命名非 binary 时，**app 启动即拒绝**（`broker_proto_acp_app:start/2`）——misconfig 不该 later 变成不透明的 spawn 失败。
+- **无 `require_auth`**：ACP stdio 的信任边界是「谁能启动这个进程」，身份固定为匿名本地身份，与 `broker_proto_mcp` 的 stdio 前端同。agent 由运维静态声明，**绝不由远程请求指定**。
+
+**目的地（数据面，均 `os_buffer`、经 `broker_router_hash:route/3` + `broker_queue:append/3`）**：
+
+| 目的地 | 承载 |
+|---|---|
+| `$acp/in/<agent>` | `session/prompt` 请求（`sessionId` + prompt content blocks） |
+| `$acp/session/<sessionId>` | turn 投影（`stopReason`、`counts`、`updates` 全文） |
+| `$acp/permission` | 每次权限裁决的审计（请求上下文 + `decision` + 匹配到的 allowlist 条目） |
+
+**prompt 生命周期**：调用方把 `session/prompt` 请求体发到 `$acp/in/<agent>`；该 agent 的瞬态读者（`broker_queue:subscribe/2` + `read_from/3`，无 SubRef、无 retention pin，承 ADR-025 §D7）按 **destination 过滤**后回读——只处理 `in/<agent>`，绝不把自身发布的 `$acp/session/*` / `$acp/permission` 回读成 prompt（否则自激循环）。`prompt/3` 写完即返回，结果异步从 `$acp/session/<id>` 的 turn 投影（`stopReason`）送达。
+
+**权限策略（`acp_policy`）**：`session/request_permission` 到达时按顺序：allowlist 精确匹配（`toolCall.kind` + `toolCall.title` 两轴都须命中，`any` 通配、不做子串/正则）→ 超时拒绝（`ElapsedMs > timeout_ms`，等于不算超时）→ 默认拒绝（即使 `default => allow` 也拒）。授权选项优先 `allow_once`、其次 `allow_always`、否则请求带的第一个 `optionId`。拒绝 → `outcome=cancelled`、会话置 `gone`、turn `stopReason=refusal`。**无论授权还是拒绝，`$acp/permission` 都写一条**（transient/os_buffer，写失败只 `logger:error`，绝不阻塞权限回合）。
+
+**不支持的方法**：`fs/*`、`terminal/*`、`elicitation/*`（`session/request_escalation`）一律回 `-32601`（`data.reason="capability not advertised"`），**但保持会话**（不因单个未支持能力销毁已协商会话）。Broker 作为 Client 不代理文件/终端/提权副作用——`clientCapabilities` 恒为空 `{}`，`_meta.unified-mq` 注明 `fs/terminal/elicitation=false`。
+
+**排查**：
+
+- agent 没起来 / 启动即拒绝：查 `agents` 每条是否良构 map、`command` 是否绝对路径且可执行；启动失败会在日志里留 `failed_to_start_child` / `transport_open_failed`。
+- 握手后立刻 `stop=unsupported_protocol_version`：agent 回的 `protocolVersion` 不是 `supported_protocol_version`（默认 1）；Broker **不发** `session/new`。
+- 权限回合一直等到超时：agent 发 `session/request_permission` 但 `allow` 空且 `default => deny`；调大 `timeout_ms` 或往 allowlist 加 `#{tool, title}`。
+- prompt 无响应：确认调用方发到了 `$acp/in/<agent>`（不是别的目的地），且该 agent 的瞬态读者订阅已成功（同分区，读者在 `session/new` 回复 cast 之后才装订阅，调用方需在握手完成后再发）。
+- agent 崩溃：`restart => temporary` 不重启；日志会有 `agent_exited` + exit_status。重启 agent 由运维在编排层做。
+- 真实六场景（handshake / plain / permission-allow / fs-reject / cancel / permission-deny）+ 11 帧 client→agent 原文见 `docs/protocol-compatibility.md` §4.18.5。**官方 ACP client / Zed 等真实编辑器客户端矩阵留 S9-F。**
 
 
 

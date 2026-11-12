@@ -58,6 +58,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
 | Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id；CONNECT 凭据（`token` / SASL PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema；TLS 由 S6 统一覆盖；订阅游标内存态；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
 | MCP（Streamable HTTP + stdio） | 支持子集（S9-D，**Broker 作网关**） | MCP `2026-07-28`：无状态逐请求（无 `initialize`/会话/`Mcp-Session-Id`）；`server/discover` 本地回答；`subscriptions/listen` 长活流（ack-first + 通知 + 心跳 + 优雅关流）；`tools`/`resources`/`prompts`/`completions` 原语**透传**到 `$mcp/<method>` 并取回结果（含 `notifications/progress`）；POST 单端点 `application/json`/`text/event-stream`；stdio 前端（newline 成帧、子进程订阅、`notifications/cancelled`）；HTTP 头门禁 `Origin`/`Accept`/`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` | 不解释/不执行工具语义（R-B1）、无 `sampling`/`elicitation`（-32601）、无 GET 流/`Last-Event-ID`/会话续传、无 `Mcp-Param-*` 强制校验、SSE 无 pending-bytes 上限、stdio 不做认证（进程即凭据）且 stdout 纯净性由部署 logger 配置保证、跨节点 reply 不支持；见 §4.17 | `apps/broker_proto_mcp/test/` |
+| ACP（v1，stdio） | 支持子集（S9-E，**Broker 作 Client**） | ACP v1：Broker 作 **Client**、agent 是本地子进程；`initialize`/`session/new`/`session/prompt` 由 Broker 主动发起；`session/request_permission` 是唯一实现的 Client 回调（默认拒绝 + allowlist + 超时 + 每次审计）；`session/cancel` 转发；`session/update` 折叠为 turn 投影写 `$acp/session/<id>`（含 `stopReason`）；prompt 经 `$acp/in/<agent>` 异步回读；`protocolVersion` 只接受 1 | **仅 stdio**（无 HTTP/WS listener、无 `listeners`）、无远程建连、无 `session/load`/`resume`/`list`/`authenticate`、`fs/*`/`terminal/*`/`elicitation/*` 全回 `-32601`（保持会话）、`clientCapabilities={}`、stdio 不做认证（进程即凭据）、跨节点 reply 不支持；见 §4.18 | `apps/broker_proto_acp/test/` |
 
 ---
 
@@ -1334,6 +1335,107 @@ data: {"id":"sub-2","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/
 - **单节点**：reply 与 listen 都读 owner 节点的本地分区，跨节点 reply/订阅不支持（与 A2A Task 同一限制）。
 - **无新增指标键**：失败只 `logger`（S9-F 统一动 `broker_metrics` 冻结键集）。
 - **真实 MCP 客户端证据留 S9-F**：本节是 `curl` 原文 + 假后端；官方 SDK / MCP Inspector 的客户端矩阵按 Gate S9 第 1 项在 S9-F 统一取证。
+
+---
+
+## 4.18 S9-E 追加（2026-11-12）：ACP v1 前端（Broker 作 ACP Client，仅 stdio）
+
+**范围**：`broker_proto_acp`。语义 = **Broker 是 ACP Client，Agent 是 Broker 的本地子进程**（ADR-026 §D5、convergence report §7.1 ACP 侧）。与 MCP（S9-D）相反：MCP 里 Broker 是网关/Server 端、原语透传给远程 server；ACP 里 Broker 是 Client 端，主动向本地 agent 子进程发 `initialize` / `session/new` / `session/prompt`，只接一个强制回调 `session/request_permission`。**仅 stdio**：没有 HTTP/WebSocket listener，没有 `listeners` 配置项，agent 路径由运维在 `agents` 里声明、绝不由远程请求指定。
+
+### 4.18.1 方法与能力矩阵
+
+| 方向 | 方法 | 实现 | 行为 |
+|---|---|---|---|
+| Client→Agent（Broker 发起） | `initialize` | ✅ 本地实现 | 发 `protocolVersion=1` + `clientCapabilities={}` + `_meta.unified-mq`（`role=client`、`version=1`、`fs/terminal/elicitation=false`）；校验回包 `protocolVersion`，不匹配 → `stop=unsupported_protocol_version` 且**不发** `session/new` |
+| | `session/new` | ✅ 本地实现 | 带 `cwd`（来自 agent 配置）+ `mcpServers=[]`，取回 `sessionId`；Broker 用它作后续目的地与状态机锚点 |
+| | `session/prompt` | ✅ 本地实现 | 写 `$acp/in/<agent>` → 瞬态读者按 destination 过滤后回读 → 异步发给 agent；结果经 `$acp/session/<id>` 的 turn 投影（含 `stopReason`）送达 |
+| Agent→Client（Agent 回调） | `session/request_permission` | ✅ **唯一实现** | 交 `acp_policy`（默认拒绝 + allowlist + 超时）裁决；授权选 `allow_once` 优先、`allow_always` 次之、否则首个 `optionId`；**每次决策**写 `$acp/permission`（transient/`os_buffer`）；拒绝 → `outcome=cancelled`、会话置 `gone`、`stop=refusal` |
+| | `fs/read_text_file`、`fs/write_text_file`、`fs/create_directory` | ⛔ 回 `-32601` | `data.reason="capability not advertised"`；**保持会话**（不因单个未支持能力销毁会话，见落地偏差 1） |
+| | `terminal/create`、`terminal/output`、`terminal/wait`、`terminal/kill`、`terminal/release` | ⛔ 回 `-32601` | 同上 |
+| | `session/request_escalation`（elicitation） | ⛔ 回 `-32601` | 同上 |
+| 取消 | `session/cancel`（notification） | ✅ | Client→Agent 方向转发；Broker 侧 turn 投影记 `stopReason=cancelled`，会话回 `ready` |
+| 数据面 | `session/update`（notification） | ✅ | Agent→Client 折叠为 turn 投影写 `$acp/session/<id>` |
+
+`clientCapabilities` 恒为空对象 `{}`：Broker 作为 Client 不代理任何文件系统 / 终端 / 提权副作用，全部由编辑器/人 侧原 ACP Client 负责——Broker 只是把 agent 接进内核消息面。`_meta.unified-mq` 显式声明 `fs/terminal/elicitation=false`，与「不广告 = 不承诺」一致。
+
+### 4.18.2 目的地（数据面）
+
+| 目的地 | 方向 | reliability | 承载 |
+|---|---|---|---|
+| `$acp/in/<agent>` | 入站（生产者→agent 读者） | `os_buffer` | `session/prompt` 请求体（`sessionId` + `prompt` content blocks） |
+| `$acp/session/<sessionId>` | 出站（agent→消费者） | `os_buffer` | `session/update` 折叠的 turn 投影（`stopReason`、`counts`、`updates` 全文） |
+| `$acp/permission` | 出站（审计） | `os_buffer` | 每次 `session/request_permission` 裁决（请求上下文 + `decision` + 匹配到的 allowlist 条目） |
+
+三者都经 `broker_router_hash:route/3` + `broker_queue:append/3`，与 `$mcp/*` 同一内核消息面。`$acp/session/*` 与 `$acp/permission` 可能与 `$acp/in/<agent>` 同分区，故瞬态读者**必须按 destination 过滤**——只把 `in_destination(name)` 当 prompt，绝不回读自身发布的会话/审计消息（否则自激 prompt 循环）。
+
+### 4.18.3 配置面
+
+`config/sys.config.src` 的 `broker_proto_acp` 段（默认空、开箱不跑任何 agent）：
+
+```erlang
+{broker_proto_acp, [
+  {agents, []},                 %% 空 = 干净启动但不跑 agent；每条是一个子进程 spec
+  {permission_policy, #{
+      default      => deny,     %% 默认拒绝 + allowlist + 无等待
+      allow        => [],       %% allowlist：#{tool, title}，两轴都须匹配，`any` 通配
+      timeout_ms   => 30000,    %% ElapsedMs > timeout_ms 判超时拒绝
+      notify_dest  => <<"$acp/permission">>  %% 审计目的地（transient/os_buffer）
+  }},
+  {supported_protocol_version, 1}
+]}.
+```
+
+每个 `agents` 条目是 `broker_proto_acp_sup` 启动的一个子进程完整 spec：`#{name => my-agent, command => "/abs/path/agent", args => ["--stdio"], env => [{"K","V"}], cwd => undefined, restart => temporary}`。**`command` 必须绝对路径、无 shell**（`acp_port` 用 `spawn_executable` 直接起，不经 `/bin/sh`，配置里的路径/元字符无法变成命令注入）。`restart => temporary`：一个 agent 崩溃永不重启（重启策略由运维在编排层决定）。`agents` 非良构 map 列表或 allowlist 条目命名非 binary 时，`broker_proto_acp_app:start/2` **启动即拒绝**（一个 misconfig 不该拖到运行期才变成不透明的 spawn 失败）。**无 `require_auth`**：ACP stdio 的信任边界是 OS 级进程访问（同 `mcp_stdio`），身份固定为匿名本地身份。
+
+### 4.18.4 权限策略（`acp_policy`）
+
+`session/request_permission` 的裁决顺序：
+
+1. **allowlist 匹配**：请求体的 `toolCall.kind` + `toolCall.title` 与某条 `#{tool, title}` 两轴都命中（`any` 是通配，不做子串/正则）。命中即授权。
+2. **超时拒绝**：`ElapsedMs > timeout_ms`（等于不算超时）直接拒绝。
+3. **默认拒绝**：以上都不命中即拒——即使配置写 `default => allow` 也拒绝（冻结姿态：Broker 侧默认 deny，不放宽到「未匹配即授权」）。
+4. **授权选项选择**：命中的 allowlist 里优先 `allow_once`、其次 `allow_always`、否则请求带的第一个 `optionId`。
+5. **拒绝的落地**：`outcome=cancelled`，会话状态机置 `gone`，turn `stopReason=refusal`。
+6. **审计**：无论授权还是拒绝，`$acp/permission` 都写一条（transient/`os_buffer`，绝不阻塞权限回合）；写失败只 `logger:error`。
+
+### 4.18.5 真实 `acp_port` 路径证据（2026-11-12）
+
+- **驱动**：`acp_evidence:run/0`（`/tmp/opencode/acp-evidence/src/acp_evidence.erl`）启动完整 Broker 内核（`broker_security`/`broker_storage`(wal)/`broker_router`/`broker_queue`/`broker_meta`），配置一个名为 `evidence-agent` 的假 ACP agent（`acp_port` 传输、`cwd=/home/wanli/workspace/acp-evidence`），依次跑六个场景并打印落在 `$acp/session/<sid>` 与 `$acp/permission` 的消息。数据目录在 ext4：`/home/wanli/workspace/acp-evidence/data`。
+- **假 agent**：`fake_acp_agent.escript`（newline-delimited JSON-RPC，按 prompt 文本选场景，每个收到的帧 `RECV …` 打到 stderr）。`acp_port` **不设** `stderr_to_stdout`，故 agent 的 stderr 与 Broker 的协议 stdout 隔离——证据文件 `evidence.out` 是纯 turn 投影，`client_frames.log` 里的 `RECV` 行是 agent 侧回声，二者不串。
+- **结果**（`evidence.out`，exit 0）：
+
+```
+== HANDSHAKE ==        state=ready   session_id=<<"acp-evidence-session">>
+== plain (4 msg) ==    2×agent_message_chunk + 1×cwd + 1×agent_thought_chunk；turn stopReason=end_turn
+== permission(allow) == agent 回 outcome=selected, optionId=allow；$acp/permission 记 decision=allow、匹配 #{tool=edit,title=any}
+== fs probe ==         agent 发 fs/read_text_file；Broker 回 -32601 (capability not advertised)；会话保持、turn end_turn
+== cancel ==           Broker 发 session/cancel；turn stopReason=cancelled；会话回 ready
+== permission(deny) == agent 发 execute/rm -rf /；无 allowlist 命中 → outcome=cancelled；会话 gone；turn stopReason=refusal
+```
+
+**client→agent 帧**（`client_to_agent.jsonl`，11 帧，`initialize` 的 `clientCapabilities` 带 `_meta.unified-mq`、`session/new` 带 `cwd`+`mcpServers=[]`、4×`session/prompt`、`session/request_permission`(allow) 回 `selected`、`fs/read_text_file` 回 `-32601`、`session/request_permission`(deny) 回 `cancelled`、`session/cancel`）。
+
+### 4.18.6 已声明的限制 / 边界
+
+- **仅 stdio**：无 HTTP/WebSocket listener、无 `listeners` 配置项、无远程建连。ACP 远程（HTTP/WebSocket）在 ACP 规范里仍 WIP，本实现不覆盖。
+- **单节点**：reply / 订阅读 owner 节点的本地分区，跨节点 reply/订阅不支持（与 MCP / A2A Task 同一限制）。
+- **只做 Client 侧**：Broker 不扮演 ACP Agent（编辑器侧那端），也不做 `session/load` / `session/resume` / `session/list` / `authenticate`（v1 无鉴权方法）；agent 由运维静态声明。
+- **`fs` / `terminal` / `elicitation` 全拒绝**：Broker 不代理文件/终端/提权副作用，回 `-32601` 但保持会话。
+- **stdio 无认证**：信任边界是「谁能启动这个进程」，身份为匿名本地身份。
+- **无新增指标键**：握手失败 / 权限拒绝 / agent 退出只 `logger`（S9-F 统一动 `broker_metrics` 冻结键集）。
+- **真实 ACP 客户端证据留 S9-F**：本节是假 agent escript 走**生产 `acp_port` 传输**六场景 + 11 帧 client→agent 原文；官方 ACP client / Zed 等真实编辑器的客户端矩阵按 Gate S9 第 1 项在 S9-F 统一取证。
+
+### 4.18.7 落地偏差（相对 ADR-026 §D5 冻结文本）
+
+ADR-026 §D5 冻结文本未改，以下为「落地后修正」批注（详见 `docs/design/s9-e-execution-plan.md` 落地偏差记录）：
+
+1. **`fs/*`、`terminal/*`、`elicitation/*` 回 `-32601` 但保持会话**（原文「不广告且回 `-32601` 并结束会话」）：实现选择不结束会话——单个未支持能力不应销毁已协商会话。证据：§4.18.5 `fs` 探针回 `-32601` 后 `session/prompt` 仍正常。
+2. **`session/request_permission` 是唯一实现的 Client 回调**，其余 ACP 回调按偏差 1 拒绝；`_meta.unified-mq` 注明 `fs/terminal/elicitation=false`。
+3. **`clientCapabilities` 为空对象 `{}`**，`_meta.unified-mq` 声明本 Client 不代做副作用能力。
+4. **`protocolVersion` 只接受 1**：不匹配记 `stop=unsupported_protocol_version` 且**不发** `session/new`。
+5. **`{line, 0}` 是非法端口选项**：`acp_port` 用 `{line, 1048576}`，超长行以 `{noeol,Chunk}` 分块到达、`feed_bytes/2` 重组；`open_port({spawn_executable,_})` 的 executable/argv/env 必须 string，`acp_port:open/1` 单点 `to_str/1` 把 binary 转 string。
+6. **prompt 读者按 destination 过滤**：瞬态读者只处理 `in_destination(name)`，绝不回读自身 `$acp/session/*` / `$acp/permission`（否则自激 prompt 循环）。
+
 
 ---
 
