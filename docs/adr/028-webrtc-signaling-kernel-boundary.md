@@ -1,0 +1,79 @@
+# ADR-028：WebRTC 信令面与消息内核的边界——进程直投、瞬时转发、不落盘
+
+- **状态**：已采纳（S10-0 评审签认，2026-11-13）
+- **日期**：2026-11-13
+- **关联**：ADR-001（协议适配与内核分离）、ADR-002（Mnesia 只承担控制面元数据）、ADR-007（显式可靠性）、ADR-009（`broker_message`）、ADR-010（router）、ADR-013（订阅/游标归属）、ADR-015（重投递/DLQ/TTL）、ADR-016（可观测）、ADR-021（集群控制面）、ADR-025（A2A 瞬态读者范式）
+- **关联文档**：[`docs/design/s10-webrtc-signaling.md`](../design/s10-webrtc-signaling.md) §3.3（R-M1/R-M2）、§4.4（OQ-1/OQ-2）、[`docs/design/s10-0-convergence-report.md`](../design/s10-0-convergence-report.md) §1/§2（OQ-1/OQ-2 收敛）、[`docs/design/s10-execution-plan.md`](../design/s10-execution-plan.md) §0（三条硬边界）
+- **事实来源**：`lambdaclass/webrtc-server`（`master`）§2.3/§2.4 报文与房间语义；本仓 `broker_queue:append/3` 源码（无 transient 旁路）、`wal_codec` 编码行为；`broker_security:authorize/2` 键集合；`rebar3 xref` 本仓既有口径
+
+## 背景（Context）
+
+S10 在既有统一消息内核之上新增 WebRTC **信令接入前端**（WSS 房间中继）与 STUN/TURN **ICE 辅助服务**（媒体面不做）。设计稿 §3.3 的 R-M1 要求「信令事件到 `broker_message` / `broker_router` 的映射必须先在 S10-0 以 ADR 冻结，再写实现；不得写第二套消息内核」；R-M2 要求给出「信令是瞬时转发、默认不持久化」的显式口径。
+
+必须一起定下来的问题：①信令数据面是否进内核、以什么形态进；②「不落盘」是契约还是实现细节，如何防止 ACP 式 transient 悄悄落盘；③房间注册表与成员生命周期放哪里；④ACL 如何表达而不把房间误读成内核 destination；⑤守护这条边界的工程手段（xref 证明不了调用边，见 D7）；⑥若未来出现「可回放加入/离开」的审计需求，怎么办。
+
+关键事实（均可在本仓源码核对）：
+
+1. `broker_queue:append/3 → append_checked → do_append → Backend:append` 路径上**没有任何基于 `persistence` 的旁路**——字段写进 `wal_codec` 的编码单元，transient 消息同样进 WAL。
+2. S9 的 ACP 前端用 `transient` 做「os_buffer 不落盘」，在本仓该语义**只在 ACP 进程内实现**，存储层并不知情。
+3. `broker_security:authorize/2` 只读 `action`（atom 或 binary）、`tenant_id`、`destination` 三个键，`destination` 用于 ACL pattern 匹配。
+4. `rebar3 xref` 在本仓的口径只覆盖 undefined/deprecated/recursive 调用与 unused-export，**不是调用图查询**，不能证明「不存在某条调用边」。
+
+## 决策
+
+### D1. 契约：信令面不产生任何内核消息——无 `#broker_message{}`、无 append、无 router、无订阅/游标/offset/retention/SubRef/`.cursors`
+
+- WebRTC 信令数据面（SDP offer/answer、ICE candidate、五类服务器事件 `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left`）是**纯内存进程间消息**：`Pid ! {text, Frame}`。
+- **明确声明**：这不是「性能选择」而是**正确性契约**——房间成员是连接态连接，无订阅、无重放语义；任何落盘都会制造「消息日志之外的第三条数据面」，与 ADR-009/010/013 的单一消息面模型冲突。
+- 判定标准（测试钉死）：S10-D 的完整 1:1 信令会话后，各分区 `committed` offset 不变、数据目录无增长、`.cursors` 无新增条目（`webrtc_no_persistence_SUITE` 或收敛报告 §0.4 脚本的正式版）。
+
+### D2. 「瞬时、不落盘」是显式契约，并写明 ACP 式 transient 不落盘的前提不成立
+
+- 本 ADR 冻结「瞬时、不落盘」为**对外承诺**；实现上不调用任何存储路径即满足，不需要新增档位。
+- 明确**不**复用 ACP 的 `transient` 语义作为依据：D1 已确认存储层不认识 `persistence`，S9-F 落地修正后的 ACP transient 由 ACP 前端自己承担。**任何「把 signaling 当 transient 发进 `broker_queue`」的方案都视为违反 D1，即使字段名相同。**
+
+### D3. 数据面进程直投；控制面内存扇出；`room` 不是 destination
+
+- 信令消息的投递路径：连接进程 →（`webrtc_dispatch` 校验）→ 目标连接进程 `Pid ! {text, Frame}`（原报文 + `from`，**保留 `to`**）。
+- 广播路径：`webrtc_room_registry` 持有的成员 pid 列表直接遍历投递；无索引、无订阅表。
+- `room` 只出现在：①WSS 路径（`/websocket/<room>` 的路径绑定）；②ACL 匹配主体（D5）；③注册表分片键。**不出现在** `broker_router` 路由、`broker_subscription` 订阅索引、`broker_queue` 任何 destination 参数中。`broker_queue:append/3` 的 destination 概念对应的是「有日志的队列」，房间不属于此类。
+
+### D4. 房间注册表：独立 app 内组件，分片 gen_server + ETS，单节点，无 Mnesia、无 boot replay
+
+- 形态照 `a2a_task_registry`：`phash2(Room, N)` 分片的 `gen_server`，每分片一张 protected ETS 表。首期 `room_shards` 默认 `schedulers_online`。
+- **单节点语义**：房间成员是连接态，节点重启后连接必然已断，注册表为空是**正确**状态，因此不落 Mnesia、不做 boot replay（与 ADR-002 不冲突——Mnesia 只存控制面元数据，这里连元数据都不需要）。
+- 进程死亡兜底：注册表对成员进程 `monitor`，DOWN 时自动清理并扇出 `left`。
+- 集群化（跨节点房间）不在本 ADR 范围，届时涉及 ADR-021 的归属/epoch，另立 ADR。
+
+### D5. ACL：`destination => <<"$webrtc/room/", Room/binary>>` 仅作模式匹配主体，不是路由目的地
+
+- 加入房间、向 `to` 发信令、服务端 API 三类操作都过 `broker_security:authorize/2`，resource 形状 `#{action => signal, tenant_id => T, destination => <<"$webrtc/room/", Room/binary>>}`。
+- **显式声明**：该 `destination` 字符串只参与 ACL rule 的 pattern 匹配（`rule_matches/3` 的 `pattern_matches/2`），**不代表房间是内核 destination**——不建订阅、不进路由表、不进日志正文。
+- `credential_capable/0` **不修改**：照 ADR-025/026/027 的「适配器自有 `require_auth`」路线。`authorize(undefined, _)` 返回 `allow`（既有语义），因此 `require_auth => true` 必须由适配器在 `broker_security:authenticate_conn/1` 处兜住，不得依赖 ACL 兜底。
+
+### D6. 显式不新增内核抽象
+
+- S10 不为信令引入任何新的内核 behavior、存储档位或路由设施。若未来出现真实需求（如「可回放加入/离开」审计、跨节点房间、需要信令的持久订阅者），**另立 ADR 并给出内核变更范围**，不在实现里夹带。
+
+### D7. 守护手段：源码级守卫测试 + 代码评审 + 不落盘实测（xref 不用）
+
+- **`webrtc_boundary_SUITE`（源码级守卫）**：grep `apps/broker_proto_webrtc/src/*.erl` 与 `apps/broker_ice/src/*.erl`，断言无 `broker_queue:` / `broker_router:` 调用、无 `#broker_message{}` 构造、不含 `broker_core` 的 include。
+- **代码评审**：新 app 的 `.app.src` `applications` 清单评审（`broker_limits` 在 `broker_security` app 内可单列；`broker_event` 因依赖 router+queue **不**在本 ADR 的默认路径内——见 D8）。
+- **S10-D 不落盘实测**：D1 的三条断言。
+- **不用 `rebar3 xref` 证明边界**：本仓 xref 口径不覆盖调用边存在性（见背景事实 4）。文档中若引用 xref，只允许引用其「无 undefined/deprecated」的既有用途。
+
+### D8. 边界口径（防误读，冻结）：契约是「无调用、无消息」，不是「依赖闭包里没有」
+
+- `broker_event`（S7 trace helper `broker_event_trace` 所在 app）本身依赖 `broker_router` + `broker_queue`。一旦信令想用 `broker_event_trace:propagate/1`，两者就进入依赖闭包。
+- 本 ADR 冻结的口径是：**默认路径下不存在对 `broker_queue` / `broker_router` 的调用、不产生 `#broker_message{}`**；`broker_event` 不在 S10-A/B 的依赖内。
+- 若 S10-D 评审决定引入 trace：**先回到本 ADR 增补 D8 一条豁免说明并声明闭包变化**，不允许静默依赖。
+
+## 后果（Consequences）
+
+- 正向：信令路径零 WAL、零 fsync、零订阅索引；S10-A~D 可全部默认关闭发布（`listeners => []`）而不影响内核存储基线；回退姿势是删 app + 两行 relx 清单。
+- 代价：信令不可审计回放（只有 `logger` 特征字段）、不可跨节点、无持久化订阅者。收敛报告 §4 已把「需要回放」列为**最可能证伪 OQ-1 的信号**，届时按 D6 另立 ADR。
+- 与既有 ADR 的关系：不 amend 任何一条；D4 与 ADR-002 一致（这里连元数据都不存）；D5 复用 ADR-006/007 的身份与 ACL 面，未改其语义。
+
+## 落地偏差记录
+
+（S10-A 起逐条追加，格式：计划 → 实际 → 为什么 → 留痕位置。冻结文本不改。）

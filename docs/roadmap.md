@@ -431,7 +431,7 @@ S7 有两项交付：
 
 **目标**：在既有统一消息内核之上，新增 WebRTC **信令接入前端**与 **STUN/TURN ICE 辅助服务**，把 Broker 扩展为实时媒体会话的可信信令中继与 NAT 穿越辅助；**媒体面不做**。协议整理（调研事实）、需求提炼与完整开发计划见 [`docs/design/s10-webrtc-signaling.md`](design/s10-webrtc-signaling.md)（§2 / §3 / §4）。
 
-**S10-0 文档**：[`docs/design/s10-0-convergence-report.md`](design/s10-0-convergence-report.md)（OQ-1~OQ-10 收敛结论 + ADR-028/029 底稿 + 反证点）与 [`docs/design/s10-execution-plan.md`](design/s10-execution-plan.md)（任务拆分 / 测试矩阵 / 证据计划 / 端口·配置·依赖表 / DoD）。两份都是**草案**：ADR-028/029 尚未落盘，签认后才进 S10-A。
+**S10-0 文档**：[`docs/design/s10-0-convergence-report.md`](design/s10-0-convergence-report.md)（OQ-1~OQ-10 收敛结论 + 反证点）与 [`docs/design/s10-execution-plan.md`](design/s10-execution-plan.md)（任务拆分 / 测试矩阵 / 证据计划 / 端口·配置·依赖表 / DoD）。**ADR-028/029 已于 2026-11-13 签认落盘**（[`docs/adr/028-...`](adr/028-webrtc-signaling-kernel-boundary.md) / [`029-...`](adr/029-ice-component-and-port-matrix.md)），S10-A 入口条件已满足。
 
 **调研来源**：[`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server)（`master`，Erlang/OTP；Cowboy WSS 信令 + `processone/stun` STUN/TURN）。该仓库只覆盖**信令面**（房间 + JSON 事件转发）与 **ICE 面**（UDP 3478 / TURN），媒体（RTP/RTCP/DataChannel）为浏览器 P2P，不经服务端。设计文档 §2 逐字整理了其报文、配置、源码缺陷（README 与源码不一致、跨房间 `to` 会令 handler 崩溃等 14 条），§3 把它们映射为候选需求。
 
@@ -443,7 +443,7 @@ S7 有两项交付：
 
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
-| S10-0 不确定性收敛 | 🟡 **收敛报告 + 执行计划已起草（2026-11-12，待评审签认；ADR-028/029 未落盘）** | [`s10-0-convergence-report.md`](design/s10-0-convergence-report.md)（OQ-1~OQ-10 全收敛 + ADR-028/029 底稿 + 风险反证点 + S10-A 入口条件）与 [`s10-execution-plan.md`](design/s10-execution-plan.md)（S10-0~D 任务拆分 / 测试矩阵 / 证据计划 / 端口·配置·依赖表 / 风险回退 / 待填门禁表） | **结论可逐条用仓库事实核对**：信令不进 `broker_queue`/`broker_router`（`append/3` 无 transient 旁路，`wal_codec` 原样编码 `persistence` → ACP 式 transient 仍落盘）；净新增依赖 0（`cowboy` 的 hex 元数据要求 `ranch ~> 1.4.0`，与 2.3.0 冲突；`stun` 拖 `fast_tls`/`p1_utils`）；端口 8084/TCP + 3478/UDP + 49152-65535/UDP 与既有清单零冲突。**尚未做**：spike 代码（`spikes/s10_0_ws_signal/`）与 ADR 签认 |
+| S10-0 不确定性收敛 | ✅ **已交付（2026-11-13）** | [`s10-0-convergence-report.md`](design/s10-0-convergence-report.md)（OQ-1~OQ-10 全收敛 + 风险反证点 + S10-A 入口条件）、[`s10-execution-plan.md`](design/s10-execution-plan.md)（S10-0~D 任务拆分 / 测试矩阵 / 证据计划 / 端口·配置·依赖表 / 风险回退 / 待填门禁表）与 **ADR-028/029 签认落盘**（[`adr/028`](adr/028-webrtc-signaling-kernel-boundary.md) 信令面边界：进程直投、无 `#broker_message{}`、无 cursor/retention、ACL 的 destination 仅模式主体；[`adr/029`](adr/029-ice-component-and-port-matrix.md) ICE 组件：独立 app、3478/UDP + relay 段、5349/TCP/TLS 不做） | 文档与 ADR 交付；**下一步 `spikes/s10_0_ws_signal/` spike**（Task 0.3），完成后进 S10-A |
 | S10-A 信令前端底座 | ⬜ 未开工 | WSS 前端 + `broker_ws` 复用 + `ping`/`pong` + 认证窗口 + `broker_security` 接线 + 配置门控（默认关闭） | 单连接认证 / 拒绝 / 保活用例；既有 1063/1063 零回归 |
 | S10-B 房间与信令内核 | ⬜ 未开工 | `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left` 事件集 + `peer_id` + `to`/`from` 转发 + 房间隔离与 ACL + 服务端 API | 两浏览器客户端 1:1 信令贯通；跨房间 / 未知 peer 拒绝不崩溃专项用例 |
 | S10-C ICE / STUN / TURN | ⬜ 未开工 | UDP 3478 + TURN 长期凭据接身份表 + `turn_ip` / 端口矩阵 + 监督树 + 限流与上限 | STUN/TURN 客户端 + 浏览器 `RTCPeerConnection` 连通性证据 |
@@ -461,7 +461,7 @@ S7 有两项交付：
 - [ ] S10 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
 - [ ] 非目标与裁剪项在能力矩阵中逐行留痕
 
-**状态口径**：**S10-0 的收敛报告与执行计划已起草（2026-11-12），但 ADR-028/029 尚未落盘、S10-A~S10-D 全部「⬜ 未开工」，Gate S10 全未勾选，无任何「已实测」数字**；S10 排在 S9 之后（S9 已于 2026-11-12 收口）。README / `progress.md` / `architecture.md` 的「S0–S9 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——S10-0 只新增文档，没有新增 app、端口或代码路径，待 S10-A 有首个代码交付时统一同步，避免把计划读成现状。`docs/operations.md` 端口表同理：8084/3478 的「计划（未实现）」标注按收敛报告 §5 入口条件第 4 条在**进入 S10-A 时**才加，现在不写。
+**状态口径**：**S10-0 已交付（2026-11-13：两份规划文档 + ADR-028/029 签认落盘），S10-A~S10-D 全部「⬜ 未开工」，Gate S10 全未勾选，无任何「已实测」数字**；S10 排在 S9 之后（S9 已于 2026-11-12 收口）。README / `progress.md` / `architecture.md` 的「S0–S9 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——S10-0 只新增文档，没有新增 app、端口或代码路径，待 S10-A 有首个代码交付时统一同步，避免把计划读成现状。`docs/operations.md` 端口表同理：8084/3478 的「计划（未实现）」标注按收敛报告 §5 入口条件第 4 条在**进入 S10-A 时**才加，现在不写。
 
 ---
 

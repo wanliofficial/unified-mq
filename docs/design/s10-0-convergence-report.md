@@ -4,7 +4,7 @@
 - **性质**：**收敛报告草案**。所有结论基于仓库内可核对的代码/配置与上游包元数据，未写实现代码、未开端口、未新增依赖。
 - **基线**：S9-F 已交付，`rebar3 ct` **1063/1063、68 套件**，`dialyzer` 0 warning（2026-11-12）。
 - **配套**：[`docs/design/s10-execution-plan.md`](s10-execution-plan.md)——S10-0~S10-D 的任务拆分、测试矩阵、证据计划、端口·配置·依赖表、风险回退与待填门禁表。
-- **待办**：本文 §3 的两份 ADR 尚未落盘；需评审签认后才进入 S10-A（见 §5 入口条件）。
+- **签认状态**：本文 §3 的两份 ADR（028/029）已于 2026-11-13 签认并落盘 `docs/adr/`；§5 入口条件第 1 条已满足，S10-A 可开工（下一个动作是 §5 第 2 条的 spike）。
 
 ---
 
@@ -199,7 +199,7 @@ S10 拟用：**8084/TCP**（信令，wss）、**3478/UDP**（STUN/TURN）、**49
 
 ## 3. 待落的 ADR（草案，未签认）
 
-### ADR-028（拟）信令面与消息内核的边界
+### ADR-028（已签认 2026-11-13）信令面与消息内核的边界
 
 要冻结的决策：
 
@@ -212,7 +212,7 @@ S10 拟用：**8084/TCP**（信令，wss）、**3478/UDP**（STUN/TURN）、**49
 7. **边界口径要写准**：契约是「**不存在对 `broker_queue` / `broker_router` 的调用、不产生 `#broker_message{}`**」，**不是**「依赖闭包里没有它们」——`broker_event`（S7 trace 所在 app）本身依赖 `broker_router` + `broker_queue`，一旦信令要用 `broker_event_trace` 就会把两者带进闭包。守护方式：**一条源码级守卫测试**（`webrtc_boundary_SUITE`：grep `apps/broker_proto_webrtc/src/*.erl` 与 `apps/broker_ice/src/*.erl`，断言无 `broker_queue:` / `broker_router:` 调用、无 `#broker_message{` 构造，`broker_core` 的 include 也不得出现）+ 代码评审 + S10-D 的「不落盘」实测三断言。**注意 `rebar3 xref` 在本仓的既有口径只覆盖 undefined/deprecated/recursive 调用与 unused-export，不是调用图查询，不能用来证明「没有这条边」**。
 8. **ACL 的 `destination` 键不是路由目的地**：`broker_security:authorize/2` 只认 `action` / `tenant_id` / `destination` 三个键，其中 `destination` 是 ACL pattern 的匹配主体。信令需要 ACL 时传 `destination => <<"$webrtc/room/", Room/binary>>`，**这个字符串只用于模式匹配**，不代表房间是内核 destination（不进 `broker_router`、不建订阅索引）。这一条要写进 ADR-028，否则实现期容易被误读。
 
-### ADR-029（拟）ICE 组件、端口矩阵与部署边界
+### ADR-029（已签认 2026-11-13）ICE 组件、端口矩阵与部署边界
 
 要冻结的决策：
 
