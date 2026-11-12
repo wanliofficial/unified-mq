@@ -1,0 +1,7 @@
+{"id":1,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"_meta":{"unified-mq":{"elicitation":false,"fs":false,"role":"client","terminal":false,"version":"1"}}},"protocolVersion":1}}
+{"id":2,"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/tmp/opencode/s9f-evidence/acp","mcpServers":[]}}
+{"id":3,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"hello from the broker client","type":"text"}],"sessionId":"acp-sdk-session-99a137fd"}}
+{"id":4,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"danger: please run the command","type":"text"}],"sessionId":"acp-sdk-session-99a137fd"}}
+{"id":0,"jsonrpc":"2.0","result":{"_meta":{"unified-mq":{"decision":"allow","toolCall":{"kind":"execute","rawInput":{"target":"/tmp/evidence.conf"},"status":"pending","title":"run-shell","toolCallId":"tool-9b4e18aa"}}},"outcome":{"optionId":"allow-once","outcome":"selected"},"reason":"matched allowlist"}}
+{"id":5,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"deny: touch a config file","type":"text"}],"sessionId":"acp-sdk-session-99a137fd"}}
+{"id":1,"jsonrpc":"2.0","result":{"_meta":{"unified-mq":{"decision":"deny","reason":"not in allowlist","toolCall":{"kind":"edit","rawInput":{"target":"/tmp/evidence.conf"},"status":"pending","title":"edit-config","toolCallId":"tool-2cb4a23a"}}},"outcome":{"outcome":"cancelled"},"reason":"not in allowlist"}}

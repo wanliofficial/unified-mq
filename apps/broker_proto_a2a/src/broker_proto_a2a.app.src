@@ -19,9 +19,9 @@
            {task_timeout_ms, 30000},
            %% S9-B ships a synchronous echo agent; async executors turn it off.
            {task_auto_complete, true},
-           %% ADR-025 §D5: checkpoint evolution point; S9-B replays from 0.
-           {task_checkpoint_dir, undefined},
-           {task_checkpoint_interval_ms, 5000},
+           %% ADR-025 §D5: recovery is full replay from offset 0 (correctness
+           %% baseline). No checkpoint env exists — it was declared but never
+           %% read in S9-B and is removed as dead config in S9-F.
            %% ADR-026 §D3: optional boot seed for the agent catalog.
            {agent_cards, []},
            {agent_card_max_age, 60},

@@ -1,0 +1,32 @@
+[acp-agent] initialize protocol_version=1 client_info=None
+[acp-agent] new_session cwd=/tmp/opencode/s9f-evidence/acp -> acp-sdk-session-99a137fd
+
+== HANDSHAKE (official ACP SDK agent over acp_port) ==
+  state=ready
+  session_id=<<"acp-sdk-session-99a137fd">>
+[acp-agent] prompt session=acp-sdk-session-99a137fd text='hello from the broker client'
+
+== plain: session/update + turn (2 msg) ==
+  {"kind":"session_update","sessionId":"acp-sdk-session-99a137fd","update":{"content":{"text":"Evidence agent handled: hello from the broker client","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+  {"kind":"turn","turn":{"counts":{"agent_message_chunk":1},"prompt":[{"text":"hello from the broker client","type":"text"}],"sessionId":"acp-sdk-session-99a137fd","status":"done","stopReason":"end_turn","updates":[{"content":{"text":"Evidence agent handled: hello from the broker client","type":"text"},"sessionUpdate":"agent_message_chunk"}]}}
+[acp-agent] prompt session=acp-sdk-session-99a137fd text='danger: please run the command'
+[acp-agent] request_permission -> outcome=selected
+
+== permission(allow, kind=execute): session/update + turn (2 msg) ==
+  {"kind":"session_update","sessionId":"acp-sdk-session-99a137fd","update":{"content":{"text":"Permission granted; running command.","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+  {"kind":"turn","turn":{"counts":{"agent_message_chunk":1},"prompt":[{"text":"danger: please run the command","type":"text"}],"sessionId":"acp-sdk-session-99a137fd","status":"done","stopReason":"end_turn","updates":[{"content":{"text":"Permission granted; running command.","type":"text"},"sessionUpdate":"agent_message_chunk"}]}}
+
+== permission(allow): $acp/permission (1 msg) ==
+  {"agent":"sdk-agent","decision":"selected","reason":"matched allowlist","sessionId":"acp-sdk-session-99a137fd","toolCall":{"kind":"execute","rawInput":{"target":"/tmp/evidence.conf"},"status":"pending","title":"run-shell","toolCallId":"tool-9b4e18aa"}}
+[acp-agent] prompt session=acp-sdk-session-99a137fd text='deny: touch a config file'
+[acp-agent] request_permission -> outcome=cancelled
+
+== permission(deny, kind=edit): session/update + turn (1 msg) ==
+  {"kind":"turn","turn":{"counts":{},"prompt":[{"text":"deny: touch a config file","type":"text"}],"sessionId":"acp-sdk-session-99a137fd","status":"done","stopReason":"refusal","updates":[]}}
+
+== permission(deny): $acp/permission (1 msg) ==
+  {"agent":"sdk-agent","decision":"cancelled","reason":"not in allowlist","sessionId":"acp-sdk-session-99a137fd","toolCall":{"kind":"edit","rawInput":{"target":"/tmp/evidence.conf"},"status":"pending","title":"edit-config","toolCallId":"tool-2cb4a23a"}}
+
+== FINAL ==
+  state=gone
+  stop=<<"refusal">>

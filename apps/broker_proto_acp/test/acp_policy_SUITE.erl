@@ -33,6 +33,7 @@ groups() ->
        timeout_refuses,
        grant_picks_allow_option,
        audit_body_shape,
+       wire_result_is_nested,
        default_policy_is_deny]},
      {session, [sequence],
       [initialize_moves_to_ready,
@@ -104,6 +105,28 @@ audit_body_shape(_Config) ->
     ?assertEqual(<<"selected">>, maps:get(<<"decision">>, Body)),
     ?assertEqual(<<"edit">>,
                  maps:get(<<"kind">>, maps:get(<<"toolCall">>, Body))).
+
+%% ACP v1 `RequestPermissionResponse.result' is a nested outcome object. A
+%% conforming agent (the official SDK) validates it as a discriminated union, so
+%% a flat `{"outcome": "selected"}' is rejected outright -- this is the defect the
+%% real SDK client surfaced in S9-F.
+wire_result_is_nested(_Config) ->
+    Granted = acp_policy:wire(acp_policy:decide(params(<<"edit">>, <<"x">>),
+                                               (policy()))),
+    ?assertEqual(<<"selected">>,
+                 maps:get(<<"outcome">>, maps:get(<<"outcome">>, Granted))),
+    ?assertEqual(<<"yes">>, maps:get(<<"optionId">>,
+                                     maps:get(<<"outcome">>, Granted))),
+    %% `_meta' and `reason' ride along; a peer ignores the extra members.
+    ?assertEqual(<<"matched allowlist">>, maps:get(<<"reason">>, Granted)),
+    ?assertMatch(#{<<"unified-mq">> := #{<<"decision">> := <<"allow">>}},
+                 maps:get(<<"_meta">>, Granted)),
+    %% A denial carries no `optionId' at all (the `DeniedOutcome' has none).
+    Denied = acp_policy:wire(acp_policy:decide(params(<<"delete">>, <<"x">>),
+                                               (policy()))),
+    DeniedOutcome = maps:get(<<"outcome">>, Denied),
+    ?assertEqual(<<"cancelled">>, maps:get(<<"outcome">>, DeniedOutcome)),
+    ?assertEqual(false, maps:is_key(<<"optionId">>, DeniedOutcome)).
 
 default_policy_is_deny(_Config) ->
     Default = acp_policy:default(),

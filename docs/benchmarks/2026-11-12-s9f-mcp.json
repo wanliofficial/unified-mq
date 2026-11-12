@@ -1,0 +1,24 @@
+{
+  "protocol": "MCP",
+  "sdk": "mcp 2.3.0",
+  "operation": "tools/call (full gateway round trip)",
+  "sequential": {
+    "samples": 200,
+    "wall_ms": 6655.2,
+    "throughput_per_s": 30.1,
+    "p50_ms": 30.65,
+    "p95_ms": 56.032,
+    "p99_ms": 67.385,
+    "mean_ms": 33.269
+  },
+  "concurrent": {
+    "concurrency": 16,
+    "samples": 192,
+    "wall_ms": 2406.8,
+    "throughput_per_s": 79.8,
+    "p50_ms": 183.609,
+    "p95_ms": 281.359,
+    "p99_ms": 296.242,
+    "mean_ms": 192.608
+  }
+}

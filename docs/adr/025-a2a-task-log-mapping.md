@@ -150,7 +150,7 @@ S9-B/S9-C 的 Gate 证据必须覆盖：
 | D2 投影在 adapter 内存（ETS + 分片 gen_server） | 完全照做：每分片一张 ETS `a2a_task_shard_<I>`（`set` + `read_concurrency`）+ 一个 `gen_server`，`phash2(TaskId, N)` 路由，`task_shards` 默认 `schedulers_online` | **`ListTasks` 的分页在 registry 汇总**：全局稳定页无法由各分片各自分页拼出，故 `list/3` 扇出到全部分片、由 registry 合并排序再切页；`page_size` 默认 50 上限 100 按 D2 执行 |
 | D3 终态不可变三层（串行化 + 追加前校验 + 重放复核） | 三层都在：分片串行、append 前 `a2a_task:legal_transition/2`、重放复核。非法迁移在**活路径**返回错误码，在**重放路径**只记日志并保留最后一个合法状态 | **`a2a_state_violation` 计数器未加**（`broker_metrics` 键集冻结，统一在 S9-F 动），S9-B 用 `logger:warning`；`WORKING → WORKING` 显式允许（进度上报），已作为迁移表的一行落地 |
 | D4 可靠性档 `fsync` 默认、创建与终态同档 | 完全照做：`a2a_event:reliability/0` 读 `task_reliability`（默认 `fsync`），创建事件与终态事件用同一档；`replicated_commit` 且 `broker_queue:reliability() =/= replicated_commit` 时 **boot 拒绝**（`{error, {task_reliability_requires_replicator, _}}`，`a2a_event:validate_reliability/0`） | 无 |
-| D5 崩溃恢复 = checkpoint + 增量重放 | **只做了增量重放的退化版：全量重放**。`a2a_task_recovery` 在 `init/1` 里从各分区 offset 0 读起、过滤 `$a2a/task/` 前缀折叠 | **checkpoint 未实现**：`data/a2a/replay.idx` 不存在，`task_checkpoint_dir` / `task_checkpoint_interval_ms` 两个 env 已声明但**不读**。全量重放先作为正确性基线（ADR §D5 的「无 checkpoint 时从 0 请求」分支即本条），checkpoint 优化列 S9-F 演进位 |
+| D5 崩溃恢复 = checkpoint + 增量重放 | **只做了增量重放的退化版：全量重放**。`a2a_task_recovery` 在 `init/1` 里从各分区 offset 0 读起、过滤 `$a2a/task/` 前缀折叠 | **checkpoint 未实现**：`data/a2a/replay.idx` 不存在，`task_checkpoint_dir` / `task_checkpoint_interval_ms` 两个 env 已声明但**不读**。全量重放先作为正确性基线（ADR §D5 的「无 checkpoint 时从 0 请求」分支即本条）；S9-F 定稿**不做** checkpoint 优化并删除这两个死 env，见文末「定稿说明（S9-F）」 |
 | D6 retention 契约 + `history_lost` 响亮失败 | `history_lost` 照做：首条可见事件不是创建快照 → 补一条服务端生成的 `TASK_STATE_FAILED` 终态事件（`metadata.reason = history_lost`），且该补写事件自身在下次重放时可被识别，重复 boot 幂等 | **`a2a_task_history_lost` 计数器与 `config/alerts.yml` 的 `a2a_task_beyond_retention` 未加**（同上，归 S9-F）；`docs/operations.md` §5.1 已给容量估算与日志特征对照表作为过渡 |
 | D7 SSE 是瞬态读者 | **未落地**（S9-C）：`SendStreamingMessage` / `SubscribeToTask` 仍回 `-32601` | 本 ADR 关于 SSE 的所有约束（不建 SubRef、不 pin retention、resync 快照、`sse_max_pending_bytes`）在 S9-C 生效，S9-B 不产生任何 SSE 路径 |
 | D8 大小上限 | `max_body_bytes` 与 `broker_security.limits.max_message_bytes` 取 min；`413` 不读体直接关连接；`Part.url` 不取回 | 无 |
@@ -168,3 +168,13 @@ D7 的 SSE 在 S9-C 落地，代码见 `apps/broker_proto_a2a/src/a2a_stream.erl
 | D7 落后于 `committed` 时发**当前 Task 快照**（`metadata._a2a.resync = true`）再续 | **改为响亮失败**：历史 offset 越界时发一个 `status: failed` 事件后**关流**，客户端自行重连（`SubscribeToTask` 从当前可读起点重放） | **没有 resync 快照那一步**：发快照要求连接进程能读投影（跨到 shard ETS），会把 SSE 与分片耦合；关流+重订阅用同一条「offset 0 重放」路径达成等价可用性，且不新增私有 `_a2a.resync` 元数据键 |
 
 **收尾说明**：D7 已落地（上表）；D5 的 checkpoint、D6 的 `a2a_task_history_lost` 计数器仍「文档承诺、代码未到位」，与 S9-C 新增的 Push/Stream 失败计数器一并归 S9-F，`docs/roadmap.md` §11.1 与 `docs/operations.md` §5.2 已留痕。**S9-C 未落地 D7 的两个 env（`sse_max_pending_bytes` / `sse_send_timeout_ms`）已在 `config/sys.config.src` 中不存在**（不保留「声明但不读」的死配置）。
+
+### 定稿说明（S9-F，2026-11-12；冻结文本不改，只结掉「留 S9-F」的悬空项）
+
+S9-F 的边界是「证据 + 矩阵 + 审计 + 容量 + 文档同步」，**不新增实现**；下列三项按「偏差改文档」结案，均有明确留痕：
+
+| 悬空项 | S9-F 结论 | 留痕位置 |
+|---|---|---|
+| D5 的持久化 replay checkpoint（`data/a2a/replay.idx`） | **不实现**：恢复始终是分区 offset 0 全量重放（正确性基线，也是当前可扩展性上界——启动时间随日志量增长）。S9-B 声明但从未被读的 `task_checkpoint_dir` / `task_checkpoint_interval_ms` 两个 env **已作为死配置删除** | 本 ADR 上方 D5 行、`docs/architecture.md` 延期表与 env 表、`docs/operations.md` §重启成本、`docs/protocol-compatibility.md` §4.15 |
+| D3/D6 的失败路径计数器（`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt`）与 S9-C 的 Push/Stream 失败计数器 | **不加**：`broker_metrics` 键集保持 S9-A 之前的冻结集合（ADR-016 冻结 API），三协议失败路径一律只 `logger` | `docs/security.md` §12.1 第 17 条、`docs/operations.md` §告警占位 |
+| D7 的两个 SSE 水位 env（`sse_max_pending_bytes` / `sse_send_timeout_ms`） | 维持 S9-C 的结论：**删除死配置，改用时间上限**（`sse_max_duration_ms` + `sse_max_event_bytes`） | ADR-026 §D7 落地注记（S9-C）、本 ADR D7 行 |

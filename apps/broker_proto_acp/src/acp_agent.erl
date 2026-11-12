@@ -307,7 +307,9 @@ handle_request(Term, State) ->
         <<"session/request_permission">> ->
             Decision = acp_policy:decide(Params, State#st.policy),
             audit(State, Decision, Params),
-            _ = write(State, acp_frame:response_ok(Id, Decision)),
+            %% ACP v1 result is a nested outcome *object*; acp_policy:wire/1
+            %% converts the internal flat decision (the audit shape) to it.
+            _ = write(State, acp_frame:response_ok(Id, acp_policy:wire(Decision))),
             case maps:get(outcome, Decision) of
                 <<"cancelled">> ->
                     State#st{session = acp_session:failed(

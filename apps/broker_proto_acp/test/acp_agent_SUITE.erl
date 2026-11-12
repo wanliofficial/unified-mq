@@ -159,8 +159,10 @@ allowlisted_tool_is_granted(_Config) ->
                        permission_params(S, <<"edit">>, <<"Write file">>)),
     Reply = expect_reply(Id),
     Result = maps:get(<<"result">>, Reply),
-    ?assertEqual(<<"selected">>, maps:get(<<"outcome">>, Result)),
-    ?assertEqual(<<"allow">>, maps:get(<<"optionId">>, Result)),
+    %% ACP v1: the result is a nested outcome object, not a bare string.
+    Outcome = maps:get(<<"outcome">>, Result),
+    ?assertEqual(<<"selected">>, maps:get(<<"outcome">>, Outcome)),
+    ?assertEqual(<<"allow">>, maps:get(<<"optionId">>, Outcome)),
     stop_agent(Pid).
 
 non_allowlisted_tool_is_denied(_Config) ->
@@ -170,7 +172,8 @@ non_allowlisted_tool_is_denied(_Config) ->
     request_from_agent(Pid, Id, <<"session/request_permission">>,
                        permission_params(S, <<"execute">>, <<"rm -rf /">>)),
     Result = maps:get(<<"result">>, expect_reply(Id)),
-    ?assertEqual(<<"cancelled">>, maps:get(<<"outcome">>, Result)),
+    ?assertEqual(<<"cancelled">>,
+                 maps:get(<<"outcome">>, maps:get(<<"outcome">>, Result))),
     %% A refusal ends the session: the agent cannot continue a turn whose
     %% sensitive call was not approved.
     ?assertEqual(gone, session_state(Pid)),

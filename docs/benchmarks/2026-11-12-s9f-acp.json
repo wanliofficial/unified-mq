@@ -1,0 +1,25 @@
+{
+  "protocol": "ACP",
+  "sdk": "agent-client-protocol 1.0.0 (Broker as Client, acp_port stdio)",
+  "operation": "session/prompt turn projection (full stdio round trip)",
+  "sequential": {
+    "samples": 200,
+    "concurrency": 1,
+    "wall_ms": 1767.023,
+    "throughput_per_s": 113.185,
+    "p50_ms": 8.531,
+    "p95_ms": 16.618,
+    "p99_ms": 18.194,
+    "mean_ms": 8.83
+  },
+  "concurrent": {
+    "samples": 200,
+    "concurrency": 4,
+    "wall_ms": 1889.012,
+    "throughput_per_s": 105.875,
+    "p50_ms": 14.85,
+    "p95_ms": 34.456,
+    "p99_ms": 97.035,
+    "mean_ms": 22.362
+  }
+}

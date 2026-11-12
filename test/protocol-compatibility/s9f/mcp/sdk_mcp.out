@@ -1,0 +1,55 @@
+
+[A1] negotiated protocol_version: 2026-07-28
+     server_info: name='unified-mq' title=None version='0.1.0' description=None website_url=None icons=None
+     capabilities: {
+  "prompts": {},
+  "resources": {},
+  "tools": {},
+  "completions": {}
+}
+     instructions: None
+     discovered tools: ['emit-list-change']
+
+=== official MCP SDK client ===
+mcp package version: (2.3.0 dist)
+SDK LATEST_PROTOCOL_VERSION: 2026-07-28
+broker implements:          2026-07-28
+
+[1] client connected (no initialize handshake needed in 2026-07-28)
+
+[2] server capabilities: {}
+    serverInfo: None
+
+[3] list_tools -> {'meta': {'io.modelcontextprotocol/serverInfo': {'name': 'unified-mq', 'version': '0.1.0'}}, 'ttl_ms': 3600000, 'cache_scope': 'public', 'tools': [{'name': 'emit-list-change', 'description': 'Emit a tools list-changed notification', 'input_schema': {'properties': {'topic': {'type': 'string'}}, 'type': 'object'}}], 'result_type': 'complete'}
+
+[4] list_resources -> {'meta': {'io.modelcontextprotocol/serverInfo': {'name': 'unified-mq', 'version': '0.1.0'}}, 'ttl_ms': 3600000, 'cache_scope': 'public', 'resources': [], 'result_type': 'complete'}
+
+[5] list_prompts -> {'meta': {'io.modelcontextprotocol/serverInfo': {'name': 'unified-mq', 'version': '0.1.0'}}, 'ttl_ms': 3600000, 'cache_scope': 'public', 'prompts': [], 'result_type': 'complete'}
+    [progress] 1.0 / 2.0 - backend working on tools/call
+
+[6] call_tool(emit-list-change) -> {
+  "meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "unified-mq",
+      "version": "0.1.0"
+    }
+  },
+  "content": [
+    {
+      "type": "text",
+      "text": "backend echo: tools/call"
+    }
+  ],
+  "is_error": false,
+  "result_type": "complete"
+}
+Tool does-not-exist not listed by server, cannot validate any structured content
+
+[7] call_tool(does-not-exist) -> passthrough answered: {"meta": {"io.modelcontextprotocol/serverInfo": {"name": "unified-mq", "version": "0.1.0"}}, "content": [{"type": "text", "text": "backend echo: tools/call"}], "is_error": false, "result_type": "compl
+
+[C1] listen acknowledged; honored subset: tools_list_changed=True prompts_list_changed=None resources_list_changed=None resource_subscriptions=None
+     event: ToolsListChanged()
+
+[C2] listen stream closed gracefully by the client
+
+=== MCP SDK evidence complete ===

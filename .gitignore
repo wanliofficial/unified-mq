@@ -86,6 +86,17 @@ spikes/*/.data/
 /test/protocol-compatibility/amqp/_build/
 /test/protocol-compatibility/amqp/__pycache__/
 
+# S9-F three-protocol official-SDK evidence harness scratch: broker data volumes,
+# agent frame captures, boot-module beam, transient run logs
+/test/protocol-compatibility/s9f/data/
+/test/protocol-compatibility/s9f/data-acp/
+/test/protocol-compatibility/s9f/data-acp-bench/
+/test/protocol-compatibility/s9f/_build/
+/test/protocol-compatibility/s9f/**/__pycache__/
+/test/protocol-compatibility/s9f/**/*.beam
+/test/protocol-compatibility/s9f/**/node.out
+/test/protocol-compatibility/s9f/**/node.err
+
 # S5 Kafka harness scratch: broker data volume, compiled classes, boot-module beam, reports
 /test/protocol-compatibility/kafka/data/
 /test/protocol-compatibility/kafka/run/

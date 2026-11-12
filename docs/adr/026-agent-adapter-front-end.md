@@ -123,6 +123,11 @@ broker_proto_a2a_sup (one_for_all)
 > - **第 6 条「只接受 `protocolVersion 1`；不匹配回 ACP 错误」**：落地为不匹配时记 `stop=unsupported_protocol_version` 且**不发** `session/new`（会话无从建立）；v2 草案特性不实现。
 > - **第 7 条「stdio 约束：stdout 只允许协议帧；启动时校验 logger 不满足即拒绝」**：**校验未落地**——ACP 的协议帧走**agent 子进程管道**（`acp_port` 的 stdin/stdout），不占 Broker 自身 stdout，因此不存在 MCP stdio 那种「日志污染协议流」的风险。`acp_port` 也**不设** `stderr_to_stdout`，agent 的 stderr 与协议数据隔离。故本条在 ACP 侧的适用性被结构性消解，而非实现了一个校验器。
 
+> **落地后修正（S9-F，2026-11-12；冻结文本不改，只改 wire 编码）**
+>
+> - **第 3 条「`session/request_permission`」的 wire 形状修正**：S9-F 用官方 `agent-client-protocol 1.0.0` 作 Agent 服务端跑真实证据时，Agent 侧以 `RequestPermissionResponse.model_validate` 拒绝 Broker 原来的扁平结果 `{"outcome":"selected","optionId":...}`，报 `model_attributes_type` / `Invalid params` `-32602`。原因是 ACP v1 的 `RequestPermissionResponse.result.outcome` 是**判别联合** `DeniedOutcome | AllowedOutcome`（判别键 `outcome`，值是**对象**）：`AllowedOutcome = {outcome:"selected", optionId:<str>}`、`DeniedOutcome = {outcome:"cancelled"}`（无 `optionId`）。修复为 `acp_policy:wire/1` 在 JSON-RPC 边界做嵌套投影（`selected` 带 `optionId`、`cancelled` 不带，`reason`/`_meta` 随路），`acp_agent` 写回包改调它；**内部 decision 语义与形状完全不变**（默认拒绝 + 精确 allowlist + 超时拒绝 + 每次审计，一字未改）。这是同一语义的正确 wire 编码，不构成对 §D5 的放宽。
+> - **证据**：官方 SDK 三场景（plain / permission-allow / permission-deny）全通，7 帧 client→agent 原文见 `docs/protocol-compatibility.md` §4.18.8（缺陷记录在 §4.18.8.1）；回归 `rebar3 ct` 1063/1063、68 套件（`acp_policy_SUITE` 新增 `wire_result_is_nested` 1 例）。
+
 ### D6. 出站 webhook：默认关闭、pin IP、禁重定向
 
 1. **默认关闭**：`push.enabled => false`、`egress_allowlist => []`；空 allowlist 等于拒绝一切 push 配置创建（回 `PushNotificationNotSupportedError` / `-32003`），不是「先接受后丢弃」。

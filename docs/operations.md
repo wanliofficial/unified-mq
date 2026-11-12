@@ -314,7 +314,7 @@ ok = logger:add_handler(default, logger_std_h,
 - 客户端拿不到结果、只看到 `: ping`：确认后端消费了 `$mcp/<method>` 并发布到 `replyTo`；`request_timeout_ms` 到点会收到 `-32603` + `data.reason="timeout"`。
 - `406`：`Accept` 必须**同时**含 `application/json` 与 `text/event-stream`（或 `*/*`）。`415`：`Content-Type` 必须是 `application/json`。`403`：`Origin` 存在但不在 `allowed_origins` 且不是 loopback。
 - stdio 的 stdout 混进日志：按上面的 logger 配置把 `default` handler 换到 `standard_error`；本 app 不会自动改。
-- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.17。**官方 MCP SDK / Inspector 的客户端矩阵留 S9-F。**
+- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.17；**官方 `mcp 2.3.0` 客户端矩阵见 §4.17.9（S9-F 已交付）**。
 
 
 
@@ -377,7 +377,7 @@ ok = logger:add_handler(default, logger_std_h,
 - 权限回合一直等到超时：agent 发 `session/request_permission` 但 `allow` 空且 `default => deny`；调大 `timeout_ms` 或往 allowlist 加 `#{tool, title}`。
 - prompt 无响应：确认调用方发到了 `$acp/in/<agent>`（不是别的目的地），且该 agent 的瞬态读者订阅已成功（同分区，读者在 `session/new` 回复 cast 之后才装订阅，调用方需在握手完成后再发）。
 - agent 崩溃：`restart => temporary` 不重启；日志会有 `agent_exited` + exit_status。重启 agent 由运维在编排层做。
-- 真实六场景（handshake / plain / permission-allow / fs-reject / cancel / permission-deny）+ 11 帧 client→agent 原文见 `docs/protocol-compatibility.md` §4.18.5。**官方 ACP client / Zed 等真实编辑器客户端矩阵留 S9-F。**
+- 真实六场景（handshake / plain / permission-allow / fs-reject / cancel / permission-deny）+ 11 帧 client→agent 原文见 `docs/protocol-compatibility.md` §4.18.5；**官方 `agent-client-protocol 1.0.0` Agent 侧证据（S9-F 已交付）见 §4.18.8**。
 
 
 
@@ -535,7 +535,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | retention | 完全由 `broker_storage.retention`（`max_bytes` / `max_age_ms`）决定，**没有 A2A 专用保留策略**。按 §9 的同一公式估算 |
 | 容量估算 | `每任务字节 ≈ 4 × (payload + ~200 B 消息头)`；一个 1 KiB 回包的任务约 5 KiB。100 万任务 ≈ 5 GB，需按 `max_bytes` 预留 |
 | 投影 | 在 shard 的 ETS 里（Task 数 × 约 1–2 KiB，含 history）。随 retention 一起被约束——创建事件被 GC 后，下次 boot replay 会把该 Task 判为 `history_lost` 并补 `FAILED` |
-| 重启成本 | boot 全量重放扫全部分区（S9-B 的正确性基线）。节点上有 N GB 日志时启动时间是分钟级，**不是秒级**；`task_checkpoint_dir` 相关 env 已声明但当前不读（S9-F 演进位） |
+| 重启成本 | boot 全量重放扫全部分区（从 S9-B 起的正确性基线，S9-F 定稿继续沿用）。节点上有 N GB 日志时启动时间是分钟级，**不是秒级**；不存在 checkpoint 环境变量——S9-B 声明但从未被读的两个 env 已在 S9-F 作为死配置删除 |
 | 删除 | 没有单独的"删任务"接口：靠 retention 覆盖。删除 `$a2a/` 前缀数据只能走运维侧的 retention 配置 |
 
 ### 5.2 A2A 出站 Push 的运维面（S9-C）
@@ -554,9 +554,9 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | DLQ | 耗尽/过期写 `$a2a/push/dlq/<tenant>`（一条普通消息，`message_id` = taskId）。**没有自动重投**：谁订阅谁负责。它的 retention 与 §5.1 同一套 |
 | 容量 | DLQ 每条约几百字节；失败率高的部署要盯它，别让它悄悄占满分区 |
 | 阻塞性 | 投递**从不阻塞任务终态**：分片只 `cast` 一次。worker 崩溃丢的是在途通知，不是任务状态 |
-| 告警占位（S9-F 落地） | 失败路径计数器（`a2a_push_dlq` / `a2a_stream_*`）推迟到 S9-F 统一动冻结键集；当前盯日志 `a2a push skipped` / `a2a push dlq` |
+| 告警占位（S9-F 定稿：仍不加计数器） | 失败路径计数器（`a2a_push_dlq` / `a2a_stream_*` / MCP / ACP 失败事件）**不实现**，`broker_metrics` 键集保持 S9-A 之前的冻结集合；当前盯日志 `a2a push skipped` / `a2a push dlq`。见 `docs/security.md` §12.1 第 17 条 |
 
-**告警占位（S9-F 落地）**：S9-B/C 没有新增 `broker_metrics` 键——`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt`（S9-B）与 Push/Stream 失败计数器（S9-C）都推迟到 S9-F 统一动冻结键集时一并加。当前这些事件只进日志，运维侧按下面的日志特征盯：
+**告警占位（S9-F 定稿：计数器明确不加）**：S9-B/C/D/E 都没有新增 `broker_metrics` 键——`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt`（S9-B）、Push/Stream 失败计数器（S9-C）、MCP / ACP 的握手/权限/退出失败事件（S9-D/E）全部只进日志；S9-F 复核后**决定不为它们动冻结键集**，列为 `docs/security.md` §12.1 第 17 条。运维侧按下面的日志特征盯：
 
 | 现象 | 日志特征 | 含义 / 处置 |
 |---|---|---|

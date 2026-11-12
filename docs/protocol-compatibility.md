@@ -42,7 +42,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -57,8 +57,16 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
 | Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id；CONNECT 凭据（`token` / SASL PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema；TLS 由 S6 统一覆盖；订阅游标内存态；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
-| MCP（Streamable HTTP + stdio） | 支持子集（S9-D，**Broker 作网关**） | MCP `2026-07-28`：无状态逐请求（无 `initialize`/会话/`Mcp-Session-Id`）；`server/discover` 本地回答；`subscriptions/listen` 长活流（ack-first + 通知 + 心跳 + 优雅关流）；`tools`/`resources`/`prompts`/`completions` 原语**透传**到 `$mcp/<method>` 并取回结果（含 `notifications/progress`）；POST 单端点 `application/json`/`text/event-stream`；stdio 前端（newline 成帧、子进程订阅、`notifications/cancelled`）；HTTP 头门禁 `Origin`/`Accept`/`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` | 不解释/不执行工具语义（R-B1）、无 `sampling`/`elicitation`（-32601）、无 GET 流/`Last-Event-ID`/会话续传、无 `Mcp-Param-*` 强制校验、SSE 无 pending-bytes 上限、stdio 不做认证（进程即凭据）且 stdout 纯净性由部署 logger 配置保证、跨节点 reply 不支持；见 §4.17 | `apps/broker_proto_mcp/test/` |
-| ACP（v1，stdio） | 支持子集（S9-E，**Broker 作 Client**） | ACP v1：Broker 作 **Client**、agent 是本地子进程；`initialize`/`session/new`/`session/prompt` 由 Broker 主动发起；`session/request_permission` 是唯一实现的 Client 回调（默认拒绝 + allowlist + 超时 + 每次审计）；`session/cancel` 转发；`session/update` 折叠为 turn 投影写 `$acp/session/<id>`（含 `stopReason`）；prompt 经 `$acp/in/<agent>` 异步回读；`protocolVersion` 只接受 1 | **仅 stdio**（无 HTTP/WS listener、无 `listeners`）、无远程建连、无 `session/load`/`resume`/`list`/`authenticate`、`fs/*`/`terminal/*`/`elicitation/*` 全回 `-32601`（保持会话）、`clientCapabilities={}`、stdio 不做认证（进程即凭据）、跨节点 reply 不支持；见 §4.18 | `apps/broker_proto_acp/test/` |
+| A2A（1.0.0 JSON-RPC + SSE） | 支持子集（S9-A~S9-C，**Broker 作网关**） | JSON-RPC 2.0 传输绑定：`SendMessage`（含 `task_auto_complete` 内建 echo 执行器）、`GetTask`、`ListTasks`、`message/send` 别名；Task 状态机（SUBMITTED→WORKING→COMPLETED / FAILED / CANCELED / REJECTED / INPUT_REQUIRED）+ 事件溯源 + boot 全量重放（无 checkpoint）；Agent Card 发现（`/.well-known/agent-card.json`、`/agents/<id>`，按 tenant 隔离）；SSE 任务事件流（ack-first + 增量 + 优雅关流）；出站 Push Notification（HMAC-SHA256 签名 + SSRF 防护 + 防重放 + DLQ） | 单节点（跨节点 Task 访问无重定向/代理）；全量重放是可扩展性上界；无 JWT/JWKS/OAuth AS（`securitySchemes` 只声明外部 scheme，card 无签名，push 密钥在 env 非 KMS）；失败路径计数器未加（S9-F 定稿不加，见 `docs/security.md` §12.1 第 17 条）；`/agents` 是项目私有接口；默认 `listeners => []`；见 §4.14/§4.15/§4.16/§4.19 | `apps/broker_proto_a2a/test/`、`test/protocol-compatibility/a2a/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/a2a/`） |
+| MCP（Streamable HTTP + stdio） | 支持子集（S9-D，**Broker 作网关**） | MCP `2026-07-28`：无状态逐请求（无 `initialize`/会话/`Mcp-Session-Id`）；`server/discover` 本地回答；`subscriptions/listen` 长活流（ack-first + 通知 + 心跳 + 优雅关流）；`tools`/`resources`/`prompts`/`completions` 原语**透传**到 `$mcp/<method>` 并取回结果（含 `notifications/progress`）；POST 单端点 `application/json`/`text/event-stream`；stdio 前端（newline 成帧、子进程订阅、`notifications/cancelled`）；HTTP 头门禁 `Origin`/`Accept`/`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` | 不解释/不执行工具语义（R-B1）、无 `sampling`/`elicitation`（-32601）、无 GET 流/`Last-Event-ID`/会话续传、无 `Mcp-Param-*` 强制校验、SSE 无 pending-bytes 上限、stdio 不做认证（进程即凭据）且 stdout 纯净性由部署 logger 配置保证、跨节点 reply 不支持；见 §4.17 | `apps/broker_proto_mcp/test/`、`test/protocol-compatibility/mcp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/mcp/`） |
+| ACP（v1，stdio） | 支持子集（S9-E，**Broker 作 Client**） | ACP v1：Broker 作 **Client**、agent 是本地子进程；`initialize`/`session/new`/`session/prompt` 由 Broker 主动发起；`session/request_permission` 是唯一实现的 Client 回调（默认拒绝 + allowlist + 超时 + 每次审计）；`session/cancel` 转发；`session/update` 折叠为 turn 投影写 `$acp/session/<id>`（含 `stopReason`）；prompt 经 `$acp/in/<agent>` 异步回读；`protocolVersion` 只接受 1 | **仅 stdio**（无 HTTP/WS listener、无 `listeners`）、无远程建连、无 `session/load`/`resume`/`list`/`authenticate`、`fs/*`/`terminal/*`/`elicitation/*` 全回 `-32601`（保持会话）、`clientCapabilities={}`、stdio 不做认证（进程即凭据）、跨节点 reply 不支持；见 §4.18 | `apps/broker_proto_acp/test/`、`test/protocol-compatibility/acp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/acp/`） |
+
+**S9-F（2026-11-12）真实第三方客户端验证**：三个 agent 协议各用**上游官方 SDK** 跑过端到端证据——
+MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）、A2A `a2a-sdk 1.3.0`
+（§4.19），原始输出与跑法在 [`test/protocol-compatibility/s9f/`](../test/protocol-compatibility/s9f/)。
+上表「证据路径」仍是各 app 的 CT 套件；官方 SDK 证据是**额外的、非 CT 的**客户端矩阵，用来回答
+「真实第三方客户端能不能跑通」，同时把协议规范偏差（例如 §4.18.8 的 ACP `outcome` 嵌套缺陷）暴露出来。
+容量见 [`benchmarks/2026-11-12-s9f-capacity.md`](benchmarks/2026-11-12-s9f-capacity.md)。
 
 ---
 
@@ -857,7 +865,7 @@ content-type: application/json
 
 **恢复语义**（ADR-025 §D5/§D6）：
 
-- boot 全量重放（从各分区 offset 0 折叠 `$a2a/task/` 前缀事件），**不做增量 checkpoint**（checkpoint 是 S9-F 的演进位，`task_checkpoint_dir`/`task_checkpoint_interval_ms` 两个 env 已声明但当前不读）。
+- boot 全量重放（从各分区 offset 0 折叠 `$a2a/task/` 前缀事件），**不做增量 checkpoint**（S9-F 定稿：不实现，两个从未被读的 env 已作为死配置删除；见 §4.19 与 `docs/security.md` §12.1）。
 - 首条可见事件不是创建快照（创建事件已被 retention GC）→ 补一条服务端生成的 `FAILED` + `metadata.reason = history_lost` 终态事件，**不返回半截 Task**；补写事件自身可被下一次重放识别，因此重复 boot 幂等。
 - 分片串行化：`phash2(TaskId, N)` 定 shard，`create`/`cancel`/`apply_event` 都经该 shard 的 gen_server，"读状态→校验迁移→追加事件→更新投影" 对所有同 Task 请求原子。不同 Task 不同 shard 互不等待。
 - 一个 shard 崩了 → registry 是 `one_for_all`，整组重启并由 recovery 重放（ETS 缓存本就是缓存）。
@@ -872,7 +880,7 @@ content-type: application/json
 
 **身份解析（安全边界）**：`/.well-known/agent-card.json` 与 `/agents` 都**不需要凭据**，但**不是跨租户的**——无凭据时身份是 `agent_rpc_auth:anonymous()`，其 tenant 为 `broker_security:default_tenant()`（默认 `t0`）。所以「匿名可读」= **在默认租户内可读**，看不到 `t1`/`t2` 的卡。带凭据但凭据无效 → `401`（不是降级成匿名）。CT 与 `curl` 证据都按这条断言。
 
-**boot 种子**：`broker_proto_a2a.agent_cards` 是配置里的初始卡列表，`a2a_card:seed/0` 在 app 启动时幂等写入 `broker_meta`——内容与状态未变则**不 bump version**（否则每次重启都让所有客户端缓存失效）；格式不合法（缺 `name`/`description`/`supportedInterfaces`/`version`/`capabilities`/`defaultInputModes`/`defaultOutputModes`/`skills`）→ **启动失败**，不静默跳过。管理面 CRUD 留 S9-F。
+**boot 种子**：`broker_proto_a2a.agent_cards` 是配置里的初始卡列表，`a2a_card:seed/0` 在 app 启动时幂等写入 `broker_meta`——内容与状态未变则**不 bump version**（否则每次重启都让所有客户端缓存失效）；格式不合法（缺 `name`/`description`/`supportedInterfaces`/`version`/`capabilities`/`defaultInputModes`/`defaultOutputModes`/`skills`）→ **启动失败**，不静默跳过。管理面 CRUD **未排期**（S9-F 复核后不做，见 `docs/architecture.md` 的延期表）。
 
 ### 4.15.4 错误映射（新增部分）
 
@@ -968,9 +976,9 @@ $ curl -sS -X POST .../ -d '{"jsonrpc":"2.0","id":4,"method":"ListTasks",
 ### 4.15.7 已声明的限制 / 边界
 
 - **单节点**：投影在本地 shard 的 ETS；跨节点访问同一 Task（非 owner 节点 `GetTask`）没有重定向/代理，是 S9-C+ 的演进位。
-- **全量重放是可扩展性上界**：每次 boot 扫全部分区。`task_checkpoint_dir` / `task_checkpoint_interval_ms` 已声明但当前**不读**；持久化 checkpoint 留 S9-F。
+- **全量重放是可扩展性上界**：每次 boot 扫全部分区，启动时间随日志量增长（分钟级，见 `docs/operations.md`）；**不做持久化 checkpoint**（S9-F 定稿），S9-B 声明但从未被读的两个 env 已删除。
 - **无真实 agent 执行器**：`task_auto_complete=true` 时内建 echo agent 同步跑完；`false` 时 Task 停在 `SUBMITTED`，需要外部执行器调 `a2a_task_registry:apply_event/4`。两者都不是"agent 推理"。
-- **失败路径计数器未加**：`a2a_state_violation`/`a2a_task_history_lost`/`a2a_checkpoint_corrupt` 三个键推迟到 S9-F 统一动 `broker_metrics` 冻结键集时一并加。S9-B 用 `logger` 记事件，`snapshot/0` 的键集合不变。
+- **失败路径计数器未加**：`a2a_state_violation`/`a2a_task_history_lost`/`a2a_checkpoint_corrupt` 三个键**不加**（S9-F 定稿：不动 `broker_metrics` 冻结键集，见 `docs/security.md` §12.1 第 17 条）。S9-B 用 `logger` 记事件，`snapshot/0` 的键集合不变。
 - **`/agents` 是项目私有接口**：A2A spec 没有注册 API；客户端不能假设别家 A2A 服务有这个端点。
 - **Agent Card 无签名**：`securitySchemes` 只能声明外部 scheme/URL，不做 JWS/PKI（收敛报告 §13 非目标）。card 里不放静态密钥（R-D6）。
 - **默认仍不监听**：`listeners => []`。18093 只是本次证据端口。
@@ -1122,7 +1130,7 @@ body: {"_meta":{"unified-mq":{"kind":"statusUpdate","seq":2}},"statusUpdate":{"c
 - **DLQ 无消费者进程**：耗尽后写进 `$a2a/push/dlq/<tenant>` 即结束；谁订阅谁负责，Broker 不自动重投。
 - **SSE 无中间快照 resync**：目前靠「重订阅 offset 0 重放」；`sse_max_duration_ms` 到点关流，客户端自行重连。
 - **仍是单节点**：`SubscribeToTask`/Push 都在 Task 的 owner 节点（本地 shard ETS）；跨节点访问是 S9-C+ 演进位。
-- **失败路径计数器仍未加**：`a2a_push_dlq` / `a2a_stream_*` 等键推迟到 S9-F 统一动 `broker_metrics` 冻结键集；S9-C 只 `logger`。
+- **失败路径计数器仍未加**：`a2a_push_dlq` / `a2a_stream_*` 等键**不加**（S9-F 定稿，见 `docs/security.md` §12.1 第 17 条）；S9-C 只 `logger`。
 - **默认仍不监听**：`listeners => []`。18094/18095/18096 只是本次证据端口。
 
 ---
@@ -1333,8 +1341,40 @@ data: {"id":"sub-2","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/
 - **SSE 只有一个时长上限**：`sse_max_duration_ms`；没有 pending-bytes / send-timeout 闸门，慢客户端靠 socket 缓冲自然反压（ADR-025 §D7 的 `sse_max_pending_bytes` 未落地）。
 - **stdio 不做认证**：身份固定为匿名（默认租户）；进程访问权即凭据。stdout 纯净性依赖部署把 logger 指向 stderr。
 - **单节点**：reply 与 listen 都读 owner 节点的本地分区，跨节点 reply/订阅不支持（与 A2A Task 同一限制）。
-- **无新增指标键**：失败只 `logger`（S9-F 统一动 `broker_metrics` 冻结键集）。
-- **真实 MCP 客户端证据留 S9-F**：本节是 `curl` 原文 + 假后端；官方 SDK / MCP Inspector 的客户端矩阵按 Gate S9 第 1 项在 S9-F 统一取证。
+- **无新增指标键**：失败只 `logger`（S9-F 定稿不加计数器，见 `docs/security.md` §12.1 第 17 条）。
+- **真实 MCP 客户端证据见 §4.17.9**（`test/protocol-compatibility/s9f/mcp/`，官方 `mcp 2.3.0`）：能力协商 / 原语透传 / `subscriptions/listen` 三段的 SDK 侧原文。
+
+---
+
+### 4.17.9 官方 MCP SDK 客户端矩阵（S9-F，2026-11-12）
+
+**是什么**：`test/protocol-compatibility/s9f/mcp/mcp_sdk_client.py`，用上游官方 Python SDK
+`mcp 2.3.0`（dist 元数据 `LATEST_PROTOCOL_VERSION = 2026-07-28`，与 Broker 实现的版本一致）当
+**真实第三方 MCP 客户端**，跑证据节点 `127.0.0.1:18096`（`features => [tools, resources, prompts,
+completions]`、`require_auth => true`、用户 `mcp-evidence`/tenant `t1`）。原文输出：
+[`test/protocol-compatibility/s9f/mcp/sdk_mcp.out`](../test/protocol-compatibility/s9f/mcp/sdk_mcp.out)。
+三阶段分别对应 §4.17.1 的「本地方法」「原语透传」「长活流」。
+
+| SDK 阶段 | 调用 | 官方 SDK 观测 | 落到本实现的哪一条 |
+|---|---|---|---|
+| A 能力协商 | `Client(mode="auto")` → SDK 自探一次 `server/discover` 并 adopt | `protocol_version=2026-07-28`；`server_info: name='unified-mq', version='0.1.0'`；`capabilities={prompts:{}, resources:{}, tools:{}, completions:{}}`；`instructions: None`；随后 `list_tools()` 解析出 `['emit-list-change']` | §4.17.1 `server/discover` 本地回答 + `_meta.io.modelcontextprotocol/serverInfo`（**由 SDK 从 Broker 的 discover 回复解析，非自报**） |
+| B 透传调用 | `mode="2026-07-28"` 直接 adopt（2026 无握手），`list_tools` / `list_resources` / `list_prompts` | 每个结果都带 `_meta.io.modelcontextprotocol/serverInfo`、`ttl_ms=3600000`、`cache_scope=public`、`result_type=complete`；`resources/prompts` 为空数组 | §4.17.3 一次透传调用的总线协议（补 `serverInfo` 的 `with_server_info/1`） |
+| B 进度 + 结果 | `call_tool("emit-list-change", {"topic": ...}, progress_callback=…)` | 先 `notifications/progress`（`progress=1.0/2.0`），再终止 `result`（`content[0].text="backend echo: tools/call"`、`is_error=false`） | §4.17.1 `tools/call` 透传（`notifications/progress` 取请求 `_meta.progressToken`） |
+| B 未知工具名 | `call_tool("does-not-exist", {})` | SDK 打印 `Tool does-not-exist not listed by server, cannot validate any structured content`，**随后透传成功** | **R-B1 的实测证明**：网关不校验工具名，任意 name 原样发布到 `$mcp/tools/call`，由后端决定；假后端对任意名字都回包，这正是透传网关该有的行为 |
+| C 长活流 | `client.listen(tools_list_changed=True)` | `honored: tools_list_changed=True prompts_list_changed=None resources_list_changed=None resource_subscriptions=None`（只回显网关同意的子集）；另一客户端触发 `emit-list-change` 后本流收到 `ToolsListChanged()` 事件；客户端退出时流被 Broker 优雅关闭 | §4.17.4 `subscriptions/listen`（ack-first、honored 子集、转发 `notifications/tools/list_changed`、Graceful Closure） |
+
+**2026-07-28 无状态在 SDK 侧的两种读法**（都要如实记录）：
+
+- `mode="2026-07-28"`（pin）：SDK 不探测，直接 adopt 一个最小 discover 结果，所以进 `__aenter__`
+  时 `server_capabilities={}`、`server_info=None`。这不是 Broker 没给能力，而是**该版本协议把
+  `serverInfo` 标记成可选**，SDK 对「没探过」的会话如实报空——真正的协商证据在阶段 A 的
+  `mode="auto"`。
+- `mode="auto"`：SDK 真的发一次 `server/discover`、解析回复并 adopt，能力矩阵（tools/resources/
+  prompts/completions 四个对象、无 `list_changed`/`subscribe` 子能力）即 Broker `features` 配置的
+  忠实投影。
+
+**版本一致性**：`assert LATEST_PROTOCOL_VERSION == "2026-07-28"` 是客户端脚本自带的门禁；SDK 升版时
+该断言先失败，证据不会静默地拿错版本跑。
 
 ---
 
@@ -1422,8 +1462,8 @@ data: {"id":"sub-2","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/
 - **只做 Client 侧**：Broker 不扮演 ACP Agent（编辑器侧那端），也不做 `session/load` / `session/resume` / `session/list` / `authenticate`（v1 无鉴权方法）；agent 由运维静态声明。
 - **`fs` / `terminal` / `elicitation` 全拒绝**：Broker 不代理文件/终端/提权副作用，回 `-32601` 但保持会话。
 - **stdio 无认证**：信任边界是「谁能启动这个进程」，身份为匿名本地身份。
-- **无新增指标键**：握手失败 / 权限拒绝 / agent 退出只 `logger`（S9-F 统一动 `broker_metrics` 冻结键集）。
-- **真实 ACP 客户端证据留 S9-F**：本节是假 agent escript 走**生产 `acp_port` 传输**六场景 + 11 帧 client→agent 原文；官方 ACP client / Zed 等真实编辑器的客户端矩阵按 Gate S9 第 1 项在 S9-F 统一取证。
+- **无新增指标键**：握手失败 / 权限拒绝 / agent 退出只 `logger`（S9-F 定稿不加计数器，见 `docs/security.md` §12.1 第 17 条）。
+- **真实 ACP 客户端证据见 §4.18.8**（`test/protocol-compatibility/s9f/acp/`，官方 `agent-client-protocol 1.0.0` 当 Agent 服务端，Broker 作 Client 经生产 `acp_port` 拉起），并记录了 S9-F 因此修复的一处 wire 缺陷。
 
 ### 4.18.7 落地偏差（相对 ADR-026 §D5 冻结文本）
 
@@ -1436,6 +1476,123 @@ ADR-026 §D5 冻结文本未改，以下为「落地后修正」批注（详见 
 5. **`{line, 0}` 是非法端口选项**：`acp_port` 用 `{line, 1048576}`，超长行以 `{noeol,Chunk}` 分块到达、`feed_bytes/2` 重组；`open_port({spawn_executable,_})` 的 executable/argv/env 必须 string，`acp_port:open/1` 单点 `to_str/1` 把 binary 转 string。
 6. **prompt 读者按 destination 过滤**：瞬态读者只处理 `in_destination(name)`，绝不回读自身 `$acp/session/*` / `$acp/permission`（否则自激 prompt 循环）。
 
+### 4.18.8 官方 ACP SDK 真实客户端证据（S9-F，2026-11-12）+ 一处 wire 缺陷修复
+
+**是什么**：`test/protocol-compatibility/s9f/acp/acp_evidence.erl` 用**生产 `acp_port` 传输**拉起
+上游官方 ACP Python SDK（`agent-client-protocol 1.0.0`，顶层包名 `acp`，`PROTOCOL_VERSION=1`）当
+**Agent 服务端**——即 Zed / 编辑器那一端的真身，只不过跑成一个本地子进程。Broker 是 Client：主动发
+`initialize` / `session/new` / `session/prompt`，只接一个强制回调 `session/request_permission`，再读
+`$acp/session/<sid>` 的 turn 投影与 `$acp/permission` 的审计。
+
+- **驱动**：`acp_evidence:run/0`，依次跑 5 个场景，退出码 0。数据目录默认在 tmpfs
+  （`/tmp/opencode/s9f-evidence/data-acp`，配 `require_durable_fs => false`）——**只用于证据，不代表
+  交付配置的持久化性能**；要换持久化目录设 `S9F_ACP_DATA`。
+- **帧级证据**：`acp/acp_sdk_agent_tee.py` 是裸 agent 的旁路 tee（SDK 用 `connect_read_pipe(sys.stdin)`
+  读 fd 0，Python 层 stdin 包装会被绕过，所以在 fd 0 前接 OS 管道、线程原样落盘），因此
+  `acp/client_to_agent.jsonl`（7 帧）是**逐字节的 client→agent 原文**，不含 agent 侧日志。
+- **结果**（`acp/sdk_acp.out` 原文）：
+
+```
+== HANDSHAKE ==          state=ready   session_id=<<"acp-sdk-session-99a137fd">>
+== plain ==              agent_message_chunk×1 + turn stopReason=end_turn
+== permission(allow, kind=execute) ==  agent_message_chunk×1 + turn stopReason=end_turn
+== permission(allow) ==  $acp/permission: decision=selected, reason="matched allowlist", toolCall.kind=execute
+== permission(deny, kind=edit) ==      turn stopReason=refusal, updates=[]
+== permission(deny) ==  $acp/permission: decision=cancelled, reason="not in allowlist", toolCall.kind=edit
+== FINAL ==              state=gone   stop=<<"refusal">>
+```
+
+- **client→agent 帧**（`acp/client_to_agent.jsonl`）：`initialize` → `session/new`（带 `cwd` +
+  `mcpServers=[]`）→ 3×`session/prompt` → `session/request_permission`(allow) 回包 id=0 →
+  `session/request_permission`(deny) 回包 id=1。**两个回包都是规范嵌套结构**：
+
+```json
+{"id": 0, "jsonrpc": "2.0",
+ "result": {"_meta": {"unified-mq": {"decision": "allow", "toolCall": {"kind": "execute", ...}}},
+            "outcome": {"optionId": "allow-once", "outcome": "selected"},
+            "reason": "matched allowlist"}}
+{"id": 1, "jsonrpc": "2.0",
+ "result": {"_meta": {"unified-mq": {"decision": "deny", "reason": "not in allowlist", "toolCall": {"kind": "edit", ...}}},
+            "outcome": {"outcome": "cancelled"},
+            "reason": "not in allowlist"}}
+```
+
+授权带 `optionId`（SDK 给的 `allow-once`），拒绝**不带** `optionId`——与 ACP v1 `AllowedOutcome` /
+`DeniedOutcome` 的形状一一对应。
+
+#### 4.18.8.1 落地偏差：官方 SDK 暴露的 `outcome` 扁平缺陷（已修）
+
+ADR-026 §D5 冻结文本**未改**；本节是「落地后修正」批注。S9-F 第一次用官方 SDK 跑证据时，Agent 侧
+以 `model_validate` 校验回包，直接失败：
+
+```
+ACP session/prompt failed: #{<<"code">> => -32602, <<"data">> => #{<<"errors">> =>
+  [#{<<"input">> => <<"selected">>, <<"loc">> => [<<"outcome">>],
+     <<"msg">> => <<"Input should be a valid dictionary or object to extract fields from">>,
+     <<"type">> => <<"model_attributes_type">>]}, <<"message">> => <<"Invalid params">>}
+```
+
+原因：ACP v1 `RequestPermissionResponse.result.outcome` 是**判别联合**
+`DeniedOutcome | AllowedOutcome`（判别键 `outcome`），即一个**对象**：
+
+- `AllowedOutcome = {outcome: "selected", optionId: <str>, _meta?: ...}`
+- `DeniedOutcome  = {outcome: "cancelled"}`（**无** `optionId`）
+
+而 Broker 原来按内部 decision 的扁平形状发 `{"outcome": "selected", "optionId": "..."}`——`outcome`
+是裸字符串，任何合规 Agent 都会以 `model_attributes_type` 拒绝。这是**只有真实 SDK 客户端能暴露**的
+规范偏差（此前 `curl` + 假 agent 都按 Broker 自己的形状回包，自证循环）。
+
+**修复**（语义零变化，只改 wire 投影）：
+
+1. 新增 `acp_policy:wire/1`（并 export）与私有 `wire_meta/2`：把内部扁平 decision 转成规范嵌套
+   result 对象；`selected` 带 `optionId`（缺省 `null`），`cancelled` 不带；`reason` 与 `_meta`
+   （`_meta.unified-mq` 审计块）作为扩展成员随路——`_meta` 是 ACP 保留给实现自定义元数据的位置，
+   合规对端忽略未知成员（SDK 实测 `model_validate` 通过、`field_meta` 保留）。
+2. `acp_agent` 写 `session/request_permission` 回包处改调 `acp_policy:wire(Decision)`；**内部
+   decision 形状不变**（`decide/2` 的返回值、`audit_body/4`、`$acp/permission` 的投影、以及全部
+   依赖扁平 `outcome` 键的断言都保持原样）。
+3. 测试：`acp_policy_SUITE` 新增 `wire_result_is_nested`（列入 `policy` group），断言嵌套形状、
+   `_meta`/`reason` 随路、拒绝不带 `optionId`；`acp_agent_SUITE` 两处断言从扁平改为嵌套
+   （`allowlisted_tool_is_granted` / `non_allowlisted_tool_is_denied`）。
+4. **回归**：`rebar3 ct` **1063/1063、68 套件**（基线 1062 + 新增 1），`acp_policy_SUITE` 17 例、
+   `acp_agent_SUITE` 17 例；`rebar3 dialyzer` **0 warning**。
+5. 修复后重跑官方 SDK 证据：三个场景（plain / permission-allow / permission-deny）全通，帧原文即
+   上面 §4.18.8 的两段回包。
+
+**为什么这不算放宽 ADR-026**：ADR-026 §D5 冻结的是「`session/request_permission` 是唯一实现的 Client
+回调 + 默认拒绝 + allowlist + 审计」这些**语义**；嵌套 `outcome` 是 ACP v1 对同一语义的**wire 编码**。
+原实现编码错了，修正后语义一字未变——§4.18.4 的裁决顺序、§4.18.2 的三个目的地、§4.18.6 的限制全部照旧。
+
+
+---
+
+## 4.19 S9-F 追加（2026-11-12）：官方 A2A SDK 真实客户端证据
+
+**是什么**：`test/protocol-compatibility/s9f/a2a/a2a_sdk_client.py`，用上游官方 Python SDK
+`a2a-sdk 1.3.0`（**protobuf** API，`a2a.types` / `a2a.client.ClientFactory`）当**真实第三方 A2A
+客户端**，跑证据节点 `127.0.0.1:18094`（`task_auto_complete => true`、tenant `t2` 的
+`evidence-agent` 卡片）。原文输出：
+[`test/protocol-compatibility/s9f/a2a/sdk_a2a.out`](../test/protocol-compatibility/s9f/a2a/sdk_a2a.out)。
+
+| SDK 步骤 | 调用 | 官方 SDK 观测 | 落到本实现的哪一条 |
+|---|---|---|---|
+| 1 解析卡片 | `A2ACardResolver.get_agent_card()` | `name=unified-mq-evidence-agent`、`version=1.0.0`、`capabilities={streaming:false, push_notifications:false}`、`supported_interfaces=[{url, protocol_binding:JSONRPC}]`、`skills=[echo]` | §4.15.3 Agent Card 发现面（`/​.well-known/agent-card.json`，按 tenant 隔离） |
+| 2 建连 | `ClientFactory(ClientConfig(streaming=false, supported_protocol_bindings=["JSONRPC"], accepted_output_modes=["text"])).create_from_url(BASE)` | 非流式 `BaseClient` | §4.14 `A2A-Version` 协商 + JSON-RPC 绑定 |
+| 3 发任务 | `client.send_message(SendMessageRequest(message=Message(role=ROLE_USER, parts=[Part(text)])))` | `send_message` 返回 `AsyncIterator[StreamResponse]`，取到 `task.status.state=TASK_STATE_COMPLETED`、`history` 2 条（USER + AGENT） | §4.14 `SendMessage` + §4.15 的 `task_auto_complete` 内建执行器（SUBMITTED→WORKING→COMPLETED） |
+| 4 二次发任务 | 同上 | 新 `task_id`，状态 `TASK_STATE_COMPLETED` | Task 状态机可重复创建 |
+| 5 读回 | `client.get_task(GetTaskRequest(id=task_id))` | 直接返回 `Task`（**非** iterator）：`TASK_STATE_COMPLETED`、`history` 2 条 | §4.15 `GetTask`（按 id 读回事件溯源结果） |
+| 6 列举 | `client.list_tasks(ListTasksRequest(page_size=10))` | 直接返回响应：N 个任务**全部** `TASK_STATE_COMPLETED` | §4.15 `ListTasks`（分页 + 状态过滤面） |
+
+**如实记录两点**：
+
+- SDK 1.3.0 是 protobuf 客户端：`Message(message_id, role, parts=[Part(text)])`、
+  `SendMessageRequest(message=...)`、`GetTaskRequest(id=...)`（是 `id`，**不是** `name`）、
+  `ListTasksRequest(page_size=...)`。`send_message` 是 `AsyncIterator[StreamResponse]`，而
+  `get_task` / `list_tasks` 是**直接返回**——这是 SDK 的 API 形状差异，不是 Broker 的差异；
+  Broker 侧三种都是同一 JSON-RPC 请求的同步响应。
+- 本证据里 `task_auto_complete=true`，Broker 自己跑完生命周期；**没有**外部 agent 执行器，
+  因此不测量「真实 agent 推理」。`task_auto_complete=false` 时 Task 停在 `SUBMITTED`，需外部执行器
+  调 `a2a_task_registry:apply_event/4`（见 §4.15.7）。
 
 ---
 

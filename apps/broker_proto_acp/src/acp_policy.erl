@@ -15,10 +15,18 @@
 %%     the module stays pure.
 %%
 %% `outcome' values are ACP v1 `RequestPermissionOutcome': `selected' with an
-%% `optionId' when granting, `cancelled' when refusing.
+%% `optionId' when granting, `cancelled' when refusing. The decision map is the
+%% *internal* shape (flat `outcome') used by the audit body; `wire/1' converts it
+%% to the spec's nested result object at the JSON-RPC boundary. ACP v1
+%% `RequestPermissionResponse.result' is
+%%   {"outcome": {"outcome": "selected", "optionId": "..."}}
+%% -- i.e. an `AllowedOutcome' / `DeniedOutcome' *object*, not a bare string. A
+%% flat `{"outcome": "selected"}' is rejected by a conforming agent (the official
+%% `agent-client-protocol' SDK fails validation with `model_attributes_type'), so
+%% the conversion is mandatory, not cosmetic.
 -module(acp_policy).
 
--export([decide/2, decide/3, audit_body/4, default/0]).
+-export([decide/2, decide/3, audit_body/4, default/0, wire/1]).
 
 -type policy() :: #{default := deny | allow,
                     allow := [map()],
@@ -60,6 +68,28 @@ audit_body(Agent, SessionId, Params, Decision) ->
       <<"decision">> => maps:get(outcome, Decision),
       <<"reason">> => maps:get(reason, Decision, undefined),
       <<"toolCall">> => tool(Params)}.
+
+%% @doc Project a decision onto the ACP v1 `RequestPermissionResponse.result'
+%% body. The `_meta' extension block and the human `reason' ride along: `_meta'
+%% is reserved for exactly this and a conforming peer ignores unknown members.
+-spec wire(map()) -> map().
+wire(#{outcome := <<"selected">>} = Decision) ->
+    Outcome = #{<<"outcome">> => <<"selected">>,
+                <<"optionId">> => maps:get(optionId, Decision, null)},
+    wire_meta(Decision, #{<<"outcome">> => Outcome});
+wire(#{outcome := <<"cancelled">>} = Decision) ->
+    Outcome = #{<<"outcome">> => <<"cancelled">>},
+    wire_meta(Decision, #{<<"outcome">> => Outcome}).
+
+wire_meta(Decision, Body) ->
+    WithReason = case maps:get(reason, Decision, undefined) of
+                     undefined -> Body;
+                     Reason -> Body#{<<"reason">> => Reason}
+                 end,
+    case maps:get('_meta', Decision, undefined) of
+        undefined -> WithReason;
+        Meta -> WithReason#{<<"_meta">> => Meta}
+    end.
 
 %%%_* Internal ---------------------------------------------------------------
 

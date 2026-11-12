@@ -1,0 +1,30 @@
+=== official A2A SDK client (a2a-sdk 1.3.0, protobuf) ===
+a2a-sdk version: 1.3.0
+
+[1] resolving Agent Card from http://127.0.0.1:18094/.well-known/agent-card.json
+    name: unified-mq-evidence-agent
+    description: S9-F evidence A2A agent
+    version: 1.0.0
+    capabilities: {'streaming': False, 'push_notifications': False}
+    supported interfaces: [{'url': 'http://127.0.0.1:18094/', 'protocol_binding': 'JSONRPC'}]
+    skills: ['echo']
+
+[2] creating client (non-streaming) ...
+    client: BaseClient
+
+[3] SendMessage (task_auto_complete=true) ...
+    StreamResponse: {"task": {"id": "5FXWf0W8f06A4zyx8jPW5Q", "context_id": "_Q78HhoffCqS-qXGnhNpUA", "status": {"state": "TASK_STATE_COMPLETED", "timestamp": "2026-11-12T12:59:17.097Z"}, "history": [{"message_id": "s9f-msg", "context_id": "_Q78HhoffCqS-qXGnhNpUA", "task_id": "5FXWf0W8f06A4zyx8jPW5Q", "role": "ROLE_USER", "parts": [{"text": "S9-F evidence: run the lifecycle"}]}, {"message_id": "pyrSpEjmtG7zbkpeymXvFw", "context_id": "_Q78HhoffCqS-qXGnhNpUA", "task_id": "5FXWf0W8f06A4zyx8jPW5Q", "role": "ROLE_AGENT", "parts": [{"text": "S9-F evidence: run the lifecycle"}]}]}}
+
+[4] second SendMessage ...
+    task id: cKSH0NN6Mua_pdSiPg9j_A
+    task state: TASK_STATE_COMPLETED
+
+[5] GetTask cKSH0NN6Mua_pdSiPg9j_A ...
+    task id: cKSH0NN6Mua_pdSiPg9j_A
+    task state: TASK_STATE_COMPLETED
+    history entries: 2
+
+[6] ListTasks ...
+    tasks: 2 ['TASK_STATE_COMPLETED', 'TASK_STATE_COMPLETED']
+
+=== A2A SDK evidence complete ===

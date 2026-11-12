@@ -151,3 +151,14 @@ S9-D 要在 ADR-026 的 Agent 接入前端骨架上加第四个 adapter app `bro
 13. **`initialize` 明确为未知方法**（§D4 的「定为 `-32601`」落地为 404，与第 1 条同一映射）；`sampling/*`/`elicitation/*` 同样是 404 + `-32601` + `data.reason`，不单独返回 200。
 14. **`server/discover` 的 `serverInfo.version`** 取 app vsn 并转成 JSON string（`"0.1.0"`）；`instructions` 为 `undefined` 时省略该键。
 
+### 定稿说明（S9-F，2026-11-12）
+
+S9-F 用官方 `mcp 2.3.0` 当真实第三方客户端复核，**未发现需要改代码的偏差**，上文 14 条落地偏差全部维持：
+
+- 能力协商（`mode="auto"`）由 SDK 自己发 `server/discover` 并 adopt，回读到的 `protocol_version=2026-07-28`、`serverInfo`、`capabilities={tools,resources,prompts,completions}` 就是 §D3 的 `features` 投影；
+- §D5 的 `subscriptions/listen` 被 SDK 的 `client.listen(tools_list_changed=True)` 正常使用（`honored` 子集 + 真实 `ToolsListChanged()` 事件 + 客户端退出时优雅关流）；
+- 「不解释工具语义」（R-B1）在 SDK 侧表现为 `call_tool("does-not-exist")` **透传成功**——这是设计而非缺陷；
+- 第 4 条的两个必填 `_meta` 项、第 11 条的 SSE 时间上限、第 13 条的 `initialize`/`sampling`/`elicitation` → `-32601` 都在 SDK 实测下成立。
+
+证据原文见 `test/protocol-compatibility/s9f/mcp/sdk_mcp.out` 与 `docs/protocol-compatibility.md` §4.17.9。
+

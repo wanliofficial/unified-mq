@@ -1,0 +1,28 @@
+Traceback (most recent call last):
+  File "/tmp/opencode/s9f-evidence/bench/mcp_bench.py", line 18, in <module>
+    from mcp import Client
+  File "/tmp/opencode/s9f-libs/mcp/__init__.py", line 1, in <module>
+    from mcp_types import (
+    ...<56 lines>...
+    )
+  File "/tmp/opencode/s9f-libs/mcp_types/__init__.py", line 8, in <module>
+    from mcp_types._types import (
+    ...<190 lines>...
+    )
+  File "/tmp/opencode/s9f-libs/mcp_types/_types.py", line 13, in <module>
+    from pydantic import (
+    ...<6 lines>...
+    )
+  File "/tmp/opencode/s9f-libs/pydantic/__init__.py", line 5, in <module>
+    from ._migration import getattr_migration
+  File "/tmp/opencode/s9f-libs/pydantic/_migration.py", line 5, in <module>
+    from pydantic.warnings import PydanticDeprecatedSince20
+  File "/tmp/opencode/s9f-libs/pydantic/warnings.py", line 5, in <module>
+    from .version import version_short
+  File "/tmp/opencode/s9f-libs/pydantic/version.py", line 7, in <module>
+    from pydantic_core import __version__ as __pydantic_core_version__
+  File "/tmp/opencode/s9f-libs/pydantic_core/__init__.py", line 8, in <module>
+    from ._pydantic_core import (
+    ...<21 lines>...
+    )
+ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'

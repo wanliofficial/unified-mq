@@ -1,0 +1,24 @@
+{
+  "protocol": "A2A",
+  "sdk": "a2a-sdk 1.3.0 (protobuf)",
+  "operation": "SendMessage with task_auto_complete (full gateway round trip)",
+  "sequential": {
+    "samples": 200,
+    "wall_ms": 3208.4,
+    "throughput_per_s": 62.3,
+    "p50_ms": 15.188,
+    "p95_ms": 23.64,
+    "p99_ms": 28.297,
+    "mean_ms": 16.035
+  },
+  "concurrent": {
+    "concurrency": 16,
+    "samples": 192,
+    "wall_ms": 1277.7,
+    "throughput_per_s": 150.3,
+    "p50_ms": 49.082,
+    "p95_ms": 257.086,
+    "p99_ms": 522.297,
+    "mean_ms": 87.573
+  }
+}

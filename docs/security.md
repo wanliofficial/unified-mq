@@ -247,3 +247,37 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 9. **MQTT over QUIC 的 0-RTT early data 与多流模式未实现**（S8-D 只做 CN Draft 3 的单流模式）：0-RTT 是 CN 的可选项，本轮不接收；多流是 EMQX 私有扩展，不在规范内。QUIC 本身**强制 TLS 1.3**（无明文模式），证书来源见 §9 与 `docs/operations.md` §1.2——`tls.enabled` 对它是「证书来源」而不是开关。另：quicer 0.4.12 不支持运行期补充流信用，`max_streams_per_conn` 是建连时的一次性配额。
 
 六协议统一走 `broker_security` 身份表已于 2026-11-09 完成，见 §2.1，不再列为待办。
+
+### 12.1 S9-F（2026-11-12）明确未实现项
+
+S9 三协议（A2A / MCP / ACP）接入前端后，以下项**仍未实现**，逐条留痕（不作为 Gate 依据，`progress.md` 有同一份清单）：
+
+**MCP（`broker_proto_mcp`）**
+
+1. 无 `sampling/*`（server→client 反向采样）、无 `elicitation/*`：一律 `-32601`（§4.17.1），网关不代理客户端侧能力。
+2. 无 GET 流 / `Last-Event-ID` / 会话续传：2026-07-28 无状态，每请求自带版本与能力（§4.17.8）。
+3. `Mcp-Param-*`（源自 `x-mcp-header`）不强制：网关没有后端 `inputSchema`，无法判断该不该出现，只按「accepted, not enforced」记录（§4.17.8）。
+4. SSE 无 pending-bytes / send-timeout 闸门：慢客户端靠 socket 缓冲自然反压（ADR-025 §D7 的 `sse_max_pending_bytes` 未落地，§4.17.8）。
+5. stdio 无认证：身份固定为匿名本地身份，信任边界是「谁能启动这个进程」；stdout 纯净性靠部署把 logger 指向 stderr（§4.17.8）。
+6. 工具名 / 参数不校验：网关只透传不解释（R-B1），校验在后端；S9-F 官方 SDK 证据里 `call_tool("does-not-exist")` 因此**透传成功**，这是设计而非缺陷（§4.17.9）。
+7. 无 GET / `initialize` 握手（2026-07-28 无该概念），未广告 feature 下的方法一律 `-32601`（§4.17.1）。
+
+**ACP（`broker_proto_acp`）**
+
+8. 仅 stdio：无 HTTP / WebSocket listener、无 `listeners` 配置项、无远程建连（§4.18.6）。
+9. `fs/*`、`terminal/*`、`elicitation/*` 全回 `-32601` 且**保持会话**（Broker 不代理文件/终端/提权副作用，§4.18.1/§4.18.6）。
+10. 无沙箱：agent 子进程由运维用绝对路径 + 白名单 env 启动（`acp_port` 不经 shell），但 Broker **不**对 agent 的文件/网络访问做任何隔离——隔离是部署（容器/用户）的职责。
+11. `clientCapabilities` 恒为 `{}`，不做 `session/load` / `resume` / `list` / `authenticate`（v1 无鉴权方法，§4.18.1）。
+12. `request_permission` 的 wire 形状按 ACP v1 嵌套 `outcome` 发送（`acp_policy:wire/1`，§4.18.8.1）；**v2 未实现**（ACP v2 仍 WIP，`acp/experimental/v2` 不在交付范围）。
+
+**A2A（`broker_proto_a2a`）**
+
+13. 无跨节点：Task 投影在本地 shard 的 ETS，非 owner 节点访问同一 Task 没有重定向/代理（§4.15.7/§4.16.7）。
+14. 无 JWT / JWKS / OAuth Authorization Server：`securitySchemes` 只**声明**外部 scheme，card 不做 JWS/PKI，push 密钥在 env 而非 KMS（收敛报告 §13 非目标，§4.15.7）。
+15. push 密钥来源是进程环境变量（`push_secret_env`），无 KMS/HSM 集成、无密钥轮换钩子（§4.16.3）。
+
+**三者共同**
+
+16. 单节点、回环 listener（18094/18096 绑 `127.0.0.1`，且默认 `listeners => []` 不监听）。
+17. **失败路径计数器未加**：`broker_metrics` 的键集仍是 S9-A 之前的冻结集合；`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt` / `a2a_push_dlq` / `a2a_stream_*` 以及 MCP / ACP 侧的失败事件**只 `logger`**，不进指标。**S9-F 复核后的最终结论是不加**：`broker_metrics` 的冻结键集（ADR-016）不为这三个前端的失败路径扩容，运维按日志特征盯（`docs/operations.md` §告警占位）。
+18. 压测/容量证据（`docs/benchmarks/2026-11-12-s9f-capacity.md`）跑在 tmpfs 数据目录 + `require_durable_fs => false` 的证据节点上，只覆盖单节点回环、无 fsync 的端到端往返；**交付配置（ext4 WAL、多节点、公网 TLS）的容量数字需另行测量**，本报告不声称 ext4 持久化性能。
