@@ -244,11 +244,8 @@ S10 拟用：**8084/TCP**（信令，wss）、**3478/UDP**（STUN/TURN）、**49
 
 ## 5. S10-A 入口条件
 
-1. ADR-028 / ADR-029 评审签认并落盘（本文 §3 的条目为底稿）。
-2. 一个 **spike**（`spikes/s10_0_ws_signal/`，独立 rebar3 项目，不进 umbrella）：
-   - 用 `ranch 2.3.0` + `ws_handshake`/`ws_frame` 在临时端口起一个 wss listener；
-   - 用 Python `websockets` 客户端完成：握手 + `authenticate` + 纯文本 `ping`/`pong` + 一条 `to` 转发；
-   - 记录：握手字节数、帧类型策略、原生 ping 与文本 ping 的并存行为。
+1. ~~ADR-028 / ADR-029 评审签认并落盘~~ → **已签认落盘（2026-11-13）**：`docs/adr/028-webrtc-signaling-kernel-boundary.md`、`docs/adr/029-ice-component-and-port-matrix.md`。
+2. ~~一个 **spike**（`spikes/s10_0_ws_signal/`）~~ → **已交付（2026-11-13）**，结论见 [`spikes/s10_0_ws_signal/REPORT.md`](../../spikes/s10_0_ws_signal/REPORT.md)：`ranch_tcp` 与 `ranch_ssl` **共用一份连接模块**（101 响应都 164 字节、wss 协商到 TLSv1.3）、子协议缺失即 400、文本 `ping` 与 opcode 9/10 并存、binary → close 1003、`to` 走进程直投且 SDP 不变、`peer_id` 服务端铸造。**唯一姿态修正**：spike 用 `{path, "../../apps/broker_ws"}` 而非 `_checkouts` 符号链接——后者在 `_build/test` 下不生效（eunit `undef`）。
 3. 基线确认：`rebar3 ct` 1063/1063（S10-A 不得先降后升）；`dialyzer` 0 warning。
 4. `docs/operations.md` 端口表新增 8084/3478 的**计划**标注（明确「未实现」），避免与现状混淆。
 5. `docs/design/s10-execution-plan.md` 与本次签认结果对齐（DoD / 测试矩阵 / 依赖表如有改动，回写到该文件而不是只留在评审记录里）。

@@ -1,0 +1,8 @@
+{application, s10_0_ws_signal,
+ [{description, "S10-0 spike: WSS signaling front-end feasibility (ranch + broker_ws, ADR-028)"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {s10_0_ws_signal_app, []}},
+  {applications, [kernel, stdlib, sasl, crypto, ranch, broker_ws]},
+  {env, []}
+ ]}.

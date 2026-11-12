@@ -23,6 +23,13 @@ spikes/*/data/
 spikes/*/logs/
 spikes/*/priv/data/
 
+# S10-0 spike: scratch output of ./run_spike.sh and ./run_wss.sh
+spikes/s10_0_ws_signal/*.out
+spikes/s10_0_ws_signal/*.txt
+spikes/s10_0_ws_signal/certs/
+spikes/s10_0_ws_signal/erl_crash.dump
+spikes/s10_0_ws_signal/__pycache__/
+
 # local overrides
 config/*.secret.config
 .env.local
