@@ -89,8 +89,7 @@ stream(Transport, Socket, Plan, From, Deadline) ->
                     case await(Transport, Socket, Next, Deadline) of
                         {ok, Next2} -> stream(Transport, Socket, Plan, Next2, Deadline);
                         closed -> closed;
-                        stopped -> stopped;
-                        error -> closed
+                        stopped -> stopped
                     end;
                 closed ->
                     closed;

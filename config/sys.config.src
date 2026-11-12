@@ -250,7 +250,37 @@
     %% SSE is not wired to a method until S9-C; the limits exist now so the
     %% library and the eventual stream share one source.
     {sse_max_event_bytes, 1048576},
-    {sse_heartbeat_ms, 15000}
+    {sse_heartbeat_ms, 15000},
+    %% S9-C: a stream has a hard ceiling so a task that never terminates cannot
+    %% hold a connection (and its retention pin) forever.
+    {sse_max_duration_ms, 1800000},
+    %% S9-C: outbound push notifications (ADR-026 §D6). Off by default: with
+    %% `push_enabled => false' the push worker is not in the supervision tree
+    %% and `CreateTaskPushNotificationConfig' answers -32003 / HTTP 400.
+    {push_enabled, false},
+    %% Two independent allowlists must both admit the endpoint (host suffix
+    %% match). An empty global list blocks every push; `allow_private => true'
+    %% on a matching entry is the only way a loopback/private target is legal.
+    {egress_allowlist, []},
+    {push_tenant_allowlist, #{}},
+    %% HMAC secrets for the `hmac-sha256' auth scheme, keyed by config id. Kept
+    %% out of `broker_meta' on purpose: the row names the scheme, never the
+    %% secret.
+    {push_auth_secrets, #{}},
+    %% Cleartext webhooks are refused unless this is true (TLS is the default).
+    {push_allow_http, false},
+    %% Retry envelope: attempts and delay grow exponentially up to the cap;
+    %% after either the attempt cap or the TTL the failure lands on
+    %% `$a2a/push/dlq/<tenant>'.
+    {push_max_attempts, 5},
+    {push_base_backoff_ms, 500},
+    {push_max_backoff_ms, 30000},
+    {push_ttl_ms, 900000},
+    %% Per-request connect/recv budget and the response body ceiling; a webhook
+    %% answer is read only for its status line, never trusted as a payload.
+    {push_timeouts, #{connect_ms => 5000, recv_ms => 10000}},
+    {push_max_response_bytes, 65536},
+    {push_inet_family, inet}
   ]},
 
   {broker_proto_mqtt_ws, [

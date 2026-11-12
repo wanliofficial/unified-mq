@@ -335,9 +335,7 @@ a2a_stream_plan(Id, TaskId, TenantId) ->
                     {ok, #{id => Id,
                            task_id => TaskId,
                            destination => Destination,
-                           partition => Partition}};
-                _ ->
-                    {error, internal_error}
+                           partition => Partition}}
             catch
                 _:_ -> {error, internal_error}
             end;

@@ -234,10 +234,6 @@ maybe_push(Proj, Body) ->
             TenantId = a2a_task_projection:tenant_id(Proj),
             Rows = try broker_meta:push_configs(TenantId, TaskId)
                    catch _:_ -> [] end,
-            _ = file:write_file("/tmp/a2a_push_diag.log",
-                io_lib:format("maybe_push tenant=~s task=~s rows=~p~n",
-                              [TenantId, TaskId, length(Rows)]),
-                [append]),
             case Rows of
                 [] ->
                     ok;

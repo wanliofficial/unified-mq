@@ -150,10 +150,6 @@ ttl_ms() ->
 %% Exhausted (or expired): write the failure to the DLQ destination. A DLQ
 %% write failure is logged, never raised: the task already ended.
 drop(#pending{} = Pending, Reason, State) ->
-    _ = file:write_file("/tmp/a2a_push_diag.log",
-        io_lib:format("drop tenant=~p task=~p reason=~p~n",
-                      [Pending#pending.tenant, Pending#pending.task_id, Reason]),
-        [append]),
     _ = write_dlq(Pending, Reason),
     State#state{dropped = State#state.dropped + 1}.
 

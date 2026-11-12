@@ -715,8 +715,8 @@ wait_for_dlq_loop(Tenant, TaskId, Deadline) ->
     end.
 
 contains(TaskId, Msg) ->
-    binary:match(element(1, Msg), TaskId) =/= nomatch orelse
-        binary:match(element(2, Msg), TaskId) =/= nomatch.
+    binary:match(element(2, Msg), TaskId) =/= nomatch orelse
+        binary:match(element(5, Msg), TaskId) =/= nomatch.
 
 all_messages() ->
     lists:append([partition_messages(P) || P <- broker_queue:partition_ids()]).
@@ -728,7 +728,7 @@ partition_messages(Partition, From, Acc) ->
     case broker_queue:read_from(Partition, From, 1000) of
         {ok, [], _Next} -> Acc;
         {ok, Page, Next} ->
-            Acc1 = Acc ++ [{Partition, element(3, M), M} || {_, M} <- Page],
+            Acc1 = Acc ++ [{Partition, element(4, M), M} || {_, M} <- Page],
             case Next > From of
                 true -> partition_messages(Partition, Next, Acc1);
                 false -> Acc1

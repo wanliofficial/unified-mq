@@ -181,20 +181,15 @@ host_matches(Host, Exact) ->
 
 resolve_and_validate(Host, Port, Path, Scheme, AllowPrivate) ->
     case resolve(Host, Port) of
-        {ok, Addresses} ->
+        {ok, Addresses} when Addresses =/= [] ->
             case AllowPrivate orelse lists:all(fun is_public/1, Addresses) of
                 true ->
-                    case Addresses of
-                        [] ->
-                            {error, no_address};
-                        _ ->
-                            {ok, #{scheme => Scheme,
-                                   host => Host,
-                                   port => Port,
-                                   path => Path,
-                                   addresses => Addresses,
-                                   allow_private => AllowPrivate}}
-                    end;
+                    {ok, #{scheme => Scheme,
+                           host => Host,
+                           port => Port,
+                           path => Path,
+                           addresses => Addresses,
+                           allow_private => AllowPrivate}};
                 false ->
                     {error, private_address}
             end;
