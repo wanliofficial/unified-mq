@@ -17,7 +17,9 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Children = [registry_spec() | [listener_spec(Spec) || Spec <- listeners()]],
+    Children = [registry_spec()]
+        ++ push_worker_specs()
+        ++ [listener_spec(Spec) || Spec <- listeners()],
     {ok, {#{strategy => one_for_one, intensity => 1, period => 5}, Children}}.
 
 registry_spec() ->
@@ -27,6 +29,22 @@ registry_spec() ->
       shutdown => 10000,
       type => supervisor,
       modules => [a2a_task_registry]}.
+
+%% The push worker exists only when egress is enabled (ADR-026 §D6.1). When it
+%% is disabled the RPC layer refuses every push config, so there is nothing to
+%% deliver and no process to run.
+push_worker_specs() ->
+    case application:get_env(broker_proto_a2a, push_enabled, false) of
+        true ->
+            [#{id => a2a_push_worker,
+               start => {a2a_push_worker, start_link, []},
+               restart => permanent,
+               shutdown => 5000,
+               type => worker,
+               modules => [a2a_push_worker]}];
+        false ->
+            []
+    end.
 
 listeners() ->
     application:get_env(broker_proto_a2a, listeners, []).

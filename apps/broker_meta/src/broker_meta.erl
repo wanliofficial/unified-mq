@@ -22,6 +22,8 @@
          put_partition/1, get_partition/1,
          put_node/2, nodes/0,
          put_agent_card/1, get_agent_card/2, delete_agent_card/2, agent_cards/1,
+         put_push_config/1, get_push_config/3, push_configs/2,
+         delete_push_config/3, delete_push_configs/1,
          version/0, bump_version/1,
          enqueue/2, pending_outbox/0, mark_published/1]).
 
@@ -51,7 +53,16 @@ tables() ->
      %% is the source of the Agent Card ETag. Cards carry no static secrets
      %% (R-D6); `securitySchemes' may declare an external scheme/URL only.
      {agent_card,     [agent_card, agent_ref, tenant_id, version, status,
-                       card, extended_card, updated_at]}].
+                       card, extended_card, updated_at]},
+     %% S9-C (ADR-026 §D6 / s9-0-convergence-report.md §8): push notification
+     %% configs. Low-frequency, tenant-isolated control plane: one row per
+     %% (tenant, task, config_id). `url' is the client-provided webhook endpoint
+     %% (the SSRF guard lives in the adapter, not here); `auth_scheme' is only a
+     %% *name* -- the material itself stays in node config and is never
+     %% persisted to Mnesia (ADR-026 §D6.6). `allow_private' is the explicit
+     %% per-entry exception for loopback/CI endpoints.
+     {push_config,    [push_config, push_ref, tenant_id, task_id, config_id,
+                       url, auth_scheme, allow_private, updated_at, version]}].
 
 %% @doc Create the schema if this node has none, start Mnesia, create any
 %% missing table and wait for all of them. Returns an error instead of booting a
@@ -253,6 +264,68 @@ delete_agent_card(Tenant, Agent) when is_binary(Tenant), is_binary(Agent) ->
 -spec agent_cards(binary()) -> [tuple()].
 agent_cards(Tenant) ->
     [R || R <- all(agent_card), element(3, R) =:= Tenant].
+
+%%%_* Push notification configs (S9-C, ADR-026 §D6) ------------------------
+
+%% @doc Create or replace a push config and bump its per-config version.
+%%
+%% `config_id' is server-generated (not client-supplied) to prevent enumeration
+%% attacks. The read-modify-write runs in one transaction so concurrent updates
+%% to the same `{TenantId, TaskId, ConfigId}' cannot both win.
+%%
+%% `auth_scheme' and `secret' come from server config, never from the client
+%% (ADR-026 §D6.6); the adapter is responsible for refusing configs when the
+%% required secrets are unavailable.
+-spec put_push_config(map()) -> {ok, non_neg_integer()} | {error, term()}.
+put_push_config(#{tenant_id := Tenant, task_id := Task, config_id := Config} = Spec)
+  when is_binary(Tenant), is_binary(Task), is_binary(Config) ->
+    Url = maps:get(url, Spec, <<>>),
+    AuthScheme = maps:get(auth_scheme, Spec, undefined),
+    AllowPrivate = maps:get(allow_private, Spec, false),
+    Ref = {Tenant, Task, Config},
+    Transaction =
+        fun() ->
+                Prev = case mnesia:read(push_config, Ref, write) of
+                           [{push_config, _, _, _, _, _, _, _, _, V}] -> V;
+                           [] -> 0
+                       end,
+                Version = Prev + 1,
+                ok = mnesia:write(
+                       {push_config, Ref, Tenant, Task, Config, Url,
+                        AuthScheme, AllowPrivate, now_ms(), Version}),
+                Version
+        end,
+    case mnesia:transaction(Transaction) of
+        {atomic, Version} -> {ok, Version};
+        {aborted, Reason} -> {error, Reason}
+    end;
+put_push_config(Other) ->
+    {error, {invalid_push_config, Other}}.
+
+%% @doc Read one push config by full ref.
+-spec get_push_config(binary(), binary(), binary()) -> {ok, tuple()} | not_found.
+get_push_config(Tenant, Task, Config)
+  when is_binary(Tenant), is_binary(Task), is_binary(Config) ->
+    get(push_config, {Tenant, Task, Config}).
+
+%% @doc All push configs for one task, so CRUD listings never leak across tasks.
+-spec push_configs(binary(), binary()) -> [tuple()].
+push_configs(Tenant, Task) ->
+    [R || R <- all(push_config),
+            element(3, R) =:= Tenant, element(4, R) =:= Task].
+
+-spec delete_push_config(binary(), binary(), binary()) -> ok | {error, term()}.
+delete_push_config(Tenant, Task, Config)
+  when is_binary(Tenant), is_binary(Task), is_binary(Config) ->
+    delete(push_config, {Tenant, Task, Config}).
+
+%% @doc All push configs of one tenant, used when a task is deleted (cleanup).
+-spec delete_push_configs(binary()) -> [tuple()].
+delete_push_configs(Tenant) ->
+    Refs = [R || R <- all(push_config), element(3, R) =:= Tenant],
+    Fun = fun() -> lists:foreach(fun(R) -> mnesia:delete_object(R) end, Refs) end,
+    _ = mnesia:transaction(Fun),
+    Refs.
 
 %%%_* Config version and outbox -------------------------------------------
 

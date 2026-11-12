@@ -21,6 +21,7 @@ all() ->
      partition_and_node_metadata,
      agent_card_crud_bumps_version,
      agent_card_registration_is_serialized,
+     push_config_crud_and_tenant_isolation,
      version_bump_broadcasts,
      reconcile_notices_a_direct_table_write,
      outbox_stays_pending_without_a_publisher,
@@ -66,7 +67,7 @@ schema_has_the_frozen_tables(_Config) ->
     ?assertEqual([tenant, broker_user, acl_rule, topic_meta, queue_meta,
                   binding_meta, subscription_meta, cluster_node,
                   partition_meta, config_version, config_outbox,
-                  agent_card], Names),
+                  agent_card, push_config], Names),
     %% ADR-002 boundary: no message body / ack / cursor table.
     lists:foreach(
       fun(Forbidden) ->
@@ -247,6 +248,64 @@ outbox_publishes_and_marks_rows(_Config) ->
     All = broker_meta:all(config_outbox),
     2 = length(All),
     true = lists:all(fun(R) -> element(6, R) =/= undefined end, All),
+    ok.
+
+push_config_crud_and_tenant_isolation(_Config) ->
+    Tenant = <<"t1">>,
+    Task1 = <<"task-aaa">>,
+    Task2 = <<"task-bbb">>,
+    ConfigId = <<"cfg-111">>,
+    %% Create: the row carries a scheme *name* only, never key material.
+    {ok, V1} = broker_meta:put_push_config(#{tenant_id => Tenant,
+                                             task_id => Task1,
+                                             config_id => ConfigId,
+                                             url => <<"https://example.com/hook">>,
+                                             auth_scheme => <<"bearer">>,
+                                             allow_private => false}),
+    ?assertEqual(1, V1),
+    %% Read back
+    {ok, Row1} = broker_meta:get_push_config(Tenant, Task1, ConfigId),
+    ?assertMatch({push_config, {Tenant, Task1, ConfigId}, Tenant, Task1, ConfigId,
+                  <<"https://example.com/hook">>, <<"bearer">>, false, _, 1},
+                 Row1),
+    %% Update bumps version
+    {ok, V2} = broker_meta:put_push_config(#{tenant_id => Tenant,
+                                             task_id => Task1,
+                                             config_id => ConfigId,
+                                             url => <<"https://other.com/hook">>,
+                                             auth_scheme => <<"api_key">>,
+                                             allow_private => true}),
+    ?assertEqual(2, V2),
+    %% List by task
+    Task1Configs = broker_meta:push_configs(Tenant, Task1),
+    ?assertEqual(1, length(Task1Configs)),
+    ?assertMatch({push_config, {Tenant, Task1, ConfigId}, _, _, _,
+                  <<"https://other.com/hook">>, <<"api_key">>, true, _, 2},
+                 hd(Task1Configs)),
+    %% Tenant isolation: another tenant cannot see it
+    {ok, _} = broker_meta:put_push_config(#{tenant_id => <<"t2">>,
+                                            task_id => Task1,
+                                            config_id => ConfigId,
+                                            url => <<"https://t2.com">>}),
+    Task1_t1 = broker_meta:push_configs(Tenant, Task1),
+    Task1_t2 = broker_meta:push_configs(<<"t2">>, Task1),
+    ?assertEqual(1, length(Task1_t1)),
+    ?assertEqual(1, length(Task1_t2)),
+    ?assertMatch({push_config, {Tenant, Task1, ConfigId}, Tenant, _, _, _, _, _, _, _},
+                 hd(Task1_t1)),
+    ?assertMatch({push_config, {<<"t2">>, Task1, ConfigId}, <<"t2">>, _, _, _, _, _, _, _},
+                 hd(Task1_t2)),
+    %% Delete
+    ok = broker_meta:delete_push_config(Tenant, Task1, ConfigId),
+    not_found = broker_meta:get_push_config(Tenant, Task1, ConfigId),
+    %% Delete all tenant configs
+    {ok, _} = broker_meta:put_push_config(#{tenant_id => <<"t3">>,
+                                            task_id => Task2,
+                                            config_id => ConfigId,
+                                            url => <<"https://t3.com">>}),
+    Deleted = broker_meta:delete_push_configs(<<"t3">>),
+    ?assertEqual(1, length(Deleted)),
+    not_found = broker_meta:get_push_config(<<"t3">>, Task2, ConfigId),
     ok.
 
 publish(Event) ->

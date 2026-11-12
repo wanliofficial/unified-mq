@@ -203,10 +203,55 @@ emit(Proj, Kind, Payload) ->
     TaskId = a2a_task_projection:id(Proj),
     TenantId = a2a_task_projection:tenant_id(Proj),
     Seq = a2a_task_projection:seq(Proj) + 1,
+    Encoded = a2a_event:encode(Kind, Seq, Payload),
     case a2a_event:append(TaskId, TenantId, Kind, Seq, Payload) of
-        {ok, Offset} -> a2a_task_projection:apply_event(Proj, Kind, Payload, Offset);
-        {error, Reason} -> {error, Reason}
+        {ok, Offset} ->
+            case a2a_task_projection:apply_event(Proj, Kind, Payload, Offset) of
+                {ok, Next} = Ok ->
+                    maybe_push(Next, Encoded),
+                    Ok;
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, Reason} ->
+            {error, Reason}
     end.
+
+%% ADR-026 §D6.7: a push goes out *after* the terminal/interrupted event is
+%% durable, and it never blocks the state machine. Disabled egress is a no-op:
+%% the worker does not even exist when `push_enabled' is false.
+%%
+%% The shard only does a fast Mnesia read and a cast. Everything slow -- the
+%% egress guard (which resolves DNS), the signature and the delivery -- belongs
+%% to `a2a_push_worker', because a webhook host that takes three seconds to
+%% resolve must not hold a task shard.
+maybe_push(Proj, Body) ->
+    case push_enabled() andalso is_pushable(Proj) of
+        false ->
+            ok;
+        true ->
+            TaskId = a2a_task_projection:id(Proj),
+            TenantId = a2a_task_projection:tenant_id(Proj),
+            Rows = try broker_meta:push_configs(TenantId, TaskId)
+                   catch _:_ -> [] end,
+            _ = file:write_file("/tmp/a2a_push_diag.log",
+                io_lib:format("maybe_push tenant=~s task=~s rows=~p~n",
+                              [TenantId, TaskId, length(Rows)]),
+                [append]),
+            case Rows of
+                [] ->
+                    ok;
+                _ ->
+                    a2a_push_worker:enqueue(TenantId, TaskId, Rows, Body)
+            end
+    end.
+
+is_pushable(Proj) ->
+    State = a2a_task_projection:state(Proj),
+    a2a_task:is_terminal(State) orelse a2a_task:is_interrupted(State).
+
+push_enabled() ->
+    application:get_env(broker_proto_a2a, push_enabled, false).
 
 %%%_* Queries ---------------------------------------------------------------
 

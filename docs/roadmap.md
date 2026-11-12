@@ -34,9 +34,10 @@ flowchart LR
     S8 --> S9[S9 Agent 互操作协议接入层]
     S9 --> S10[S10 WebRTC 信令与 ICE 接入]
     S10 --> S11[S11 协议候选池]
+    S11 --> S12[S12 基础设施 HA / TCP 集群 / 负载均衡]
 ```
 
-S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。S9 承接 S8 之后新增 A2A / MCP / ACP 三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的承载与网关；**S9-0 已结项、S9-A（协议底座 + A2A JSON-RPC echo 前端）已交付（2026-11-11）、S9-B（A2A Task 状态机 + 事件溯源 + Agent Card）已交付（2026-11-12），S9-C~S9-F 未开工**，需求与计划见 §11 与 [`docs/design/s9-agent-protocols.md`](design/s9-agent-protocols.md)。S10 是更后一阶段的立项建议：调研 [`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server) 后，把 WebRTC 的**信令面（WSS 房间中继）与 ICE 面（STUN/TURN）**作为新的接入前端纳入规划，媒体面明确不做；**同为立项规划、未开工**，需求与计划见 §12 与 [`docs/design/s10-webrtc-signaling.md`](design/s10-webrtc-signaling.md)。S10 排在 S9 之后但不阻塞 S9，两者都复用 S6/S7 的身份表与前端经验。S11 是**协议候选池 / 筛选阶段**而非「14 个协议一起实现」：调研 14 个 Erlang 网络协议仓库（CoAP / LoRaWAN / STUN / DNS / mDNS / DNS-SD / DHT / beacon / SIP ×3 / MTProto Proxy / APNs），9 个 IoT/UDP 类深挖、5 个索引级，各写一份三段式立项稿；**同为立项规划、未开工**，总览与筛选结论见 §13 与 [`docs/design/s11-protocol-candidates.md`](design/s11-protocol-candidates.md)。S11 排在 S10 之后但不阻塞 S10；当前建议仅 CoAP 进入实现评审，其余按「归并 S9/S10 / 参考 / 明确不做」收口。
+S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面很小。S3 必须早于 S4，因为跨协议转换报告与属性映射规则需要在分布式语义稳定前定型。S7 承接 S6 之后遗留的两件事：六协议的身份表统一（2026-11-09 已完成，见 §9），以及各协议标准 CloudEvents Binding 的逐字结论（2026-11-10 已结案，见 §9.1）。S8 在 MQTT 引擎之上补三种 MQTT 系传输（MQTT-SN / QUIC / WebSocket），2026-11-11 全部结案，见 §10。S9 承接 S8 之后新增 A2A / MCP / ACP 三个协议接入前端，把 Broker 扩展为 agent 间任务、事件与流式消息的承载与网关；**S9-0 已结项、S9-A（协议底座 + A2A JSON-RPC echo 前端）已交付（2026-11-11）、S9-B（A2A Task 状态机 + 事件溯源 + Agent Card）已交付（2026-11-12），S9-C~S9-F 未开工**，需求与计划见 §11 与 [`docs/design/s9-agent-protocols.md`](design/s9-agent-protocols.md)。S10 是更后一阶段的立项建议：调研 [`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server) 后，把 WebRTC 的**信令面（WSS 房间中继）与 ICE 面（STUN/TURN）**作为新的接入前端纳入规划，媒体面明确不做；**同为立项规划、未开工**，需求与计划见 §12 与 [`docs/design/s10-webrtc-signaling.md`](design/s10-webrtc-signaling.md)。S10 排在 S9 之后但不阻塞 S9，两者都复用 S6/S7 的身份表与前端经验。S11 是**协议候选池 / 筛选阶段**而非「14 个协议一起实现」：调研 14 个 Erlang 网络协议仓库（CoAP / LoRaWAN / STUN / DNS / mDNS / DNS-SD / DHT / beacon / SIP ×3 / MTProto Proxy / APNs），9 个 IoT/UDP 类深挖、5 个索引级，各写一份三段式立项稿；**同为立项规划、未开工**，总览与筛选结论见 §13 与 [`docs/design/s11-protocol-candidates.md`](design/s11-protocol-candidates.md)。S11 排在 S10 之后但不阻塞 S10；当前建议仅 CoAP 进入实现评审，其余按「归并 S9/S10 / 参考 / 明确不做」收口。S12 是**基础设施层**需求而非新协议：底层调研 4 个 Erlang 仓库（`tcp_gen_server_cluster` / `tcpbalance` / `gen_lb` / `nkdist`）后，收敛为「增强基础设施的高可用性、支持 TCP 集群以及负载均衡特性」三项统一目标，4 仓各一份源码级三段式立项稿 + 一份总览需求文档；**同为立项规划、未开工**，需求与计划见 §14 与 [`docs/design/s12-infrastructure-ha-and-lb.md`](design/s12-infrastructure-ha-and-lb.md)。S12 承接 S11 但不阻塞 S11，核心是补齐 ADR-021 明确留下的「S4 不做自动再平衡」缺口，并把 `docs/operations.md` 已隐含的外部负载均衡器假设落成节点视图 / 健康 / 权重契约；**不引入第二套共识、不把 Broker 改成四层 TCP 代理**。
 
 ---
 
@@ -56,6 +57,7 @@ S2 与 S3 可并行：CloudEvents 是纯逻辑层，与内核开发的冲突面�
 | **S9** | Agent 互操作协议接入层 | A2A 1.0.0 / MCP 2026-07-28 / ACP v1 三个 `broker_proto_*` adapter，以 A2A 为主线；复用统一消息内核、CloudEvents `ce-*` 通道、`broker_security` 身份表与 ACL | 三协议各一份真实第三方客户端证据 + 能力矩阵与限制清单；Task 状态机与终态不可变、认证与 SSRF 防护专项用例；既有 952/952 零回归（**S9-0/S9-A/S9-B 已交付，S9-C~S9-F 未开工，见 §11**） |
 | **S10** | WebRTC 信令与 ICE 接入 | `broker_proto_webrtc` 信令前端 + STUN/TURN ICE 组件；调研 [`lambdaclass/webrtc-server`](https://github.com/lambdaclass/webrtc-server)，复用 `broker_ws` / `broker_security` / 统一消息内核；**媒体面（SFU/MCU/转码）不做** | 浏览器 `RTCPeerConnection` + STUN/TURN 真实客户端证据 + 能力矩阵与限制清单；信令「瞬时转发、不落盘」由 ADR 冻结并有测试证明；跨房间/未知 peer 拒绝不崩溃、认证接身份表专项用例；既有 823/823 零回归（**立项规划，未开工，见 §12**） |
 | **S11** | 协议候选池（14 个 Erlang 协议仓库） | 9 深挖 + 5 索引级三段式立项稿 + 总览；筛选结论「立项 / 归并 / 参考 / 不做」由 ADR 冻结；**不写第二套消息内核、不替代 S4 Membership** | 14 个候选各有一份立项稿与明确结论；发现面 / DHT / SIP 三组完成统一裁决；经 Gate 通过的候选有真实第三方客户端证据 + 能力矩阵与限制清单；既有 823/823 零回归（**立项规划，未开工，见 §13**） |
+| **S12** | 基础设施高可用 / TCP 集群 / 负载均衡 | 底层调研 4 仓（`tcp_gen_server_cluster` / `tcpbalance` / `gen_lb` / `nkdist`）各一份源码级三段式立项稿 + 总览需求文档；收敛 G1 高可用 / G2 TCP 集群 / G3 负载均衡；**不引入第二套共识、不做四层 TCP 代理、4 仓代码与依赖一律不引入** | 节点视图唯一真相与 LB 形态由 ADR 冻结；自动再平衡触发者 + 两阶段迁移 + 旧 owner Fencing 的故障注入全套；会话粘性 / drain / `/readyz` 一致性 / 主动健康上报 / 连接容量与排队上限专项用例；外部 LB 或等价模拟器分发证据 + 能力矩阵；既有零回归（**立项规划，未开工，见 §14**） |
 
 ---
 
@@ -498,9 +500,50 @@ S7 有两项交付：
 
 ---
 
-## 14. 附录
+## 14. S12 — 基础设施高可用 / TCP 集群 / 负载均衡（立项规划）
 
-### 14.1 关键 ADR 索引
+**目标**：增强基础设施的**高可用性（G1）**、支持 **TCP 集群（G2）**、具备**负载均衡（G3）**特性。三者共享同一套集群真相，不得各自建设。完整需求文档见 [`docs/design/s12-infrastructure-ha-and-lb.md`](design/s12-infrastructure-ha-and-lb.md)（§1 需求陈述、§2 现状与缺口、§4 需求提炼、§5 计划与 Gate）。
+
+**调研范围**：4 个 Erlang/OTP 基础设施仓库，按「底层调研」口径**全部深挖到源码级**（README + 全部核心源码逐行核对，无索引级稿）：`developerworks/tcp_gen_server_cluster`（有状态 `gen_server` 主备框架）、`mdaguete/tcpbalance`（TCP 四层负载均衡代理）、`boundary/gen_lb`（Erlang 节点间消息分发 + 可插拔策略）、`erlnets/nkdist`（riak_core 一致性哈希进程分布 + handoff 自动再平衡）。
+
+**定位与边界**：与 S5 / S8 / S9 / S10 / S11 不同，S12 是**基础设施层增强**，不新增消息协议、不新增 `broker_proto_*` adapter、不改协议语义。复用 S4（`broker_cluster` / `ra 3.2.0` / epoch Fencing / 两阶段 migrate，ADR-021）、S6（`broker_admin` 8090 / `/healthz` / `/readyz` / `broker_metrics`，ADR-016）、S7（`broker_security` 统一身份表）、ADR-001/002/007/008/010/011/013。
+
+**三条硬边界**：① **不引入第二套共识 / 成员真相**——4 仓的 `global` 注册主备、`net_kernel` 成员视图、riak_core ring / 最终一致全部排除，归属唯一真相仍是 ra 提交的 `owner/epoch`；② **不把 Broker 做成四层 TCP 代理**——连接是有状态的（MQTT session / 游标 / `proto_meta.cluster_epoch`），S12 做「外部 LB + Broker 供给节点视图 / 健康 / 权重」契约；③ **不把最终一致 / 无共识主备当强一致 HA**——可用性承诺必须绑定 ADR-007 三档并落在 WAL / `broker_storage`（ADR-011），禁止「零停机 / 自动故障转移」含糊表述。
+
+**核心缺口**：ADR-021「后果」逐字写着「**S4 只实现组内归属，不做自动再平衡**」；`docs/operations.md` 已写「指标/管理面故障不应把 broker 摘出负载均衡」，即**项目已隐含外部 LB 假设**但 Broker 没有节点视图 / 健康 / 权重供给能力。
+
+### 14.1 子阶段表
+
+| 子阶段 | 状态 | 产出 | 证据 |
+|---|---|---|---|
+| S12-0 不确定性收敛 | ⬜ 未开工 | 收敛报告 + ADR（LB 形态、节点视图唯一真相、再平衡触发者与稳定条件、迁移契约、依赖边界）；OQ-1~OQ-10 收敛 | spike + 评审签认；**不新增 app / 端口 / 代码路径** |
+| S12-A 节点视图与健康契约 | ⬜ 未开工 | 统一节点视图 + 主动健康上报（`up/draining/down`）+ drain 优雅摘流 + `/readyz` 对齐 + 管理 API 严格校验 | 多节点视图一致性用例；drain 期间在用连接不中断；既有零回归 |
+| S12-B 连接容量与选择策略 | ⬜ 未开工 | 可插拔节点选择策略 + 连接上限 / pending-active 计数 + 排队上限与超时 + 无可用节点 / 恢复竞态 + 指标 | 外部 LB 或等价模拟器分发证据；背压与拒绝专项用例；能力矩阵 |
+| S12-C 自动再平衡与迁移 | ⬜ 未开工 | 再平衡触发者 + ADR-021 两阶段迁移 + 有状态进程迁移契约 + 状态持久化 + 故障注入 + 文档同步 + ADR 定稿 | 扩 `broker_cluster_dist_SUITE`（3 节点 peer）：节点加入/退出/故障、旧 owner `{fenced,_}`、无双写、崩溃恢复；全量 CT + dialyzer/xref + 容量报告 |
+
+> 子阶段命名与粒度是**建议**；实际以 S12-0 评审后冻结的 ADR 为准（同 S8 / S9 / S10 / S11 设计稿的落地偏差处理方式）。
+
+### 14.2 Gate S12（与需求文档 §5.3 同一份清单）
+
+- [ ] G1/G2/G3 三项需求各有可验收的自动化用例，且共享同一套集群真相（无第二套成员 / 共识）
+- [ ] LB 形态、节点视图唯一真相、再平衡触发者与稳定条件、迁移契约由 ADR 冻结
+- [ ] 节点加入 / 退出 / 故障的故障注入全套通过；迁移期间旧 owner 被 `{fenced, _}` 拒绝；无双写
+- [ ] 会话粘性、drain、`/readyz` 一致性、主动健康上报专项用例通过
+- [ ] 连接上限 / 排队上限 / 超时拒绝 / 全不可用与恢复竞态专项用例通过
+- [ ] 有状态服务的状态持久化与崩溃恢复有测试证明，并绑定 ADR-007 显式可靠性等级
+- [ ] 外部 LB 或等价模拟器的真实分发证据落盘 `test/protocol-compatibility/`；能力矩阵与限制清单齐全
+- [ ] 4 仓全部裁剪项（各单仓稿 §2.5 的 F- 条目）在能力矩阵中逐行留痕
+- [ ] 既有 `rebar3 ct` 零回归（基线以当次 `rebar3 ct` 为准）；dialyzer / xref 干净；`rebar3 release` 装配成功
+- [ ] 压测 / 容量 / 迁移耗时报告落盘，数字全部来自实测
+- [ ] S12 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
+
+**状态口径**：**S12 全部「⬜ 未开工」，Gate S12 全未勾选，无任何「已实测」数字**；S12 排在 S11 之后但不阻塞 S11。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——本阶段只新增文档，没有新增 app、端口或代码路径，待 S12-A 有首个代码交付时统一同步，避免把计划读成现状。**4 个仓库全部只作设计参考，不引入任何一仓的代码或依赖。**
+
+---
+
+## 15. 附录
+
+### 15.1 关键 ADR 索引
 
 | ADR | 主题 | 定稿阶段 |
 |---|---|---|
@@ -531,7 +574,7 @@ S7 有两项交付：
 | ADR-025 | A2A Task 状态机到统一消息内核的映射（事件溯源、可靠性档、retention 契约） | S9-0（已采纳） |
 | ADR-026 | Agent 接入前端：应用拆分、HTTP/SSE 选型、Agent Card 落点与边界 | S9-0（已采纳） |
 
-### 14.2 文档产出物
+### 15.2 文档产出物
 
 | 文档 | 阶段 | 对应 README 章节 |
 |---|---|---|
@@ -571,6 +614,11 @@ S7 有两项交付：
 | `docs/design/s11-yxa.md` | S11（索引级立项稿；历史 SIP 套件 / `yxa`） | 4.1、11.1 |
 | `docs/design/s11-mtproto-proxy.md` | S11（索引级立项稿；MTProto Proxy，明确不做） | 4.1、11.1 |
 | `docs/design/s11-apns4erl.md` | S11（索引级立项稿；APNs 出站客户端 / `apns4erl`，归并 S9 webhook） | 4.1、11.1 |
+| `docs/design/s12-infrastructure-ha-and-lb.md` | S12（**统一需求文档**，2026-11-11；G1 高可用 / G2 TCP 集群 / G3 负载均衡，4 仓调研汇总 + 需求 + Gate + OQ-1~OQ-10） | 2、5.3、6、11.3 |
+| `docs/design/s12-infra-gen-server-cluster.md` | S12（源码级立项稿；`tcp_gen_server_cluster` 主备框架，P2 设计参考） | 5.3、6 |
+| `docs/design/s12-infra-tcpbalance.md` | S12（源码级立项稿；`tcpbalance` TCP 四层代理调度状态机，P1 借鉴） | 5.3、6 |
+| `docs/design/s12-infra-gen-lb.md` | S12（源码级立项稿；`gen_lb` 可插拔策略接口，P1 借鉴） | 5.3、6 |
+| `docs/design/s12-infra-nkdist.md` | S12（源码级立项稿；`nkdist` handoff 自动再平衡，**P0 重点架构参考**，命中 ADR-021 缺口） | 5.3、6、11.3 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/protocol-conformance-validation.md` | S6 之后（2026-11-10 起草；外部 conformance 资源接入规划，S8 三协议不在范围） | 11.1、11.2 |

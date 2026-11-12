@@ -13,13 +13,22 @@
 %%     the other task errors on 400, unlike envelope errors which stay 200.
 -module(a2a_rpc).
 
+-include_lib("broker_core/include/broker_message.hrl").
+-include_lib("broker_router/include/broker_router.hrl").
+
 -export([handle/1, max_body_bytes/0, request_timeout_ms/0,
-         require_auth/0, supported_versions/0]).
+         require_auth/0, supported_versions/0, push_method_enabled/0]).
+
+%% `handle/1' answers a plain HTTP response *or* hands the socket to the SSE
+%% streamer. The five-tuple is the S9-A/B shape; `{stream, Plan}' means "200 +
+%% chunked, then `a2a_stream:run/3' owns the socket until the task ends".
 
 %% @doc HTTP entry point. Discovery GETs bypass JSON-RPC (and therefore the
 %% `A2A-Version' negotiation, which a browser fetching a well-known card will
 %% not send); everything else keeps the S9-A gate order.
--spec handle(map()) -> {non_neg_integer(), [{binary(), binary()}], iodata(), boolean()}.
+-spec handle(map()) ->
+          {non_neg_integer(), [{binary(), binary()}], iodata(), boolean()}
+        | {stream, map()}.
 handle(#{method := get, path := Path} = Req) when is_binary(Path) ->
     case a2a_card:route(Path) of
         {ok, Kind, Query} ->
@@ -173,6 +182,98 @@ dispatch(#{method := <<"GetExtendedAgentCard">>, params := Params, id := Id},
       fun() ->
               rpc_result(Id, a2a_card:extended(tenant(Identity), Params), Keep)
       end);
+%% S9-C: streaming. `SendStreamingMessage' creates the task then streams it, so
+%% the first frame is the creation snapshot and the last one is the terminal
+%% state (R-A1). `SubscribeToTask' streams an existing task from offset 0, which
+%% is what makes a dropped connection recoverable (R-A2).
+dispatch(#{method := <<"SendStreamingMessage">>, params := Params, id := Id},
+         Identity, Keep) ->
+    case message(Params) of
+        {ok, Message} ->
+            with_authorization(
+              Identity, publish, <<"$a2a/task/new">>, Keep,
+              fun() ->
+                      ContextId = maps:get(<<"contextId">>, Message, undefined),
+                      case registry(create, [tenant(Identity), ContextId,
+                                             Message]) of
+                          {ok, #{<<"task">> := #{<<"id">> := TaskId}}} ->
+                              stream_plan(Id, TaskId, tenant(Identity), Keep);
+                          {error, Reason} ->
+                              rpc_error(Id, classify(Reason), Keep)
+                      end
+              end);
+        {error, invalid_params} ->
+            rpc_error(Id, invalid_params, Keep)
+    end;
+dispatch(#{method := <<"SubscribeToTask">>, params := Params, id := Id},
+         Identity, Keep) ->
+    case task_id(Params) of
+        {ok, TaskId} ->
+            with_authorization(
+              Identity, subscribe, a2a_event:destination(TaskId), Keep,
+              fun() ->
+                      case get_task(TaskId, tenant(Identity)) of
+                          {ok, _Task} ->
+                              stream_plan(Id, TaskId, tenant(Identity), Keep);
+                          {error, Reason} ->
+                              rpc_error(Id, classify(Reason), Keep)
+                      end
+              end);
+        error ->
+            rpc_error(Id, invalid_params, Keep)
+    end;
+%% S9-C: push config CRUD (R-A4). Creation is gated on `push_enabled' *and* the
+%% two-layer allowlist; when either says no, the answer is the spec's
+%% `PushNotificationNotSupportedError' (-32003), never a silently accepted
+%% config that will never fire (ADR-026 §D6.1).
+dispatch(#{method := <<"CreateTaskPushNotificationConfig">>, params := Params,
+           id := Id}, Identity, Keep) ->
+    case push_config_request(Params, tenant(Identity)) of
+        {ok, Spec} ->
+            with_authorization(
+              Identity, publish, a2a_event:destination(maps:get(task_id, Spec)),
+              Keep,
+              fun() -> rpc_result(Id, create_push_config(Spec), Keep) end);
+        {error, invalid_params} ->
+            rpc_error(Id, invalid_params, Keep)
+    end;
+dispatch(#{method := <<"GetTaskPushNotificationConfig">>, params := Params,
+           id := Id}, Identity, Keep) ->
+    case push_config_id(Params, tenant(Identity)) of
+        {ok, Tenant, TaskId, ConfigId} ->
+            with_authorization(
+              Identity, subscribe, a2a_event:destination(TaskId), Keep,
+              fun() ->
+                      rpc_result(Id,
+                                 get_push_config(Tenant, TaskId, ConfigId), Keep)
+              end);
+        {error, invalid_params} ->
+            rpc_error(Id, invalid_params, Keep)
+    end;
+dispatch(#{method := <<"ListTaskPushNotificationConfigs">>, params := Params,
+           id := Id}, Identity, Keep) ->
+    case task_only(Params, tenant(Identity)) of
+        {ok, Tenant, TaskId} ->
+            with_authorization(
+              Identity, subscribe, a2a_event:destination(TaskId), Keep,
+              fun() -> rpc_result(Id, list_push_configs(Tenant, TaskId), Keep) end);
+        {error, invalid_params} ->
+            rpc_error(Id, invalid_params, Keep)
+    end;
+dispatch(#{method := <<"DeleteTaskPushNotificationConfig">>, params := Params,
+           id := Id}, Identity, Keep) ->
+    case push_config_id(Params, tenant(Identity)) of
+        {ok, Tenant, TaskId, ConfigId} ->
+            with_authorization(
+              Identity, publish, a2a_event:destination(TaskId), Keep,
+              fun() ->
+                      rpc_result(Id,
+                                 delete_push_config(Tenant, TaskId, ConfigId),
+                                 Keep)
+              end);
+        {error, invalid_params} ->
+            rpc_error(Id, invalid_params, Keep)
+    end;
 dispatch(#{method := _Other, id := Id}, _Identity, Keep) ->
     rpc_error(Id, method_not_found, Keep).
 
@@ -210,6 +311,177 @@ registry(create, [TenantId, ContextId, Message]) ->
         {ok, Proj} -> {ok, #{<<"task">> => a2a_task_projection:to_wire(Proj)}};
         {error, Reason} -> {error, Reason}
     end.
+
+%%%_* Streaming (S9-C) ------------------------------------------------------
+
+%% @doc The plan a stream needs: which destination to follow, which partition
+%% it lives on, and the request id every frame echoes. The partition comes from
+%% the same router call the append path used, so a stream can never watch the
+%% wrong log.
+stream_plan(Id, TaskId, TenantId, Keep) ->
+    case a2a_stream_plan(Id, TaskId, TenantId) of
+        {ok, Plan} -> {stream, Plan};
+        {error, Reason} -> rpc_error(Id, classify(Reason), Keep)
+    end.
+
+a2a_stream_plan(Id, TaskId, TenantId) ->
+    Destination = a2a_event:destination(TaskId),
+    case broker_router:env() of
+        {ok, Env} ->
+            Ctx = #route_ctx{tenant_id = TenantId, publisher = <<"a2a">>,
+                             reliability = fsync},
+            try broker_router_hash:route(Destination, Ctx, Env) of
+                {ok, [{Partition, _Refs} | _]} ->
+                    {ok, #{id => Id,
+                           task_id => TaskId,
+                           destination => Destination,
+                           partition => Partition}};
+                _ ->
+                    {error, internal_error}
+            catch
+                _:_ -> {error, internal_error}
+            end;
+        {error, _} ->
+            {error, internal_error}
+    end.
+
+%%%_* Push config CRUD (S9-C) ----------------------------------------------
+
+push_method_enabled() ->
+    application:get_env(broker_proto_a2a, push_enabled, false).
+
+%% `CreateTaskPushNotificationConfig' params:
+%%   {"taskId": "...", "config": {"url": "...", "authentication": {"scheme": "..."}}}
+push_config_request(Params, TenantId) when is_map(Params) ->
+    case {maps:get(<<"taskId">>, Params, undefined),
+          maps:get(<<"config">>, Params, undefined)} of
+        {TaskId, Config} when is_binary(TaskId), TaskId =/= <<>>, is_map(Config) ->
+            case maps:get(<<"url">>, Config, undefined) of
+                Url when is_binary(Url), Url =/= <<>> ->
+                    Scheme = auth_scheme(Config),
+                    {ok, #{tenant_id => TenantId,
+                           task_id => TaskId,
+                           url => Url,
+                           auth_scheme => Scheme,
+                           allow_private => maps:get(<<"allowPrivate">>, Config,
+                                                     false)}};
+                _ ->
+                    {error, invalid_params}
+            end;
+        _ ->
+            {error, invalid_params}
+    end;
+push_config_request(_Params, _TenantId) ->
+    {error, invalid_params}.
+
+auth_scheme(Config) ->
+    case maps:get(<<"authentication">>, Config, undefined) of
+        #{<<"scheme">> := Scheme} when is_binary(Scheme), Scheme =/= <<>> -> Scheme;
+        _ -> undefined
+    end.
+
+%% {"taskId": "...", "configId": "..."}
+push_config_id(Params, TenantId) when is_map(Params) ->
+    case {maps:get(<<"taskId">>, Params, undefined),
+          maps:get(<<"configId">>, Params, undefined)} of
+        {TaskId, ConfigId} when is_binary(TaskId), TaskId =/= <<>>,
+                                is_binary(ConfigId), ConfigId =/= <<>> ->
+            {ok, TenantId, TaskId, ConfigId};
+        _ ->
+            {error, invalid_params}
+    end;
+push_config_id(_Params, _TenantId) ->
+    {error, invalid_params}.
+
+task_only(Params, TenantId) when is_map(Params) ->
+    case maps:get(<<"taskId">>, Params, undefined) of
+        TaskId when is_binary(TaskId), TaskId =/= <<>> ->
+            {ok, TenantId, TaskId};
+        _ ->
+            {error, invalid_params}
+    end;
+task_only(_Params, _TenantId) ->
+    {error, invalid_params}.
+
+create_push_config(#{tenant_id := Tenant, task_id := TaskId, url := Url,
+                     auth_scheme := Scheme, allow_private := AllowPrivate}) ->
+    Enabled = push_method_enabled(),
+    case Enabled of
+        false ->
+            {error, push_notification_not_supported};
+        true ->
+            case config_id_for(Tenant, TaskId, Url) of
+                ConfigId ->
+                    Spec = #{tenant_id => Tenant, task_id => TaskId,
+                             config_id => ConfigId, url => Url,
+                             auth_scheme => Scheme,
+                             allow_private => AllowPrivate},
+                    case broker_meta:put_push_config(Spec) of
+                        {ok, _Version} ->
+                            {ok, push_config_wire(Spec)};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end
+            end
+    end.
+
+%% The config id is server-generated so a client cannot enumerate another
+%% tenant's configs by guessing ids; the same (task, url) is idempotent.
+config_id_for(Tenant, TaskId, Url) ->
+    Digest = crypto:hash(sha256, <<Tenant/binary, 0, TaskId/binary, 0,
+                                    Url/binary>>),
+    base64url(binary:part(Digest, 0, 9)).
+
+get_push_config(Tenant, TaskId, ConfigId) ->
+    case broker_meta:get_push_config(Tenant, TaskId, ConfigId) of
+        {ok, Row} -> {ok, push_config_wire(row_to_spec(Row))};
+        not_found -> {error, task_not_found}
+    end.
+
+list_push_configs(Tenant, TaskId) ->
+    Rows = broker_meta:push_configs(Tenant, TaskId),
+    {ok, #{<<"configs">> => [push_config_wire(row_to_spec(R)) || R <- Rows]}}.
+
+delete_push_config(Tenant, TaskId, ConfigId) ->
+    case broker_meta:get_push_config(Tenant, TaskId, ConfigId) of
+        {ok, _Row} ->
+            _ = broker_meta:delete_push_config(Tenant, TaskId, ConfigId),
+            {ok, #{}};
+        not_found ->
+            {error, task_not_found}
+    end.
+
+%% Row: {push_config, Ref, Tenant, Task, Config, Url, AuthScheme, AllowPrivate,
+%%        UpdatedAt, Version}
+row_to_spec(Row) ->
+    #{tenant_id => element(3, Row),
+      task_id => element(4, Row),
+      config_id => element(5, Row),
+      url => element(6, Row),
+      auth_scheme => element(7, Row),
+      allow_private => element(8, Row)}.
+
+%% Wire shape follows `TaskPushNotificationConfig' (convergence report §2.4):
+%% tenant, id, taskId, url, authentication.scheme. `token' is ours (`configId').
+push_config_wire(#{tenant_id := Tenant, task_id := TaskId, config_id := ConfigId,
+                   url := Url, auth_scheme := Scheme}) ->
+    Base = #{<<"tenant">> => Tenant,
+             <<"id">> => ConfigId,
+             <<"taskId">> => TaskId,
+             <<"url">> => Url},
+    case Scheme of
+        undefined -> Base;
+        <<>> -> Base;
+        S -> Base#{<<"authentication">> => #{<<"scheme">> => S}}
+    end.
+
+base64url(Bin) ->
+    Encoded = base64:encode(Bin),
+    iolist_to_binary([url_char(B) || <<B/integer>> <= Encoded, B =/= $=]).
+
+url_char($+) -> $-;
+url_char($/) -> $_;
+url_char(B) -> B.
 
 %% @doc Validate the parts of `SendMessageRequest' this stage promises to
 %% understand. Everything else in the proto (configuration, push config,
@@ -332,6 +604,7 @@ rpc_error(Id, Reason, Keep) ->
 classify(task_not_found) -> task_not_found;
 classify(task_not_cancelable) -> task_not_cancelable;
 classify(unsupported_operation) -> unsupported_operation;
+classify(push_notification_not_supported) -> push_notification_not_supported;
 classify(extended_agent_card_not_configured) -> extended_agent_card_not_configured;
 classify(invalid_params) -> invalid_params;
 classify(_Other) -> internal_error.

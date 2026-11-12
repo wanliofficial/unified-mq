@@ -32,14 +32,21 @@ loop(Socket, Transport, Count) when Count < ?MAX_REQUESTS ->
                request_timeout_ms => a2a_rpc:request_timeout_ms()},
     case agent_rpc_http:read_request(Transport, Socket, Limits) of
         {ok, Req} ->
-            {Status, Headers, Body, KeepAlive} = safe_handle(Req),
-            _ = Transport:send(
-                  Socket,
-                  agent_rpc_http:response(Status, Headers, Body,
-                                          #{keep_alive => KeepAlive})),
-            case KeepAlive of
-                true -> loop(Socket, Transport, Count + 1);
-                false -> ok
+            case safe_handle(Req) of
+                {stream, Plan} ->
+                    %% SSE owns the socket until the task ends: a stream is a
+                    %% long-lived response, so keep-alive ends here.
+                    _ = a2a_stream:run(Transport, Socket, Plan),
+                    ok;
+                {Status, Headers, Body, KeepAlive} ->
+                    _ = Transport:send(
+                          Socket,
+                          agent_rpc_http:response(Status, Headers, Body,
+                                                  #{keep_alive => KeepAlive})),
+                    case KeepAlive of
+                        true -> loop(Socket, Transport, Count + 1);
+                        false -> ok
+                    end
             end;
         {error, closed} ->
             ok;
