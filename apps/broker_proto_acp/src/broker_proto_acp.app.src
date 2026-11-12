@@ -1,0 +1,39 @@
+{application, broker_proto_acp, [
+    {description, "ACP v1 front end: broker as Client over stdio (S9-E)"},
+    {vsn, "0.1.0"},
+    {registered, [broker_proto_acp_sup]},
+    {mod, {broker_proto_acp_app, []}},
+    {applications, [kernel, stdlib, sasl,
+                    broker_core, broker_security, broker_meta,
+                    broker_router, broker_queue, broker_proto_agent_rpc]},
+    {env, [
+        %% S9-E (ADR-026 §D5): default off. An operator release ships the app
+        %% but runs no ACP agent until `agents' names at least one. Each entry is
+        %% the complete spec of one child process the supervisor starts.
+        %%
+        %%   agents => [#{name    => my-agent,          %% supervisor child id
+        %%                command => "/path/to/agent",   %% absolute, no shell
+        %%                args    => ["--stdio"],        %% argv tail
+        %%                env     => [{"KEY","VALUE"}],  %% environment allowlist
+        %%                cwd     => undefined,          %% operator's job
+        %%                restart => temporary}]          %% one crashed agent
+        %%                                                 %% never restarts
+        {agents, []},
+        %% `session/request_permission' policy. Default is deny + allowlist + no
+        %% wait: a request that matches nothing is refused immediately, which is
+        %% the posture the convergence report §7.1 freezes.
+        %%
+        %%   permission_policy => #{default   => deny,          %% deny | allow
+        %%                          allow     => [],            %% [#{tool=>binary(), title=>binary()}]
+        %%                          timeout_ms => 30000,
+        %%                          notify_dest => <<"$acp/permission">>}
+        {permission_policy, #{
+            default        => deny,
+            allow          => [],          %% [#{tool => binary(), title => binary()}]
+            timeout_ms     => 30000,
+            notify_dest    => <<"$acp/permission">>
+        }},
+        %% v1 only. A mismatched `protocolVersion' ends the session.
+        {supported_protocol_version, 1}
+    ]}
+]}.

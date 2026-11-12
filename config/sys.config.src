@@ -326,6 +326,32 @@
     {request_reliability, fsync}
   ]},
 
+  {broker_proto_acp, [
+    %% S9-E: ACP v1 front end. The broker is the ACP *Client*: it spawns the
+    %% agent declared here and speaks JSON-RPC over its stdin/stdout. An empty
+    %% list means the app starts clean but runs no agent. Each entry is the
+    %% complete spec of one child the supervisor starts:
+    %%   #{name    => my-agent,          %% supervisor child id
+    %%    command => "/path/to/agent",   %% absolute, no shell
+    %%    args    => ["--stdio"],        %% argv tail
+    %%    env     => [{"KEY","VALUE"}],  %% environment allowlist
+    %%    cwd     => undefined,          %% operator's job
+    %%    restart => temporary}          %% one crashed agent never restarts
+    {agents, []},
+    %% `session/request_permission' policy. Default deny + allowlist + no wait:
+    %% a request that matches nothing is refused immediately (convergence
+    %% report §7.1). The audit destination is an ordinary kernel destination;
+    %% records are transient/os_buffer and never block a permission turn.
+    {permission_policy, #{
+        default      => deny,
+        allow        => [],
+        timeout_ms   => 30000,
+        notify_dest  => <<"$acp/permission">>
+    }},
+    %% v1 only. A mismatched `protocolVersion' ends the session.
+    {supported_protocol_version, 1}
+  ]},
+
   {broker_proto_mqtt_ws, [
     %% S8-B: MQTT over WebSocket. A separate app and port from the broker's own
     %% ws API above (8080) -- the two speak entirely different protocols, and
