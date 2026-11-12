@@ -24,6 +24,7 @@
 | Kafka | 9093 | 明文（可 TLS） | `broker_proto_kafka` |
 | Pulsar | 6650 | 明文（可 TLS） | `broker_proto_pulsar` |
 | A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A/B/C）。示例部署端口 8081，`listeners => []` 是出厂值；出站 Push webhook 单独由 `push_enabled` 门控（默认关） |
+| MCP (Streamable HTTP) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_mcp`（S9-D）。示例部署端口 8082，`listeners => []` 是出厂值；stdio 前端另由 `stdio_enabled` 门控（默认关） |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前九个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
@@ -234,6 +235,85 @@ curl -sS -X POST http://127.0.0.1:8081/ \
 - **webhook 收到多次 POST**：按 `push_max_attempts` 的指数退避重试，正常现象；端点幂等靠 `X-A2A-Task-Id` + `X-A2A-Config-Id` + `X-A2A-Nonce` 去重。
 - **投递耗尽后消息去哪了**：写进 `$a2a/push/dlq/<tenant>`（租户名替换）。它是普通消息——用任一前端订阅该 destination 即可审计；payload 里有 `taskId`/`configId`/`url`/`attempts`/`reason`。
 - 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.14（S9-A）、§4.15（S9-B）与 §4.16（S9-C）。
+
+### 1.4 MCP 前端（默认关闭，S9-D）
+
+`broker_proto_mcp` 是 MCP `2026-07-28` 的前端，形态是**网关**：`server/discover` 与 `subscriptions/listen` 由 Broker 本地回答，其余原语（`tools/*`、`resources/*`、`prompts/*`、`completion/complete`）原样发布到 `$mcp/<method>`，由后端消费并回复。**Broker 不执行工具语义**；`sampling`/`elicitation` 不支持。默认不监听，stdio 也默认关闭。
+
+**配置**（`config/sys.config.src`，出厂值）：
+
+```erlang
+{broker_proto_mcp, [
+  {listeners, []},                    % 默认零 listener
+  {require_auth, true},               % 新面没有历史包袱，失败关闭
+  {path, <<"/">>},                    % 单端点（2026-07-28 只接受 POST）
+  {max_body_bytes, 1048576},          % 与 max_message_bytes 取 min
+  {max_connections, 1024},
+  {request_timeout_ms, 30000},        % 一次透传调用的等待上限（超时 -> -32603）
+  {features, []},                     % 诚实空：没挂后端就没有能力
+  {discover_ttl_ms, 3600000},         % server/discover 的 ttlMs
+  {instructions, undefined},          % 可选的自然语言说明
+  {allowed_origins, []},              % Origin 白名单（loopback 总是允许）
+  {stdio_enabled, false},             % 不抢占 release 的 stdin
+  {sse_max_event_bytes, 1048576},     % 单帧上限
+  {sse_heartbeat_ms, 15000},          % 空闲 ": ping"
+  {sse_max_duration_ms, 600000},      % 一条流的硬上限
+  {request_reliability, fsync}        % 请求消息的可靠性档（ADR-007）
+]}.
+```
+
+**启用顺序**：
+
+1. 在 `broker_security.users` 里给调用方建一条带 `token` 的用户记录；MCP HTTP 只接受 `Authorization: Bearer <token>`（`broker_security` 的不透明 token），`X-API-Key` 也识别。租户由用户记录决定，客户端不能自选。
+2. 配 `features`：`[tools, resources, prompts, completions]` 的子集。**没配的 family 一律 `404 + -32601`**（`data.reason="feature not advertised"`）；空列表是诚实的出厂值（`server/discover` 的 `capabilities` 也为空）。
+3. 让后端消费 `$mcp/<method>`：消息是普通 `#broker_message{}`（`payload_encoding=json`），payload 是客户端 JSON-RPC 原文，`_meta.unified-mq` 里带 `replyTo`/`requestToken`/`tenantId`；`headers` 里另有 `reply_to`/`tenant_id`/`request_token`。后端把 `{"result":…}` 或 `{"error":{…}}` 发到 `replyTo`；要发进度就在 `_meta.unified-mq.kind` 写 `progress`，要发通知就写 `notification`。
+4. 如需按主体限制，配 `broker_security.acl` 的 `publish`（原语调用，resource 是 `$mcp/<method>`）与 `subscribe`（`subscriptions/listen`，resource 是 `$mcp/notify`）规则。**MCP 的 ACL 检查不做租户比较**（`$mcp/*` 是网关自己的命名空间，租户由网关写入），HTTP ACL 拒绝回裸 `403`。
+5. 把 `listeners` 改成 `[#{port => 8082, ref => {mcp, 8082}, num_acceptors => 10, max_connections => 1024}]`（`ip` 默认 `{127,0,0,1}`）再重启。`require_auth => false` 只在回环绑定下允许（同 A2A 的 boot 校验）。
+
+**客户端调用形态**（HTTP；三个镜像头都必填）：
+
+```sh
+curl -sS -N -X POST http://127.0.0.1:8082/ \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/call' \
+  -H 'Mcp-Name: my-tool' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":"my-tool","arguments":{},
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                 "io.modelcontextprotocol/clientCapabilities":{},
+                 "progressToken":"p1"}}}'
+```
+
+- `server/discover` 回**单帧** `application/json`；所有透传方法回 `text/event-stream`（进度帧在前，终止帧是带客户端 `id` 的 Response；空闲 `: ping`）。
+- `subscriptions/listen` 第一帧固定是 `notifications/subscriptions/acknowledged`；到达 `sse_max_duration_ms` 时先回 `resultType: complete` 再关流。
+- **通知 POST**（`notifications/*`）回 `202` 无 body；服务端不回复。
+
+**stdio 部署**：`stdio_enabled => true` 且 `listeners => []`（或保留 HTTP 也行，但同机通常二选一）。协议帧写 `stdout`，**部署必须把 logger 的 `default` handler 指向 `stderr`**，否则日志会污染协议流：
+
+```erlang
+%% vm.args / -eval 里（OTP 不允许原地改 type）
+logger:remove_handler(default),
+ok = logger:add_handler(default, logger_std_h,
+                        #{config => #{type => standard_error}}).
+```
+
+一行一条 JSON（不得内嵌换行）；EOF 即优雅退出。stdio **没有认证**：身份固定是匿名（默认租户），信任边界是进程访问权。`notifications/cancelled` 按 listen 请求 id 取消订阅子进程。
+
+**排查**：
+
+- 端口没起来：先看 `listeners` 是否为 `[]`，再看日志里有没有 `insecure_listener`。
+- 全部 `401`：token 与 `broker_security.users` 不一致，或用户表为空。401 带 `WWW-Authenticate: Bearer realm="mcp"`、无 body。
+- 全部 `400 + -32020`：`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` 缺失或与 body 不一致（`Mcp-Name` 只要求在 `tools/call`/`resources/read`/`prompts/get` 上出现）。三个头都**必填**，不是可选。
+- `400 + -32602`：body 缺 `_meta.io.modelcontextprotocol/protocolVersion` 或 `clientCapabilities`。
+- `400 + -32022`：`supportedVersions` 只声明 `2026-07-28`；`data.supported/requested` 会给出对照。
+- `404 + -32601`：方法不存在、`initialize`（无握手）、`sampling`/`elicitation`（明确拒绝），或该方法所属 feature 没配（`data.reason="feature not advertised"`）。
+- 客户端拿不到结果、只看到 `: ping`：确认后端消费了 `$mcp/<method>` 并发布到 `replyTo`；`request_timeout_ms` 到点会收到 `-32603` + `data.reason="timeout"`。
+- `406`：`Accept` 必须**同时**含 `application/json` 与 `text/event-stream`（或 `*/*`）。`415`：`Content-Type` 必须是 `application/json`。`403`：`Origin` 存在但不在 `allowed_origins` 且不是 loopback。
+- stdio 的 stdout 混进日志：按上面的 logger 配置把 `default` handler 换到 `standard_error`；本 app 不会自动改。
+- 真实请求/响应原文见 `docs/protocol-compatibility.md` §4.17。**官方 MCP SDK / Inspector 的客户端矩阵留 S9-F。**
 
 
 

@@ -42,7 +42,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -57,6 +57,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
 | Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id；CONNECT 凭据（`token` / SASL PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema；TLS 由 S6 统一覆盖；订阅游标内存态；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
+| MCP（Streamable HTTP + stdio） | 支持子集（S9-D，**Broker 作网关**） | MCP `2026-07-28`：无状态逐请求（无 `initialize`/会话/`Mcp-Session-Id`）；`server/discover` 本地回答；`subscriptions/listen` 长活流（ack-first + 通知 + 心跳 + 优雅关流）；`tools`/`resources`/`prompts`/`completions` 原语**透传**到 `$mcp/<method>` 并取回结果（含 `notifications/progress`）；POST 单端点 `application/json`/`text/event-stream`；stdio 前端（newline 成帧、子进程订阅、`notifications/cancelled`）；HTTP 头门禁 `Origin`/`Accept`/`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` | 不解释/不执行工具语义（R-B1）、无 `sampling`/`elicitation`（-32601）、无 GET 流/`Last-Event-ID`/会话续传、无 `Mcp-Param-*` 强制校验、SSE 无 pending-bytes 上限、stdio 不做认证（进程即凭据）且 stdout 纯净性由部署 logger 配置保证、跨节点 reply 不支持；见 §4.17 | `apps/broker_proto_mcp/test/` |
 
 ---
 
@@ -1122,6 +1123,217 @@ body: {"_meta":{"unified-mq":{"kind":"statusUpdate","seq":2}},"statusUpdate":{"c
 - **仍是单节点**：`SubscribeToTask`/Push 都在 Task 的 owner 节点（本地 shard ETS）；跨节点访问是 S9-C+ 演进位。
 - **失败路径计数器仍未加**：`a2a_push_dlq` / `a2a_stream_*` 等键推迟到 S9-F 统一动 `broker_metrics` 冻结键集；S9-C 只 `logger`。
 - **默认仍不监听**：`listeners => []`。18094/18095/18096 只是本次证据端口。
+
+---
+
+## 4.17 S9-D 追加（2026-11-12）：MCP 2026-07-28 前端（Broker 作网关）
+
+**是什么**：`broker_proto_mcp` 把 **MCP `2026-07-28`** 接到统一消息内核，形态是**网关**而不是 MCP Server 执行体：
+
+1. **原语透传**（ADR-027 §D2）：`tools/*`、`resources/*`、`prompts/*`、`completion/complete` 的请求原文发布到 `$mcp/<method>`，后端把结果发布到网关注入的 `$mcp/reply/<tenant>/<token>`；网关只做「门控 → 发布 → 取回 → 补客户端 id」。**Broker 不解释工具/资源/prompt 的语义**（R-B1）。
+2. **本地方法**（ADR-027 §D3/§D5）：`server/discover` 由配置（`features`）直接组装；`subscriptions/listen` 映射成内核分区上的瞬态读者，转发 `notifications/<name>`。
+3. **两个前端共用一个协议层**：`mcp_dispatch`（信封/`_meta`/路由）、`mcp_route`（method→feature）、`mcp_discover`、`mcp_sub`（listen filter）、`mcp_stream`（call/listen 的流循环）与传输无关；HTTP（`mcp_rpc`/`mcp_conn`/`mcp_listener`，SSE sink）与 stdio（`mcp_stdio`，newline sink）只差成帧与长活订阅的宿主。**无状态**：没有 `initialize` 握手、没有 `Mcp-Session-Id`、没有 GET 流、没有 `Last-Event-ID` 续传；版本与能力逐请求走 `_meta`。
+
+### 4.17.1 方法能力矩阵
+
+| 方法 | 状态 | 语义要点 |
+|---|---|---|
+| `server/discover` | **本地实现** | 返回 `resultType`、`supportedVersions`（`2026-07-28`）、`capabilities`（由 `features` 推导）、`_meta.io.modelcontextprotocol/serverInfo`、`ttlMs`（`discover_ttl_ms`，默认 3600000）、`cacheScope: public`；`instructions` 仅在配置时输出。不发布到内核 |
+| `subscriptions/listen` | **本地实现（长活流）** | 第一帧固定 `notifications/subscriptions/acknowledged`（`subscriptionId` = 请求 id），其后转发客户端订阅的通知；`sse_max_duration_ms` 到点回成功 response（`resultType: complete`）再关流（Graceful Closure） |
+| `tools/list`、`tools/call` | **透传（`tools` feature）** | `call` 的 `Mcp-Name` 映 `params.name` |
+| `resources/list`、`resources/templates/list`、`resources/read` | **透传（`resources`）** | `read` 的 `Mcp-Name` 映 `params.uri` |
+| `prompts/list`、`prompts/get` | **透传（`prompts`）** | `get` 的 `Mcp-Name` 映 `params.name` |
+| `completion/complete` | **透传（`completions`）** | — |
+| `initialize` | **不支持** | 2026-07-28 已无握手；按未知方法 → **404 + `-32601`** |
+| `sampling/*`、`elicitation/*` | **明确拒绝** | server→client 方向；→ **404 + `-32601`**，`data.reason` 为 `"sampling is not supported"` / elicitation 同形（R-B2） |
+| 其余任何 method | **不支持** | **404 + `-32601`** |
+| 未广告 feature 下的方法 | **门控** | **404 + `-32601`**，`data = {reason:"feature not advertised", feature:<name>}`（见 §4.17.7 #25；ADR-027 原文写 200，落地为 404，见执行计划偏差 2） |
+
+### 4.17.2 Streamable HTTP 门禁顺序与错误映射
+
+单端点（`path`，默认 `/`），**仅 POST**；固定顺序、先传输后信封：
+
+| 顺序 | 门禁 | 失败响应 |
+|---|---|---|
+| 1 | `Origin`（若存在）必须是 loopback 或 `allowed_origins` 之一 | **403**，**无 body** |
+| 2 | `Accept` 必须同时含 `application/json` 与 `text/event-stream`（或 `*/*`） | **406**，无 body |
+| 3 | 方法必须是 POST（GET/DELETE 等） | **405** + `Allow: POST` |
+| 4 | `Content-Type` 基类型必须是 `application/json` | **415**，无 body |
+| 5 | `MCP-Protocol-Version` 必填且 == body `_meta` 版本 | **400 + `-32020`**（缺失与不等同判） |
+| 6 | `Mcp-Method` 必填且 == body `method` | **400 + `-32020`** |
+| 7 | `Mcp-Name` 必填（仅 `tools/call`/`resources/read`/`prompts/get`）且 == body 值（`=?base64?…?=` 哨兵先解码） | **400 + `-32020`** |
+| 8 | 认证（`broker_security` 不透明 bearer token） | **401** + `WWW-Authenticate: Bearer realm="mcp"`，无 body |
+| 9 | 信封（`jsonrpc`/`method`/`id`；`id` 必须是 string 或 integer，**`null` 非法**） | **400 + `-32700`/`-32600`** |
+| 10 | `_meta` 必填：`protocolVersion` 在 `supportedVersions` 内，否则 `-32022`；`clientCapabilities` 必填，缺 → `-32602` | **400** |
+| 11 | 路由：未知/未广告/`sampling`/`elicitation` | **404 + `-32601`** |
+| 12 | 参数校验（listen 的 `notifications` 必须是对象等） | **400 + `-32602`** |
+
+HTTP 状态映射是 MCP 局部覆盖（不改 `agent_rpc_error` 的 A2A 语义）：`method_not_found → 404`，`invalid_params`/`invalid_request`/`parse_error → 400`，其余走 `agent_rpc_error:http_status/1`（`internal_error → 500`、`unsupported_protocol_version → 400`）。**通知 POST**（无 `id`）不校验 5–7 三个镜像头（spec 未定义），过 Origin/Accept/Content-Type/认证后回 **202 无 body**。
+
+### 4.17.3 一次透传调用的总线协议
+
+```
+客户端 ──POST tools/call──► mcp_rpc（门禁）──► mcp_dispatch:route
+   └─ 生成 token / replyTo = $mcp/reply/<tenant>/<token>
+   └─ 记录 reply 分区的 tail（发布前）为读起点
+   └─ 发布 $mcp/tools/call：payload = 客户端 JSON-RPC 原文 + _meta.unified-mq = {replyTo, requestToken, tenantId}
+        └─► 后端（任意语言）：读该 destination，把结果发布到 replyTo
+              _meta.unified-mq.kind = rpcResult（缺省）→ 终止帧 {"result":…} 或 {"error":{…}}
+                                     = progress   → notifications/progress（token 取请求 _meta.progressToken）
+                                     = notification → notifications/<payload.method>
+   └─ mcp_stream：瞬态读者（subscribe 分区邮箱 + read_from/3，不建 SubRef、不 pin retention）
+        终止帧 → 覆盖客户端 id → 关流；request_timeout_ms 到点 → -32603 + data.reason="timeout"
+```
+
+- 请求消息是普通 `#broker_message{}`：`payload_encoding = json`、`persistence = durable`、`reliability = request_reliability`（默认 `fsync`）、分区由 `broker_router_hash:route/3` 求得；`headers` 里另放 `reply_to`/`tenant_id`/`request_token` 供 Erlang 消费者免解析 JSON。
+- **SSE 响应头**：`content-type: text/event-stream`、`transfer-encoding: chunked`、`cache-control: no-cache`、`x-accel-buffering: no`；每个 `data:` 帧是一个完整 JSON-RPC 对象（进度/通知是 Notification，终止帧是带客户端 `id` 的 Response）。
+- 后端回什么 `id` 都不影响关联：网关在终止帧上用客户端自己的 `id` 覆盖。
+- `server/discover` **不发布**，直接单帧 `application/json` 200（不是 SSE）。
+
+### 4.17.4 `subscriptions/listen`
+
+`params.notifications` 的字段映射到内核目的地（`mcp_sub:plan/1`）：
+
+| 请求字段 | 内核目的地 | 转发方法 |
+|---|---|---|
+| `toolsListChanged: true` | `$mcp/notify/tools/list_changed` | `notifications/tools/list_changed` |
+| `promptsListChanged: true` | `$mcp/notify/prompts/list_changed` | `notifications/prompts/list_changed` |
+| `resourcesListChanged: true` | `$mcp/notify/resources/list_changed` | `notifications/resources/list_changed` |
+| `resourceSubscriptions: [uri]` | `$mcp/notify/resources/updated/<uri>` | `notifications/resources/updated`（`params.uri` 由目的地回填） |
+
+- **第一帧必须是 ack**，`_meta.io.modelcontextprotocol/subscriptionId = <listen 请求 id>`；`notifications` 字段只回显网关**实际同意**的子集（未广告/无法路由的项被丢掉，ack 里不出现）。
+- 之后每条转发的通知都带同一 `subscriptionId`；后端发布到通知 destination 的 **payload 就是通知 params 对象**（网关只补 `_meta.subscriptionId`，不重写 payload）。
+- 关流条件：客户端断开 / 到达 `sse_max_duration_ms`（回 `resultType: complete` 的成功 response 再关）/ 单帧超 `sse_max_event_bytes`（先发 `-32603` 再关）。空闲期按 `sse_heartbeat_ms` 发 `: ping` 注释行。
+- **瞬态读者**：`broker_queue:subscribe/2` + `read_from/3`，读起点是订阅前的分区 tail；不建 SubRef、不写 cursor、不 pin retention（承 ADR-025 §D7）。
+
+### 4.17.5 stdio 前端
+
+- **成帧**：一行一条 JSON-RPC（`io:get_line/1`，trim 后按行解码）；`stdout` 只用 `io:put_chars(standard_io, …)` 写协议帧；坏 JSON 回 `-32700`，**不回**任何非协议文本。
+- **身份**：stdio 没有 header/凭据通道，固定 `agent_rpc_auth:anonymous()`（默认租户，默认 `t0`）；信任边界是「谁能启动这个进程」。
+- **长活订阅**：`subscriptions/listen` 在 **子进程**（`spawn_link`）里跑 `mcp_stream:run_stdio/2`，与主读循环共享 stdout；主循环继续读其他行。`notifications/cancelled`（`params.requestId`）按 listen 请求 id 给子进程发 `mcp_cancel`，由子进程的 `after` 子句退订。
+- **EOF** = 优雅退出：主循环 `shutdown/1` 给所有订阅子进程发取消信号后返回。
+- **stdout 纯净性由部署保证**：默认 `logger` handler 写 `standard_io`；生产 stdio 部署必须把 `default` handler 换到 `standard_error`（OTP 不允许原地改 `type`，需 `remove_handler` + `add_handler`）。本 app **不**自建 handler，也不在启动时校验（偏差 13）。
+
+### 4.17.6 证据
+
+| 类型 | 位置 | 规模 |
+|---|---|---|
+| CT（HTTP） | `apps/broker_proto_mcp/test/mcp_listener_SUITE.erl` | **32 例**：`discover` 6（本地回答 / capabilities 随 features / instructions+缓存提示 / 缺版本 / 版本不支持 / 缺 clientCapabilities）、`headers` 13（401 / 405 / 错 path 404 / Origin 403 / loopback 放行 / Accept 406 / Content-Type 415 / 缺版本头 / 方法头不匹配 / name 必填与校验 / base64 哨兵 / 坏 JSON / 通知 202）、`call` 9（往返 / 进度+结果 / 透传通知 / 后端 error / 超时 / name 头 / 未知方法 404 / 未广告 404 / sampling 拒绝）、`stream` 4（ack-first / tools list_changed / resource updated / 时长上限优雅关流），全部 `port => 0` |
+| CT（stdio） | `apps/broker_proto_mcp/test/mcp_stdio_SUITE.erl` | **10 例**：`protocol` 8（discover / 未知方法 / 坏 JSON / 通知无输出 / 缺版本 / 调用往返 / ACL 拒绝 / EOF 退出）、`subscription` 2（ack + 转发 / cancel 结束子进程） |
+| 全量回归 | `rebar3 ct` | **1015/1015、65 套件**（基线 973/63；净增 = 32 + 10，零 FAILED） |
+| 静态门禁 | `rebar3 dialyzer` / `rebar3 xref` / 两种 release | dialyzer **0 warning**；xref 除既有 unused-export 外无新告警；`rebar3 release` 与 `rebar3 as quic release` 均成功，`lib/` 含 `broker_proto_mcp-0.1.0` |
+| 真实请求 | `curl` + 一个假后端进程（读 `$mcp/<method>`、按协议回 progress/result 与通知） | **HTTP 24 条** + **stdio 6 行**（下节原文） |
+
+### 4.17.7 `curl` 实测（2026-11-12，证据节点 `127.0.0.1:18096`）
+
+节点配置：`listeners => [#{port => 18096}]`、`features => [tools, resources, prompts, completions]`、`require_auth => true`、`sse_heartbeat_ms => 3000`、`request_timeout_ms => 5000`、`sse_max_duration_ms => 4000`；用户 `mcp-evidence`（tenant `t1`，token `mcp-evidence-token`）。公共请求头为 `Content-Type: application/json`、`Accept: application/json, text/event-stream`、`MCP-Protocol-Version: 2026-07-28`、`Authorization: Bearer mcp-evidence-token`，body 的 `_meta` 带 `protocolVersion` 与 `clientCapabilities`。
+
+```
+$ curl -sS -D - -X POST http://127.0.0.1:18096/ \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: server/discover' \
+    -H 'Authorization: Bearer mcp-evidence-token' \
+    -d '{"jsonrpc":"2.0","id":"d1","method":"server/discover","params":{"_meta":{…}}}'
+HTTP/1.1 200 OK
+connection: keep-alive
+content-length: 295
+content-type: application/json
+
+{"id":"d1","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"unified-mq","version":"0.1.0"}},"cacheScope":"public","capabilities":{"completions":{},"prompts":{},"resources":{},"tools":{}},"resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":3600000}}
+```
+
+```
+$ curl -sS -N -D - -X POST http://127.0.0.1:18096/ \
+    -H 'Mcp-Method: tools/call' -H 'Mcp-Name: echo' \
+    -H '…公共头…' \
+    -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo",
+         "arguments":{"text":"hi"},"_meta":{…,"progressToken":"p-1"}}}'
+HTTP/1.1 200 OK
+transfer-encoding: chunked
+connection: keep-alive
+content-type: text/event-stream
+cache-control: no-cache
+x-accel-buffering: no
+
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"backend working on tools/call","progress":1,"progressToken":"p-1","total":2}}
+
+data: {"id":7,"jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"unified-mq","version":"0.1.0"}},"content":[{"text":"backend echo: tools/call","type":"text"}],"isError":false}}
+```
+
+```
+$ curl -sS -N http://127.0.0.1:18096/ … 'Mcp-Method: subscriptions/listen' \
+    -d '{"jsonrpc":"2.0","id":"sub-1","method":"subscriptions/listen","params":{
+         "notifications":{"toolsListChanged":true},"_meta":{…}}}'
+data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-1"},"notifications":{"toolsListChanged":true}}}
+
+# 另起一条连接触发 tools/call(name=emit-list-change)，假后端发布 $mcp/notify/tools/list_changed：
+data: {"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-1"},"reason":"tools changed"}}
+
+: ping
+```
+
+```
+# sse_max_duration_ms=4000：到点先回成功 response，再关流（Graceful Closure）
+data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-2"},"notifications":{"promptsListChanged":true,"toolsListChanged":true}}}
+
+: ping
+
+data: {"id":"sub-2","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-2"},"resultType":"complete"}}
+```
+
+**stdio 会话**（同一节点配置改成 `stdio_enabled => true`、`listeners => []`，输入 6 行，stdout 原文）：
+
+```
+{"id":"s1","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"unified-mq","version":"0.1.0"}},"cacheScope":"public","capabilities":{"completions":{},"prompts":{},"resources":{},"tools":{}},"resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":3600000}}
+{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"s2"},"notifications":{"toolsListChanged":true}}}
+{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"s2"},"reason":"tools changed"}}
+{"id":"s3","jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"unified-mq","version":"0.1.0"}},"content":[{"text":"backend echo: tools/call","type":"text"}],"isError":false}}
+{"error":{"code":-32601,"message":"Method not found"},"id":"s4","jsonrpc":"2.0"}
+{"error":{"code":-32700,"message":"Parse error"},"id":null,"jsonrpc":"2.0"}
+```
+
+输入的 6 行依次是：`server/discover`（`s1`）、`subscriptions/listen`（`s2`，`toolsListChanged`）、`tools/call name=emit-list-change`（`s3`）、`notifications/cancelled requestId=s2`、未知方法（`s4`）、坏 JSON。stdout **只有上面 6 个协议帧**；同一次运行的日志在 **stderr**（`STDIO_READY`、`mcp evidence backend up …`、`SIGTERM received`），证实「stdout-only」在正确配置 logger 后成立。
+
+| # | 请求 | 响应 / 观测 |
+|---|---|---|
+| 1 | `server/discover` | `200`，`capabilities` 四对象齐全、`ttlMs=3600000`、`cacheScope=public`（上） |
+| 2 | `tools/call` + `progressToken` | `200 text/event-stream`；先 `notifications/progress`，后终止帧 `result`（上） |
+| 3 | `tools/nope`（未知方法） | **`404`** `-32601` `{"error":{"code":-32601,"message":"Method not found"}}` |
+| 4 | `initialize` | **`404`** `-32601`（无握手） |
+| 5 | `sampling/createMessage` | **`404`** `-32601`，`data.reason="sampling is not supported"` |
+| 6 | 缺 `MCP-Protocol-Version` 头 | **`400`** `-32020` `MCP-Protocol-Version header is required` |
+| 7 | `MCP-Protocol-Version: 2025-06-18` vs body `2026-07-28` | **`400`** `-32020` `…does not match the request body` |
+| 8 | 头与 body 同为 `2025-06-18` | **`400`** `-32022`，`data={supported:["2026-07-28"],requested:"2025-06-18"}` |
+| 9 | `Mcp-Name: other` vs body `name=echo` | **`400`** `-32020` `Mcp-Name header does not match the request body` |
+| 10 | body `_meta` 缺 `clientCapabilities` | **`400`** `-32602`，`data.reason="missing _meta.io.modelcontextprotocol/clientCapabilities"` |
+| 11 | `id: null` | **`400`** `-32600`（MCP 的 `id` 不接受 `null`） |
+| 12 | 无 `Authorization`（头/体一致） | **`401`**，`www-authenticate: Bearer realm="mcp"`，无 body |
+| 13 | `Accept: application/json`（无 SSE） | **`406`**，无 body，`connection: close` |
+| 14 | `GET /` | **`405`** + `allow: POST`，无 body |
+| 15 | `Origin: http://evil.example` | **`403`**，无 body（DNS-rebinding 防御） |
+| 16 | `Content-Type: text/plain` | **`415`**，无 body |
+| 17 | 通知 POST（`notifications/cancelled`） | **`202`**，`content-length: 0` |
+| 18 | 错误 token | **`401`**，与 #12 同形 |
+| 19 | 坏 JSON（请求头未带版本，先到解析） | **`400`** `-32700` `{"error":{"code":-32700,"message":"Parse error"},"id":null,"jsonrpc":"2.0"}` |
+| 20 | `subscriptions/listen`（`toolsListChanged`） | `200 text/event-stream`：ack → 通知 → `: ping`（上） |
+| 21 | 触发 `tools/call name=emit-list-change` | 自己的流：一帧终止 `result`（无 progressToken 时无进度帧） |
+| 22 | 同一 listen（`sse_max_duration_ms=4000`） | ack → `: ping` → `resultType: complete` 后关流（上） |
+| 23 | stdio 会话（6 行） | stdout 6 个协议帧、日志全在 stderr（上） |
+| 24 | `features => []` 时 `server/discover` | `200`，`capabilities: {}`（诚实空） |
+| 25 | `features => []` 时 `tools/list` | **`404`** `-32601`，`data={reason:"feature not advertised",feature:"tools"}` |
+
+### 4.17.8 已声明的限制 / 边界
+
+- **默认零端口**：`listeners => []`、`stdio_enabled => false`。18096 只是本次证据端口；8082 是设计示例，不由本 app 出厂占用。
+- **不做 MCP Server 的活**：工具参数校验、资源内容、prompt 模板、`sampling`/`elicitation` 回调都在网关之外（R-B1/R-B2）。
+- **无状态**：没有 `initialize`、会话 id、GET 流、断点续传；每个请求自带版本与客户端能力。
+- **通知 POST 的镜像头不校验**：spec 未定义，网关只做传输/认证门禁后回 202。
+- **`Mcp-Param-*`（源自 `x-mcp-header`）不强制**：网关没有后端 `inputSchema`，无法判断这些头是否该出现；能力矩阵按「accepted, not enforced」记录。
+- **SSE 只有一个时长上限**：`sse_max_duration_ms`；没有 pending-bytes / send-timeout 闸门，慢客户端靠 socket 缓冲自然反压（ADR-025 §D7 的 `sse_max_pending_bytes` 未落地）。
+- **stdio 不做认证**：身份固定为匿名（默认租户）；进程访问权即凭据。stdout 纯净性依赖部署把 logger 指向 stderr。
+- **单节点**：reply 与 listen 都读 owner 节点的本地分区，跨节点 reply/订阅不支持（与 A2A Task 同一限制）。
+- **无新增指标键**：失败只 `logger`（S9-F 统一动 `broker_metrics` 冻结键集）。
+- **真实 MCP 客户端证据留 S9-F**：本节是 `curl` 原文 + 假后端；官方 SDK / MCP Inspector 的客户端矩阵按 Gate S9 第 1 项在 S9-F 统一取证。
 
 ---
 

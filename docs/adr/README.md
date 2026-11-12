@@ -50,6 +50,7 @@
 |---|---|---|
 | [025](025-a2a-task-log-mapping.md) | A2A Task 状态机到统一消息内核的映射：Task 事件 = 普通 `broker_message`（事件溯源），Task = adapter 投影，不用订阅游标；可靠性档绑定 ADR-007；retention 为运维契约 | A2A 1.0.0 `specification/a2a.proto`（`Task`/`TaskState`/`StreamResponse`）、`docs/specification.md` §5.4/§9；ADR-001/002/007/009/013/014/015/026 |
 | [026](026-agent-adapter-front-end.md) | Agent 接入前端：四 app 拆分（纯库底座 + 三 adapter）、ranch + `{packet, http_bin}` + OTP 28 `json` 自建 HTTP/1.1/SSE、Agent Card 落 `broker_meta.agent_card`（amends ADR-002）、端口/boot/relx 双清单、ACP 只做 stdio 且 Broker 扮 Client、egress pin IP 与 OAuth 不纳入 | A2A 1.0.0 §5.3/§5.5/§9、MCP 2026-07-28 architecture、ACP v1 overview；ADR-001/002/015/016/021/023/024/025 |
+| [027](027-mcp-front-end-kernel-mapping.md) | MCP 前端：Broker 作网关（原语透传到 `$mcp/<method>`、`server/discover`/`subscriptions/listen` 本地实现）、无状态无会话（2026-07-28）、单端点 Streamable HTTP 请求头门禁、stdio 前端、能力 env 驱动、瞬态读者取回；**不 amends ADR-002**（MCP 不落 Mnesia） | MCP 2026-07-28 `basic/*` + `server/discover` + schema；ADR-001/002/007/009/010/013/015/025/026 |
 
 > S9 决策只冻结抽象与边界，S9-A~S9-F 的代码与 Gate 证据尚未产出（roadmap §11.1）；结论与证据汇总见 [`docs/design/s9-0-convergence-report.md`](../design/s9-0-convergence-report.md)。
 

@@ -18,6 +18,8 @@
                 | method_not_found
                 | invalid_params
                 | internal_error
+                | header_mismatch
+                | unsupported_protocol_version
                 | task_not_found
                 | task_not_cancelable
                 | push_notification_not_supported
@@ -49,6 +51,11 @@ code(invalid_agent_response)         -> -32006;
 code(extended_agent_card_not_configured) -> -32007;
 code(extension_support_required)     -> -32008;
 code(version_not_supported)          -> -32009;
+%% MCP 2026-07-28 (`basic/index' error table). `-32020' is a transport safety
+%% error: the request headers disagree with the JSON-RPC body, which is exactly
+%% the class the Streamable HTTP binding answers before touching the envelope.
+code(header_mismatch)                -> -32020;
+code(unsupported_protocol_version)   -> -32022;
 %% Transport-level failures have no JSON-RPC code. Answering with
 %% `internal_error' would be a lie (the request never became an envelope), so
 %% the adapter asks `http_status/1' and sends a bare HTTP response instead.
@@ -69,6 +76,8 @@ http_status(payload_too_large) -> 413;
 http_status(unsupported_media_type) -> 415;
 http_status(parse_error) -> 400;
 http_status(invalid_request) -> 400;
+http_status(header_mismatch) -> 400;
+http_status(unsupported_protocol_version) -> 400;
 http_status(internal_error) -> 500;
 http_status(Reason) ->
     %% Every other A2A error maps to 400 (§5.4). An atom outside the table is a
@@ -99,6 +108,8 @@ message(invalid_agent_response) -> <<"Invalid agent response">>;
 message(extended_agent_card_not_configured) -> <<"Extended agent card is not configured">>;
 message(extension_support_required) -> <<"A required extension is not supported">>;
 message(version_not_supported) -> <<"Protocol version not supported">>;
+message(header_mismatch) -> <<"Request headers do not match the request body">>;
+message(unsupported_protocol_version) -> <<"Unsupported protocol version">>;
 message(unauthorized) -> <<"Unauthorized">>;
 message(forbidden) -> <<"Forbidden">>;
 message(payload_too_large) -> <<"Payload too large">>;

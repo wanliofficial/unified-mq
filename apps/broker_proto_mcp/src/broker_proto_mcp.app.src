@@ -1,0 +1,48 @@
+{application, broker_proto_mcp, [
+    {description, "MCP 2026-07-28 front end: broker as gateway (S9-D)"},
+    {vsn, "0.1.0"},
+    {registered, [broker_proto_mcp_sup]},
+    {mod, {broker_proto_mcp_app, []}},
+    {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
+                    broker_core, broker_security, broker_meta,
+                    broker_router, broker_queue, broker_proto_agent_rpc]},
+    {env, [
+        %% S9-D (ADR-027): empty by default. An operator release ships the app
+        %% but opens no port until a listener map is configured. The MCP endpoint
+        %% is a single endpoint that accepts POST only (2026-07-28 removed the
+        %% GET stream and protocol-level sessions).
+        {listeners, []},
+        %% New surface, no legacy clients: authentication is on by default and
+        %% turns off only for a loopback bind (validated at boot).
+        {require_auth, true},
+        %% The MCP endpoint path. Only POST to this path is routed; everything
+        %% else is a 404.
+        {path, <<"/">>},
+        %% Effective body cap is min(this, broker_security:limits.max_message_bytes/0).
+        {max_body_bytes, 1048576},
+        {max_connections, 1024},
+        {request_timeout_ms, 30000},
+        %% Server feature advertisement (ADR-027 §D6). Empty = honest default:
+        %% no backend attached, so no capability and every primitive answers
+        %% -32601 until a feature is configured.
+        {features, []},
+        %% server/discover caching hint (ResultMetaObject.ttlMs).
+        {discover_ttl_ms, 3600000},
+        %% Optional natural-language guidance for the LLM (DiscoverResult.instructions).
+        {instructions, undefined},
+        %% Allowed Origin hosts for the transport-gate 1 refusal (403). Loopback
+        %% is always allowed regardless of this list.
+        {allowed_origins, []},
+        %% stdio front end (R-T4). Disabled by default: a running release must
+        %% not steal stdin.
+        {stdio_enabled, false},
+        %% SSE framing (shared with the agent_rpc_sse vocabulary).
+        {sse_max_event_bytes, 1048576},
+        {sse_heartbeat_ms, 15000},
+        %% A pass-through call has a hard ceiling so a backend that never
+        %% replies cannot hold a connection forever.
+        {sse_max_duration_ms, 600000},
+        %% Reliability of a published request message (ADR-007 explicit tiers).
+        {request_reliability, fsync}
+    ]}
+]}.

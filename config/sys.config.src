@@ -285,6 +285,47 @@
     {push_inet_family, inet}
   ]},
 
+  {broker_proto_mcp, [
+    %% S9-D: MCP 2026-07-28 front end (ADR-027). The broker is an MCP *gateway*:
+    %% primitives are forwarded to `$mcp/<method>' and the broker answers
+    %% `server/discover' / `subscriptions/listen' itself. An operator release
+    %% adds e.g.
+    %%   #{port => 8082, ref => {mcp, 8082}, num_acceptors => 10,
+    %%     max_connections => 1024}
+    {listeners, []},
+    %% New surface, no legacy clients: authentication is on by default and
+    %% turns off only for a loopback bind (validated at boot).
+    {require_auth, true},
+    %% The single MCP endpoint. Streamable HTTP is POST-only on this path; the
+    %% GET stream and protocol sessions were removed in 2026-07-28.
+    {path, <<"/">>},
+    %% Effective body cap is min(this, broker_security:limits.max_message_bytes/0).
+    {max_body_bytes, 1048576},
+    {max_connections, 1024},
+    %% Reply wait for one pass-through call (SSE timeout -> -32603).
+    {request_timeout_ms, 30000},
+    %% Honest default: nothing is attached, so no capability is advertised and
+    %% every primitive answers -32601. Configure `[tools, resources, prompts,
+    %% completions]' once backends are bound to `$mcp/<method>' destinations.
+    {features, []},
+    %% `server/discover' cache hints (`CacheableResult').
+    {discover_ttl_ms, 3600000},
+    {instructions, undefined},
+    %% Allowed `Origin' hosts besides loopback (a present-but-illegal Origin is
+    %% 403, the DNS-rebinding defence).
+    {allowed_origins, []},
+    %% stdio front end: off by default, a running release must not steal stdin.
+    {stdio_enabled, false},
+    %% SSE framing, shared vocabulary with the A2A front end.
+    {sse_max_event_bytes, 1048576},
+    {sse_heartbeat_ms, 15000},
+    %% A listen stream closes gracefully after this; a call gives up earlier
+    %% (`request_timeout_ms').
+    {sse_max_duration_ms, 600000},
+    %% Reliability of a published request message (ADR-007 explicit tiers).
+    {request_reliability, fsync}
+  ]},
+
   {broker_proto_mqtt_ws, [
     %% S8-B: MQTT over WebSocket. A separate app and port from the broker's own
     %% ws API above (8080) -- the two speak entirely different protocols, and
