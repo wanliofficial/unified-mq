@@ -1,0 +1,43 @@
+{application, broker_ice, [
+    {description, "ICE helper: STUN Binding and TURN over UDP (ADR-029 boundary)"},
+    {vsn, "0.1.0"},
+    {registered, [broker_ice_sup, broker_ice_udp, turn_allocation_sup]},
+    {mod, {broker_ice_app, []}},
+    %% Deliberately NOT a dependency of, or on, `broker_proto_webrtc' (the
+    %% signaling face) and never on `broker_queue' / `broker_router' /
+    %% `broker_core' record types (ADR-029 §D1): this app exists to give a
+    %% browser STUN/TURN service and nothing else.
+    {applications, [kernel, stdlib, sasl, crypto, broker_security,
+                    broker_metrics]},
+    {env, [{%% The ship default: the app is in every release, and opens no
+            %% socket until an operator turns it on (ADR-029 §D2).
+            enabled, false},
+           {%% IANA-registered STUN/TURN port.
+            port, 3478},
+           %% The address put into XOR-RELAYED-ADDRESS. Required when enabled:
+           %% a relay that advertises the wrong address produces ICE candidates
+           %% no peer can reach, so a missing value is a boot failure rather
+           %% than a silent 0.0.0.0 (R-I1).
+           {turn_ip, undefined},
+           %% Used to resolve `turn_ip' when it is not configured, and nothing
+           %% else.
+           {hostname, undefined},
+           %% TURN long-term credential realm (RFC 5766 §4). Required.
+           {realm, undefined},
+           %% HMAC key for the stateless nonce. Left `undefined' the app
+           %% generates 32 random bytes per boot, which invalidates every
+           %% outstanding nonce across a restart -- correct, because every
+           %% allocation is gone too. Set it to keep nonces valid across a
+           %% planned restart.
+           {nonce_secret, undefined},
+           %% The dynamic/private range (RFC 6335 §6); narrowing it is the
+           %% deployment-side firewall decision ADR-029 §D2 anticipates.
+           {relay_port_range, {49152, 65535}},
+           {max_allocations, 1024},
+           {allocation_lifetime_s, 600},
+           {max_permissions_per_allocation, 16},
+           {max_channels_per_allocation, 16},
+           %% Socket buffers, in bytes. TURN relays media-shaped traffic, so
+           %% the default is well above the kernel's 128 KB.
+           {recbuf_bytes, 262144}]}
+]}.

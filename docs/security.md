@@ -1,6 +1,6 @@
 # 安全与治理（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S7 追加 §2.1（六协议统一身份表）；S9-F 追加 §12.1（三协议 18 条未实现项）；**S10-A 追加 §2.1（WebRTC 信令共用同一张 `users` 表）、§9 的 TLS 调用者清单与 §12.2（信令面未实现项）；S10-B 更新 §12.2（房间/`to` 转发/ACL/分片重组四条已实现，新增 ICE 面未实现项）**
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S7 追加 §2.1（六协议统一身份表）；S9-F 追加 §12.1（三协议 18 条未实现项）；S10-A 追加 §2.1（WebRTC 信令共用同一张 `users` 表）、§9 的 TLS 调用者清单与 §12.2（信令面未实现项）；S10-B 更新 §12.2（房间/`to` 转发/ACL/分片重组四条已实现）；**S10-C 追加 §2.1（TURN 长期凭据同表派生）、§12.2 第 12 条结案与新的 §12.3（ICE 面 8 条未实现项）**
 - **对应**：README §10.1 / §10.2；`docs/roadmap.md` §8.1；Gate S6 第 1 项
 - **实现**：`apps/broker_security/`（`broker_security`、`broker_limits`、`broker_security_tls`）
 - **测试**：`broker_security_SUITE`、`broker_security_acl_SUITE`、`broker_limits_SUITE`、`broker_security_tls_SUITE`、`broker_security_audit_SUITE`
@@ -55,6 +55,8 @@
 `authenticate_conn/1` 的失败形态同样统一：未知用户、错误密码、未知 token、错误 token、以及两种形态之间的差异，对外都是同一个 `bad_username_or_password`，探测方无法据此枚举。
 
 **S10-A 再加一个调用者（2026-11-13）**：WebRTC 信令前端 `webrtc_conn` 在认证窗口内收到 `{"event":"authenticate","data":{"username":…,"password":…}}` 后调用同一个 `authenticate_conn({user_pass, U, P})`，因此信令面也与上述协议**共用同一张 `users` 表**，租户同样只来自用户记录。它不引入新的凭据形态、不读 `broker_security.require_auth`（那是「必须认证的协议名列表」），而是用自己的 `broker_proto_webrtc.require_auth` 开关，见 `docs/architecture.md` §3.16 与本文件 §12.2。S9 的 A2A / MCP 经由 `agent_rpc_auth` 也在同一张表上取身份（不重复计入这里的「六协议」口径）。
+
+**S10-C 再加一个派生者（2026-11-14），但走的是另一条函数**：TURN 的长期凭据（RFC 5766 §4）不是「校验口令」而是「与客户端派生同一个 key」，因此 `turn_auth` 调用新增的 `broker_security:long_term_key(User, Realm)` → `key = MD5(username ":" realm ":" password)`，口令仍**只**从 `user_record/1` 取；认证之后仍然走 `authorize/2`，只是新增了五个 `turn_*` action、主体不带 `tenant_id`（TURN 报文里没有租户字段，填 `default_tenant()` 会把默认租户部署的请求整片拒掉）。**`authenticate_conn/1` 与 `authorize/2` 的既有语义一字未动**；口令与派生 key 都不进日志（`turn_auth_SUITE:no_password_or_key_reaches_the_log/1` 带 probe 断言）。ICE 面的未实现项见 §12.3。
 
 ### 2.2 匿名连接是部署决策
 
@@ -199,13 +201,15 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
         versions => ['tlsv1.2', 'tlsv1.3']}}
 ```
 
-- `broker_security_tls:transport/0` 返回 `{ranch_tcp, []}`（禁用）或 `{ranch_ssl, Opts}`（启用）。**十个**协议 supervisor 都调用它（MQTT、WebSocket、MQTT over WebSocket、NATS、AMQP、Kafka、Pulsar，以及 S9 的 A2A、MCP 与 S10-A 的 WebRTC 信令），**一个开关覆盖所有 listener**，没有哪个 listener 能「知道 TLS 但不消费配置」。两个不在这条链上：MQTT-SN 走 UDP（要 DTLS，见 §12 第 8 条），MQTT over QUIC 只把证书配置当作**来源**读（握手本身就是 TLS 1.3，没有明文模式）。
+- `broker_security_tls:transport/0` 返回 `{ranch_tcp, []}`（禁用）或 `{ranch_ssl, Opts}`（启用）。**十个**协议 supervisor 都调用它（MQTT、WebSocket、MQTT over WebSocket、NATS、AMQP、Kafka、Pulsar，以及 S9 的 A2A、MCP 与 S10-A 的 WebRTC 信令），**一个开关覆盖所有 listener**，没有哪个 listener 能「知道 TLS 但不消费配置」。**三个**不在这条链上：MQTT-SN 走 UDP（要 DTLS，见 §12 第 8 条），MQTT over QUIC 只把证书配置当作**来源**读（握手本身就是 TLS 1.3，没有明文模式），S10-C 的 `broker_ice`（STUN/TURN over UDP，5349/TLS 与 DTLS 都不做，见 §12.3 第 1 条）。
 - **协议侧还要真的把 TLS 握手跑完**：ranch 对 TLS 只做 `transport_accept`，协议进程收到 `{handshake, Ref, Transport, Sock, Timeout}` 后必须自己调 `Transport:handshake/2`（`ranch_tcp` 是 no-op，`ranch_ssl` 才完成握手），否则首个 `ssl:setopts/2` 报 `notsup_on_transport_accept_socket`。这正是 S8-B 修掉的既有缺陷：`broker_proto_ws` 的 wss 在此前**完全不可用**（listener 明明是 `ranch_ssl`），现由 `ws_conn_SUITE` 的 wss 用例钉住；`broker_proto_mqtt_ws` 从第一版起就正确握手。
 - 启动时 `broker_security_app:start/2` 校验：启用且缺 PEM 文件 → 应用启动失败；禁用永远合法。
 - 轮换：替换同路径 PEM，调用 `broker_security_tls:reload/0`（管理 API `POST /api/v1/tls/reload`），清 `ssl` PEM 缓存，下一个握手用新证书；已建立连接保持原证书（标准 TLS 语义）。
 - 脱敏：`redacted_config/0` 不返回密钥内容。
 
 证据：`broker_security_tls_SUITE`（12 例，含真实 `ssl:listen` + 握手 + `transport/0`）。
+
+**S10-C 的 `broker_ice` 不是这个清单里的调用者**：它的 3478/UDP 与 relay 段全是**明文 UDP**（ADR-029 §D2 明确不做 5349/TLS 与 DTLS），`broker_security.tls.enabled` 对它没有任何影响。TURN 的密码学边界只有 `MESSAGE-INTEGRITY` 的**完整性**保护（口令不过线，但 username/realm/relay 流量在链路上是明文），见 §12.3 第 2 条。
 
 ---
 
@@ -314,4 +318,18 @@ S10-A 只交付**信令连接底座**（`broker_proto_webrtc` 的 WSS 接入层�
 ~~11. **未做 WebSocket 分片重组**：`ws_frame:decode/2` 会把 `fin => false` 的帧照实返回（分片是「暴露给连接进程」的，见该模块注释），但 `webrtc_conn:on_frame/2` 不看 `fin`——首片直接当作完整文本送进 `handle_text/2`，`opcode 0` 续帧落到兜底子句被静默忽略。后果：分片发送的 `authenticate` 只会被判 `unauthorized`，分片发送的信令一律 `invalid_message`（不会误路由、不会崩溃），而对照的 `ws_conn` 与 `mqtt_transport_ws` 都做了重组。浏览器信令客户端默认不分片（一个 SDP 远小于 `max_frame_bytes`），所以本阶段不阻塞；S10-B 房间转发落地时一并补，避免把「半条消息」当完整消息路由。~~
    **已由 S10-B 补齐（2026-11-13）**：`webrtc_conn` 增加 `frag = {Op, Acc, Size}` 状态，`fin = false` 的数据帧开一条消息（opcode 决定 text/binary），`opcode 0` 续帧按首帧 opcode 累积，`fin = true` 的续帧才 `handle_message/3`；**无起始帧的续帧、开消息期间又来新的数据帧 → close 1002**；重组过程同样受 `max_frame_bytes` 约束（超限 → 1009）。**客户端 close 帧现在也回显**（同 code；1005/1006/1015 与越界值统一回 1000，RFC 6455 §7.4.1）。`webrtc_conn_SUITE` frames 组 27→31 补 4 例：分片 `authenticate` 重组成功、孤儿续帧 → 1002、close 回显、保留码 → 1000。
 
-12. **无 STUN / TURN（ICE 面）**：3478/UDP、TURN 长期凭据、relay 端口段全部属 S10-C（独立 app `broker_ice`，与信令互不依赖）。本阶段 NAT 穿越只能靠对端直连，跨 NAT 会话需要外部 STUN/TURN。
+~~12. **无 STUN / TURN（ICE 面）**：3478/UDP、TURN 长期凭据、relay 端口段全部属 S10-C（独立 app `broker_ice`，与信令互不依赖）。~~
+    **已由 S10-C 实现（2026-11-14）**：独立 app `broker_ice`，STUN Binding（**无认证**——它就是浏览器在拿到凭据前探测 reflexive 地址用的）与 TURN over UDP 全套（`Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`/`ChannelData`/`Send`/`Data`），长期凭据从**同一张 `users` 表**派生（`key = MD5(user ":" realm ":" password)`，新增 `broker_security:long_term_key/2`），ACL 走 `authorize/2`（新增 `turn_allocate`/`turn_refresh`/`turn_permission`/`turn_channel`/`turn_send` 五个 action）。出厂 `enabled => false` **零 socket**。ICE 面自己的未实现项见 §12.3。
+
+### 12.3 S10 ICE 面明确未实现项（S10-C 2026-11-14 立）
+
+S10-C 交付 STUN Binding + TURN over UDP。下表逐条留痕本阶段**真实没有**的东西（不作为 Gate 依据，`docs/design/s10-execution-plan.md` §8、§2.3 与 ADR-029「落地偏差记录」有同一份口径）：
+
+1. **只做 UDP，不做 TURN over TCP / TLS / DTLS**：`Allocate` 的 `REQUESTED-TRANSPORT ≠ 17` 直接回 **442**（不是静默降级）。后果：只放行 TCP 出站的企业网络里 TURN 不可用；UDP 被限速时也没有回退路径。5349 是 ADR-029 §D2 明确排到 P2 的项，不允许实现期悄悄补。
+2. **长期凭据的派生密钥在明文 UDP 上协商**：`MESSAGE-INTEGRITY` 提供**完整性**（口令本身不过线），但**链路没有加密**——同网段的被动嗅探者能看到 username、realm、allocation 元数据与中继流量。这是「不做 5349」的直接后果，ADR-029「后果」段已冻结：跨公网部署需自行评估。
+3. **无 IPv6 候选**：`turn_ip` 必须是 IPv4 四元组，否则启动失败（`{invalid_turn_ip, V}`）；`XOR-MAPPED-ADDRESS` / `XOR-RELAYED-ADDRESS` / `XOR-PEER-ADDRESS` 都只编 IPv4。IPv6 网络里 TURN 不可用（STUN Binding 也回不了 IPv6 mapped address）。
+4. **无 ICE-lite、无 ICE 状态机**：本 app 完全是 STUN/TURN 服务端，**不是 ICE agent**——不做候选配对、不做连通性检查、不选 pair。这些全在浏览器/`aiortc` 侧。
+5. **单节点语义**：allocation、permission、channel、relay 端口都是节点内资源，无 ra、无 Mnesia、无跨节点归属（ADR-029 §D5）。多节点部署时同一客户端的 `Allocate` 会落到负载均衡器选中的那个节点，**没有**跨节点 relay 复用或迁移。集群化需另立 ADR。
+6. **无速率限制与反滥用闸门**：只有 `max_allocations`（默认 1024）、`max_permissions_per_allocation`（16）、`max_channels_per_allocation`（16）与 `allocation_lifetime_s`（600 s）。**没有**每 IP / 每用户 的 allocation 速率限制、没有令牌桶、没有针对「伪造 5-tuple 刷 `Allocate`」的缓解（虽然每条都要过 `MESSAGE-INTEGRITY`，即攻击者必须先有一个有效账号）。relay 端口段是有限的，`508` 比限流更早出现。**`max_allocations` 是全局的，不是按用户分的**。
+7. **不写指标、不写协议层日志**：沿用 §12.1 第 17 条与 ADR-016 冻结键集——`broker_metrics` 出现在 `.app.src` 的 `applications` 里但**代码零调用**；`broker_ice_udp` / `turn_allocation` / `turn_auth` **一次 `logger` 调用都没有**（认证失败、`438`、`441`、`486`、`508` 全是纯状态转移）。`turn_auth_SUITE:no_password_or_key_reaches_the_log/1` 用 probe 断言「即使将来加日志也不能带口令或 key」。运维可见性目前只有 `broker_ice_udp:allocations/0` 快照与 `ss -lunp`。
+8. **没有真实第三方客户端证据**：现有证据是 CT 里手写字节的 `ice_test_client`（`stun_codec_SUITE` 21 + `turn_auth_SUITE` 16 + `stun_server_SUITE` 13 + `turn_allocation_SUITE` 22）。`aiortc` 的 `iceTransportPolicy="relay"` 与浏览器 `RTCPeerConnection` 的 STUN/TURN 连通性证据仍属 S10-D 的 D.1。同样**未做压测**：allocation 建立速率与 relay 吞吐都还没有数字（D.6）。

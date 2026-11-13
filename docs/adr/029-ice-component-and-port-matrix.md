@@ -68,3 +68,37 @@ S10 的第二个组件是为浏览器 `RTCPeerConnection` 提供 STUN/TURN 辅�
 ## 落地偏差记录
 
 （S10-C 起逐条追加，格式：计划 → 实际 → 为什么 → 留痕位置。冻结文本不改。）
+
+### S10-C（2026-11-14）
+
+> 以下每一条都不改变 D1~D6 的冻结口径（app 边界、端口矩阵、裁剪项、单节点语义）。逐条的完整版本在 [`docs/design/s10-execution-plan.md`](../design/s10-execution-plan.md) §8「S10-C」。
+
+1. **D1 的 `broker_metrics` 依赖只留在 `.app.src`，代码零调用**
+   - 计划 → 实际：`.app.src` 的 `applications` 照 D1 原样含 `broker_metrics`；但没有任何指标写入。
+   - 为什么：D1 自己引了 ADR-016 的冻结键集——既有的 `connection` 指标语义是「客户端连接数」，把 TURN allocation 记进去会让运维读错；新键必须另立 ADR。宁可零指标，不借语义不符的键。
+   - 留痕：`apps/broker_ice/src/broker_ice.app.src` 的 `applications` 注释。
+
+2. **D3 的「长期凭据」在 `broker_security` 上只新增一个纯函数**
+   - 计划 → 实际：新增导出 `long_term_key(User, Realm)`，口令仍只从 `user_record/1` 取；`authenticate_conn/1` / `authorize/2` 的语义与返回形状一字未改，`request()` 类型只是增加了五个 `turn_*` action。
+   - 为什么：TURN 的 `key = MD5(user:realm:password)` 必须拿到明文口令，而这个数据只有身份表里有。让 ICE app 自己解用户记录，等于在 app 边界上开第二个口令出口。
+   - 留痕：`broker_security:long_term_key/2` 的 `-spec` 与注释。
+
+3. **D3 的 ACL 主体比 S10-B 少一个字段**
+   - 计划 → 实际：主体是 `#{action => turn_allocate | turn_refresh | turn_permission | turn_channel | turn_send, destination => <<"$ice/turn">>}`，**不带 `tenant_id`**。
+   - 为什么：TURN 报文里没有租户字段。若填 `default_tenant()`，默认租户为 `<<"default">>` 的部署会被 `authorize/2` 整片拒掉（与 S10-B 同源的坑）。「没有凭据就没有租户可隔离」。
+   - 留痕：`turn_auth:authorize/3` 构造的 `Request`、`turn_auth:tenant_of/1`；执行计划 §8 S10-C 第 5 条。
+
+4. **D4 的错误响应细节按 RFC 8489 §7.3.3 收紧**
+   - 计划 → 实际：错误响应**回显请求的 method**（不是恒用 `binding`），且**不带 `MESSAGE-INTEGRITY`**（我们拒掉的正是那份凭据，客户端验证不了摘要）。无 `MESSAGE-INTEGRITY` 的请求一律 401 带 `REALM`/`NONCE` 挑战，即使它也没带 `USERNAME`——否则 TURN 客户端的第一包永远失败。
+   - 为什么：D4 只列了「错误码」，没写响应构造规则；实现期两个疏漏各自都让一类客户端完全不可用。
+   - 留痕：`turn_allocation:respond/5`、`broker_ice_udp:reply_error/5`；`stun_codec:requested_transport/1` 被 `broker_ice_udp` 复用（不再各写一份）。
+
+5. **D2 的端口段是「环绕分配」，不是从低到高耗尽**
+   - 计划 → 实际：`next_port` 单调递增后环绕回 `Min`，跳过已占用端口；单次 `Allocate` 最多试 8 个候选。`max_allocations` 先判（486），端口绑定连续失败才 508。
+   - 为什么：单调不环绕会让一个长期运行、频繁建/拆 allocation 的节点把端口段「用旧」，而池子里其实有大量空闲端口。两个错误码分开是因为运维处置不同：486 是配置上限，508 是端口段被别的进程抢。
+   - 留痕：`broker_ice_udp:candidate_ports/1` / `wrap_ports/3` / `next_port/2` / `try_ports/7`。
+
+6. **D4 的「注册表双侧管理」落在 socket owner 进程里**
+   - 计划 → 实际：`broker_ice_udp` 是唯一 socket owner，持 `{ClientIp, ClientPort, udp} => #{pid, relay_port, username}` 索引并 `monitor` 每个 allocation；`turn_allocation_sup` 只管进程归属（`one_for_one` + 每 allocation 一条 `temporary` child spec，`simple_one_for_one` 在 OTP 27 起废弃）。
+   - 为什么：5-tuple 的归属判定必须在收包路径上、且必须与 socket 同生灭；放进独立注册表进程会多一次 RPC 且引入「注册表活着、socket 死了」的半死状态。
+   - 留痕：`broker_ice_udp.erl` 的 `#st{}` 注释、`turn_allocation_sup.erl` 模块注释。

@@ -24,7 +24,8 @@
 
 -export([authenticate/2, authorize/2, tenant_id/1,
          authorized/2, acl_rules/0, redacted_config/0,
-         authenticate_conn/1, auth_required/1, default_tenant/0]).
+         authenticate_conn/1, auth_required/1, default_tenant/0,
+         long_term_key/2]).
 
 -export_type([principal/0, request/0, credential/0, conn_identity/0]).
 
@@ -32,7 +33,9 @@
 %% the authenticated identity, and the tenant is a property of the identity.
 -type principal() :: binary().
 -type request() :: {connect, binary()}
-                 | #{action := publish | subscribe | admin,
+                 | #{action := publish | subscribe | admin
+                              | turn_allocate | turn_refresh | turn_permission
+                              | turn_channel | turn_send,
                      tenant_id => binary(),
                      destination => binary()}.
 
@@ -123,6 +126,27 @@ authenticate_conn({token, Secret}) when is_binary(Secret) ->
         error -> {error, bad_username_or_password}
     end;
 authenticate_conn(_Other) ->
+    {error, bad_username_or_password}.
+
+%% @doc Long-term credential key for TURN (RFC 8489 §9.2.2, RFC 5766 §4):
+%% `MD5(username ":" realm ":" password)', using the password stored in the
+%% same `users' table every protocol authenticates against.
+%%
+%% Exists because TURN never sees the password: the client proves knowledge of
+%% it with MESSAGE-INTEGRITY, so the server has to derive the key itself. This
+%% is an *addition* to the S6 surface -- `authenticate/2',
+%% `authenticate_conn/1' and `authorize/2' keep their exact semantics. The
+%% password and the key are never logged; a caller that stores the key must
+%% treat it as a credential.
+-spec long_term_key(binary(), binary()) -> {ok, <<_:128>>} | {error, term()}.
+long_term_key(Username, Realm) when is_binary(Username), is_binary(Realm) ->
+    case user_record(Username) of
+        #{password := Password} when is_binary(Password) ->
+            {ok, crypto:hash(md5, [Username, <<":">>, Realm, <<":">>, Password])};
+        _ ->
+            {error, bad_username_or_password}
+    end;
+long_term_key(_Username, _Realm) ->
     {error, bad_username_or_password}.
 
 %% @doc Whether a protocol must present a credential at all.

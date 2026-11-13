@@ -2,7 +2,7 @@
 
 - **对应设计**：[`docs/design/s10-webrtc-signaling.md`](s10-webrtc-signaling.md) §3（候选需求 R-T/R-S/R-M/R-I/R-X/R-C/R-O/R-E）、§4.2（子阶段）、§4.3（Gate S10）、§4.4（OQ-1~OQ-10）；[`docs/design/s10-0-convergence-report.md`](s10-0-convergence-report.md)（OQ 收敛结论与 ADR-028/029 底稿）；[`docs/roadmap.md`](../roadmap.md) §12.1 / §12.2。
 - **基线（开工前）**：`rebar3 ct` **1063/1063、68 套件**；`dialyzer` 0 warning；`rebar3 release` 装配成功（S9-F 收尾，`fcbf83e`）。
-- **性质**：**计划稿 + S10-A/S10-B 交付记录**。S10-A 的实现事实（含 45 例实测与 13 条落地偏差）已回填 §1/§2.1/§4/§5/§7/§8，S10-B 的实现事实（含 61 例实测与 12 条落地偏差）已回填 §1/§2.2/§4.2/§5/§7/§8；S10-C/D 仍是计划值，未勾选。本文件不在 S10-A/B 之外开任何端口、不新增任何依赖。
+- **性质**：**计划稿 + S10-A/S10-B/S10-C 交付记录**。S10-A 的实现事实（含 45 例实测与 13 条落地偏差）已回填 §1/§2.1/§4/§5/§7/§8，S10-B 的实现事实（含 61 例实测与 12 条落地偏差）已回填 §1/§2.2/§4.2/§5/§7/§8，S10-C 的实现事实（含 72 例实测与 13 条落地偏差）已回填 §1/§2.3/§4/§5/§7/§8；S10-D 仍是计划值，未勾选。本文件不在 S10-A/B/C 之外开任何端口、不新增任何依赖。
 - **范围**：一个不碰消息日志的 **信令接入前端** + 一个与内核解耦的 **ICE 辅助服务**。**媒体面（RTP/RTCP/DataChannel/SFU/录制/转码）明确不做**。
 - **执行约束**（仓库既定规则，全程适用）：编译/测试前 `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"`；`rebar3 ct` 前 `rm -rf _build/test/extras`；Python 一律 `/usr/bin/python3`（3.12）；用例数由各套件 `all/0`（含 `groups/0`）展开后逐个数出；CT 一律 `port => 0`，不动既有 8080/8083/1883/8081/8082；不杀用户进程；ADR 冻结文本不动、偏差处加批注；设计稿原文不改。
 
@@ -127,14 +127,16 @@
 | `webrtc_conn_SUITE`（扩展） | 原 27 例 + **4 例**：分片 `authenticate`（opcode 1 FIN=0 + opcode 0 FIN=1 重组）成功、无起始帧的续帧 → close 1002、客户端 close 帧回显同 code、保留码（1005）→ 回 1000；并把旧名 `a_message_with_to_is_invalid_message_in_s10a` 改为 `a_message_with_an_unknown_to_is_invalid_message` | **31** |
 | `webrtc_boundary_SUITE`（扩展） | 原 6 例 + **3 例**：无 `mnesia:`/`broker_meta:`（成员不是控制面元数据）、无 `syn:`（peer 查找是分片内 ETS，不是全局进程组）、**S10-B 六个模块都在扫描集合里**（守卫的覆盖率本身被断言） | **9** |
 
-### 2.3 后续阶段（计划值，未实现）
+### 2.3 已交付（S10-C 实测 72 例，全部 `port => 0`）
 
-| 套件 | 归属 | 覆盖 | 计划例数 |
-|---|---|---|---|
-| `stun_codec_SUITE` | S10-C | 头编解码、`XOR-MAPPED-ADDRESS`（IPv4）、`MESSAGE-INTEGRITY`、`ERROR-CODE`、`FINGERPRINT`、截断/超长报文 | ~12 |
-| `stun_server_SUITE` | S10-C | 裸 UDP Binding 请求/响应字节、未知 method、非法 cookie、认证失败 | ~8 |
-| `turn_allocation_SUITE` | S10-C | `Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`/`ChannelData`/`Send`/`Data`、生命周期过期回收、端口池耗尽、`max_allocations` | ~14 |
-| `turn_auth_SUITE` | S10-C | 长期凭据接身份表、错凭据、realm 不匹配、口令不进日志断言 | ~8 |
+> 计划值与实测的差异：本表四套件的**计划合计 42 例**（12/8/14/8），实测 **72 例**（21/16/13/22）。差异全部是「按 RFC 逐条钉线格式」带来的用例粒度细化，不是范围扩张——见 §8「S10-C」第 11 条。
+
+| 套件 | 覆盖 | 实测例数 |
+|---|---|---|
+| `stun_codec_SUITE` | 首部 20 字节与 length 字段（不含首部自身）、14 位 type 拆 method/class、属性 4 字节填充、截断/长度不匹配/坏 magic cookie 三类拒收、`XOR-MAPPED-ADDRESS` 往返 + 绑定 transaction（换 `tid` 即解不出原地址）、IPv6 明确拒绝、`MESSAGE-INTEGRITY` 往返 + 篡改检出 + 缺失属性、`FINGERPRINT` 往返 + 篡改检出 + **必须是最后一个属性**、`ERROR-CODE` 往返、`CHANNEL-NUMBER` 往返、七个 method 名往返（未知 method 保留整数）、`UNKNOWN-ATTRIBUTES` 列出未理解项、`SOFTWARE` 属 comprehension-optional | **21** |
+| `turn_auth_SUITE` | `key = MD5(user ":" realm ":" password)` 与 RFC 5769 向量一致、`broker_security:long_term_key/2` 同向量、未知用户取 key 报错、挑战/响应往返、错口令 → 401、未知用户与错口令**不可区分**、无 `MESSAGE-INTEGRITY` → 401 带 `REALM`/`NONCE`、realm 不符 → 441、nonce 过期 → 438、伪造 nonce → 438、带 integrity 但缺 nonce → 400、未来 60 s 内 nonce 仍接受、ACL deny → 403、ACL 看到的主体是 turn action、**口令与 key 都不进日志**（带 probe 断言防空洞）、`enabled => false` 时不要求 realm | **16** |
+| `stun_server_SUITE` | 裸 UDP Binding 回 `XOR-MAPPED-ADDRESS`（字节级校验）、同一响应与 `transaction_id` 无关、每个响应都带合法 `FINGERPRINT`、重放同一事务只应答一次、未知 comprehension-required 属性 → 420 + `UNKNOWN-ATTRIBUTES`、comprehension-optional 属性被忽略、未知 method → 400、`REQUESTED-TRANSPORT ≠ 17` → 442（在质询之前）、畸形报文静默丢弃、坏 cookie 静默丢弃、无 allocation 的 ChannelData 丢弃、`enabled => false` 一个 socket 都不开、监听端口可配 | **13** |
+| `turn_allocation_SUITE` | `Allocate` 回落在池内的 relay 地址、回显 lifetime 且响应带 integrity、未认证 Allocate → 401 带 realm/nonce、同 5-tuple 二次 Allocate → 437、错口令 → 401、错 realm → 441、伪造 nonce → 438、`Refresh` 续命、`Refresh(0)` 拆除且端口归还、无 allocation 的 `Refresh` → 437、过期 allocation 被回收、端口池耗尽 → 508、`max_allocations` → 486、`CreatePermission` 后 `Send` 可达、无 permission 的 `Send` 被丢、`ChannelBind` 无 permission → 403、ChannelData 送达到 peer、peer 数据以 ChannelData 帧回来、无绑定则回落 Data indication、无 permission 的 peer 数据被丢、channel number 越界 → 400、`allocations/0` 快照同时给出 client 与 relay 端口 | **22** |
 
 **约束**：全部 `port => 0`；不依赖外部网络；不新增 Umbrella 外进程（真实客户端证据另立 `test/protocol-compatibility/s10/`）。
 
@@ -150,17 +152,17 @@
 
 ## 4. 端口 / 配置 / 依赖表
 
-`broker_proto_webrtc` 部分**已实现**（S10-A + S10-B）；`broker_ice` 部分仍是计划值。
+`broker_proto_webrtc` 与 `broker_ice` 两部分**均已实现**（S10-A + S10-B；S10-C）。
 
 ### 4.1 端口
 
 | 端口 | 传输 | 默认 | 状态 |
 |---|---|---|---|
 | 8084 | TCP（wss；明文仅回环） | **关**（`listeners => []`） | **S10-A 已实现**：app 随 release 装配，出厂不占端口。与既有 8080/8083/1883/8081/8082 零冲突 |
-| 3478 | UDP | **关**（`enabled => false`） | 未实现（S10-C）。STUN + TURN（IANA 注册的标准端口） |
-| 49152-65535 | UDP | 关（随 3478 一起开） | 未实现（S10-C）。TURN relay；可配窄区间，部署需放行 |
-| ~~5349~~ | — | **不做** | TURN over TLS，首期非目标 |
-| ~~3478/TCP~~ | — | **不做** | TURN over TCP，首期非目标 |
+| 3478 | UDP | **关**（`enabled => false`） | **S10-C 已实现**：STUN Binding + TURN。出厂不 bind，`gen_udp:open(3478)` 可成功 |
+| 49152-65535 | UDP | 关（随 3478 一起开） | **S10-C 已实现**：TURN relay，可配窄区间（用例用 `{49210, 49212}` 验证池耗尽） |
+| ~~5349~~ | — | **不做** | TURN over TLS，首期非目标（R-I6，能力矩阵留行） |
+| ~~3478/TCP~~ | — | **不做** | TURN over TCP，首期非目标；`REQUESTED-TRANSPORT = 6` 回 442 |
 
 **端口占用复核（2026-11-12，写计划时实跑 `ss -ltnup`）**：`8080`、`8083` 正在监听（用户进程，勿动）；`8084`、`3478`、`49152` 段当时无占用。S10-A 交付时全量 CT 与两个 release 装配均在 `port => 0` 下跑完，未占用任何固定端口。
 
@@ -186,18 +188,22 @@
 | `max_peers_per_room` | 2 | 首期 1:1。超额 → `invalid_message` + close 1008。`join/4` 的 `Opts` 可带 `max_peers` 逐次覆盖（用例用它构造三人房间）；非正整数 → 启动失败 `{invalid_max_peers_per_room, V}`。**代码兜底，`.app.src` 未声明** |
 | `room_shards` | `undefined` → `schedulers_online` | 分片数（`phash2(Room, N) + 1`）。**改值必须重启**：分片进程不重建。非正整数 → 启动失败 `{invalid_room_shards, V}`。**代码兜底，`.app.src` 未声明** |
 
-**后续阶段（未实现，计划值）**：
+**S10-C 已实现（`broker_ice`）**：
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `broker_proto_webrtc.log_signaling_payloads` | `false` | 显式开启才在 `debug` 记前 64 字节 + SHA-256 前缀（S10-D） |
-| `broker_ice.enabled` | `false` | 出厂零 socket（S10-C） |
-| `broker_ice.stun_port` | 3478 | UDP |
-| `broker_ice.turn_ip` | `undefined` | 必填（`enabled => true` 时缺失 → 启动失败）；**不**按 hostname A 记录静默兜底 |
-| `broker_ice.realm` | `undefined` | 必填；参与长期凭据密钥派生 |
-| `broker_ice.relay_min_port` / `relay_max_port` | 49152 / 65535 | 区间非法 → 启动失败 |
-| `broker_ice.max_allocations` | 1024 | 端口池上限 |
-| `broker_ice.allocation_lifetime_s` | 600 | `Refresh` 可续 |
+| `enabled` | `false` | 出厂零 socket。`false` 时 `config/0` 直接返回 `#{enabled => false}`，**不要求** `realm`/`turn_ip`（少一个必填项就少一次启动失败） |
+| `port` | 3478 | UDP 监听端口。**代码与 `.app.src` 均声明** |
+| `turn_ip` | `undefined` | 必填（`enabled => true` 时）；必须是 IPv4 四元组。缺失时回落到 `hostname` 的**首条 A 记录**，仍无 → `{error, {missing_config, turn_ip}}` / `{error, {turn_ip_unresolved, H}}`；非 IPv4 → `{error, {invalid_turn_ip, V}}` |
+| `hostname` | `undefined` | 只用于解析 `turn_ip`，没有第二个用途 |
+| `realm` | `undefined` | 必填；参与长期凭据密钥派生。缺失 → `{missing_config, realm}`；非 binary 或空 → `{invalid_realm, V}` |
+| `nonce_secret` | `undefined` | 非白名单 nonce 的 HMAC 密钥。`undefined` → 每 boot `crypto:strong_rand_bytes(32)`（重启即失效所有 nonce，正确：allocation 也一起没了）；显式配置但 < 16 字节 → `{invalid_nonce_secret, V}` |
+| `relay_port_range` | `{49152, 65535}` | relay 端口池。越出 49152-65535 或 `Min > Max` → `{invalid_relay_port_range, {Min, Max}}` |
+| `max_allocations` | 1024 | 超出 → `486 Allocation Quota Reached` |
+| `allocation_lifetime_s` | 600 | 客户端请求的 lifetime 被 clamp 到此值；`Refresh` 续命 |
+| `max_permissions_per_allocation` | 16 | `CreatePermission` 超限 → 508 |
+| `max_channels_per_allocation` | 16 | `ChannelBind` 超限 → 508 |
+| `recbuf_bytes` | 262144 | socket 收发缓冲。TURN 转发的是媒体形状的流量，默认高于内核 128 KB |
 
 ### 4.3 依赖账本
 
@@ -209,9 +215,9 @@
 | `cowboy` | **不引入** | hex 元数据 2.0.0 要求 `ranch ~> 1.4.0`，与本仓 2.3.0 冲突；且该版本线在两条 2026 年公告的受影响区间 |
 | `syn` | **不引入** | 房间注册表用分片 ETS，不需要全局进程组 |
 | `jsx` | **不引入** | OTP 28 自带 `json` |
-| `stun` | **不引入** | 拖 `fast_tls 1.0.20` + `p1_utils 1.0.10`，只为 5349（首期不做） |
+| `stun` | **不引入** | 拖 `fast_tls 1.0.20` + `p1_utils 1.0.10`，只为 5349（首期不做）；S10-C 手写 `stun_codec` 取代它 |
 
-**净新增运行时依赖：0（S10-A 实测确认）。** `broker_proto_webrtc` 的 `applications` 只有 `kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics`；`rebar.config` 的 `deps` 一行未改，只在两份 relx 清单各加一行 app 名。
+**净新增运行时依赖：0（S10-A / S10-C 实测确认）。** `broker_proto_webrtc` 的 `applications` 只有 `kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics`；`broker_ice` 的 `applications` 只有 `kernel, stdlib, sasl, crypto, broker_security, broker_metrics`（无 `ranch` / `broker_ws` / `broker_core`）；`rebar.config` 的 `deps` 一行未改，只在两份 relx 清单各加一行 app 名。`broker_ice` **不写** `broker_metrics`——ADR-016 冻结键集，`connection` 指标不加新键（ADR-029 §D1）。
 
 ## 5. DoD（对照 Gate S10）
 
@@ -228,7 +234,16 @@
 - [x] ACL 越权 / 跨房间 `to` / 未知 `peer_id` / 伪造 `peer_id` 专项用例通过且 **handler 不崩溃**（`webrtc_acl_SUITE` 13 + `webrtc_route_SUITE` 14）
 - [x] 断线清理两条路径：`terminate/2` 与 `exit(Pid, kill)`（后者由分片 `monitor` 兜底，`left` 恰一次、无幽灵成员）
 - [x] ADR-028 §D3 的「广播在分片内」由实现位置保证（`webrtc_room_shard` 持锁期间扇出），边界套件扩到 **9 例**（新增无 `mnesia`/`broker_meta`/`syn`，以及「六个新模块都在扫描集合里」）
-- [x] 既有 `rebar3 ct` 零回归：**1169/1169、75 套件**（S10-A 基线 1108/71 + S10-B 54 例 / 4 套件 + `webrtc_conn_SUITE` 扩 4 例 + 边界 3 例）；`dialyzer` 0 warning（过程中删掉 3 处不可达的 `{binary, _}` 分支）；`xref` 全仓 265 条全部是 unused-export；两份 release 均装配成功
+- [x] 既有 `rebar3 ct` 零回归：**1169/1169、75 套件**（74 个 `apps/*/test/` 套件 + `test/integration/s1_e2e_SUITE`）（S10-A 基线 1108/71 + S10-B 54 例 / 4 套件 + `webrtc_conn_SUITE` 扩 4 例 + 边界 3 例）；`dialyzer` 0 warning（过程中删掉 3 处不可达的 `{binary, _}` 分支）；`xref` 全仓 265 条全部是 unused-export；两份 release 均装配成功
+
+**S10-C 已勾选**：
+
+- [x] 手写 `stun_codec`（20 字节头 / `XOR-MAPPED-ADDRESS` / `MESSAGE-INTEGRITY` SHA-1 长期凭据 / `ERROR-CODE` / `FINGERPRINT` / `UNKNOWN-ATTRIBUTES`）逐条线格式由 `stun_codec_SUITE` **21 例**钉死，**未引入 `stun` hex 包**（净新增依赖保持 0）
+- [x] 裸 UDP Binding 请求/响应真实 socket 用例 **13 例**（`stun_server_SUITE`），含未知 method → 400、坏 cookie 静默丢弃、`REQUESTED-TRANSPORT ≠ 17` → 442
+- [x] TURN `Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`/`ChannelData`/`Send`/`Data` 走真实 UDP **22 例**（`turn_allocation_SUITE`），含过期回收、端口池耗尽 → 508、`max_allocations` → 486、无 permission 的 `ChannelBind` → 403
+- [x] 长期凭据接 `broker_security` 同一张 `users` 表，ACL 走 `authorize/2`（新 action `turn_allocate`/`turn_refresh`/`turn_permission`/`turn_channel`/`turn_send`，`destination => <<"$ice/turn">>`），口令与派生 key **不进日志**（`turn_auth_SUITE` 16 例，含 probe 防空洞断言）
+- [x] 出厂姿态：`enabled => false` → `config/0 = {ok, #{enabled => false}}`、监督树空、`broker_ice_udp`/`turn_allocation_sup` 未注册、3478 仍可被 `gen_udp:open/2` 拿到
+- [x] 既有 `rebar3 ct` 零回归：**1241/1241、79 套件**（S10-B 基线 1169/75 + 本阶段 72 例 / 4 套件）；`dialyzer` **0 warning**；`xref` 只剩 unused-export（本 app 20 条，全部是只被测试或运维调用的导出）；`rebar3 release` 装配成功，`lib/broker_ice-0.1.0` 存在
 
 **Gate S10 剩余（未勾选）**：
 
@@ -255,11 +270,23 @@
 
 ## 7. 门禁实测表（逐阶段交付后回填）
 
+**S10-C 实测（2026-11-14）**：
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| 全量 CT | `rm -rf _build/test/extras && rebar3 ct` | **1241/1241 全绿、79 套件**（S10-B 基线 1169/75 + `stun_codec_SUITE` 21 + `turn_auth_SUITE` 16 + `stun_server_SUITE` 13 + `turn_allocation_SUITE` 22 = 72 例 / 4 套件），零 FAILED、零 Skipped |
+| 静态分析 | `rebar3 dialyzer` | **0 warning**（初版 6 条：`message()` 把解码器输出字段 `type` 声明为必填，调用方编码时无从提供 → 改为可选；`respond/5` 对 `undefined` key 走 `add_integrity/2` 触发 `function_clause`，连带 4 条 no-local-return） |
+| xref | `rebar3 xref` | 全仓**只剩 unused-export**，本 app **20 条**（`stun_codec` 的编解码/属性访问器多数只被测试调用、`broker_ice_udp:port/0`/`allocations/0` 是运维与测试入口、`broker_ice_app:validate/0`/`config/0` 同姿态），与既有 app 的测试入口同性质，零非预期告警 |
+| Release（默认） | `rebar3 release` | 装配成功，`_build/default/rel/unified_mq/lib/broker_ice-0.1.0` 存在 |
+| 出厂 release 启动 | 装配出的 `sys.config`（无 `broker_ice` 段）+ `-pa` 加载后 | `validate/0 → ok`；`config/0 → {ok, #{enabled => false}}`；`ensure_all_started(broker_ice)` 后 `supervisor:which_children(broker_ice_sup) → []`，`whereis(broker_ice_udp) → undefined`、`whereis(turn_allocation_sup) → undefined`；**3478/UDP 仍可被 `gen_udp:open/2` 拿到**（零 socket） |
+| STUN/TURN 证据 | `turn_allocation.py` + 裸 UDP `stun_raw.py` | **未做**（S10-D D.1；本阶段只有 Broker 侧的 socket 级用例，客户端是 `ice_test_client` 手写字节） |
+| 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
+
 **S10-B 实测（2026-11-13）**：
 
 | 门禁 | 命令 | 结果 |
 |---|---|---|
-| 全量 CT | `rm -rf _build/test/extras && rebar3 ct` | **1169/1169 全绿、75 套件**（S10-A 基线 1108/71 + `webrtc_signal_SUITE` 13 + `webrtc_room_SUITE` 14 + `webrtc_route_SUITE` 14 + `webrtc_acl_SUITE` 13 + `webrtc_conn_SUITE` 27→31 + `webrtc_boundary_SUITE` 6→9），零 FAILED、零 Skipped |
+| 全量 CT | `rm -rf _build/test/extras && rebar3 ct` | **1169/1169 全绿、75 套件**（74 个 `apps/*/test/` 套件 + `test/integration/s1_e2e_SUITE`）（S10-A 基线 1108/71 + `webrtc_signal_SUITE` 13 + `webrtc_room_SUITE` 14 + `webrtc_route_SUITE` 14 + `webrtc_acl_SUITE` 13 + `webrtc_conn_SUITE` 27→31 + `webrtc_boundary_SUITE` 6→9），零 FAILED、零 Skipped |
 | 静态分析 | `rebar3 dialyzer` | **0 warning**（初版 2 条：`send_event/2` 与 `webrtc_room_shard:send_frame/2` 的 `{binary, _}` 分支不可达——五类事件全是 text 帧，已删；同源的 `handle_info({binary, _})` 一并删） |
 | xref | `rebar3 xref` | 全仓 **265 条**，全部 unused-export（S10-A 时 252 条；新增 13 条均为 `webrtc_room_registry`/`webrtc_room_shard`/`webrtc_server` 的对外 API 与 `start_link/0,1`，与既有 app 的测试入口同性质），零非预期告警 |
 | Release（默认） | `rebar3 release` | 装配成功，`_build/default/rel/unified_mq/lib/` 含 `broker_proto_webrtc-0.1.0` |
@@ -287,6 +314,73 @@
 ## 8. 落地偏差记录
 
 > 格式照 `docs/design/s9-f-execution-plan.md` §落地偏差记录：每条写「计划 → 实际 → 为什么 → 留痕位置」。设计稿原文不改，偏差只在这里与 ADR 批注里记。
+
+### S10-C（2026-11-14）
+
+1. **不给 `broker_ice` 加 `broker_metrics` 依赖的实质用法**
+   - 计划：§1 表格写「依赖 `…, broker_security, broker_metrics`」，ADR-029 §D1 也列了它，并写「复用既有键」。
+   - 实际：`.app.src` 里保留了 `broker_metrics`（与 ADR 冻结文本一致），但**代码一行都不调**。ADR-016 冻结了 `connection` 指标的键集（ADR-029 §D1 自己引了这条），`broker_ice` 能复用的既有键（`connections_current` 之类）语义是「客户端连接数」，把 TURN allocation 塞进去会让运维读错；新键又要单独立 ADR。于是这里的选择是「零指标」而不是「借一个语义不符的键」。
+   - 留痕：`broker_ice.app.src` 的 `applications` 注释、本节 §4.3。
+
+2. **无 `MESSAGE-INTEGRITY` 的请求一律 401，即使没带 `USERNAME`**
+   - 计划：§1 只说「长期凭据接身份表」，未细究「没带凭据」与「凭据错」的区别。
+   - 实际：初版把「无 `MESSAGE-INTEGRITY` 且无 `USERNAME`」判成 400，结果**所有 TURN 客户端的第一包都失败**——RFC 5766 的客户端第一包本来就不带凭据，它在等 401 里的 `REALM`/`NONCE` 挑战。改为无 `MESSAGE-INTEGRITY` → 401 + 挑战；带 `MESSAGE-INTEGRITY` 但缺 `USERNAME`/`REALM`/`NONCE` 才是 400（那种请求是残缺的，再挑战也拼不起来）。
+   - 留痕：`turn_auth.erl` 的 `authenticate/3`、`turn_auth_SUITE:a_missing_message_integrity_asks_for_a_challenge/1` 与 `a_missing_nonce_with_integrity_is_a_400/1`。
+
+3. **错误响应回显请求的 method，且不带 `MESSAGE-INTEGRITY`**
+   - 计划：未写（只写「错误码」）。
+   - 实际：两处都必须按 RFC 8489 §7.3.3 来。①错误响应的 type 用**请求**的 method + `error` class——初版 `broker_ice_udp:reply_error/5` 硬用 `binding`，客户端按 transaction 匹配不上；②错误响应不带 `MESSAGE-INTEGRITY`——我们拒掉的正是那个凭据，客户端算不出验证用的摘要，带上只会让它把响应丢掉。初版 `turn_allocation:respond/5` 无条件 `add_integrity(Key, ...)`，`Key = undefined` 时直接 `function_clause` 崩掉 allocation 进程（`ChannelBind` 无 permission 的两个用例就是这么红的）。
+   - 留痕：`turn_allocation:respond/5` 的两个子句、`broker_ice_udp:reply_error/5`、`reply_error/3` 的注释、`turn_allocation_SUITE:channel_bind_without_a_permission_is_a_403/1`。
+
+4. **新增 `broker_security:long_term_key/2`（只加函数，不改语义）**
+   - 计划：`turn_auth` 自行算 `MD5(user:realm:password)`。
+   - 实际：口令只能从 `broker_security` 的用户表拿（`user_record/1`），在 ICE app 里再解一遍表结构等于在 app 边界上开第二个口子；改为 `broker_security` 导出一个纯函数 `long_term_key(User, Realm)`，仍从 `user_record/1` 取 `password`。**只新增导出**，`authenticate_conn/1` / `authorize/2` 的行为一字未改；ACL 主体新增五个 turn action 也只是 `request()` 类型的并集扩展。
+   - 留痕：`broker_security.erl` 的 `long_term_key/2` 与其 `-spec`、`turn_auth_SUITE:long_term_key_matches_the_same_vector/1`。
+
+5. **ACL 主体只判 `#{action, destination}`，不带 `tenant_id`**
+   - 计划：照 S10-B 的 `#{action => signal, tenant_id, destination}`。
+   - 实际：TURN 请求里没有租户字段；若拿 `broker_security:default_tenant()` 填上，默认租户为 `<<"default">>` 的部署里 `authorize/2` 会因租户不匹配把**全部** TURN 请求拒掉（与 S10-B 第 6 条同源的坑）。改为主体只有 `#{action => turn_*, destination => <<"$ice/turn">>}`，`tenant_of/1` 把 `<<"default">>` 归一成 `undefined`。`destination` 是单一常量而不是 `$ice/turn/<ip>`：TURN 的每个 action 都在同一台服务器上，按目标 IP 细分要新增一类资源匹配规则，而首期没有按目标 IP 授权的需求。
+   - 留痕：`turn_auth:authorize/3` 构造的 `Request`（只有 `action` 与 `destination`）、`turn_auth:tenant_of/1`、`turn_auth_SUITE:the_turn_action_is_what_acl_sees/1`。
+
+6. **nonce 是无状态的，不是进程内的 nonce 表**
+   - 计划：只说「挑战/响应」。
+   - 实际：`nonce = base64(<<Ts:64, HMAC-SHA256(Secret, Ts) 前 16 字节>>)`，`?NONCE_MAX_AGE_S = 3600`、`?NONCE_SKEW_S = 60`（容忍未来 60 s 内的时钟漂移）。这样 `broker_ice_udp` 不必为每个客户端存 nonce，也无「nonce 表无限增长」的运维问题；代价是服务重启即失效全部 nonce——但重启时 allocation 也全没了，客户端本来就要重新 Allocate。`nonce_secret` 未配置时每 boot 随机 32 字节，正是这个语义。
+   - 留痕：`turn_auth.erl` 的模块注释、`a_nonce_from_the_future_within_the_skew_is_accepted/1`、`broker_ice.app.src` 的 `nonce_secret` 注释。
+
+7. **`turn_allocation_sup` 用 `one_for_one` + 每 allocation 一条 child spec**
+   - 计划：只说「每 allocation 一个进程」。
+   - 实际：`simple_one_for_one` 在 OTP 27 起废弃（本仓 OTP 28.3.1 会报 deprecation），改为在 `start_allocation/1` 里用 `supervisor:start_child(Sup, ChildSpec)` 逐条挂 `temporary` 子进程，id 取 `erlang:unique_integer([positive])`。`broker_ice_sup` 则是 `one_for_all`：socket owner 与 allocation 容器同时生灭，半死状态没有意义。
+   - 留痕：`turn_allocation_sup.erl` 模块注释、`broker_ice_sup.erl`。
+
+8. **relay 端口按环绕分配，单次 Allocate 最多试 8 个候选**
+   - 计划：「端口池耗尽 → 508」。
+   - 实际：`next_port` 单调递增后环绕回 `Min`，跳过 `broker_ice_udp` 索引里已占用的端口；`?PORT_ATTEMPTS = 8` 次里若全部 `gen_udp:open` 失败（被别的进程占着）→ 508；`max_allocations` 先于端口尝试判定 → 486。两个错误码分开是因为运维处置不同：486 是配置上限，508 是端口段被抢。
+   - 留痕：`broker_ice_udp:candidate_ports/1` + `wrap_ports/3` + `next_port/2` + `try_ports/7`、`turn_allocation_SUITE:a_full_relay_pool_is_a_508/1` 与 `max_allocations_is_a_486/1`。
+
+9. **`Refresh(0)` 走 `reply/1` 透传 `{stop, normal, St}`**
+   - 计划：只说「`Refresh` 可续 / 可拆」。
+   - 实际：初版 `handle_cast` 收 `{stop, ...}` 后包成 `{noreply, {stop, normal, St}}`——gen_server 把它当新状态存下，进程活着但状态畸形，端口被一条僵尸 allocation 永久占着（后续用例表现为「池耗尽」）。改为 `reply/1` 把 `{stop, ...}` 原样透传给 `handle_cast`。这条同时修了「`Refresh(0)` 之后端口必须归还」的用例。
+   - 留痕：`turn_allocation:reply/1`、`refresh_zero_tears_the_allocation_down/1`。
+
+10. **`stun_codec:requested_transport/1` / `method_atom/1` 由生产代码与测试复用，不删**
+    - 计划：未写（`broker_ice_udp` 初版把两处逻辑内联）。
+    - 实际：`broker_ice_udp:requested_transport/1` 改为调 `stun_codec:requested_transport/1`（同一份「取第一个字节，短包回 `undefined`」）；`method_atom/1` 补一个 `method_names_round_trip/1` 用例覆盖七个已实现 method + 未知 method 保留整数。这样两个导出都有真实调用点，而不是留成死代码或删掉一个 RFC 语义明确的函数。
+    - 留痕：`broker_ice_udp:requested_transport/1`、`stun_codec_SUITE:method_names_round_trip/1`。
+
+11. **四套件的实测例数是计划值的 1.7 倍（42 → 72）**
+    - 计划：§2.3 原表给 `stun_codec` ~12、`stun_server` ~8、`turn_allocation` ~14、`turn_auth` ~8。
+    - 实际：21 / 13 / 22 / 16。多出来的是「一条 RFC 规则一条用例」的结果：`FINGERPRINT` 拆成往返/篡改/必须是最后一项三条，`XOR-MAPPED-ADDRESS` 拆成往返/绑 transaction/IPv6 拒绝三条，TURN 的每个错误码（400/401/403/437/438/441/442/486/508）各一条。**没有扩张范围**——§1 的模块表与 ADR-029 的裁剪项逐条未变。
+    - 留痕：本节 §2.3 表头说明。
+
+12. **`stun_codec:decode/1` 解出的是 12 字节 `transaction_id`，不是整数**
+    - 计划：未写形状。
+    - 实际：初版写 `Tid:96`（96 位整数），编码侧却按 12 字节 binary 用，两者在 `xor_address/3` 里相遇时才算错地址。改为 `Tid:12/binary`。同源的三处偏移计算也一并修正：`integrity_offset/fingerprint_offset` 的属性推进量是 `Offset + 4 + Len + pad4(Len)`（漏了长度不算首部自身），`verify_integrity/2` 的补丁长度用 `+ Len` 而不是 `+ Len + 20`。
+    - 留痕：`stun_codec:decode/1`、`integrity_offset/1`、`xor_address_is_bound_to_its_transaction/1`。
+
+13. **`attribute_type/1` 与 `comprehended/1` 必须认识 `xor_mapped_address`**
+    - 计划：属性表里列了 `XOR-MAPPED-ADDRESS`。
+    - 实际：初版只把 `mapped_address` 加进映射，`XOR-MAPPED-ADDRESS`（0x0020）漏了。`comprehended/1` 认不出它 → Binding 请求被判成「含未知 comprehension-required 属性」；`attribute/2` 也取不到它，`binding_answers_xor_mapped_address/1` 在构造响应时直接崩。两处映射补齐后才绿。
+    - 留痕：`stun_codec:attribute_type/1`、`comprehended/1`。
 
 ### S10-B（2026-11-13）
 

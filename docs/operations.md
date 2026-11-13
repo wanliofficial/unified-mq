@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；**S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL**
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）**
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -26,7 +26,8 @@
 | A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A/B/C）。示例部署端口 8081，`listeners => []` 是出厂值；出站 Push webhook 单独由 `push_enabled` 门控（默认关） |
 | MCP (Streamable HTTP) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_mcp`（S9-D）。示例部署端口 8082，`listeners => []` 是出厂值；stdio 前端另由 `stdio_enabled` 门控（默认关） |
 | ACP (v1) | **无（仅 stdio，无 listener）** | 子进程管道（无网络） | `broker_proto_acp`（S9-E）。出厂 `agents => []`，不跑任何 agent；语义是 Broker 作 Client、agent 是本地子进程。见 §1.5 |
-| WebRTC 信令 (WSS) | **无（默认不监听）** | WebSocket（明文可 TLS，wss） | `broker_proto_webrtc`（S10-A/B）。示例部署端口 8084，`listeners => []` 是出厂值。连接层（子协议 `webrtc.v1`、认证窗口、保活、帧上限）+ 房间注册表 + 五类事件 + `to` 进程直投 + 房间隔离/ACL；**媒体面不做**。STUN/TURN（3478/UDP）属 S10-C，未实现。见 §1.6 |
+| WebRTC 信令 (WSS) | **无（默认不监听）** | WebSocket（明文可 TLS，wss） | `broker_proto_webrtc`（S10-A/B）。示例部署端口 8084，`listeners => []` 是出厂值。连接层（子协议 `webrtc.v1`、认证窗口、保活、帧上限）+ 房间注册表 + 五类事件 + `to` 进程直投 + 房间隔离/ACL；**媒体面不做**。见 §1.6 |
+| STUN / TURN | **无（默认不监听）** | STUN/TURN over **UDP**（无 TLS、无 DTLS） | `broker_ice`（S10-C）。出厂 `enabled => false`，**零 socket**；开了之后是 `3478/UDP`（STUN Binding + TURN）+ relay 段 `49152-65535/UDP`（可配窄区间）。TURN over TCP / 5349/TLS 与 DTLS **不做**（ADR-029 §D2）。见 §1.7 |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener 共用同一份证书配置同时切换（含 S10-A 起的 WebRTC 信令 listener）。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
@@ -427,6 +428,76 @@ listener spec 形状：`#{port => 8084, ip => {127,0,0,1}, num_acceptors => 10, 
 - 回 `{"event":"invalid_message"}`：`to` 指向的 `peer_id` 不在本房间、`to` 为空、缺 `event`、relay 被 ACL 拒，或房间已满（close 1008）——都是连接层拒绝，不是崩溃；连接保持可用（房间满与 join 被拒除外）。
 - 房间满 close 1008：`max_peers_per_room`（默认 2）到了；首期按 1:1 设计，多人房间是 P2。
 - 空闲被 close 1001：`idle_timeout_ms` 到了；客户端要按周期发文本 `ping` 保活（服务端回文本 `pong`，同房间 peer 的信令也算活动）。
+
+### 1.7 ICE 辅助服务（STUN / TURN，默认关闭，S10-C）
+
+`broker_ice` 是 WebRTC 的 **ICE 辅助服务**：STUN Binding（给浏览器拿 `srflx` 候选）+ TURN over UDP（中继）。**与信令面互不依赖**（ADR-029 §D1）——`broker_proto_webrtc` 不开也不影响它，反之亦然。出厂 `enabled => false`：app 随 release 装配，但 `config/0` 直接返回 `#{enabled => false}`，**不 bind 任何 socket、不起任何进程**（`supervisor:which_children(broker_ice_sup) → []`）。
+
+**配置**（出厂值在 `broker_ice.app.src`，`config/sys.config.src` 里没有这一段，要开就自己加）：
+
+```erlang
+{broker_ice, [
+  {enabled,          true},                    %% 出厂 false；true 才会走下面四项校验
+  {port,             3478},                    %% STUN + TURN 的 UDP 监听端口
+  {turn_ip,          {192,0,2,10}},            %% 必填：写进 XOR-RELAYED-ADDRESS 的地址
+  {hostname,         undefined},               %% 仅当 turn_ip 缺失时用来解析 A 记录
+  {realm,            <<"unified-mq">>},        %% 必填：参与长期凭据密钥派生
+  {nonce_secret,     undefined},               %% undefined = 每 boot 随机 32 字节
+  {relay_port_range, {49152, 65535}},          %% 可配窄区间，如 {49200, 49300}
+  {max_allocations,  1024},                    %% 超出 -> 486
+  {allocation_lifetime_s, 600},                %% 客户端请求的 lifetime 被 clamp 到此值
+  {max_permissions_per_allocation, 16},        %% 超出 -> 508
+  {max_channels_per_allocation,    16},        %% 超出 -> 508
+  {recbuf_bytes,     262144}                   %% socket 收发缓冲
+]}.
+```
+
+**四项启动期显式失败**（不会带病启动，配置错了就是起不来）：
+
+| 条件 | 错误 |
+|---|---|
+| `turn_ip` 缺失，且 `hostname` 也没配或解析不出 A 记录 | `{missing_config, turn_ip}` / `{turn_ip_unresolved, Host}` |
+| `turn_ip` 不是 IPv4 四元组（IPv6 首期不做，R-I6） | `{invalid_turn_ip, V}` |
+| `relay_port_range` 越出 `49152-65535`，或 `Min > Max`，或不是二元组 | `{invalid_relay_port_range, {Min, Max}}` |
+| `realm` 缺失/非 binary/空；或显式配置了 `nonce_secret` 但不足 16 字节 | `{missing_config, realm}` / `{invalid_realm, V}` / `{invalid_nonce_secret, V}` |
+
+`enabled => false` 时**不做上面任何一项校验**——禁用状态的 app 不该要求一个它用不到的 realm。
+
+**防火墙**（ADR-029 §D2 / §D6）。只开 UDP，且**两段都要开**：
+
+| 端口 | 传输 | 方向 | 说明 |
+|---|---|---|---|
+| 3478 | UDP | 入站 + 出站 | STUN Binding 与 TURN 控制面（`Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`），也是 TURN 响应的源端口 |
+| `relay_port_range` | UDP | 入站 + 出站 | TURN 中继端口。默认整段 `49152-65535`；收敛到窄区间（如 `{49200, 49300}`）能显著缩小暴露面，但**同时会降低可并发的 allocation 数**（每条 allocation 占一个端口） |
+
+- **不要**为 TURN 开 5349 或 3478/TCP：这两个形态首期不做，开了也不会有服务响应（`REQUESTED-TRANSPORT ≠ 17` 回 442）。
+- `recbuf_bytes` 默认 262144（高于内核 128 KB 默认值）；高并发 allocation 时按实际吞吐再调，单向丢包优先查这里与内核 `net.core.rmem_max`。
+- **`turn_ip` 必须是客户端能路由到的地址**，不是 `0.0.0.0`，也不是只在容器内部可见的地址。写错的表现是「TURN 分配成功但媒体不通」——这是本模块宁可启动失败也不静默兜底的原因。
+
+**浏览器侧 `iceServers`**：
+
+```js
+const pc = new RTCPeerConnection({
+  iceServers: [
+    { urls: "stun:broker.example.com:3478" },
+    { urls: "turn:broker.example.com:3478",
+      username: "alice", credential: "alicepw" }   // 与 broker_security.users 同一张表
+  ],
+  // 强制走中继（验证 TURN 是否真的通）：iceTransportPolicy: "relay"
+});
+```
+
+- **凭据与信令同账号**（R-I3）：`broker_security.users` 里的 `password` 直接作为 TURN 长期凭据的口令；服务端派生 `key = MD5(username ":" realm ":" password)`。**没有单独的 TURN 用户表，也不引入 KMS**。
+- **凭据轮换**：改用户记录 + 客户端 `Refresh` 重认证即生效（`key` 在每次认证的请求上重新派生，不缓存）。已经建立的 allocation 在轮换后不会主动断开——它下一次 `Refresh` 会带上新口令。
+- `realm` 一旦上线就**不要改**：改了等于让所有客户端手里的口令全部失效（同一口令派生出不同 key）。真要改，按「停机 + 通知客户端换配置」处理。
+
+**排查**：
+
+- 客户端完全拿不到 `srflx`：先 `ss -lunp | grep 3478` 确认端口真的在听；再确认防火墙放行了 3478/**UDP**（不是 TCP）。
+- Binding 通、TURN `Allocate` 失败：看错误码。`401` 是正常的挑战（客户端会带凭据重试）；连续 `401` 说明口令错或 `realm` 与客户端配置不一致（realm 不符回 `441`）；`486` 是 `max_allocations` 到了；`508` 是 relay 端口段被别的进程占着或太窄。
+- `Allocate` 成功但媒体不通：`turn_ip` 写错（最常见），或 `relay_port_range` 没在防火墙上放行——客户端拿到 relay 候选却连不上。
+- allocation 自己消失（`Refresh` 得到 `437`）：进程是 `temporary`，随崩溃/过期消失，不会自动重建（这是 ADR-029 §D4 的既定语义，客户端应重新 `Allocate`）；`allocation_lifetime_s`（默认 600 s）到期而客户端没 `Refresh` 也会这样。
+- `enabled => false` 时 `broker_ice_udp` 未注册、3478 不被占用——这是出厂状态，不是故障。要确认当前是否开着：`whereis(broker_ice_udp)`，或 `broker_ice_udp:allocations/0` 看快照（`#{client, relay_port, username}`，**不含口令**）。
 
 ---
 
