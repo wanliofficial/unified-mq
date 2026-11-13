@@ -77,3 +77,27 @@ S10 在既有统一消息内核之上新增 WebRTC **信令接入前端**（WSS 
 ## 落地偏差记录
 
 （S10-A 起逐条追加，格式：计划 → 实际 → 为什么 → 留痕位置。冻结文本不改。）
+
+### S10-A（2026-11-13）
+
+1. **D5 的「适配器自有 `require_auth`」实现方向**
+   - 计划：D5 冻结「照 ADR-025/026/027 的路线，适配器自有 `require_auth`」。
+   - 实际：初版把该键当成 `broker_security.require_auth` 读——但那是一个**协议名列表**（出厂 `[]`），当布尔读会让装配成功的出厂 release 一启动就 `{error, {invalid_require_auth, []}}`。已改为读本 app 自己的 `broker_proto_webrtc.require_auth`，与 `broker_proto_a2a` / `broker_proto_mcp` 一致，且有意**不**触碰 `broker_security` 语义。
+   - 为什么：D5 想表达的是「开关由适配器拥有」，不是「开关的值从 `broker_security` 取」。`broker_security.require_auth` 说的是「哪些协议必须认证」，与「本适配器要不要认证」是两回事。
+   - 留痕：`broker_proto_webrtc_app:auth_env/0` 注释、`webrtc_validate_SUITE:the_shipped_security_config_does_not_block_boot/1` 与 `a_non_boolean_require_auth_is_refused/1`、`docs/design/s10-execution-plan.md` §8 第 1 条。
+   - **冻结文本无需变更**：D5 原文「适配器自有 `require_auth`」与修正后的实现一致，本条只记录实现曾一度读错对象。
+
+2. **D7 的守卫测试在实现期的两处细化（不改契约，只补扫描手法）**
+   - 计划：D7 写「grep `src/*.erl`，断言无 `broker_queue:` / `broker_router:` / `#broker_message{}` / 不含 `broker_core` include」。
+   - 实际：①直接 grep 会把**注释里**引用的 `broker_queue:append/3`（本 ADR 原文被抄进模块注释）当成调用，用例自己先红 → 扫描前剥离注释；②`_build/test/lib/<app>/src` 是符号链接，`filelib:wildcard/1` 不跟随符号链接目录，会数出 0 个文件 → 先用 `file:read_link_all/1` 解析真实路径。
+   - 为什么：守卫测试若因文档措辞或构建布局而失败，一周内就会被关掉，等于没有守卫。
+   - 留痕：`webrtc_boundary_SUITE:strip_comments/1` 与 `real_path/1`、执行计划 §8 第 10/11 条。
+   - **D7 冻结文本不改**：断言集合一字未少。
+
+3. **D8 的依赖清单口径确认**
+   - 计划：D8 冻结「契约是『无调用、无消息』，不是『依赖闭包里没有』」。
+   - 实际：`broker_proto_webrtc.app.src` 的 `applications` **不列 `broker_core`**（不调用、不 include，只经 `broker_security` 传递进来），也不列 `broker_queue` / `broker_router` / `broker_subscription` / `broker_event`。`webrtc_boundary_SUITE` 对这四项各有一条断言。
+   - 留痕：`broker_proto_webrtc.app.src` 注释、`webrtc_boundary_SUITE:app_dependency_ledger_is_clean/1`、执行计划 §8 第 9 条。
+
+4. **D4「不落 Mnesia、不做 boot replay」的现状确认**
+   - S10-A 无房间注册表（D4 描述的是 S10-B 的 `webrtc_room_registry`），因此本阶段**连注册表都没有**：监督树下默认零子进程，`listeners => []` 时零 socket。D4 的语义在 S10-B 落地时再核对。

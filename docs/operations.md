@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；**S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）**
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -26,15 +26,16 @@
 | A2A (JSON-RPC) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_a2a`（S9-A/B/C）。示例部署端口 8081，`listeners => []` 是出厂值；出站 Push webhook 单独由 `push_enabled` 门控（默认关） |
 | MCP (Streamable HTTP) | **无（默认不监听）** | HTTP/1.1 明文（可 TLS） | `broker_proto_mcp`（S9-D）。示例部署端口 8082，`listeners => []` 是出厂值；stdio 前端另由 `stdio_enabled` 门控（默认关） |
 | ACP (v1) | **无（仅 stdio，无 listener）** | 子进程管道（无网络） | `broker_proto_acp`（S9-E）。出厂 `agents => []`，不跑任何 agent；语义是 Broker 作 Client、agent 是本地子进程。见 §1.5 |
+| WebRTC 信令 (WSS) | **无（默认不监听）** | WebSocket（明文可 TLS，wss） | `broker_proto_webrtc`（S10-A）。示例部署端口 8084，`listeners => []` 是出厂值。**只有连接层**：子协议 `webrtc.v1`、认证窗口、保活、帧上限；**房间成员与 `to` 转发属 S10-B**，当前带 `to` 的消息一律回 `invalid_message`。STUN/TURN（3478/UDP）属 S10-C，未实现。见 §1.6 |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
-TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener（目前九个 app、七个受 TLS 控制）同时切换。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
+TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener 共用同一份证书配置同时切换（含 S10-A 起的 WebRTC 信令 listener）。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
 
 **例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一**明文且没有 TLS 路径**的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
 
 **QUIC 是另一个方向的例外**：它**没有明文模式**，握手本身就是 TLS 1.3，所以 `broker_security.tls.enabled` 对它不是「开关」而是「证书来源」——关掉这个开关不会让 14567 变明文，只会让 listener 找不到证书而**拒绝启动**（`{quic_requires_tls, Key}`，只影响这一个 app）。
 
-`broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws` 与 `broker_proto_mqtt_ws` 共用。运维上无需任何配置项，也不出现在上表。
+`broker_ws`（S8-A 起）是**纯库 app**：无进程、无监听端口、无运行时配置，只提供 `ws_frame`（RFC 6455 帧编解码）与 `ws_handshake`（握手），供 `broker_proto_ws`、`broker_proto_mqtt_ws` 与 `broker_proto_webrtc`（S10-A）共用。运维上无需任何配置项，也不出现在上表。
 
 `broker_proto_agent_rpc`（S9-A 起）同样是**纯库 app**：无进程、无端口、无自有 env，只提供 JSON-RPC 2.0 信封、HTTP/1.1 帧、SSE 帧、`A2A-Version` 协商与凭据 helper，供将来的 A2A/MCP/ACP 三个前端共用。运维上无需配置，也不出现在上表。
 
@@ -379,7 +380,40 @@ ok = logger:add_handler(default, logger_std_h,
 - agent 崩溃：`restart => temporary` 不重启；日志会有 `agent_exited` + exit_status。重启 agent 由运维在编排层做。
 - 真实六场景（handshake / plain / permission-allow / fs-reject / cancel / permission-deny）+ 11 帧 client→agent 原文见 `docs/protocol-compatibility.md` §4.18.5；**官方 `agent-client-protocol 1.0.0` Agent 侧证据（S9-F 已交付）见 §4.18.8**。
 
+### 1.6 WebRTC 信令前端（WSS，默认关闭，S10-A）
 
+`broker_proto_webrtc` 是 WebRTC 的**信令接入前端**，**只有连接层**：WSS 握手、子协议协商、认证窗口、保活、帧上限。复用 `broker_ws` 的 `ws_handshake` / `ws_frame`（不写第二份 RFC 6455），**不碰消息内核**（ADR-028：不产生 `#broker_message{}`、不调 `broker_queue` / `broker_router`）。出厂 `listeners => []`，装配进 release 但**零 socket**——`application:ensure_all_started(broker_proto_webrtc)` 后 `supervisor:which_children(broker_proto_webrtc_sup)` 是 `[]`。
+
+**配置**（出厂值在 `broker_proto_webrtc.app.src`，`config/sys.config.src` 里没有这一段，要开就自己加）：
+
+```erlang
+{broker_proto_webrtc, [
+  {listeners,       []},              %% 空 = 不监听；要开就填一条 spec（示例端口 8084）
+  {require_auth,    true},            %% 本 app 自己的开关，不是 broker_security.require_auth
+  {subprotocols,    [<<"webrtc.v1">>]},
+  {auth_timeout_ms, 5000},            %% 握手完成后必须在此窗口内认证，超时 close 1008
+  {idle_timeout_ms, 60000},           %% 已认证后空闲窗口，超时 close 1001；infinity = 不起计时器
+  {binary_frames,   reject},          %% reject -> close 1003；ignore -> 丢帧并保持连接
+  {max_frame_bytes, 262144},          %% 超限 close 1009
+  {max_connections, 1024}             %% 每 listener 的 ranch 上限（代码兜底，app.src 未声明；可由 spec 覆盖）
+]}.
+```
+
+listener spec 形状：`#{port => 8084, ip => {127,0,0,1}, num_acceptors => 10, max_connections => 1024}`（另可给 `ref`，缺省 `{webrtc, Port}`；`ip` 缺省 `{127,0,0,1}`；TLS 走 `broker_security.tls` 的同一份证书，无按 listener 覆盖）。
+
+- **`require_auth => false` 只在全部 listener 都绑回环时被接受**，否则 app 起不来（`{error, {insecure_listener, Port, Ip}}`）。该模式下握手完成即主动下发一条 `authenticated`（客户端要拿 `peer_id`），随后直接进活跃态——这是给单机开发用的，不是安全边界。
+- **`require_auth` 不是布尔值的典型事故**：从 `broker_security` 抄来 `require_auth`（那是**协议名列表**，出厂 `[]`）会让装配好的 release 一启动就 `{error, {invalid_require_auth, []}}`。
+- 认证帧是 JSON 文本 `{"event":"authenticate","data":{"username":U,"password":P}}`，走 `broker_security:authenticate_conn/1`，与其余六协议**同一张 `users` 表**；`peer_id` 由服务端铸造（`base64(strong_rand_bytes(10))`，16 字符），客户端不能指定。
+- 缺子协议 / 子协议不在白名单 → **HTTP 400 不升级**；path 任意。
+
+**排查**：
+
+- 连不上：先确认 `listeners` 非空且端口未被占用（`eaddrinuse` 会让整个 app 起不来，与其它 ranch listener 一致）。
+- 升级被拒（400）：客户端没带 `Sec-WebSocket-Protocol: webrtc.v1`，或带了白名单外的值。
+- 握手成功后立刻断开（close 1008）：`auth_timeout_ms` 内没有发 `authenticate`，或发了别的帧。
+- 认证一直 `{"event":"unauthorized"}`：`broker_security.users` 里没有该用户名/密码对，**连接会保持**可以重试；看看是不是把 `broker_security.require_auth` 当成了本 app 的开关。
+- 发什么都回 `{"event":"invalid_message"}`：**S10-A 没有房间也没有 `to` 转发**，带 `to` 的信令一律回这个——这是当前阶段的正确行为，不是故障；房间与转发在 S10-B。
+- 空闲被 close 1001：`idle_timeout_ms` 到了；客户端要按周期发文本 `ping` 保活（服务端回文本 `pong`）。
 
 ---
 

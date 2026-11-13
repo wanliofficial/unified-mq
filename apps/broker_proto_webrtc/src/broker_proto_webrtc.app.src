@@ -1,0 +1,46 @@
+{application, broker_proto_webrtc, [
+    {description, "WebRTC signaling front end: WSS room relay (ADR-028 boundary)"},
+    {vsn, "0.1.0"},
+    {registered, [broker_proto_webrtc_sup]},
+    {mod, {broker_proto_webrtc_app, []}},
+    %% `broker_core' is NOT listed: this app never calls into it and never
+    %% includes its headers (ADR-028 D8). It arrives transitively through
+    %% `broker_security', which is the app that actually owns the identity
+    %% table.
+    {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
+                    broker_ws, broker_security, broker_metrics]},
+    {env, [
+        %% No listener unless the release config supplies one; CT binds its
+        %% own ephemeral port, exactly like broker_proto_ws and
+        %% broker_proto_mqtt_ws.
+        {listeners, []},
+        %% ADR-028 §D5: the adapter owns its own auth switch, exactly like
+        %% broker_proto_a2a and broker_proto_mcp. `broker_security.require_auth'
+        %% is a *list of protocol names* (the six protocols whose handshake can
+        %% carry a credential) and has nothing to say about this app, so it must
+        %% not be read here.
+        {require_auth, true},
+        %% The signaling subprotocol is a version negotiation point (R-T6).
+        %% ADR-028: the signaling face is process-direct, so this is the ONLY
+        %% thing this app negotiates with the kernel.
+        {subprotocols, [<<"webrtc.v1">>]},
+        %% R-C1 / R-T4. The upstream default (300 ms) is a bug-for-compatibility
+        %% value that no real client can meet; this app ships 5000 ms instead.
+        %% validate/0 only requires a positive value -- it does not enforce a
+        %% floor, so a deployment may pick any window it likes.
+        {auth_timeout_ms, 5000},
+        %% Idle window: a connection that sends nothing (no frames, no text
+        %% ping) is closed. Keepalive is the client's text "ping".
+        {idle_timeout_ms, 60000},
+        %% R-T3: binary frames are a protocol decision, not a codec one.
+        %% `reject' closes with 1003; `ignore' drops the frame and keeps the
+        %% connection (the upstream behavior, kept as an explicit opt-out
+        %% rather than a silent default). Note: nothing is logged on this path
+        %% -- S10-A does not log at wire level at all.
+        {binary_frames, reject},
+        %% Per-message cap handed to `ws_frame:decode/2'. 256 KiB fits an SDP
+        %% offer with a large candidate list and is far below the 16 MiB
+        %% `ws_frame' default.
+        {max_frame_bytes, 262144}
+    ]}
+]}.

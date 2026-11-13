@@ -1,6 +1,6 @@
 # 安全与治理（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S7 追加 §2.1（六协议统一身份表）；S9-F 追加 §12.1（三协议 18 条未实现项）；**S10-A 追加 §2.1（WebRTC 信令共用同一张 `users` 表）、§9 的 TLS 调用者清单与 §12.2（信令面 11 条未实现项）**
 - **对应**：README §10.1 / §10.2；`docs/roadmap.md` §8.1；Gate S6 第 1 项
 - **实现**：`apps/broker_security/`（`broker_security`、`broker_limits`、`broker_security_tls`）
 - **测试**：`broker_security_SUITE`、`broker_security_acl_SUITE`、`broker_limits_SUITE`、`broker_security_tls_SUITE`、`broker_security_audit_SUITE`
@@ -53,6 +53,8 @@
 **租户来自记录，不来自客户端。** 这是本次修复的核心：修复前 WS/NATS/AMQP/Kafka/Pulsar 的租户来自协议字段或硬编码的 `t0`，客户端可以自称任何租户；修复后租户一律由匹配到的用户记录给出，协议帧里的 `tenant` 字段被忽略。
 
 `authenticate_conn/1` 的失败形态同样统一：未知用户、错误密码、未知 token、错误 token、以及两种形态之间的差异，对外都是同一个 `bad_username_or_password`，探测方无法据此枚举。
+
+**S10-A 再加一个调用者（2026-11-13）**：WebRTC 信令前端 `webrtc_conn` 在认证窗口内收到 `{"event":"authenticate","data":{"username":…,"password":…}}` 后调用同一个 `authenticate_conn({user_pass, U, P})`，因此信令面也与上述协议**共用同一张 `users` 表**，租户同样只来自用户记录。它不引入新的凭据形态、不读 `broker_security.require_auth`（那是「必须认证的协议名列表」），而是用自己的 `broker_proto_webrtc.require_auth` 开关，见 `docs/architecture.md` §3.16 与本文件 §12.2。S9 的 A2A / MCP 经由 `agent_rpc_auth` 也在同一张表上取身份（不重复计入这里的「六协议」口径）。
 
 ### 2.2 匿名连接是部署决策
 
@@ -197,7 +199,7 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
         versions => ['tlsv1.2', 'tlsv1.3']}}
 ```
 
-- `broker_security_tls:transport/0` 返回 `{ranch_tcp, []}`（禁用）或 `{ranch_ssl, Opts}`（启用）。**七个**协议 supervisor 都调用它（MQTT、WebSocket、MQTT over WebSocket、NATS、AMQP、Kafka、Pulsar），**一个开关覆盖所有 listener**，没有哪个 listener 能「知道 TLS 但不消费配置」。两个不在这条链上：MQTT-SN 走 UDP（要 DTLS，见 §12 第 8 条），MQTT over QUIC 只把证书配置当作**来源**读（握手本身就是 TLS 1.3，没有明文模式）。
+- `broker_security_tls:transport/0` 返回 `{ranch_tcp, []}`（禁用）或 `{ranch_ssl, Opts}`（启用）。**十个**协议 supervisor 都调用它（MQTT、WebSocket、MQTT over WebSocket、NATS、AMQP、Kafka、Pulsar，以及 S9 的 A2A、MCP 与 S10-A 的 WebRTC 信令），**一个开关覆盖所有 listener**，没有哪个 listener 能「知道 TLS 但不消费配置」。两个不在这条链上：MQTT-SN 走 UDP（要 DTLS，见 §12 第 8 条），MQTT over QUIC 只把证书配置当作**来源**读（握手本身就是 TLS 1.3，没有明文模式）。
 - **协议侧还要真的把 TLS 握手跑完**：ranch 对 TLS 只做 `transport_accept`，协议进程收到 `{handshake, Ref, Transport, Sock, Timeout}` 后必须自己调 `Transport:handshake/2`（`ranch_tcp` 是 no-op，`ranch_ssl` 才完成握手），否则首个 `ssl:setopts/2` 报 `notsup_on_transport_accept_socket`。这正是 S8-B 修掉的既有缺陷：`broker_proto_ws` 的 wss 在此前**完全不可用**（listener 明明是 `ranch_ssl`），现由 `ws_conn_SUITE` 的 wss 用例钉住；`broker_proto_mqtt_ws` 从第一版起就正确握手。
 - 启动时 `broker_security_app:start/2` 校验：启用且缺 PEM 文件 → 应用启动失败；禁用永远合法。
 - 轮换：替换同路径 PEM，调用 `broker_security_tls:reload/0`（管理 API `POST /api/v1/tls/reload`），清 `ssl` PEM 缓存，下一个握手用新证书；已建立连接保持原证书（标准 TLS 语义）。
@@ -281,3 +283,19 @@ S9 三协议（A2A / MCP / ACP）接入前端后，以下项**仍未实现**，�
 16. 单节点、回环 listener（18094/18096 绑 `127.0.0.1`，且默认 `listeners => []` 不监听）。
 17. **失败路径计数器未加**：`broker_metrics` 的键集仍是 S9-A 之前的冻结集合；`a2a_state_violation` / `a2a_task_history_lost` / `a2a_checkpoint_corrupt` / `a2a_push_dlq` / `a2a_stream_*` 以及 MCP / ACP 侧的失败事件**只 `logger`**，不进指标。**S9-F 复核后的最终结论是不加**：`broker_metrics` 的冻结键集（ADR-016）不为这三个前端的失败路径扩容，运维按日志特征盯（`docs/operations.md` §告警占位）。
 18. 压测/容量证据（`docs/benchmarks/2026-11-12-s9f-capacity.md`）跑在 tmpfs 数据目录 + `require_durable_fs => false` 的证据节点上，只覆盖单节点回环、无 fsync 的端到端往返；**交付配置（ext4 WAL、多节点、公网 TLS）的容量数字需另行测量**，本报告不声称 ext4 持久化性能。
+
+### 12.2 S10-A（2026-11-13）明确未实现项
+
+S10-A 只交付**信令连接底座**（`broker_proto_webrtc` 的 WSS 接入层），以下全部**未实现**，逐条留痕（不作为 Gate 依据，`progress.md` 与 `docs/design/s10-execution-plan.md` §8 有同一份口径）：
+
+1. **没有房间**：无 `webrtc_room_registry`、无成员表、无 `joined`/`left` 事件。两个已认证客户端之间**无法互相发现**，S10-B 才建注册表。
+2. **没有 `to` 转发**：已认证连接发来的带 `to` 的消息一律回 `invalid_message`（诚实地说「现在不能路由」，不静默丢弃）。跨房间越权因此在本阶段**不存在可被利用的路径**——不是「已修好」，而是「还没这条路径」。
+3. **不做 ACL 判定**：`broker_security:authorize/2` 未被调用。身份只用于认证（`peer_id` 铸造）与租户归属，没有 destination 级策略。ADR-028 §D5 规定将来 ACL 的 destination 只作模式主体。
+4. **`peer_id` 无跨连接语义**：服务端用 `base64(strong_rand_bytes(10))` 铸造 16 字符 ID，只为本次连接有效；重连即换新 ID，无法据此做稳定寻址或审计关联。
+5. **无失败路径计数器，也无线协议层日志**：沿用 §12.1 第 17 条的口径，`broker_metrics` 的冻结键集不扩容；更严格的是，S10-A 的 `webrtc_conn` / `webrtc_listener` **一次 `logger` 调用都没有**——握手失败、`unauthorized`、`invalid_message`、认证窗口/空闲超时、close 1003/1009/1002 全是**纯状态转移**，不上报。所以本阶段对信令面的运维可见性**只有 ranch 自身的 accept 计数**（见 `docs/operations.md` §1.6 的排查段）。加日志字段属 S10-D 的 D.4（`room`/`peer_id`/`bytes`，永不记 `data`）。
+6. **`require_auth => false` 是运维开关，不是安全边界**：只在所有 listener 都绑回环时被接受，且它让**任何**能连上该回环端口的人无需凭据即取得 `peer_id`。这与 A2A/MCP 的同一开关同姿态，适用于单机开发，不适用于共享主机。
+7. **无消息大小之外的反滥用闸门**：只有 `max_frame_bytes`（单帧 262144）与 `max_connections`（每 listener 1024）。没有速率限制、没有每 `peer_id` 的令牌桶、没有慢速攻击缓解（`auth_timeout_ms` 只挡「一直不认证」，不挡「认证后长时间不做事」——后者由 `idle_timeout_ms` 收，两者都只关单连接）。
+8. **TLS 只走 `broker_security.tls`**：没有按 listener 覆盖证书的路径（与 A2A/MCP 一致）；没有客户端证书/mTLS 身份。
+9. **没有真实第三方客户端证据**：本阶段零端口、无 `to` 转发，1:1 信令走不通，因此 `test/protocol-compatibility/s10/` 的 `aiortc` 证据推到 S10-D。现有证据只有 CT 里的字节级客户端（27 例）。
+10. **未做压测 / 容量**：一个连接数 × 信令速率的分档数字都还没有（`docs/benchmarks/` 无 S10 文件）。
+11. **未做 WebSocket 分片重组**：`ws_frame:decode/2` 会把 `fin => false` 的帧照实返回（分片是「暴露给连接进程」的，见该模块注释），但 `webrtc_conn:on_frame/2` 不看 `fin`——首片直接当作完整文本送进 `handle_text/2`，`opcode 0` 续帧落到兜底子句被静默忽略。后果：分片发送的 `authenticate` 只会被判 `unauthorized`，分片发送的信令一律 `invalid_message`（不会误路由、不会崩溃），而对照的 `ws_conn` 与 `mqtt_transport_ws` 都做了重组。浏览器信令客户端默认不分片（一个 SDP 远小于 `max_frame_bytes`），所以本阶段不阻塞；S10-B 房间转发落地时一并补，避免把「半条消息」当完整消息路由。

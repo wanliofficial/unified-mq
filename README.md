@@ -2,7 +2,7 @@
 ## Erlang/OTP + Raft + 多协议接入 + Pulsar + CloudEvents
 
 - **文档版本**：v1.2
-- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S9 已实现并验证（`rebar3 ct` **1063/1063、68 套件**；六协议真实客户端套件 + MQTT-SN / MQTT over QUIC / MQTT over WebSocket / **A2A / MCP / ACP 三协议官方 SDK** 六套真实客户端证据），S9 收口后仍未实现的方向（含三协议的 18 条明确未实现项）列在 [`docs/security.md`](docs/security.md) §12.1。本文 §7.3 的监督树示意、§8 的目录结构与 §12 的分阶段表是**设计建议**（S0 阶段写下的规划，模块名与分阶段粒度都不是现状），实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1，实际监督树见其 §3.1，实际阶段与证据见 [`docs/roadmap.md`](docs/roadmap.md) §10。
+- **状态**：架构方案基线。**实现状态见 [`docs/roadmap.md`](docs/roadmap.md) 与 [`progress.md`](progress.md)**：S0–S9 已实现并验证（S9 收尾时 `rebar3 ct` **1063/1063、68 套件**；六协议真实客户端套件 + MQTT-SN / MQTT over QUIC / MQTT over WebSocket / **A2A / MCP / ACP 三协议官方 SDK** 六套真实客户端证据），S9 收口后仍未实现的方向（含三协议的 18 条明确未实现项）列在 [`docs/security.md`](docs/security.md) §12.1。**S10（WebRTC 信令面 + ICE 面，媒体面不做）进行中**：S10-0（收敛报告 + ADR-028/029）与 **S10-A（信令前端底座 `broker_proto_webrtc`，WSS 连接层，出厂 `listeners => []` 零端口）已交付**，当前全量 `rebar3 ct` **1108/1108、71 套件**；S10-B（房间成员与 `to` 转发）、S10-C（STUN/TURN）、S10-D（安全与一致性收口）未开工，见 [`docs/design/s10-execution-plan.md`](docs/design/s10-execution-plan.md)。本文 §7.3 的监督树示意、§8 的目录结构与 §12 的分阶段表是**设计建议**（S0 阶段写下的规划，模块名与分阶段粒度都不是现状），实际应用清单见 [`docs/architecture.md`](docs/architecture.md) §2.1，实际监督树见其 §3.1，实际阶段与证据见 [`docs/roadmap.md`](docs/roadmap.md) §10。
 - **目标**：构建一个以 Erlang/OTP 为核心、支持多消息协议、分布式一致性、持久化消息和标准化事件的统一消息 Broker。
 - **核心原则**：协议适配与消息内核解耦；控制面与数据面分离；共识层不替代消息语义；CloudEvents 是事件表达标准，不是传输协议。
 

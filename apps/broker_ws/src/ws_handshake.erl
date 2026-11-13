@@ -3,9 +3,10 @@
 %% This module owns exactly the HTTP part of RFC 6455: parse the client's
 %% opening handshake, validate it, and produce the `101 Switching Protocols'
 %% response (including the `Sec-WebSocket-Accept' digest). It does no I/O, holds
-%% no state and knows nothing about the broker, so both WebSocket front ends
-%% (`broker_proto_ws', the broker's own JSON/binary API, and
-%% `broker_proto_mqtt_ws', the MQTT-over-WebSocket transport) share it.
+%% no state and knows nothing about the broker, so every WebSocket front end
+%% (`broker_proto_ws', the broker's own JSON/binary API,
+%% `broker_proto_mqtt_ws', the MQTT-over-WebSocket transport, and
+%% `broker_proto_webrtc', the S10-A signaling front end) shares it.
 %%
 %% Two entry points:
 %%
