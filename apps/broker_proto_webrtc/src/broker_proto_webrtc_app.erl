@@ -36,7 +36,7 @@ validate() ->
     case auth_env() of
         ok ->
             case check_subprotocols() of
-                ok -> check_timeouts();
+                ok -> check_rooms();
                 {error, Reason} -> {error, Reason}
             end;
         {error, Reason} ->
@@ -57,6 +57,29 @@ auth_env() ->
             check_loopback(listeners());
         Other -> {error, {invalid_require_auth, Other}}
     end.
+
+%% S10-B knobs, checked before the timeouts so a bad room setting is reported
+%% first (it is the one most likely to be copy-pasted from an example config).
+%% `max_peers_per_room' gates room capacity; `room_shards' the registry layout.
+%% Both must be positive integers when set -- zero would make every join fail or
+%% the registry empty, which is a configuration error, not a way to disable a
+%% feature (for that, leave `listeners' empty).
+check_rooms() ->
+    case positive(max_peers_per_room()) of
+        ok ->
+            case room_shards() of
+                undefined -> check_timeouts();
+                N -> case positive(N) of
+                         ok -> check_timeouts();
+                         {error, _} -> {error, {invalid_room_shards, N}}
+                     end
+            end;
+        {error, _} ->
+            {error, {invalid_max_peers_per_room, max_peers_per_room()}}
+    end.
+
+positive(N) when is_integer(N), N > 0 -> ok;
+positive(_) -> {error, not_positive}.
 
 check_timeouts() ->
     case auth_timeout_ms() > 0 of
@@ -122,6 +145,12 @@ idle_timeout_ms() ->
 
 max_frame_bytes() ->
     application:get_env(broker_proto_webrtc, max_frame_bytes, 262144).
+
+max_peers_per_room() ->
+    application:get_env(broker_proto_webrtc, max_peers_per_room, 2).
+
+room_shards() ->
+    application:get_env(broker_proto_webrtc, room_shards, undefined).
 
 subprotocols() ->
     case application:get_env(broker_proto_webrtc, subprotocols,

@@ -1,9 +1,10 @@
-%% @doc Supervisor of the WebRTC signaling front end (S10-A).
+%% @doc Supervisor of the WebRTC signaling front end (S10-B).
 %%
-%% One-for-one, listeners only. Each listener is a ranch-managed acceptor pool
-%% (ADR-028: the signaling face is connection state, nothing else -- there is
-%% no registry child here yet; the room registry lands in S10-B behind this
-%% same supervisor, one child per shard).
+%% One-for-one, listeners plus the room registry. Each listener is a
+%% ranch-managed acceptor pool (ADR-028: the signaling face is connection state,
+%% nothing else). The room registry is its own sub-supervisor (one shard per
+%% child); it owns no sockets, so a listener crash and a room crash must not
+%% babysit each other -- hence one_for_one with both as siblings.
 -module(broker_proto_webrtc_sup).
 -behaviour(supervisor).
 
@@ -13,8 +14,16 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Children = [listener_spec(S) || S <- listeners()],
+    Children = [registry_spec() | [listener_spec(S) || S <- listeners()]],
     {ok, {#{strategy => one_for_one, intensity => 1, period => 5}, Children}}.
+
+registry_spec() ->
+    #{id => webrtc_room_registry,
+      start => {webrtc_room_registry, start_link, []},
+      restart => permanent,
+      shutdown => 5000,
+      type => supervisor,
+      modules => [webrtc_room_registry]}.
 
 listeners() ->
     application:get_env(broker_proto_webrtc, listeners, []).

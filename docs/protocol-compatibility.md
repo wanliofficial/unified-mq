@@ -1,7 +1,7 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
 - **文档版本**：v1.3
-- **最近一次追加**：2026-11-13——新增 §4.20：WebRTC 信令前端（S10-A，只有连接层；CT 45 例，**无真实第三方客户端证据**）+ §2 能力矩阵新增一行。此前一次：2026-11-11——新增 §4.12：MQTT over QUIC（S8-D，EMQX `emqtt` 1.16.1 真实客户端 8/8 + CT 17 例）。再此前：2026-11-10——§4.11 MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）；再此前：§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。§4/§4.1~§4.10 原文保留为当时事实
+- **最近一次追加**：2026-11-13——新增 §4.21：WebRTC 信令内核（S10-B，房间 + 五类事件 + `to` 直投 + ACL；CT 61 例，**仍无真实第三方客户端证据**）；同日稍早的 §4.20（S10-A 连接层）保留为当时事实。此前一次：2026-11-13——新增 §4.20：WebRTC 信令前端（S10-A，只有连接层；CT 45 例）。再此前：2026-11-11——新增 §4.12：MQTT over QUIC（S8-D，EMQX `emqtt` 1.16.1 真实客户端 8/8 + CT 17 例）。再此前：2026-11-10——§4.11 MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）；再此前：§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。§4/§4.1~§4.10 原文保留为当时事实
 - **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定、§10 S8 三条 MQTT 传输（MQTT-SN / MQTT over QUIC / MQTT over WebSocket）、§11 S9 三协议 agent 前端、§12 S10 WebRTC 信令面与 ICE 面
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
@@ -42,7 +42,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行，S10-A 追加 WebRTC 信令行）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行，S10-A/B 追加 WebRTC 信令行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -60,7 +60,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | A2A（1.0.0 JSON-RPC + SSE） | 支持子集（S9-A~S9-C，**Broker 作网关**） | JSON-RPC 2.0 传输绑定：`SendMessage`（含 `task_auto_complete` 内建 echo 执行器）、`GetTask`、`ListTasks`、`message/send` 别名；Task 状态机（SUBMITTED→WORKING→COMPLETED / FAILED / CANCELED / REJECTED / INPUT_REQUIRED）+ 事件溯源 + boot 全量重放（无 checkpoint）；Agent Card 发现（`/.well-known/agent-card.json`、`/agents/<id>`，按 tenant 隔离）；SSE 任务事件流（ack-first + 增量 + 优雅关流）；出站 Push Notification（HMAC-SHA256 签名 + SSRF 防护 + 防重放 + DLQ） | 单节点（跨节点 Task 访问无重定向/代理）；全量重放是可扩展性上界；无 JWT/JWKS/OAuth AS（`securitySchemes` 只声明外部 scheme，card 无签名，push 密钥在 env 非 KMS）；失败路径计数器未加（S9-F 定稿不加，见 `docs/security.md` §12.1 第 17 条）；`/agents` 是项目私有接口；默认 `listeners => []`；见 §4.14/§4.15/§4.16/§4.19 | `apps/broker_proto_a2a/test/`、`test/protocol-compatibility/a2a/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/a2a/`） |
 | MCP（Streamable HTTP + stdio） | 支持子集（S9-D，**Broker 作网关**） | MCP `2026-07-28`：无状态逐请求（无 `initialize`/会话/`Mcp-Session-Id`）；`server/discover` 本地回答；`subscriptions/listen` 长活流（ack-first + 通知 + 心跳 + 优雅关流）；`tools`/`resources`/`prompts`/`completions` 原语**透传**到 `$mcp/<method>` 并取回结果（含 `notifications/progress`）；POST 单端点 `application/json`/`text/event-stream`；stdio 前端（newline 成帧、子进程订阅、`notifications/cancelled`）；HTTP 头门禁 `Origin`/`Accept`/`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` | 不解释/不执行工具语义（R-B1）、无 `sampling`/`elicitation`（-32601）、无 GET 流/`Last-Event-ID`/会话续传、无 `Mcp-Param-*` 强制校验、SSE 无 pending-bytes 上限、stdio 不做认证（进程即凭据）且 stdout 纯净性由部署 logger 配置保证、跨节点 reply 不支持；见 §4.17 | `apps/broker_proto_mcp/test/`、`test/protocol-compatibility/mcp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/mcp/`） |
 | ACP（v1，stdio） | 支持子集（S9-E，**Broker 作 Client**） | ACP v1：Broker 作 **Client**、agent 是本地子进程；`initialize`/`session/new`/`session/prompt` 由 Broker 主动发起；`session/request_permission` 是唯一实现的 Client 回调（默认拒绝 + allowlist + 超时 + 每次审计）；`session/cancel` 转发；`session/update` 折叠为 turn 投影写 `$acp/session/<id>`（含 `stopReason`）；prompt 经 `$acp/in/<agent>` 异步回读；`protocolVersion` 只接受 1 | **仅 stdio**（无 HTTP/WS listener、无 `listeners`）、无远程建连、无 `session/load`/`resume`/`list`/`authenticate`、`fs/*`/`terminal/*`/`elicitation/*` 全回 `-32601`（保持会话）、`clientCapabilities={}`、stdio 不做认证（进程即凭据）、跨节点 reply 不支持；见 §4.18 | `apps/broker_proto_acp/test/`、`test/protocol-compatibility/acp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/acp/`） |
-| WebRTC 信令（WSS） | **连接层已支持**（S10-A；信令语义未实现） | RFC 6455 over TLS（wss）/明文仅回环；子协议 `webrtc.v1` 强制；认证窗口 `auth_timeout_ms`（超时 close **1008**）；空闲窗口 `idle_timeout_ms`（超时 close **1001**，`infinity` 可关）；帧上限 `max_frame_bytes`（超限 close **1009**）；文本 `ping`→`pong` 与原生 opcode 9→10 并存；binary → close **1003**（`binary_frames => ignore` 可改为忽略）；认证 = JSON `{"event":"authenticate","data":{username,password}}` → `broker_security:authenticate_conn/1`（与其余六协议同一张 `users` 表）；`peer_id` 服务端铸造 | **本阶段只有连接层**：无房间、无 `to` 转发（带 `to` 一律回 `invalid_message`）、无 `joined`/`left`、不做 ACL；`peer_id` 仅本次连接有效；无真实第三方客户端证据、无压测；默认 `listeners => []`；见 §4.20 与 `docs/security.md` §12.2 | `apps/broker_proto_webrtc/test/`（CT 45 例，字节级客户端；S10-D 才有 `aiortc` 第三方证据） |
+| WebRTC 信令（WSS） | **连接层 + 信令内核已支持**（S10-A + S10-B；ICE/STUN/TURN 未实现） | RFC 6455 over TLS（wss）/明文仅回环；子协议 `webrtc.v1` 强制；路径 `/websocket/<room>` 绑定房间；认证窗口 `auth_timeout_ms`（超时 close **1008**）；空闲窗口 `idle_timeout_ms`（超时 close **1001**，`infinity` 可关）；帧上限 `max_frame_bytes`（超限 close **1009**）；文本 `ping`→`pong` 与原生 opcode 9→10 并存；binary → close **1003**；分片重组 + close 回显；认证 = JSON `{"event":"authenticate",...}` → `broker_security:authenticate_conn/1`（同一张 `users` 表）；`peer_id` 服务端铸造；**五类事件** `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left`；`to` 进程直投（原报文 + `from`、保留 `to`）；房间隔离；ACL（`broker_security:authorize/2`） | **首期 1:1**：`max_peers_per_room` 默认 2，超额 close 1008；**ACL 只能整房间允许/拒绝**（join 与 relay 共用主体）；`peer_id` 仅本次连接有效；未知/跨房间 `to` 同形为 `invalid_message`（不做存在性预言机）；**无 ICE 面**（STUN/TURN 属 S10-C）；无真实第三方客户端证据 / 无压测（S10-D）；默认 `listeners => []`；见 §4.20、§4.21 与 `docs/security.md` §12.2 | `apps/broker_proto_webrtc/test/`（CT **106 例** = S10-A 45 + S10-B 新增 61，字节级客户端；S10-D 才有 `aiortc` 第三方证据） |
 
 **S9-F（2026-11-12）真实第三方客户端验证**：三个 agent 协议各用**上游官方 SDK** 跑过端到端证据——
 MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）、A2A `a2a-sdk 1.3.0`
@@ -1616,7 +1616,7 @@ gen_server，**不碰消息内核**（ADR-028：不产生 `#broker_message{}`、
 | 升级 | `ws_handshake:accept/2`，返回 `{ok, Response, Subprotocol}`（三元素） |
 | 子协议 | `webrtc.v1` 必须在 `subprotocols` 白名单里；缺失或未知 → **HTTP 400 不升级** |
 | 服务端优先 | 客户端把 `webrtc.v1` 排在第二位时，服务端仍选中它 |
-| path | 任意 path 都接受（子协议才是协议判据，与 `broker_proto_mqtt_ws` 同一姿态） |
+| path | 必须是 `GET /websocket/<room>`（两段，S10-B 起强制）；其它形状 → **HTTP 400 不升级**。S10-A 曾接受任意 path |
 | 传输 | `ranch_tcp` 与 `ranch_ssl` **共用同一个连接模块**；wss 走 `broker_security.tls` 的证书 |
 
 ### 4.20.2 认证（R-C1 / R-S7）
@@ -1650,8 +1650,8 @@ gen_server，**不碰消息内核**（ADR-028：不产生 `#broker_message{}`、
 | binary 帧 | **close 1003**；配 `binary_frames => ignore` 时改为丢帧并保持连接（不写日志） |
 | 单帧超过 `max_frame_bytes`（默认 262144） | **close 1009** |
 | RSV 位非 0 / 非法控制帧 / 未知 opcode | **close 1002** |
-| 客户端 close 帧 | 回 close 帧后关（会话结束；本实现不回 close 帧，直接停进程） |
-| 分片（`fin => false` 首片 / `opcode 0` 续帧） | **不重组**：首片当完整文本处理（结果多为 `unauthorized` / `invalid_message`），续帧被兜底子句忽略；见 §4.20.5 与 `docs/security.md` §12.2 第 11 条 |
+| 客户端 close 帧 | **回显**同 code 的 close 帧后关（1005/1006/1015 与越界值统一回 1000，RFC 6455 §7.4.1） |
+| 分片（`fin => false` 首片 / `opcode 0` 续帧） | **重组**：首帧 opcode 决定 text/binary，续帧累积到 FIN=1 再处理；无起始帧的续帧、开消息期间的新数据帧 → **close 1002**。S10-B 补齐，见 §4.21.4 |
 | 已认证后闲置超过 `idle_timeout_ms`（默认 60000） | **close 1001**（`infinity` 可关） |
 
 文本 `ping`/`pong` 与原生 9/10 **并存**，两条路径都有用例钉死（上游只有前者，浏览器只会用后者）。
@@ -1674,11 +1674,97 @@ gen_server，**不碰消息内核**（ADR-028：不产生 `#broker_message{}`、
 出厂 `[]`。初版读错对象，导致装配成功的出厂 release 一启动就 `{error,{invalid_require_auth,[]}}`；
 已在落地时修正并加两条回归用例（`webrtc_validate_SUITE`）。
 
-### 4.20.5 本阶段明确没有的东西
+### 4.20.5 本阶段明确没有的东西（历史留痕：S10-A 时点）
+
+> **本小节描述的是 S10-A 交付时点的状态，已被 §4.21 取代。** 原文保留以对照偏差，当前事实见 §4.21。
 
 没有房间、没有成员表、没有 `to` 转发、没有 `joined`/`left`、不调 `broker_security:authorize/2`。另有一处传输层缺口：**未做 WebSocket 分片重组**（`fin => false` 的首片被当作完整文本，`opcode 0` 续帧被忽略），所以分片发送的 `authenticate` 会被判 `unauthorized`——浏览器信令客户端默认不分片，S10-B 补。
 因此**跨房间越权在本阶段不存在可被利用的路径**——不是「已修好」，而是「还没有这条路径」。
 逐条留痕见 `docs/security.md` §12.2（11 条）。
+
+---
+
+## 4.21 S10-B 追加（2026-11-13）：房间、五类事件、`to` 直投、ACL
+
+**是什么**：在同一 app 上补**信令内核**——房间注册表（`phash2` 分片 + protected ETS）、五类服务器事件、`to` 进程直投、房间隔离与 ACL、服务端 API，并补齐 S10-A 记的两处传输层缺口（分片重组、close 回显）。**仍然不碰消息内核**：不产生 `#broker_message{}`、不调 `broker_queue` / `broker_router`、无 cursor/retention（`webrtc_boundary_SUITE` 扩到 9 例，源码级守卫）。
+
+**证据**：CT **61 例**（`webrtc_signal_SUITE` 13 / `webrtc_room_SUITE` 14 / `webrtc_route_SUITE` 14 / `webrtc_acl_SUITE` 13 + `webrtc_conn_SUITE` 27→31 + `webrtc_boundary_SUITE` 6→9，全部 `port => 0`）。全量 `rebar3 ct` **1169/1169、75 套件**。**仍无真实第三方客户端证据**（`aiortc` / 浏览器 `RTCPeerConnection` 推到 S10-D），也没有压测数字。
+
+### 4.21.1 房间绑定与生命周期
+
+| 项 | 行为 |
+|---|---|
+| 房间键 | URL 路径 `GET /websocket/<room>`，只接受两段；其它形状 → **HTTP 400 不升级**（R-T1） |
+| 加入时机 | 认证成功（或 `require_auth => false` 的握手完成）后自动 `join`，无需客户端额外指令 |
+| 成员表 | 每分片一张 `protected` ETS `webrtc_room_shard_<N>_members`，行 `{{Room, PeerId}, Pid, Username}`；`erlang:phash2(Room, N) + 1` 选分片（**从 1 起**） |
+| `room_shards` | 未设 = `schedulers_online`；改动必须重启（分片进程不在热更新路径上） |
+| 持久化 | **无**。无 Mnesia、无 boot replay；重启后空注册表是**正确状态**（ADR-028 §D4） |
+| 清理 | `terminate/2` → `leave`；被 `kill` 时由分片 `monitor` 兜底（`left` 恰一次）；分片重启后 30 s `sweep` 清残留 |
+
+### 4.21.2 五类服务器事件（设计 §2.3 冻结）
+
+| 事件 | 何时发 | 载荷 | 发给谁 |
+|---|---|---|---|
+| `authenticated` | 认证成功（或关闭认证的握手完成） | `data: {peer_id}` | 请求者 |
+| `unauthorized` | 认证失败 / 未认证就发别的帧 / join 被 ACL 拒 | **无 `data`** | 请求者 |
+| `invalid_message` | 缺/空/未知/跨房间 `to`、缺 `event`、relay 被 ACL 拒、房间满、`peer_id` 冲突 | **无 `data`** | 请求者 |
+| `joined` | 同房间有新成员加入 | `data: {username, peer_id}` | **加入前已有**成员（不含加入者） |
+| `left` | 同房间有成员离开（含 `kill`） | `data: {username, peer_id}` | **剩余**成员（不含离开者） |
+
+全部是 **text 帧**（opcode 1），`event` / `data` 之外没有额外字段。
+
+### 4.21.3 `to` 转发与房间隔离（R-X4）
+
+| 客户端发出 | 服务端行为 |
+|---|---|
+| `{"event":E,"to":P,"data":D}`，`P` 是同房间活着的成员 | 把**原报文**转发给 `P` 的连接，追加/覆盖 `from` = 发送者 `peer_id`，**保留 `to`**，`E`/`D` 不改写 |
+| `to` 指向不存在的 `peer_id` | `{"event":"invalid_message"}`，连接保持 |
+| `to` 指向**另一房间**的 `peer_id` | 同上，且响应与「不存在」**逐字节相同**（不做存在性预言机） |
+| `to` 为空串 / 非字符串 | `{"event":"invalid_message"}` |
+| 缺 `to` | `{"event":"invalid_message"}` |
+| 缺 `event` | `{"event":"invalid_message"}` |
+| 客户端自带的 `from` | 被服务端**覆盖**（R-S7：`from` 只能是服务端铸造的 `peer_id`） |
+
+`event` 名对服务器**不透明**：`offer` / `answer` / `candidate` / 任何自定义名都原样透传（`webrtc_route_SUITE` 有 SDP 与 ICE candidate 的逐字节比对）。
+
+### 4.21.4 传输层补口（S10-A 遗留）
+
+| 项 | 行为 |
+|---|---|
+| 分片消息 | `fin = false` 的数据帧开一条消息（opcode 决定 text/binary），`opcode 0` 续帧累积，FIN=1 时整体处理 |
+| 无起始帧的续帧 | **close 1002** |
+| 开消息期间又来新数据帧 | **close 1002** |
+| 重组超限 | 累计字节数超 `max_frame_bytes` → **close 1009** |
+| 客户端 close 帧 | **回显**同 code；1005/1006/1015 与越界值 → 1000 |
+
+### 4.21.5 ACL（ADR-028 §D5）
+
+| 路径 | 主体 | 拒绝时 |
+|---|---|---|
+| join（认证后自动） | `#{action => signal, tenant_id => T, destination => <<"$webrtc/room/", Room/binary>>}` | `{"event":"unauthorized"}` + **close 1008**（且**不进注册表**，客户端拿不到用不了的 `peer_id`） |
+| relay（`to` 转发） | 同上（同一房间 = 同一 `destination`） | `{"event":"invalid_message"}`，连接保持 |
+| 服务端 API（`webrtc_server`） | 同上 | `{error, unauthorized}` |
+
+- `destination` **只作 ACL pattern 的匹配主体**，不是路由目的地——它不进 `broker_router`，也不代表信令「有 destination」。
+- `authorize/2` 只读 `action` / `tenant_id` / `destination` 三个键；`data` 属性、`event` 名、消息体里的 `tenant_id` 都**不能**放大权限（`webrtc_acl_SUITE` 的 `not_bypassable` 组）。
+- `broker_security.credential_capable/0` **未改**；`authorize(undefined, _)` 返回 `allow`，所以 `require_auth => true` 由适配器自己兜住（ADR-028 §D5）。
+- `require_auth => false` 的匿名身份是 `principal => <<"anonymous">>, tenant_id => undefined`（填默认租户会因不匹配把全部信令拒掉）。
+
+### 4.21.6 服务端 API（`webrtc_server`）
+
+| 函数 | 行为 |
+|---|---|
+| `peers(Room)` | 房间成员列表（`#{peer_id, username, pid}`） |
+| `publish(Room, Event)` / `publish(Room, Event, Data)` | 向房间广播一条事件，返回写入条数 |
+| `send(Room, PeerId, Event)` / `send(Room, PeerId, Event, Data)` | 定向发送；未知 peer → `{error, unknown_peer}`（**不抛 `badarg`**，修上游 F-2） |
+
+### 4.21.7 已声明的限制 / 边界
+
+- **首期 1:1**：`max_peers_per_room` 默认 2，超额 → `invalid_message` + close 1008。多人房间（成员快照、选路）是 P2。
+- **ACL 不能拆 join / relay**：两者共用同一 `$webrtc/room/<room>` 主体，只能整房间允许/拒绝。
+- **无速率限制 / 无每 peer 令牌桶 / 房间数无上限**（见 `docs/security.md` §12.2 第 7 条）。
+- **无 ICE 面**：STUN/TURN（3478/UDP、relay 段）属 S10-C。
+- **无真实第三方客户端证据 / 无容量数字**：S10-D 的 D.1 / D.6。
 
 ---
 

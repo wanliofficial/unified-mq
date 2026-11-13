@@ -100,4 +100,26 @@ S10 在既有统一消息内核之上新增 WebRTC **信令接入前端**（WSS 
    - 留痕：`broker_proto_webrtc.app.src` 注释、`webrtc_boundary_SUITE:app_dependency_ledger_is_clean/1`、执行计划 §8 第 9 条。
 
 4. **D4「不落 Mnesia、不做 boot replay」的现状确认**
-   - S10-A 无房间注册表（D4 描述的是 S10-B 的 `webrtc_room_registry`），因此本阶段**连注册表都没有**：监督树下默认零子进程，`listeners => []` 时零 socket。D4 的语义在 S10-B 落地时再核对。
+   - S10-A 无房间注册表（D4 描述的是 S10-B 的 `webrtc_room_registry`），因此本阶段**连注册表都没有**：监督树下默认零子进程，`listeners => []` 时零 socket。D4 的语义在 S10-B 落地时再核对（见下节 S10-B 第 1 条）。
+
+### S10-B（2026-11-13）
+
+1. **D4 落地核对：分片 gen_server + protected ETS，单节点，无 Mnesia、无 boot replay**
+   - 计划：D4 冻结「分片 gen_server + ETS，单节点，无 Mnesia、无 boot replay」；D3 冻结「广播在持锁期内扇出」。
+   - 实际：`webrtc_room_registry` 是 `one_for_all` 分片 supervisor，`erlang:phash2(Room, N) + 1` 选分片（`room_shards` 未设取 `schedulers_online`），每分片一张 `protected` named ETS `webrtc_room_shard_<N>_members`（行 `{{Room, PeerId}, Pid, Username}`，读者免 call）。`joined`/`left` 在 `webrtc_room_shard` 的同一个 `handle_call` 里、插入/删除之后立即扇出，成员集合不可能与插入竞争。`erlang:monitor/2` + `maps:take` + `demonitor(Ref, [flush])` 保证 `exit(Pid, kill)` 也恰一次 `left`；30 s `sweep` 作兜底。
+   - 为什么（与 D4 一致）：成员是**连接态**，重启后连接必然已断，空注册表是正确状态；因此不建 Mnesia 表、不做 boot replay、不需要恢复语义。`one_for_all` 而非 `one_for_one` 是 D4「分片必须一致」的机械后果：单个分片崩溃时其余分片的 `monitor`/成员行会陈旧，只有整组重建 + `sweep` 才能让「注册表 = 活着的连接」重新成立。
+   - 留痕：`webrtc_room_registry.erl` / `webrtc_room_shard.erl` 模块注释、`webrtc_room_SUITE:placement_is_phash2_sharded/1` 与 lifecycle 组、`webrtc_boundary_SUITE:no_mnesia_or_boot_replay/1`、`docs/architecture.md` §3.16、执行计划 §8 第 10 条。
+   - **冻结文本无需变更**。
+
+2. **D3 落地核对：`room` 只出现在三处**
+   - 计划：D3 冻结「`room` 只出现在 ①WSS 路径 ②ACL 匹配主体 ③注册表分片键；不出现在 router/subscription/queue 的任何 destination 参数中」。
+   - 实际：`webrtc_conn:room_from_head/1` 从 `GET /websocket/<room>` 取房间（①）；`acl/2,3` 把它拼成 `<<"$webrtc/room/", Room/binary>>` 作 ACL pattern 主体（②）；`webrtc_room_registry:shard_for/1` 用 `phash2(Room, N)` 选分片、`table_name/1` 用它作 ETS 键的一部分（③）。`webrtc_dispatch` 只在 `lookup(Room, PeerId)` 里用房间，转发目标是 `Pid`；**没有任何一处**把房间传给 `broker_router` / `broker_subscription` / `broker_queue`——这三个模块在本 app 里根本不存在（`webrtc_boundary_SUITE` 的源码扫描断言无 `broker_queue:` / `broker_router:` 调用）。
+   - 留痕：`webrtc_conn:room_from_head/1` / `acl/2,3`、`webrtc_room_registry:shard_for/1`、`webrtc_boundary_SUITE`、`docs/protocol-compatibility.md` §4.21.1/§4.21.5。
+   - **冻结文本无需变更**。
+
+3. **D5 落地的一条有意简化：join 与 relay 共用同一 ACL 主体**
+   - 计划：D5 冻结 `destination => <<"$webrtc/room/", Room/binary>>`，join 与 relay 自然同址。
+   - 实际：照此实现，后果是 ACL **无法「允许 join、拒绝 relay」**——逐房间规则只能对整个房间允许/拒绝。两条拒绝姿态也不同：join 拒 → `unauthorized` + close 1008（且先判 ACL 再 `join`，客户端拿不到用不了的 `peer_id`），relay 拒 → `invalid_message`（冻结五类事件没有第六类，连接保持可用）。
+   - 为什么：不在实现里偷偷加第二个 `action` 主体。若将来需要拆分，应当新增一个 `action`（例如 `join_room`）并改 D5 的冻结文本，而不是让 ACL 语义随实现漂移。
+   - 留痕：`webrtc_acl_SUITE:a_denied_room_cannot_be_reached_at_all/1` 的注释、`docs/protocol-compatibility.md` §4.21.5、执行计划 §8 第 4/5 条。
+   - **冻结文本无需变更**。

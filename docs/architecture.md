@@ -1,10 +1,10 @@
 # UnifiedMQ 架构
 
-- **文档版本**：v1.1（S10-A，2026-11-13）
-- **状态**：描述当前已实现并实测的架构事实（S0–S9 + S10-A 连接层）。S10-B 及之后明确未实现的方向在 §9 单列，不与现状混写
+- **文档版本**：v1.2（S10-B，2026-11-13）
+- **状态**：描述当前已实现并实测的架构事实（S0–S9 + S10-A/S10-B）。S10-C 及之后明确未实现的方向在 §9 单列，不与现状混写
 - **读者**：接手实现的工程师、评审人、需要判断“某个行为归哪一层”的测试作者
 - **对应**：`docs/roadmap.md`、`docs/design/`（各阶段设计基线）、ADR-001/002/004/007/009/010/011/016/017/018/019/020/021/025/026/027/028/029
-- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**1108/1108**，**71 个套件**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端 + A2A/MCP/ACP 三协议官方 SDK）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
+- **证据口径**：本文件中“已实测”来自 `rebar3 ct`（**1169/1169**，**75 个套件**）、`tools/docker/`（T14/S2 故障注入）、`test/protocol-compatibility/`（六协议真实客户端 + A2A/MCP/ACP 三协议官方 SDK）、`apps/broker_cluster/test/`（3 节点 peer 的 `broker_cluster_dist_SUITE`）与 `docs/benchmarks/` 的产物；引用处给出路径
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
@@ -47,7 +47,7 @@ apps/
 ├── broker_security/      username/password 认证与 allow-all ACL 桩（纯函数）
 ├── broker_admin/         S6：HTTP 管理面（health/metrics/status/config/backup/tls reload）
 ├── broker_proto_mqtt/    MQTT 3.1.1/5 编解码 + 连接 FSM + ranch listener（S8：mqtt_transport 传输抽象，可跑 TCP/TLS/WS/QUIC）
-├── broker_ws/            S8-A：纯 RFC 6455 库（ws_frame 帧编解码 + ws_handshake 握手），无进程、无配置，供三个 WS 前端共用（ws / mqtt_ws / S10-A 的 webrtc）
+├── broker_ws/            S8-A：纯 RFC 6455 库（ws_frame 帧编解码 + ws_handshake 握手），无进程、无配置，供三个 WS 前端共用（ws / mqtt_ws / S10 的 webrtc）
 ├── broker_proto_ws/      S5：WebSocket（RFC 6455）+ JSON/binary 消息 API
 ├── broker_proto_mqtt_ws/ S8-B：MQTT over WebSocket（MQTT 3.1.1 §6 / 5.0 §6），RFC 6455 传输跑同一个 mqtt_conn_fsm
 ├── broker_proto_mqtt_sn/ S8-C：MQTT-SN 1.2 网关（UDP），一个 socket 服务全部会话，不复用 mqtt_conn_fsm
@@ -60,7 +60,7 @@ apps/
 ├── broker_proto_a2a/     S9-A/B/C：A2A 1.0.0 JSON-RPC 前端（Task 生命周期 + Agent Card 发现 + SSE 流式 + 出站 Push webhook），默认 `listeners => []`
 ├── broker_proto_mcp/     S9-D：MCP 2026-07-28 前端（Streamable HTTP + stdio，工具/资源/提示原语透传到 `$mcp/<method>`，本地实现发现与订阅），默认 `listeners => []`
 ├── broker_proto_acp/     S9-E：ACP v1 前端（仅 stdio，Broker 作 Client、agent 是本地子进程；主动发 initialize/session/new/session/prompt，实装 session/request_permission 权限策略），出厂 `agents => []`
-├── broker_proto_webrtc/  S10-A：WebRTC 信令前端（WSS 连接层；复用 broker_ws 的 ws_handshake/ws_frame，子协议 webrtc.v1 强制、认证窗口、保活、帧上限），默认 `listeners => []`；房间成员与 `to` 转发属 S10-B
+├── broker_proto_webrtc/  S10-A/B：WebRTC 信令前端（WSS 连接层 + 房间注册表 + `to` 进程直投；复用 broker_ws 的 ws_handshake/ws_frame，子协议 webrtc.v1 强制、认证窗口、保活、帧上限、五类事件、ACL），默认 `listeners => []`；ICE/STUN/TURN 属 S10-C
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
@@ -91,7 +91,7 @@ apps/
 | `broker_proto_a2a` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_a2a_sup` + `a2a_task_registry`（`one_for_all` 监督 N 个 `a2a_task_shard` + `a2a_task_recovery`）+ 每条配置的 listener（`ranch_embedded_sup`，默认零条）+ 每连接一个 `a2a_conn` 循环进程 | `a2a_listener`（ranch_protocol）、`a2a_conn`（keep-alive 循环）、`a2a_rpc:handle/1`（方法分派与全部门控）、`a2a_task_registry`（`create/3`、`get/1`、`list/3`、`cancel/2`、`apply_event/4`）、`a2a_task`（纯状态机）、`a2a_event`（事件 → `#broker_message{}`）、`a2a_task_projection`（纯折叠）、`a2a_card`（well-known/catalog/ETag/seed） | 每连接的请求计数与 socket；**每 shard 一张 ETS 投影表**（Task 视图，evict 由 boot replay 重建）+ 注册表里的分片名单。Task 事件本身**不在**这里——它们是 `$a2a/task/<id>` 上的普通消息，归 `broker_storage`/`broker_queue`；无 cursor、无 Mnesia |
 | `broker_proto_mcp` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_mcp_sup` + 每条配置的 listener（`ranch_embedded_sup`，默认零条）+ 每 HTTP 连接一个 `mcp_conn` 循环进程 + stdio 前端一个 `mcp_stdio` 主循环进程（订阅以 `spawn_link` 子进程运行） | `mcp_listener`（ranch_protocol）、`mcp_conn`（per-conn HTTP loop）、`mcp_route`（method → capability 门控）、`mcp_discover`（能力发现）、`mcp_dispatch`（传输无关协议层）、`mcp_rpc`（HTTP 门禁 + 分派）、`mcp_stream`（SSE/stdio 双 sink）、`mcp_stdio`（newline 成帧 + 订阅子进程） | 每连接的请求计数与 socket；MCP 原语**不在**这里——它们是 `$mcp/<method>` 上的普通消息，归 `broker_storage`/`broker_queue`；无会话、无 Mnesia 表（发现结果动态计算）；stdio 无状态、无会话（2026-07-28） |
 | `broker_proto_acp` | kernel, stdlib, sasl, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_acp_sup`（`one_for_one`）+ 每个配置的 agent 一个 `acp_agent` gen_server（spawn 并扮演 ACP Client） | `acp_transport`（行为）+ `acp_port`（生产子进程传输，`spawn_executable`）+ `acp_fake_transport`（测试态内存传输）+ `acp_frame`（newline 分帧 + JSON-RPC 信封）+ `acp_policy`（权限裁决）+ `acp_turn`（turn 折叠）+ `acp_session`（纯状态机）+ `acp_event`（`$acp/*` 目的地）+ `acp_agent`（每连接主循环） | 每个 agent 子进程的 stdin/stdout 句柄与握手/会话状态（进程内，不持久化）；`$acp/in/<agent>`、`$acp/session/<id>`、`$acp/permission` 上的消息是普通 `#broker_message{}`，归 `broker_storage`/`broker_queue`；无 Mnesia 表、无 listener |
-| `broker_proto_webrtc` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics（**不含 `broker_core`**——ADR-028 §D8：不调用、不 include，只经 `broker_security` 传递进来） | `broker_proto_webrtc_sup`（`one_for_one`）+ 每条配置的 listener（`ranch:child_spec`，`restart => transient`，默认零条）+ 每连接一个 `webrtc_conn` gen_server | `webrtc_listener`（`ranch_protocol`，`start_link/3` 直接返回连接 pid）、`webrtc_conn`（握手 → 认证窗口 → 帧循环）、`broker_proto_webrtc_app:validate/0`（六类启动门控） | 每连接 socket、握手缓冲、子协议、`peer_id`、认证/空闲两个计时器（进程内，**不持久化**）；**不产生 `#broker_message{}`、不调 `broker_queue`/`broker_router`**（`webrtc_boundary_SUITE` 源码级守卫）；无 Mnesia 表；房间成员注册表属 S10-B |
+| `broker_proto_webrtc` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics（**不含 `broker_core`**——ADR-028 §D8：不调用、不 include，只经 `broker_security` 传递进来） | `broker_proto_webrtc_sup`（`one_for_one`）+ `webrtc_room_registry`（`one_for_all` 分片 supervisor，S10-B）+ 每条配置的 listener（`ranch:child_spec`，`restart => transient`，默认零条）+ 每连接一个 `webrtc_conn` gen_server | `webrtc_listener`（`ranch_protocol`，`start_link/3` 直接返回连接 pid）、`webrtc_conn`（握手 → 认证窗口 → 帧循环）、`webrtc_room_registry` / `webrtc_room_shard`（房间分片 + protected ETS）、`webrtc_signal`（五类事件）、`webrtc_dispatch`（`to` 直投）、`webrtc_server`（服务端 API）、`broker_proto_webrtc_app:validate/0`（六类启动门控 + `check_rooms/0`） | 每连接 socket、握手缓冲、子协议、`peer_id`、认证/空闲两个计时器（进程内，**不持久化**）；房间成员在分片 ETS（**不持久化、无 boot replay**）；**不产生 `#broker_message{}`、不调 `broker_queue`/`broker_router`**（`webrtc_boundary_SUITE` 源码级守卫）；无 Mnesia 表 |
 
 ### 2.2 `broker_event` 的真实状态（S3 已实现）
 
@@ -217,8 +217,10 @@ broker_proto_acp_app ───► broker_proto_acp_sup                      one_
                            └── acp_agent × N（每个配置的 agent 一个，默认 0 个，`agents => []`）
 
 broker_proto_webrtc_app ► broker_proto_webrtc_sup                   one_for_one, 1/5s
+                           ├── webrtc_room_registry                  one_for_all, 1/5s
+                           │   └── webrtc_room_shard × N（每分片一个 gen_server + 一张 protected ETS）
                            └── ranch:child_spec → listener × N（默认 0 条，`listeners => []`，restart = transient）
-                               └── 每连接 webrtc_conn gen_server（握手 → 认证 → 帧循环）
+                               └── 每连接 webrtc_conn gen_server（握手 → 认证 → 帧循环 → 离开房间）
 ```
 
 24 个顶层 supervisor（`broker_core` / `broker_ws` / `broker_proto_agent_rpc` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。27 个 app 减去这 3 个纯类型/纯库 app = 24，逐个核对过 `apps/*/src/*_sup.erl`。
@@ -234,7 +236,8 @@ broker_proto_webrtc_app ► broker_proto_webrtc_sup                   one_for_on
 | `broker_proto_a2a_sup` | `one_for_one`, 1 次/5 s | 只有两类子进程，且 registry 必须早于 listener（boot 契约，ADR-026 §D4）；registry 自己崩了由 `one_for_one` 单独重启整棵 registry 子树，不必连累 listener | listener 重启时 live 连接被收掉；registry 重启 = 全量重放重建投影，正在处理的 Task 请求收到 `internal_error` |
 | `broker_proto_mcp_sup` | `one_for_one`, 1 次/5 s | 只有两类子进程（listener + stdio 主循环），彼此无关，各自独立重启 | listener 重启时 live SSE/HTTP 连接被收掉；stdio 主循环重启 = 新进程接管 stdin/stdout，订阅子进程随 `spawn_link` 一并重启 |
 | `broker_proto_acp_sup` | `one_for_one`, 1 次/5 s | 每个 agent 一个 `acp_agent` 子进程，彼此无关；一个 agent 崩溃（`temporary`）不重启、也不该连累其他 agent | 单个 agent 崩溃只收掉它自己（`agent_exited` 日志）；其他 agent 与内核不受影响 |
-| `broker_proto_webrtc_sup` | `one_for_one`, 1 次/5 s | 只有 listener 一类子进程（房间注册表属 S10-B），彼此无关 | listener 重启时 live 连接由 ranch conns sup 随它一起收掉；内核不受影响 |
+| `broker_proto_webrtc_sup` | `one_for_one`, 1 次/5 s | 两类子进程：`webrtc_room_registry`（分片 supervisor）与 listener，彼此无关；registry 自己崩了单独重启 | listener 重启时 live 连接由 ranch conns sup 随它一起收掉；registry 重启 = 房间成员清空（连接态，ADR-028 §D4 的正确状态），随后连接重新 join |
+| `webrtc_room_registry` | **`one_for_all`, 1 次/5 s** | 分片的 ETS 与进程状态同生同死：单个分片崩溃时，其余分片可能持有陈旧 `monitor`/成员行，整组重建 + 30 s `sweep` 才能让「注册表 = 活着的连接」重新成立 | 所有房间成员清空；连接仍是活的，重连/下次 `join` 重建；`left` 不补发（没有真相可依据） |
 | `a2a_task_registry` | **`one_for_all`, 3 次/10 s** | 分片的 ETS 投影是缓存，日志才是真相；单个分片崩了只有整组重启 + `a2a_task_recovery` 重放才能让"投影等于日志"重新成立。`3/10` 让崩溃循环仍然可见 | 全部 Task 投影重建（耗时 = 全量重放）；期间 `create/get/cancel` 调用方收到 `internal_error`；日志不丢，Task 语义不变 |
 | `broker_proto_amqp_sup` / `broker_proto_kafka_sup` / `broker_proto_pulsar_sup` | `one_for_one`, 5 次/10 s | listener 之外还有 app 级的共享进程（`amqp_topo` 的拓扑表、`kafka_group` 的消费组协调、`pulsar_subscriptions` 的游标），它们与被 listen 的连接无关，不该跟着 listener 一起重启 | listener 或协调进程单独重启，另一类不受影响 |
 | `broker_meta_sup` / `broker_cluster_sup` / `broker_retain_sup` / `broker_admin_sup` / `broker_event_sup` | `one_for_one`, 5 次/10 s | 配置版本、outbox、归属缓存、retain 树、管理 listener、去重窗口彼此独立；retain/admin 的 `permanent` 子进程从文件/配置重建，`broker_event_dedup` 重启只丢窗口内状态 | 单个进程重启，其余不受影响 |
@@ -496,28 +499,31 @@ broker_proto_acp_sup ──► acp_agent（每个配置的 agent 一个 gen_serv
 
 **无认证、无 listener。** 信任边界是「谁能启动这个进程」，身份固定为匿名本地身份（同 MCP stdio）；agent 由运维在 `agents` 里静态声明，绝不由远程请求指定。`agents` 非良构 map 列表或 allowlist 条目命名非 binary 时，`broker_proto_acp_app:start/2` 启动即拒绝。
 
-### 3.16 WebRTC 信令前端的连接模型（S10-A）
+### 3.16 WebRTC 信令前端的连接与房间模型（S10-A + S10-B）
 
 ```
-broker_proto_webrtc_sup ──► ranch:child_spec × N（默认 0 条，`listeners => []`，restart = transient）
-                              │
-                     ranch_acceptors ──accept──► ranch_conns_sup ──► webrtc_conn（每连接一个 gen_server）
-                                                                       │
+broker_proto_webrtc_sup ──► webrtc_room_registry（one_for_all，分片 supervisor）
+                          │      └── webrtc_room_shard × N（每分片一个 gen_server + 一张 protected ETS）
+                          └──► ranch:child_spec × N（默认 0 条，`listeners => []`，restart = transient）
+                                 │
+                        ranch_acceptors ──accept──► ranch_conns_sup ──► webrtc_conn（每连接一个 gen_server）
+                                                                          │
   webrtc_conn:init/1：从 `{handshake, Ref, Transport, Socket, Timeout}` 接手 socket，arm `{active, once}`
   handle_info({tcp|ssl, S, Bytes})：
-     ① 未握手 → ws_handshake:accept/2（子协议必须在白名单，否则 400 并关）
+     ① 未握手 → ws_handshake:accept/2（子协议必须在白名单，否则 400 并关）；路径必须是 `/websocket/<room>`（两段，否则 400）
      ② 已握手未认证 → 只有 `{"event":"authenticate",...}` 被接受；其它文本一律回 `unauthorized`
-     ③ 已认证 → ws_frame:decode/2 循环；文本 `ping`→`pong`、原生 9→10、`to` 消息回 `invalid_message`、binary→close 1003
+     ③ 已认证 → ws_frame:decode/2 循环（含分片重组）；文本 `ping`→`pong`、原生 9→10、binary→close 1003
+        带 `to` 且同房间 → webrtc_dispatch 直投 `Pid ! {text, Frame}`；未知/跨房间 → `invalid_message`
      每次处理完重新 arm `{active, once}`
 ```
 
-**`webrtc_listener:start_link/3` 直接返回连接进程的 pid。** 它**不能**像 `a2a_listener` 那样用 `spawn_link` 包一层：`a2a_conn:start/3` 自己进 receive 循环、是长期驻留入口，而 `webrtc_conn` 是 gen_server（`start_link` 返回即已驻留）；包一层后外层立刻返回，ranch 拿到一个立刻退出的 pid，会把整个 listener 撕掉。
+**房间注册表是分片 supervisor（S10-B）。** `webrtc_room_registry` 用 `erlang:phash2(Room, N) + 1` 把房间分到 N 个 `webrtc_room_shard` 之一（`room_shards` 未设取 `schedulers_online`；**编号从 1 起**），每个分片持一张 `protected` named ETS `webrtc_room_shard_<N>_members`，行 `{{Room, PeerId}, Pid, Username}`。**读者免 call**——`lookup/2` 直接 `ets:lookup`，所以 `to` 转发是一次查找加一次 `Pid !`（ADR-028 §D1/D3），不经过 `broker_router`、不产 `#broker_message{}`。supervisor 为 `one_for_all`：分片的 ETS 与进程状态必须同生同死，单个分片崩溃时整体重建，由 30 s `sweep` 清掉重启瞬间的残留。
 
-**两个计时器都是 `erlang:send_after/3`。** `start_timer/3` 投递的是 `{timeout, Ref, Msg}`，与 `handle_info` 的裸 `auth_timeout` / `idle_timeout` 不匹配，用错会让两个窗口静默不生效。`idle_timeout_ms => infinity` 表示**不起计时器**，不是起一个永不触发的计时器。
+**广播在分片内、在持锁期完成（ADR-028 §D3）。** 「数成员 → 判容量 → 插入 → 告诉其他人」是分片 gen_server 里同一个 `handle_call`，所以 `joined`（发给加入前已有成员，不含加入者）与 `left`（发给剩余成员，不含离开者）的成员集合不可能与插入/删除竞争。进程被 `exit(Pid, kill)` 杀掉时，`erlang:monitor/2` 保证 `left` 恰一次、无幽灵成员。
 
-**认证开关是本 app 自己的 env 键。** `broker_proto_webrtc.require_auth`（ADR-028 §D5，照 A2A/MCP），**不是** `broker_security.require_auth`——后者是「必须认证的协议名列表」，出厂 `[]`，当布尔读会让装配成功的 release 一启动就 `{invalid_require_auth, []}`。`false` 只在全部 listener 绑回环时被接受；该模式下握手完成即推一条 `authenticated`（客户端需要 `peer_id`，R-S7 规定只能服务端铸造）并直接进 `active`。
+**房间是唯一的隔离边界（R-X4）。** `to` 只在发送者所在房间内解析；未知 `peer_id` 与「另一房间的 `peer_id`」都返回 `{error, unknown_peer}` → `invalid_message`，两种失败在线上逐字节相同（用例直接断言相等），避免 `to` 变成 peer id 存在性预言机。客户端自带的 `from` 被服务端覆盖，`to` 保留（照上游 §2.3/F-12）。
 
-**本阶段没有状态可丢。** 每连接状态（socket、握手缓冲、子协议、`peer_id`、两个 timer）全在进程内，进程死了就没了；**不写日志、不建表、不产 `#broker_message{}`**。房间成员注册表是 S10-B 的事，且同样只放内存 ETS。
+**本阶段仍没有持久化状态。** 每连接状态（socket、握手缓冲、子协议、`peer_id`、两个 timer）与房间成员（ETS 行）全在进程/内存里，进程死了就没了；**不写日志、不建表、不产 `#broker_message{}`**（`webrtc_boundary_SUITE` 源码级守卫，扩到 9 例）。ADR-028 §D4：重启后连接必然已断，空注册表是**正确状态**，不是数据丢失。
 
 ---
 
@@ -548,8 +554,8 @@ sasl → broker_core → broker_metrics → broker_storage
 
 它按需配置 listener 才开端口，与 MQTT 的 boot 顺序没有相互约束（互不引用）。**分区必须先存在**：干净数据目录下 `broker_queue` 会按 §4.2 的 step 1 失败，A2A 的 recovery 也就无从谈起——这与 MQTT 的"首启必须带外 `create_partition/1`"是同一条规则，不是 A2A 特有的。
 
-**S10-A 也不在这条链上，且比 S9 更轻。** `broker_proto_webrtc` 的 `applications` 只有 `kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics`——**连 `broker_core` 都不列**（ADR-028 §D8，不调用不 include，只经 `broker_security` 传递进来）。它**不读 MQTT 的数据目录、不参与任何 boot step、不建表**，`listeners => []` 时监督树下零子进程。实测（以装配出的出厂 `sys.config`）：
-`application:ensure_all_started(broker_proto_webrtc)` → `{ok, [sasl, crypto, asn1, public_key, ssl, ranch, broker_ws, broker_core, broker_security, broker_metrics, broker_proto_webrtc]}`，`supervisor:which_children(broker_proto_webrtc_sup)` → `[]`。注意 `broker_core` 仍出现在启动列表里，但那是 `broker_security` 拉进来的，不是本 app 声明的。
+**S10-A/B 也不在这条链上，且比 S9 更轻。** `broker_proto_webrtc` 的 `applications` 只有 `kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics`——**连 `broker_core` 都不列**（ADR-028 §D8，不调用不 include，只经 `broker_security` 传递进来）。它**不读 MQTT 的数据目录、不参与任何 boot step、不建表**；`listeners => []` 时监督树下只有一个 `webrtc_room_registry`（房间分片，全在内存），零 listener。实测（以装配出的出厂 `sys.config`）：
+`application:ensure_all_started(broker_proto_webrtc)` → `{ok, [sasl, crypto, asn1, public_key, ssl, ranch, broker_ws, broker_core, broker_security, broker_metrics, broker_proto_webrtc]}`，`supervisor:which_children(broker_proto_webrtc_sup)` → 仅 `webrtc_room_registry`（及其 N 个分片），`webrtc_room_registry:rooms() → []`、`shard_count() → 16`（= `schedulers_online`）。注意 `broker_core` 仍出现在启动列表里，但那是 `broker_security` 拉进来的，不是本 app 声明的。
 
 ### 4.2 四个 boot step
 
@@ -736,6 +742,8 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `broker_proto_webrtc.max_frame_bytes` | 262144 | S10-A：单帧上限，直接交给 `ws_frame:decode/2`；超限 → close **1009**。≤ 0 → 启动失败 |
 | `broker_proto_webrtc.binary_frames` | `reject` | S10-A：binary 帧策略。`reject` → close **1003**；`ignore` → 丢帧并保持连接（上游行为，显式保留为退出口；这条路径不写日志）。其它值按 `reject` 处理 |
 | `broker_proto_webrtc.max_connections` | 1024（**代码兜底，`.app.src` 未声明**） | S10-A：每个 listener 的 ranch 连接上限（listener spec 的 `max_connections` 逐条覆盖它） |
+| `broker_proto_webrtc.max_peers_per_room` | 2（**代码兜底，`.app.src` 未声明**） | S10-B：每个房间的成员上限，首期 1:1。超额或 `peer_id` 冲突 → `invalid_message` + close **1008**。`join/4` 的 `Opts` 可带 `max_peers` 逐次覆盖（用例构造三人房间）。非正整数 → 启动失败 `{invalid_max_peers_per_room, V}` |
+| `broker_proto_webrtc.room_shards` | `undefined` → `schedulers_online`（**代码兜底，`.app.src` 未声明**） | S10-B：房间注册表的分片数（`erlang:phash2(Room, N) + 1`）。**改值必须重启**（分片进程在 app 启动时建好，热改 env 不重建）。非正整数 → 启动失败 `{invalid_room_shards, V}` |
 
 `vm.args.src` 另设 `-name`、`-C multi_time_warp`、`+sbwt none`（避免忙等调度器抢 WAL 写者）、`+Q 1000000`。
 
@@ -757,8 +765,8 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 | 证据 | 内容 | 位置 |
 |---|---|---|
-| 单元/契约/集成 | `rebar3 ct` → **1108/1108、71 套件全部被执行**（`apps/*/test/` 70 个 + `test/integration/s1_e2e_SUITE` 1 个；含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。S9-A 新增 7 个套件 85 例（基线 823/52），S9-B 再新增 3 个套件 25 例并改写 1 个（`a2a_task_SUITE` 11 / `a2a_event_SUITE` 6 / `a2a_task_projection_SUITE` 8 / `a2a_listener_SUITE` 16→33，`broker_meta_SUITE` 10→12），S9-C 新增 1 个套件 20 例（`a2a_stream_push_SUITE`），S9-D 新增 2 个套件 42 例（`mcp_listener_SUITE` 32 + `mcp_stdio_SUITE` 10），S9-E 新增 3 个套件 47 例（`acp_frame_SUITE` 14 + `acp_policy_SUITE` 16 + `acp_agent_SUITE` 17），**S10-A 新增 3 个套件 45 例**（`webrtc_conn_SUITE` 27 + `webrtc_boundary_SUITE` 6 + `webrtc_validate_SUITE` 12，全部 `port => 0`）。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
-| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 全仓 252 条**全部**是 unused-export，其中 S9/S10 新 app 的告警都是「仅供测试调用的导出」（如 `broker_proto_acp_app:validate_agents/1`、`broker_proto_webrtc_app:validate/0`），零非预期告警 | CI/本地 |
+| 单元/契约/集成 | `rebar3 ct` → **1169/1169、75 套件全部被执行**（`apps/*/test/` 74 个 + `test/integration/s1_e2e_SUITE` 1 个；含 `broker_storage_contract.hrl` 驱动的两档后端各 13 例契约），零 `FAILED` 明细、零 `Skipped`。S9-A 新增 7 个套件 85 例（基线 823/52），S9-B 再新增 3 个套件 25 例并改写 1 个（`a2a_task_SUITE` 11 / `a2a_event_SUITE` 6 / `a2a_task_projection_SUITE` 8 / `a2a_listener_SUITE` 16→33，`broker_meta_SUITE` 10→12），S9-C 新增 1 个套件 20 例（`a2a_stream_push_SUITE`），S9-D 新增 2 个套件 42 例（`mcp_listener_SUITE` 32 + `mcp_stdio_SUITE` 10），S9-E 新增 3 个套件 47 例（`acp_frame_SUITE` 14 + `acp_policy_SUITE` 16 + `acp_agent_SUITE` 17），**S10-A 新增 3 个套件 45 例**（`webrtc_conn_SUITE` 27 + `webrtc_boundary_SUITE` 6 + `webrtc_validate_SUITE` 12，全部 `port => 0`），**S10-B 新增 4 个套件 54 例并把 2 个套件扩容**（`webrtc_signal_SUITE` 13 + `webrtc_room_SUITE` 14 + `webrtc_route_SUITE` 14 + `webrtc_acl_SUITE` 13；`webrtc_conn_SUITE` 27→31、`webrtc_boundary_SUITE` 6→9）。`rebar3 as quic ct` 另有 827 passed + 2 skipped（QUIC 组展开；两个「quicer 缺失」用例按设计 skip） | `apps/*/test/`、`test/integration/`、`apps/broker_cluster/test/` |
+| 静态检查 | `rebar3 dialyzer` 0 warning；`rebar3 xref` 全仓 265 条**全部**是 unused-export，其中 S9/S10 新 app 的告警都是「仅供测试调用/服务端调用的导出」（如 `broker_proto_acp_app:validate_agents/1`、`broker_proto_webrtc_app:validate/0`、`webrtc_server:publish/2,3`、`webrtc_room_registry:rooms/0`），零非预期告警 | CI/本地 |
 | A2A 真实客户端 | `curl` **25 条**（S9-B）：Task 生命周期、`GetTask` 404、`ListTasks` 过滤/分页、`CancelTask` 400、跨租户 404、well-known 匿名/认证 extended、ETag 304、catalog 三类过滤 + 分页 + 租户隔离、`GetExtendedAgentCard` 200 与 `-32007`、**重启后 boot replay 恢复同一 Task**、异步模式 SUBMITTED→CANCELED、401/health/`-32602`（证据端口 18093，默认不监听）。S9-A 的 11 条见 §4.14 | `docs/protocol-compatibility.md` §4.15 |
 | MCP 真实客户端 | `curl` **24 条**（S9-D，证据端口 18096）：HTTP 门禁矩阵（Origin 403、Accept 406、GET 405、text/plain 415、坏 JSON -32700、缺/错版本头 -32020、版本不支持 -3220、Mcp-Name 不匹配 -32020、缺 clientCapabilities -32602、null id -32600、无 auth/错 token 401）、tools/call SSE（progress + result）、未知方法/initialize/sampling 404、`tools/list` 404（feature 未通告）、listen ack + 通知 + `: ping` + 到点 Graceful Closure、`features => []` discover 空能力；stdio 6 帧驱动（stdout 恰 6 协议帧、日志全 stderr） | `docs/protocol-compatibility.md` §4.17 |
 | ACP 真实路径 | 假 ACP agent 走**生产 `acp_port` 传输**六场景（S9-E）：handshake（`initialize` 空 caps + `_meta.unified-mq` + `session/new` 得 sessionId）、plain（2×message_chunk + thought + turn `end_turn`）、permission-allow（`selected` + `$acp/permission` 审计）、fs probe（`fs/read_text_file` → `-32601` 保持会话）、cancel（turn `cancelled`）、permission-deny（`cancelled` + 会话 `gone` + turn `refusal`）；捕获 **11 帧** client→agent 原文 | `docs/protocol-compatibility.md` §4.18.5 |
@@ -801,8 +809,8 @@ broker_subscription_worker ──┘                              ├→ broker_
 | A2A 流式（SSE）、`SubscribeToTask`、Push Notification / 出站 webhook | **S9-C** | `agent_rpc_sse` 接到方法；`$a2a/push/dlq/<tenant>` | SSE 是瞬态读者：不建 cursor、不 pin retention，落后即发 Task 快照 resync；出站默认关闭、只 `https`、host allowlist + pin IP、禁重定向（ADR-026 §D6/§D7） |
 | MCP 2026-07-28 前端 | **S9-D** | 新 app `broker_proto_mcp`，监听 8082 | 与 A2A 共享 `broker_proto_agent_rpc`，两个 adapter 互不引用 |
 | ACP v1 前端（stdio，Broker 扮 Client） | **已交付（S9-E）** | 新 app `broker_proto_acp`，无端口；`acp_agent`/`acp_port`/`acp_policy`/`acp_session`/`acp_turn`/`acp_event`/`acp_frame`/`acp_transport`；`$acp/in/<agent>`、`$acp/session/<id>`、`$acp/permission` | 只 stdio；`fs/*`、`terminal/*`、elicitation 不广告（回 `-32601` 但保持会话）；`session/request_permission` 默认拒绝 + allowlist + 超时 + 每次审计；v2 不实现 |
-| WebRTC 信令前端底座 | **已交付（S10-A）** | 新 app `broker_proto_webrtc`，示例端口 8084、出厂 `listeners => []`；`webrtc_listener`/`webrtc_conn`；复用 `broker_ws` 的 `ws_handshake`/`ws_frame` | ADR-028：信令**不进消息内核**——不产生 `#broker_message{}`、不调 `broker_queue`/`broker_router`、无 offset/cursor/retention（`webrtc_boundary_SUITE` 源码级守卫）；只有连接层，房间成员与 `to` 转发属 S10-B |
-| WebRTC 房间成员、`to` 转发、`joined`/`left`、ACL | **S10-B** | `webrtc_room_registry`（分片 ETS）+ `webrtc_dispatch` | 仍是进程直投、不落盘；ACL 的 destination 只作模式主体（ADR-028 §D5） |
+| WebRTC 信令前端底座 | **已交付（S10-A）** | 新 app `broker_proto_webrtc`，示例端口 8084、出厂 `listeners => []`；`webrtc_listener`/`webrtc_conn`；复用 `broker_ws` 的 `ws_handshake`/`ws_frame` | ADR-028：信令**不进消息内核**——不产生 `#broker_message{}`、不调 `broker_queue`/`broker_router`、无 offset/cursor/retention（`webrtc_boundary_SUITE` 源码级守卫） |
+| WebRTC 房间成员、`to` 转发、`joined`/`left`、ACL | **已交付（S10-B）** | `webrtc_room_registry`（`phash2` 分片 supervisor + protected ETS）+ `webrtc_room_shard`（join/leave/sweep/monitor）+ `webrtc_signal`（五类事件）+ `webrtc_dispatch`（`to` 直投）+ `webrtc_server`（服务端 API）；`webrtc_conn` 加房间加入/离开、分片重组、close 回显 | 仍是进程直投、不落盘（重启后空注册表是正确状态，ADR-028 §D4）；ACL 的 destination 只作模式主体（ADR-028 §D5），join 与 relay 共用同一主体 |
 | STUN / TURN（`broker_ice`） | **S10-C** | 新 app，3478/UDP + relay 段 | ADR-029：独立 app、与内核解耦；5349/TCP/TLS 不做、ICE-lite 不做 |
 | SFU/MCU、转码、录制、DataChannel Broker 内终结 | 非目标（设计 §1.3） | — | 媒体面不做，只做信令面与 ICE 面 |
 | A2A gRPC / REST 绑定、HTTP/2 | 非目标（ADR-026 §D8） | — | 只 HTTP/1.1 + JSON-RPC binding |

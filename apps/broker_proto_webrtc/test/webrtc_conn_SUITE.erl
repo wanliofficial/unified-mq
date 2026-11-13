@@ -52,10 +52,14 @@ groups() ->
        a_binary_frame_is_closed_with_1003,
        a_binary_frame_is_ignored_when_configured,
        a_message_without_to_is_invalid_message,
-       a_message_with_to_is_invalid_message_in_s10a,
+       a_message_with_an_unknown_to_is_invalid_message,
        a_client_close_frame_ends_the_session,
+       a_client_close_frame_is_echoed,
+       a_reserved_close_code_is_normalized_to_1000,
        an_oversized_frame_closes_with_1009,
-       a_reserved_bit_closes_with_1002]},
+       a_reserved_bit_closes_with_1002,
+       a_fragmented_authenticate_frame_is_reassembled,
+       a_continuation_without_a_start_frame_closes_with_1002]},
      {timeouts, [sequence],
       [the_auth_window_closes_an_unauthenticated_connection,
        an_idle_connection_is_closed_with_1001,
@@ -98,6 +102,11 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_proto_webrtc, idle_timeout_ms, 60000),
     ok = application:set_env(broker_proto_webrtc, max_frame_bytes, 4096),
     ok = application:set_env(broker_proto_webrtc, binary_frames, reject),
+    %% Every case here connects to the same `/websocket/room1', and a few of
+    %% them keep more than two sockets open at once. Room capacity is
+    %% `webrtc_room_SUITE''s subject, so the ceiling is raised here rather than
+    %% letting a full room masquerade as a connection-layer failure.
+    ok = application:set_env(broker_proto_webrtc, max_peers_per_room, 32),
     ok = case_env(Case, Config0),
     {ok, _} = application:ensure_all_started(broker_security),
     {ok, _} = application:ensure_all_started(broker_proto_webrtc),
@@ -314,9 +323,9 @@ a_message_without_to_is_invalid_message(Config) ->
     ?assertEqual(#{<<"event">> => <<"invalid_message">>}, decode(P)),
     close(S).
 
-a_message_with_to_is_invalid_message_in_s10a(Config) ->
-    %% S10-A has no room registry yet. The honest answer is
-    %% `invalid_message', not a silent drop and not a crash.
+a_message_with_an_unknown_to_is_invalid_message(Config) ->
+    %% S10-B has a room registry, but the `to' names a peer that does not exist.
+    %% The honest answer is `invalid_message', not a silent drop and not a crash.
     {ok, S} = authed(Config),
     ok = send_text(S, <<"{\"event\":\"offer\",\"to\":\"somebody\",\"data\":{}}">>),
     #{opcode := 1, payload := P} = recv_frame(S),
@@ -345,6 +354,52 @@ a_reserved_bit_closes_with_1002(Config) ->
     %% RSV1 set on a text frame: a protocol violation the codec rejects.
     {ok, S} = authed(Config),
     ok = gen_tcp:send(S, <<16#C1, 0>>),
+    case recv_frame(S) of
+        #{opcode := 8, payload := P} ->
+            ?assertEqual(1002, close_code(P));
+        Other ->
+            exit({expected_close_1002, Other})
+    end,
+    drain_until_closed(S).
+
+a_client_close_frame_is_echoed(Config) ->
+    %% RFC 6455 §5.5.1: a server that receives a close frame must echo it back
+    %% with the same status code before closing the connection.
+    {ok, S} = authed(Config),
+    ok = send_frame(S, 8, ws_frame:close_payload(1000, <<>>)),
+    #{opcode := 8, payload := P} = recv_frame(S),
+    ?assertEqual(1000, close_code(P)),
+    drain_until_closed(S).
+
+a_reserved_close_code_is_normalized_to_1000(Config) ->
+    %% RFC 6455 §7.4.1 reserves status codes 1005, 1006, and 1015; a close frame
+    %% with one of these must be answered with 1000 (normal closure).
+    {ok, S} = authed(Config),
+    ok = send_frame(S, 8, ws_frame:close_payload(1005, <<>>)),
+    #{opcode := 8, payload := P} = recv_frame(S),
+    ?assertEqual(1000, close_code(P)),
+    drain_until_closed(S).
+
+a_fragmented_authenticate_frame_is_reassembled(Config) ->
+    %% RFC 6455 §5.4: a message split across multiple frames (opcode 1 with FIN=0,
+    %% then opcode 0 with FIN=true) must be reassembled before processing.
+    %% `ws_frame:encode/3' always sets FIN=1, so the frames are hand-built here.
+    {ok, S, _} = handshake(Config, [?SUBPROTOCOL]),
+    Authenticate = iolist_to_binary(authenticate(<<"alice">>, <<"s3cr3t!">>)),
+    Size = byte_size(Authenticate),
+    Half = Size div 2,
+    <<First:Half/binary, Rest/binary>> = Authenticate,
+    ok = gen_tcp:send(S, frag_frame(1, First, false)),
+    ok = gen_tcp:send(S, frag_frame(0, Rest, true)),
+    #{opcode := 1, payload := P} = recv_frame(S),
+    #{<<"event">> := <<"authenticated">>} = decode(P),
+    close(S).
+
+a_continuation_without_a_start_frame_closes_with_1002(Config) ->
+    %% RFC 6455 §5.4: a continuation frame (opcode 0) with no preceding data
+    %% frame (opcode 1 or 2) is a protocol violation.
+    {ok, S} = authed(Config),
+    ok = gen_tcp:send(S, frag_frame(0, <<"orphan">>, true)),
     case recv_frame(S) of
         #{opcode := 8, payload := P} ->
             ?assertEqual(1002, close_code(P));
@@ -461,7 +516,7 @@ raw_handshake_on(S, Mode, Subprotocols) ->
                  "Sec-WebSocket-Key: ">>, Key, <<"\r\n">>,
                ProtoHeader, <<"Sec-WebSocket-Version: 13\r\n\r\n">>],
     ok = send_raw(Mode, S, Request),
-    {ok, Response} = recv_until(Mode, S, <<"\r\n\r\n">>, <<>>),
+    {ok, Response} = recv_header(Mode, S, <<>>),
     case Response of
         <<"HTTP/1.1 101", _/binary>> ->
             {ok, response_subprotocol(Response)};
@@ -484,6 +539,17 @@ send_text(S, Payload) ->
 
 send_frame(S, Op, Payload) ->
     gen_tcp:send(S, ws_frame:encode(Op, Payload, true)).
+
+%% Build a single masked client frame with an explicit FIN bit. The shared
+%% `ws_frame:encode/3' is a server-side/single-frame encoder (its third argument
+%% is the mask bit, and it always sets FIN=1), so a fragmented message has to be
+%% assembled by hand. Payloads here are short (< 126 bytes), so a 7-bit length
+%% is enough.
+frag_frame(Op, Payload, Fin) ->
+    Key = crypto:strong_rand_bytes(4),
+    Len = byte_size(Payload),
+    FinBit = case Fin of true -> 1; false -> 0 end,
+    [<<FinBit:1, 0:3, Op:4, 1:1, Len:7>>, Key, unmask(Key, Payload)].
 
 close(S) ->
     catch gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true)),
@@ -547,17 +613,15 @@ decode(Bin) -> json:decode(Bin).
 send_raw(tcp, S, IoData) -> gen_tcp:send(S, IoData);
 send_raw(tls, S, IoData) -> ssl:send(S, IoData).
 
-recv_until(Mode, S, Needle, Acc) ->
-    case binary:match(Acc, Needle) of
+%% Read the handshake response *byte-exactly*, stopping at the terminating
+%% `\r\n\r\n'. A `recv(S, 0)' loop would swallow whatever the server wrote
+%% after the 101 -- with `require_auth => false' that is the unsolicited
+%% `authenticated' frame, and losing it makes the next `recv_frame/1' block.
+recv_header(Mode, S, Acc) ->
+    case binary:match(Acc, <<"\r\n\r\n">>) of
         nomatch ->
-            Got = case Mode of
-                      tcp -> gen_tcp:recv(S, 0, 5000);
-                      tls -> ssl:recv(S, 0, 5000)
-                  end,
-            case Got of
-                {ok, Data} -> recv_until(Mode, S, Needle, <<Acc/binary, Data/binary>>);
-                Other -> Other
-            end;
+            {ok, Byte} = recv_exact(Mode, S, 1),
+            recv_header(Mode, S, <<Acc/binary, Byte/binary>>);
         _ ->
             {ok, Acc}
     end.

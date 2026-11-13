@@ -23,6 +23,9 @@ all() ->
      no_broker_message_record,
      no_broker_core_include,
      no_subscription_or_cursor_state,
+     no_mnesia_or_boot_replay,
+     no_global_name_registry,
+     s10b_modules_are_scanned,
      app_dependency_ledger_is_clean].
 
 %%%_* Source scanning -------------------------------------------------------
@@ -125,6 +128,35 @@ no_subscription_or_cursor_state(Config) ->
                   <<"ADR-028 D1: no cursor state in the signaling face">>),
     assert_absent(Config, <<"broker_queue:append">>,
                   <<"ADR-028 D2: append/3 has no transient bypass">>).
+
+%% ADR-028 D4: room membership is connection state, so there is no Mnesia table
+%% and nothing to replay at boot. A `mnesia:' call or a `restore'/'replay' entry
+%% point would mean the registry had grown a persistence story, which the design
+%% explicitly rules out (an empty registry after a restart is the correct state).
+no_mnesia_or_boot_replay(Config) ->
+    assert_absent(Config, <<"mnesia:">>,
+                  <<"ADR-028 D4: room membership is not control-plane metadata">>),
+    assert_absent(Config, <<"broker_meta:">>,
+                  <<"ADR-028 D4: the room registry has no Mnesia-backed edge">>).
+
+%% The upstream sample uses `syn' (a global name registry) to find a peer. This
+%% app must not: peer lookup is a local ETS read inside the room's shard, which
+%% is what makes the `to' path one lookup plus one send (ADR-028 D1/D3) and what
+%% keeps the isolation per-room rather than global.
+no_global_name_registry(Config) ->
+    assert_absent(Config, <<"syn:">>,
+                  <<"ADR-028 D1/D3: peer lookup is local and room-scoped, not a "
+                    "global registry">>).
+
+%% The guard is only as good as its coverage: every S10-B module must be in the
+%% scanned set, otherwise a module could be added outside the boundary check.
+s10b_modules_are_scanned(Config) ->
+    Files = [filename:basename(F) || {F, _} <- sources(Config)],
+    Required = ["webrtc_conn.erl", "webrtc_room_registry.erl",
+                "webrtc_room_shard.erl", "webrtc_signal.erl",
+                "webrtc_dispatch.erl", "webrtc_server.erl"],
+    Missing = [R || R <- Required, not lists:member(R, Files)],
+    ?assertEqual([], Missing).
 
 %% The dependency ledger is the other half of the guard (ADR-028 D8): the .app
 %% `applications' list must not name an app that would drag the kernel in.
