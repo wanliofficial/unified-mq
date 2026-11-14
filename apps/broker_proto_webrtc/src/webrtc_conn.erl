@@ -31,6 +31,8 @@
 -module(webrtc_conn).
 -behaviour(gen_server).
 
+-include_lib("kernel/include/logger.hrl").
+
 %% Public entry from webrtc_listener:start_link/3
 -export([start_link/3]).
 %% gen_server
@@ -160,13 +162,25 @@ handle_info(_Info, St) ->
 %% the normal path, and it is the one that must not raise.
 terminate(_Reason, #st{room = undefined}) ->
     ok;
-terminate(_Reason, #st{room = Room, socket = undefined}) ->
+terminate(Reason, #st{room = Room, socket = undefined} = St) ->
     webrtc_room_registry:leave(Room, self()),
+    log_disconnect(St, terminate_code(Reason)),
     ok;
-terminate(_Reason, #st{room = Room, transport = T, socket = S}) ->
+terminate(Reason, #st{room = Room, transport = T, socket = S} = St) ->
     webrtc_room_registry:leave(Room, self()),
     _ = T:close(S),
+    log_disconnect(St, terminate_code(Reason)),
     ok.
+
+%% Map a gen_server terminate reason to the WebSocket close code an operator
+%% would correlate against. `normal' here means the socket path already decided
+%% (1000/1001/1008/1009/1002 ...); it is not re-derived, so the log carries a
+%% stable `normal' rather than a guessed code.
+terminate_code(normal) -> 1000;
+terminate_code({shutdown, closed}) -> 1000;
+terminate_code({shutdown, {socket_error, _}}) -> 1006;
+terminate_code({shutdown, {tls_handshake_failed, _}}) -> 1006;
+terminate_code(_) -> 1000.
 
 code_change(_OldVsn, St, _Extra) -> {ok, St}.
 
@@ -387,27 +401,32 @@ handle_text(Payload, #st{phase = authenticating} = St) ->
 handle_text(Payload, #st{phase = active} = St) ->
     case decode_json(Payload) of
         Message when is_map(Message) ->
-            relay(Message, St);
+            relay(Message, byte_size(Payload), St);
         _ ->
+            log_refused(St, invalid_json),
             send_event(St, webrtc_signal:invalid_message()),
             reset_idle(St)
     end;
-
 handle_text(_Payload, St) ->
     %% handshake / stopping phases do not take text frames
     St.
 
 %% `to' is the only field the server reads; `event' and `data' are opaque.
-relay(Message, St = #st{room = Room, peer_id = PeerId}) ->
+%% `Bytes' is the inbound frame's payload size -- logged (never the body) so an
+%% operator can see signalling volume without seeing SDP/candidate text.
+relay(Message, Bytes, St = #st{room = Room, peer_id = PeerId}) ->
     case acl(Room, St) of
         allow ->
             case webrtc_dispatch:deliver(Room, Message, PeerId) of
-                ok -> reset_idle(St);
-                {error, _Reason} ->
+                ok ->
+                    log_relay(St, Bytes),
+                    reset_idle(St);
+                {error, Reason} ->
                     %% Unknown peer, peer in another room, missing/blank `to'
                     %% or `event'. One answer for all of them: the client is
                     %% told the message was not relayed, the connection stays
                     %% up (R-S5; upstream F-1 crashed the handler here).
+                    log_refused(St, Reason),
                     send_event(St, webrtc_signal:invalid_message()),
                     reset_idle(St)
             end;
@@ -415,6 +434,7 @@ relay(Message, St = #st{room = Room, peer_id = PeerId}) ->
             %% No sixth event exists in the frozen set (R-S1), so a refusal
             %% reuses `invalid_message' -- no `data', no hint about what the
             %% ACL allows.
+            log_refused(St, acl_denied),
             send_event(St, webrtc_signal:invalid_message()),
             reset_idle(St)
     end.
@@ -432,10 +452,12 @@ try_authenticate(Data, #st{} = St) ->
                 {ok, Identity} ->
                     go_active(Identity, St);
                 {error, _Reason} ->
+                    log_auth_failed(St, bad_credentials),
                     send_event(St, webrtc_signal:unauthorized()),
                     St
             end;
         _ ->
+            log_auth_failed(St, malformed_authenticate),
             send_event(St, webrtc_signal:unauthorized()),
             St
     end.
@@ -447,6 +469,7 @@ go_active(#{principal := Principal, tenant_id := Tenant} = _Identity, St) ->
     Room = St#st.room,
     case acl(Room, Principal, Tenant) of
         deny ->
+            log_auth_failed(St#st{username = Principal}, acl_denied),
             send_event(St, webrtc_signal:unauthorized()),
             close_with(1008, St);
         allow ->
@@ -455,17 +478,19 @@ go_active(#{principal := Principal, tenant_id := Tenant} = _Identity, St) ->
             case webrtc_room_registry:join(Room, PeerId, self(), Opts) of
                 {ok, _Present} ->
                     send_event(St, webrtc_signal:authenticated(PeerId)),
-                    reset_idle(St#st{phase = active,
-                                     peer_id = PeerId,
-                                     principal = Principal,
-                                     tenant = Tenant,
-                                     username = Principal,
-                                     auth_timer = disarm(St#st.auth_timer)});
+                    St2 = St#st{phase = active,
+                                peer_id = PeerId,
+                                principal = Principal,
+                                tenant = Tenant,
+                                username = Principal,
+                                auth_timer = disarm(St#st.auth_timer)},
+                    log_authenticated(St2),
+                    reset_idle(St2);
                 {error, Reason} ->
                     %% Room full (or the impossible peer-id collision). Same
                     %% refusal shape as the ACL one: a clear event + close,
                     %% never a silent half-join.
-                    _ = Reason,
+                    log_auth_failed(St#st{username = Principal}, {join_refused, Reason}),
                     send_event(St, webrtc_signal:invalid_message()),
                     close_with(1008, St)
             end
@@ -538,6 +563,60 @@ cancel(Ref) -> _ = erlang:cancel_timer(Ref), ok.
 -spec disarm(undefined | reference()) -> undefined.
 disarm(undefined) -> undefined;
 disarm(Ref) -> _ = erlang:cancel_timer(Ref), undefined.
+
+%%%===================================================================
+%%% Observability (R-O2 / D.4)
+%%%
+%%% Structured, REDACTED logging only. The hard rule (design §2.7 / R-X6,
+%%% docs/security.md §9): the log line carries `room', `peer_id', `username' and
+%%% a byte count -- never the frame `data', never the credential, never the SDP
+%%% or ICE candidate text. A signal's `data' is opaque to us and may embed
+%%% credentials or internal network addresses, so only `byte_size' is logged.
+%%% `traceparent' is accepted at the door by `broker_ws' (opt-in, default off)
+%%% and is not re-emitted here; when a deployment wants end-to-end correlation
+%%% the W3C context rides the message headers, not these connection logs.
+%%%%
+%%% `broker_metrics' is deliberately NOT touched (ADR-016 §16.2 frozen key set):
+%%% these paths emit no metrics, so no key is added for them.
+%%%===================================================================
+
+%% Auth succeeded: the connection joined a room. No credential, no peer payload.
+log_authenticated(#st{room = Room, peer_id = PeerId, username = Username}) ->
+    ?LOG_INFO("webrtc_conn: authenticated room=~s peer_id=~s username=~s",
+              [s(Room), s(PeerId), s(Username)]),
+    ok.
+
+%% Auth failed (bad credential / malformed authenticate frame / ACL deny).
+%% The reason is a coarse atom, never the offending value.
+log_auth_failed(#st{room = Room, username = Username}, Reason) ->
+    ?LOG_INFO("webrtc_conn: auth_refused room=~s username=~s reason=~p",
+              [s(Room), s(Username), Reason]),
+    ok.
+
+%% A signal was relayed to a same-room peer. Byte count only -- never the body.
+log_relay(#st{room = Room, peer_id = PeerId}, Bytes) ->
+    ?LOG_INFO("webrtc_conn: relay room=~s from=~s bytes=~b",
+              [s(Room), s(PeerId), Bytes]),
+    ok.
+
+%% A signal was refused (unknown/foreign/missing `to', or an ACL deny). The
+%% client-facing event is `invalid_message'; this log is for operators, and the
+%% `to' is reduced to "absent" (a peer id is not logged before it exists).
+log_refused(#st{room = Room, peer_id = PeerId}, Reason) ->
+    ?LOG_INFO("webrtc_conn: signal_refused room=~s peer_id=~s reason=~p",
+              [s(Room), s(PeerId), Reason]),
+    ok.
+
+%% The connection is leaving (close code + room/peer if known). No payload.
+log_disconnect(#st{room = Room, peer_id = PeerId}, Code) ->
+    ?LOG_INFO("webrtc_conn: disconnect room=~s peer_id=~s code=~b",
+              [s(Room), s(PeerId), Code]),
+    ok.
+
+%% A field that is a binary once known, `undefined' before then. `~s' would
+%% raise on an atom, and a logging crash must never take a connection down.
+s(undefined) -> <<"-">>;
+s(Bin) when is_binary(Bin) -> Bin.
 
 %%%===================================================================
 %%% Socket helpers

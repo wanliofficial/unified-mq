@@ -1,0 +1,14 @@
+{"event": "peer_ids", "peer_a": "C7iXvoaSnRj4Xg==", "peer_b": "hk6soCsv5JeI2Q=="}
+{"event": "joined", "observed_peer": "hk6soCsv5JeI2Q==", "expected": "hk6soCsv5JeI2Q=="}
+{"event": "peer_a_candidates", "host": ["192.168.10.26", "2409:8a4c:81d:1af4:275b:956:34d4:191b", "100.75.150.16", "fd7a:115c:a1e0::ce38:9611", "172.17.0.1", "172.18.0.1", "172.19.0.1", "172.20.0.1", "10.42.0.0", "10.42.0.1", "10.222.222.1"], "srflx": ["192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26", "10.222.222.1", "192.168.10.26", "192.168.10.26", "100.75.150.16", "192.168.10.26"]}
+{"event": "peer_b_candidates", "host": ["192.168.10.26", "2409:8a4c:81d:1af4:275b:956:34d4:191b", "100.75.150.16", "fd7a:115c:a1e0::ce38:9611", "172.17.0.1", "172.18.0.1", "172.19.0.1", "172.20.0.1", "10.42.0.0", "10.42.0.1", "10.222.222.1"], "srflx": ["192.168.10.26", "10.222.222.1", "100.75.150.16", "192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26"]}
+{"event": "connection_state", "peer": "b", "state": "connecting"}
+{"event": "connection_state", "peer": "a", "state": "connecting"}
+{"event": "connection_state", "peer": "a", "state": "connected"}
+{"event": "connection_state", "peer": "b", "state": "connected"}
+{"event": "result", "connected": [true, true], "state_a": "connected", "state_b": "connected"}
+{"event": "data_channel", "sent": "s10-d-evidence-ping", "received": "s10-d-evidence-ping", "ok": true}
+{"event": "stun_srflx", "ok": true, "srflx_count": 18, "addresses": ["192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26", "10.222.222.1", "192.168.10.26", "192.168.10.26", "100.75.150.16", "192.168.10.26", "192.168.10.26", "10.222.222.1", "100.75.150.16", "192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26", "192.168.10.26"]}
+{"event": "connection_state", "peer": "a", "state": "closed"}
+{"event": "connection_state", "peer": "b", "state": "closed"}
+{"event": "verdict", "ok": true}

@@ -296,7 +296,7 @@ S10-A 只交付**信令连接底座**（`broker_proto_webrtc` 的 WSS 接入层�
    **已由 S10-B 实现（2026-11-13）**：`webrtc_room_registry`（`phash2(Room,N)+1` 分片 supervisor + 每分片 protected ETS）+ `webrtc_room_shard`；`joined`/`left` 广播集合由 `webrtc_signal_SUITE`（13 例）与 `webrtc_room_SUITE`（14 例）钉死。房间成员是**连接态**、只在内存（ADR-028 §D4），重启后清空是正确状态。
 
 ~~2. **没有 `to` 转发**：已认证连接发来的带 `to` 的消息一律回 `invalid_message`（诚实地说「现在不能路由」，不静默丢弃）。跨房间越权因此在本阶段**不存在可被利用的路径**——不是「已修好」，而是「还没这条路径」。~~
-   **已由 S10-B 实现**：`webrtc_dispatch:deliver/3` + `relay/3` 进程直投（`lookup/2` + `Pid ! {text, Bin}`），原报文 + 覆盖式 `from`、保留 `to`；`webrtc_route_SUITE` 14 例覆盖 SDP/ICE 字节透传、缺 `to`/空 `to`/未知 `to`/缺 `event` 一律 `invalid_message`、跨房间与未知响应**逐字节相同**（不做 peer 存在性预言机）、伪造 `from` 被覆盖。
+   **已由 S10-B 实现**：`webrtc_dispatch:deliver/3` + `relay/3` 进程直投（`lookup/2` + `Pid ! {text, Bin}`），原报文 + 覆盖式 `from`、保留 `to`；`webrtc_route_SUITE` 14 例覆盖 SDP/ICE 字节透传、缺 `to`/空 `to`/未知 `to`/缺 `event` 一律 `invalid_message`、跨房间与未知响应**逐字节相同**（不做 peer 存在性预言机）、伪造 `from` 被覆盖。**S10-D D.3 再补 3 例（共 17 例）**：`to` 为非二进制（JSON 数字/布尔/null/对象）→ `invalid_message`（`deliver/3` 只用 `is_binary/1` 判 `to`，类型混淆穿不过寻址层）、单连接连拒 50 条后合法信令仍正常路由（持续滥用退化探针）、把自己的 `peer_id` 当 `to` → **回环投递一次**（注册表把自己解析到自己的 pid，帧原样写回、`from`=自身；因 `{text, Frame}` 只写出不再转发，恰好一次、无循环、无放大——如实留痕为「不拒绝、良性」而非缺陷）。
 
 ~~3. **不做 ACL 判定**：`broker_security:authorize/2` 未被调用。身份只用于认证（`peer_id` 铸造）与租户归属，没有 destination 级策略。ADR-028 §D5 规定将来 ACL 的 destination 只作模式主体。~~
    **已由 S10-B 实现**：join / relay / 服务端 API 三条路径都过 `broker_security:authorize/2`，主体 `#{action => signal, tenant_id, destination => "$webrtc/room/<room>"}`（`destination` **只作 ACL 模式主体**，不进 `broker_router`）。join 拒 → `unauthorized` + close 1008；relay 拒 → `invalid_message`（冻结五类事件无第六类）。`broker_security` 的既有语义**一字未动**。`webrtc_acl_SUITE` 13 例（含 `data`/`event`/消息体 `tenant_id` 都不能绕过 ACL）。**已知简化**：join 与 relay 共用同一主体，因此 ACL 只能对整个房间允许/拒绝，无法「允许 join、拒绝 relay」。
@@ -304,14 +304,18 @@ S10-A 只交付**信令连接底座**（`broker_proto_webrtc` 的 WSS 接入层�
 4. **`peer_id` 无跨连接语义**：服务端用 `base64(strong_rand_bytes(10))` 铸造 16 字符 ID，**只为本次连接有效**；重连即换新 ID，无法据此做稳定寻址或审计关联。S10-B 未改这条——`to` 只在同房间、同连接生命周期内可寻址。
 
 5. **无失败路径计数器，也无线协议层日志**：沿用 §12.1 第 17 条的口径，`broker_metrics` 的冻结键集不扩容；`webrtc_conn` / `webrtc_listener` / `webrtc_room_shard` / `webrtc_dispatch` **一次 `logger` 调用都没有**——握手失败、`unauthorized`、`invalid_message`、认证窗口/空闲超时、close 1003/1009/1002、房间满、ACL 拒、未知 `to` 全是**纯状态转移**，不上报。信令面的运维可见性只有 ranch 自身的 accept 计数（`docs/operations.md` §1.6 的排查段）。加日志字段属 S10-D 的 D.4（`room`/`peer_id`/`bytes`，永不记 `data`）。
+   **S10-D D.4 已补（2026-11-14）**：`webrtc_conn` 现在发出结构化、**脱敏**的 `?LOG_INFO`（`logger` 直接调用，无 `lager` 运行时依赖）：`authenticated` / `auth_refused`（带 `reason` 粗粒度原子）/ `relay`（`room` + `from` + `bytes`，**永不记 `data`**）/ `signal_refused` / `disconnect`。`broker_metrics` 键集**仍不扩容**（D.4 只加日志、不加指标）。`webrtc_route_SUITE:the_log_carries_room_peer_and_bytes_but_never_the_payload/1` 用 logger handler 捕获全量 debug 日志，断言一条真实 relayed offer 的 SDP sentinel 与口令**都不出现**、而 `room=` / `from=` / `bytes=` 与发送方 `peer_id` 出现。traceparent 仍由 `broker_ws` 在门口按 opt-in（默认 off）接收，连接日志不重复发射；失败路径仍**不进指标**。
 
 6. **`require_auth => false` 是运维开关，不是安全边界**：只在所有 listener 都绑回环时被接受，且它让**任何**能连上该回环端口的人无需凭据即取得 `peer_id`。S10-B 下匿名连接的 ACL 主体是 `principal => <<"anonymous">>, tenant_id => undefined`（填默认租户会因不匹配把全部信令拒掉）。这与 A2A/MCP 的同一开关同姿态，适用于单机开发，不适用于共享主机。
 
-7. **无消息大小之外的反滥用闸门**：只有 `max_frame_bytes`（单帧 262144）、`max_connections`（每 listener 1024）与 `max_peers_per_room`（每房间 2）。**没有速率限制**、没有每 `peer_id` 的令牌桶、没有慢速攻击缓解；`auth_timeout_ms` 只挡「一直不认证」，`idle_timeout_ms` 只挡「认证后长时间不做事」，两者都只关单连接。**房间数没有上限**（房间按 URL 路径即建即用，空房间在最后一个成员离开时消失，但并发房间数不受限）。
+7. **无消息大小之外的反滥用闸门**：只有 `max_frame_bytes`（单帧 262144）、`max_connections`（每 listener 1024）与 `max_peers_per_room`（每房间 2）。**没有速率限制**、没有每 `peer_id` 的令牌桶、没有慢速攻击缓解；`auth_timeout_ms` 只挡「一直不认证」，`idle_timeout_ms` 只挡「认证后长时间不做事」，两者都只关单连接。**房间数没有上限**（房间按 URL 路径即建即用，空房间在最后一个成员离开时消失，但并发房间数不受限）。**S10-D D.3 行为探测的诚实结论**：(a) 单连接持续滥用已被 `webrtc_route_SUITE:fifty_refused_signals_still_forward_a_valid_one` 钉住——连拒 50 条后合法信令仍正常路由，说明每条拒绝是**纯状态转移**、不泄漏累积状态（不会因拒绝计数增长而最终停滞或崩溃）；(b) **没有「JSON 深度」专项防御也不需要**：`json:decode` 对深嵌套不栈溢出（实测 40000 层 240001 字节秒回、2000 层嵌套数组走 `not_a_map` → `invalid_message`），输入大小由 `max_frame_bytes` 在帧层兜住（超限 → 1009），因此深度炸弹不构成 DoS 向量——`webrtc_conn_SUITE` 的 `a_deeply_nested_json_frame_is_invalid_message`（深数组 → `invalid_message`、连接存活、ping → pong）与 `an_oversized_to_field_closes_with_1009`（超大 `to` 撑爆帧 → 1009）分别钉住这两条路径。
 
 8. **TLS 只走 `broker_security.tls`**：没有按 listener 覆盖证书的路径（与 A2A/MCP 一致）；没有客户端证书/mTLS 身份。
 
-9. **没有真实第三方客户端证据**：`test/protocol-compatibility/s10/` 的 `aiortc` / 浏览器 `RTCPeerConnection` 证据仍推到 S10-D。现有证据是 CT 里的字节级客户端（`webrtc_conn_SUITE` 31 例 + 四个 S10-B 套件 54 例）。
+~~9. **没有真实第三方客户端证据**：`test/protocol-compatibility/s10/` 的 `aiortc` / 浏览器 `RTCPeerConnection` 证据仍推到 S10-D。现有证据是 CT 里的字节级客户端（`webrtc_conn_SUITE` 31 例 + 四个 S10-B 套件 54 例）。~~
+   **已由 S10-D D.1 交付（2026-11-14）**：`test/protocol-compatibility/s10/` 下 aiortc 1.13.0 两 peer 走完 offer/answer、`connectionState == "connected"`、`RTCDataChannel` 载荷往返一致。**诚实口径**：第三方实现是 aiortc **不是浏览器**（环境无 headless Chromium，已在 README 标注）；**逐项限制清单仍未成表**（D.5/D.8）。
+
+   **同批还补上了「不落盘」的运行时证据（D.2，2026-11-14）**：原先只有 `webrtc_boundary_SUITE` 这个**源码级**守卫（它只能证明 `src/*.erl` 里没有 `broker_queue:` 之类的调用点，证明不了运行时一个字节都没写——写可以从依赖里绕进来）。`run_no_persist.sh` 在一个 VM 里起 WAL 存储 + **活的** `broker_subscription`（其 100 ms cursor tick 是唯一会写 `.cursors` 的东西）+ 两个生产监听，seed 一条消息后跑完整 1:1 aiortc 通话，断言 `offsets`（`broker_queue:watermarks/1` 逐分区 `{Committed, High}`）/ `wal_bytes`（`data_dir/wal` 全部普通文件字节和）/ `cursors`（`*.cursors` basename 集合）**三者逐字段不变**（实测 117 → 117 字节、`moved: []`）。**两条负控**证明检测器可证伪：一次 append 使 `{P0,0,2}`→`{P0,0,3}` 且字节 117→228；真订阅 + ack 使 `.cursors` 出现。**边界**：只在这一次运行、这一个节点上成立，不替代源码级扫描，也不覆盖其他 app 的写路径。
 
 10. **未做压测 / 容量**：连接数 × 房间数 × 信令速率的分档数字都还没有（`docs/benchmarks/` 无 S10 文件）。S10-B 只证明了语义正确，不证明容量。
 
@@ -320,6 +324,13 @@ S10-A 只交付**信令连接底座**（`broker_proto_webrtc` 的 WSS 接入层�
 
 ~~12. **无 STUN / TURN（ICE 面）**：3478/UDP、TURN 长期凭据、relay 端口段全部属 S10-C（独立 app `broker_ice`，与信令互不依赖）。~~
     **已由 S10-C 实现（2026-11-14）**：独立 app `broker_ice`，STUN Binding（**无认证**——它就是浏览器在拿到凭据前探测 reflexive 地址用的）与 TURN over UDP 全套（`Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`/`ChannelData`/`Send`/`Data`），长期凭据从**同一张 `users` 表**派生（`key = MD5(user ":" realm ":" password)`，新增 `broker_security:long_term_key/2`），ACL 走 `authorize/2`（新增 `turn_allocate`/`turn_refresh`/`turn_permission`/`turn_channel`/`turn_send` 五个 action）。出厂 `enabled => false` **零 socket**。ICE 面自己的未实现项见 §12.3。
+
+13. **S10-D D.3 安全专项的行为探测（2026-11-14）**：对信令面与 ICE 面做了一轮「先探测真实行为、再冻结用例钉住」的安全专项。**实现侧未发现需修补的缺陷**，探测结论全部如实留痕（含良性行为与不构成风险的边界）：
+    - **握手头无读超时（缺口，如实留痕）**：`webrtc_conn` 在握手阶段（`ws_handshake:accept` 无超时 + `{active, once}` 只武装一次）**没有读超时**——连上后一直不发包、或只发半截握手头，连接不会被关闭（实测静置 8 s 不关）。`auth_timeout_ms`（默认 5000）**只在 101 之后**的认证窗口生效，挡不住「占着连接不发完整握手」。后果：一个未认证的攻击者可用半开连接占用 ranch acceptor 槽位，直到 TCP 层超时。**这是真实缺口**，但修补需在 `webrtc_conn` 握手路径加超时（动既有实现），按 S10-D「不改既有语义、偏差须记」的纪律，本阶段只留痕、不擅自加；`max_connections` 仍是总量兜底。`webrtc_conn_SUITE` 未为「握手前静置」加用例（避免把当前行为钉成契约），改在本文档与 §8 偏差记录留痕。
+    - **self-loop 不拒绝（良性，已留痕）**：见第 2 条 D.3 补充——把自己的 `peer_id` 当 `to` 会回环投递一次，不崩溃、不放大、不循环，属良性行为而非可利用缺陷。
+    - **深嵌套 JSON / 非法 UTF-8（无风险，已钉住）**：见第 7 条 D.3 补充——`json:decode` 不栈溢出，输入由 `max_frame_bytes` 兜底，深数组/非法 UTF-8 一律 `invalid_message` 且连接存活，已分别由 `webrtc_conn_SUITE` 两例钉住。
+    - **握手头超 16 KiB → 431（已覆盖，非新增）**：`ws_handshake:max_handshake()=16384`，握手头超限在 `on_handshake` 回 `431 Request Header Fields Too Large` 并 `stop_now`；既有 `broker_ws` 层测试与本次探测一致，信令面不另立用例（行为属 `broker_ws` 既有契约）。
+    - **TURN 侧的 D.3 探测**见 §12.3 第 9 条。
 
 ### 12.3 S10 ICE 面明确未实现项（S10-C 2026-11-14 立）
 
@@ -332,4 +343,12 @@ S10-C 交付 STUN Binding + TURN over UDP。下表逐条留痕本阶段**真实�
 5. **单节点语义**：allocation、permission、channel、relay 端口都是节点内资源，无 ra、无 Mnesia、无跨节点归属（ADR-029 §D5）。多节点部署时同一客户端的 `Allocate` 会落到负载均衡器选中的那个节点，**没有**跨节点 relay 复用或迁移。集群化需另立 ADR。
 6. **无速率限制与反滥用闸门**：只有 `max_allocations`（默认 1024）、`max_permissions_per_allocation`（16）、`max_channels_per_allocation`（16）与 `allocation_lifetime_s`（600 s）。**没有**每 IP / 每用户 的 allocation 速率限制、没有令牌桶、没有针对「伪造 5-tuple 刷 `Allocate`」的缓解（虽然每条都要过 `MESSAGE-INTEGRITY`，即攻击者必须先有一个有效账号）。relay 端口段是有限的，`508` 比限流更早出现。**`max_allocations` 是全局的，不是按用户分的**。
 7. **不写指标、不写协议层日志**：沿用 §12.1 第 17 条与 ADR-016 冻结键集——`broker_metrics` 出现在 `.app.src` 的 `applications` 里但**代码零调用**；`broker_ice_udp` / `turn_allocation` / `turn_auth` **一次 `logger` 调用都没有**（认证失败、`438`、`441`、`486`、`508` 全是纯状态转移）。`turn_auth_SUITE:no_password_or_key_reaches_the_log/1` 用 probe 断言「即使将来加日志也不能带口令或 key」。运维可见性目前只有 `broker_ice_udp:allocations/0` 快照与 `ss -lunp`。
+   **S10-D D.4 已补（2026-11-14）**：`turn_allocation` 现在发**两条**低量生命周期 `?LOG_INFO`——`allocated`（`client` 5-tuple + `relay_port` + `username`）与 `released`（同上 + 粗粒度 `reason`），**永不记 key / 口令**（`key` 只在进程状态里，从不进日志；`turn_auth` 仍是零 `logger` 调用，认证失败照旧纯状态转移）。`turn_auth_SUITE:no_password_or_key_reaches_the_log/1` 仍在（现也覆盖 `turn_allocation` 的生命周期行，全量 debug 捕获后仍断言口令/key 缺席）。`broker_metrics` 键集**仍不扩容**，per-packet 不记日志（只记建立/释放，避免高基数与地址泄漏）。
 8. **没有真实第三方客户端证据**：现有证据是 CT 里手写字节的 `ice_test_client`（`stun_codec_SUITE` 21 + `turn_auth_SUITE` 16 + `stun_server_SUITE` 13 + `turn_allocation_SUITE` 22）。`aiortc` 的 `iceTransportPolicy="relay"` 与浏览器 `RTCPeerConnection` 的 STUN/TURN 连通性证据仍属 S10-D 的 D.1。同样**未做压测**：allocation 建立速率与 relay 吞吐都还没有数字（D.6）。
+
+9. **S10-D D.3 安全专项的 TURN 侧行为探测（2026-11-14）**：对 `turn_allocation` 的边界做了一轮探测并补冻结用例。**实现侧未发现需修补的缺陷**，结论如实留痕：
+    - **channel number 区间是闭区间（已钉住）**：`channel_of/1` 取 `>= 16#4000, =< 16#7FFF`。既有 `a_channel_number_outside_the_range_is_a_400` 钉住区间外两值（`0x3FFF`/`0x8000`）→ 400；D.3 新增 `channel_number_boundaries_are_inclusive` 钉住区间两边界值（`0x4000`/`0x7FFF`，各用独立 peer）→ `{ok}`，防未来 off-by-one 悄悄收窄可用区间。**注意一个真实约束**：一个 peer 只能绑一个 channel（RFC 5766 §11.2），同一 peer 绑第二个 channel 会得 400——所以两个边界值必须各用独立 peer 才能都验成 `{ok}`。
+    - **畸形 LIFETIME（非 4 字节）→ 400 且 allocation 存活（已钉住）**：`a_malformed_lifetime_on_refresh_is_a_400_and_the_allocation_survives` 用 3 字节 LIFETIME 发 Refresh，得 400、`broker_ice_udp:allocations()` 不变、listener 仍在，且随后一个合法 Refresh 仍 `{ok}`——钉住「畸形属性不会拆掉 relay 或共享 UDP 前端」的健壮性。诚实口径：非 4 字节 LIFETIME 合规客户端产生不了，这是敌意/垃圾输入探针，不是 spec 分支。
+    - **超大 UDP 报文不可达（如实留痕，不设用例）**：`recbuf_bytes=262144` 看着像上限，但**单个 UDP 数据报本身最大 ~65507 字节**（IP 20 + UDP 8 头后），且客户端 `gen_udp:send` 发更大的报就返回 `{error, emsgsize}`。所以 relay 前端的 recbuf 永远不会被单个合法数据报撑爆——这是 UDP 协议本身的边界，不是本实现能测到的路径，故不设「超大报文」用例，只在此留痕。
+    - **permission 过期重放不可达（如实留痕，不设用例）**：permission 有效期 `?PERMISSION_LIFETIME_S=300 s`，要构造「过期后重放」需在 CT 里等 5 分钟，不现实；本地无法在不改实现（把有效期改短会动既有语义）的前提下触发该分支，故不设用例，只在此留痕。
+    - **`Refresh` lifetime 越界（已覆盖，非新增）**：`99999 → 600` 钳制已由既有 `a_refresh_keeps_the_allocation_alive` 钉住；负数/非整数 lifetime 在 wire 上不可达（`stun_codec:lifetime/1` 解的是 32 位无符号，永远是 0..4294967295 的整数，`refresh/2` 的 `case` 已覆盖 0 与正整数），畸形长度走上面的「畸形 LIFETIME」分支。

@@ -48,6 +48,8 @@ all() ->
      peer_data_without_a_binding_arrives_as_a_data_indication,
      peer_data_without_a_permission_is_dropped,
      a_channel_number_outside_the_range_is_a_400,
+     channel_number_boundaries_are_inclusive,
+     a_malformed_lifetime_on_refresh_is_a_400_and_the_allocation_survives,
      the_allocations_snapshot_names_client_and_relay_port].
 
 init_per_suite(Config) ->
@@ -538,6 +540,72 @@ a_channel_number_outside_the_range_is_a_400(_Config) ->
                                                    Attrs, Alloc),
                   ?assertMatch({error, 400, _}, Result)
           end, [16#3FFF, 16#8000])
+    after
+        ice_test_client:close(Socket),
+        ice_test_client:close(Peer)
+    end.
+
+%% The complement of the case above: 0x4000 and 0x7FFF -- the exact inclusive
+%% edges of the RFC 5766 §11.2 range -- are *accepted*. The existing case pins
+%% the two just-outside values as 400; this pins the two boundary values as ok,
+%% so a future off-by-one in `channel_of/1' (e.g. `> ?CHANNEL_MIN' instead of
+%% `>=') fails here rather than silently narrowing the usable range. Each edge
+%% gets its own peer: a peer may hold only one channel (RFC 5766 §11.2), so
+%% binding two channels to one peer would legitimately 400 on the second.
+channel_number_boundaries_are_inclusive(_Config) ->
+    lists:foreach(
+      fun(Channel) ->
+              Socket = ice_test_client:open(),
+              Peer = peer_socket(),
+              try
+                  Alloc = allocate(Socket),
+                  Port = broker_ice_udp:port(),
+                  PeerAddr = peer_addr(Peer),
+                  %% Permission first, so the range gate (not the permission
+                  %% gate) is what answers: without it both edges are a 403.
+                  {ok, _} = ice_test_client:create_permission(
+                              Socket, Port, Alloc, [PeerAddr]),
+                  Tid = ice_test_client:transaction_id(),
+                  Attrs = [{stun_codec:attribute_type(channel_number),
+                            <<Channel:16, 0:16>>},
+                           {stun_codec:attribute_type(xor_peer_address),
+                            ice_test_client:xaddr(PeerAddr, Tid)}],
+                  ?assertMatch({ok, _},
+                               ice_test_client:request(Socket, Port, channel_bind,
+                                                       Attrs, Alloc))
+              after
+                  ice_test_client:close(Socket),
+                  ice_test_client:close(Peer)
+              end
+      end, [16#4000, 16#7FFF]).
+
+%% A LIFETIME attribute whose value is not the 4 bytes the codec expects (here 3)
+%% is refused with 400 and the allocation survives: the listener never crashes
+%% and the client can keep using (and Refreshing) the allocation. This pins the
+%% robustness half of the refresh path -- a malformed attribute must not tear
+%% down the relay or the shared UDP front end. (A non-4-byte LIFETIME cannot be
+%% produced by a conformant client, so this is a hostile/garbage-input probe,
+%% not a spec branch.)
+a_malformed_lifetime_on_refresh_is_a_400_and_the_allocation_survives(_Config) ->
+    Socket = ice_test_client:open(),
+    Peer = peer_socket(),
+    try
+        Alloc = allocate(Socket),
+        Port = broker_ice_udp:port(),
+        Before = length(broker_ice_udp:allocations()),
+        ?assertEqual(1, Before),
+        %% Permission first so the only odd thing about this Refresh is the
+        %% malformed LIFETIME value.
+        {ok, _} = ice_test_client:create_permission(Socket, Port, Alloc,
+                                                    [peer_addr(Peer)]),
+        Attrs = [{stun_codec:attribute_type(lifetime), <<0, 0, 1>>}],
+        ?assertMatch({error, 400, _},
+                     ice_test_client:request(Socket, Port, refresh, Attrs, Alloc)),
+        %% The allocation is still there and the listener still answers.
+        ?assertEqual(Before, length(broker_ice_udp:allocations())),
+        ?assert(is_pid(whereis(broker_ice_udp))),
+        %% A well-formed Refresh on the same allocation still works.
+        ?assertMatch({ok, _}, ice_test_client:refresh(Socket, Port, Alloc, 300))
     after
         ice_test_client:close(Socket),
         ice_test_client:close(Peer)

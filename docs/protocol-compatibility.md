@@ -42,7 +42,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行，S10-A/B 追加 WebRTC 信令行，S10-C 追加 STUN/TURN 行）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行，S10-A/B 追加 WebRTC 信令行，S10-C 追加 STUN/TURN 行，S10-D 更新这两行口径 + 追加 §4.23 能力/限制清单）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -60,8 +60,8 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | A2A（1.0.0 JSON-RPC + SSE） | 支持子集（S9-A~S9-C，**Broker 作网关**） | JSON-RPC 2.0 传输绑定：`SendMessage`（含 `task_auto_complete` 内建 echo 执行器）、`GetTask`、`ListTasks`、`message/send` 别名；Task 状态机（SUBMITTED→WORKING→COMPLETED / FAILED / CANCELED / REJECTED / INPUT_REQUIRED）+ 事件溯源 + boot 全量重放（无 checkpoint）；Agent Card 发现（`/.well-known/agent-card.json`、`/agents/<id>`，按 tenant 隔离）；SSE 任务事件流（ack-first + 增量 + 优雅关流）；出站 Push Notification（HMAC-SHA256 签名 + SSRF 防护 + 防重放 + DLQ） | 单节点（跨节点 Task 访问无重定向/代理）；全量重放是可扩展性上界；无 JWT/JWKS/OAuth AS（`securitySchemes` 只声明外部 scheme，card 无签名，push 密钥在 env 非 KMS）；失败路径计数器未加（S9-F 定稿不加，见 `docs/security.md` §12.1 第 17 条）；`/agents` 是项目私有接口；默认 `listeners => []`；见 §4.14/§4.15/§4.16/§4.19 | `apps/broker_proto_a2a/test/`、`test/protocol-compatibility/a2a/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/a2a/`） |
 | MCP（Streamable HTTP + stdio） | 支持子集（S9-D，**Broker 作网关**） | MCP `2026-07-28`：无状态逐请求（无 `initialize`/会话/`Mcp-Session-Id`）；`server/discover` 本地回答；`subscriptions/listen` 长活流（ack-first + 通知 + 心跳 + 优雅关流）；`tools`/`resources`/`prompts`/`completions` 原语**透传**到 `$mcp/<method>` 并取回结果（含 `notifications/progress`）；POST 单端点 `application/json`/`text/event-stream`；stdio 前端（newline 成帧、子进程订阅、`notifications/cancelled`）；HTTP 头门禁 `Origin`/`Accept`/`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` | 不解释/不执行工具语义（R-B1）、无 `sampling`/`elicitation`（-32601）、无 GET 流/`Last-Event-ID`/会话续传、无 `Mcp-Param-*` 强制校验、SSE 无 pending-bytes 上限、stdio 不做认证（进程即凭据）且 stdout 纯净性由部署 logger 配置保证、跨节点 reply 不支持；见 §4.17 | `apps/broker_proto_mcp/test/`、`test/protocol-compatibility/mcp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/mcp/`） |
 | ACP（v1，stdio） | 支持子集（S9-E，**Broker 作 Client**） | ACP v1：Broker 作 **Client**、agent 是本地子进程；`initialize`/`session/new`/`session/prompt` 由 Broker 主动发起；`session/request_permission` 是唯一实现的 Client 回调（默认拒绝 + allowlist + 超时 + 每次审计）；`session/cancel` 转发；`session/update` 折叠为 turn 投影写 `$acp/session/<id>`（含 `stopReason`）；prompt 经 `$acp/in/<agent>` 异步回读；`protocolVersion` 只接受 1 | **仅 stdio**（无 HTTP/WS listener、无 `listeners`）、无远程建连、无 `session/load`/`resume`/`list`/`authenticate`、`fs/*`/`terminal/*`/`elicitation/*` 全回 `-32601`（保持会话）、`clientCapabilities={}`、stdio 不做认证（进程即凭据）、跨节点 reply 不支持；见 §4.18 | `apps/broker_proto_acp/test/`、`test/protocol-compatibility/acp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/acp/`） |
-| WebRTC 信令（WSS） | **连接层 + 信令内核已支持**（S10-A + S10-B；ICE/STUN/TURN 见下一行） | RFC 6455 over TLS（wss）/明文仅回环；子协议 `webrtc.v1` 强制；路径 `/websocket/<room>` 绑定房间；认证窗口 `auth_timeout_ms`（超时 close **1008**）；空闲窗口 `idle_timeout_ms`（超时 close **1001**，`infinity` 可关）；帧上限 `max_frame_bytes`（超限 close **1009**）；文本 `ping`→`pong` 与原生 opcode 9→10 并存；binary → close **1003**；分片重组 + close 回显；认证 = JSON `{"event":"authenticate",...}` → `broker_security:authenticate_conn/1`（同一张 `users` 表）；`peer_id` 服务端铸造；**五类事件** `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left`；`to` 进程直投（原报文 + `from`、保留 `to`）；房间隔离；ACL（`broker_security:authorize/2`） | **首期 1:1**：`max_peers_per_room` 默认 2，超额 close 1008；**ACL 只能整房间允许/拒绝**（join 与 relay 共用主体）；`peer_id` 仅本次连接有效；未知/跨房间 `to` 同形为 `invalid_message`（不做存在性预言机）；无真实第三方客户端证据 / 无压测（S10-D）；默认 `listeners => []`；见 §4.20、§4.21 与 `docs/security.md` §12.2 | `apps/broker_proto_webrtc/test/`（CT **106 例** = S10-A 45 + S10-B 新增 61，字节级客户端；S10-D 才有 `aiortc` 第三方证据） |
-| STUN / TURN（UDP） | **已支持**（S10-C；STUN + TURN over UDP，独立 app `broker_ice`，出厂 `enabled => false`） | STUN Binding（RFC 8489）：`XOR-MAPPED-ADDRESS`、`MESSAGE-INTEGRITY`（SHA-1 长期凭据）、`ERROR-CODE`、`FINGERPRINT`、`UNKNOWN-ATTRIBUTES`/420；TURN over UDP（RFC 5766）：`Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` / `ChannelData` / `Send` / `Data`；每 allocation 一进程；relay 端口从 `relay_port_range` 环绕分配；长期凭据 = `MD5(user ":" realm ":" password)`，与信令**共用同一张 `users` 表**（`broker_security:long_term_key/2`），ACL 走 `authorize/2`（`turn_*` action） | **只 UDP**：`REQUESTED-TRANSPORT ≠ 17` → **442**；TURN over TCP / 5349/TLS / DTLS **不做**；**无 IPv6**（`turn_ip` 非 IPv4 → 启动失败）；无 ICE-lite、无候选配对（本 app 不是 ICE agent）；单节点语义（无跨节点 allocation）；无速率限制（只有 `max_allocations` / `max_permissions` / `max_channels`）；**不写 `broker_metrics`**（ADR-016 冻结键集）；链路无加密（`MESSAGE-INTEGRITY` 只保完整性）；无真实第三方客户端证据 / 无压测（S10-D）；见 §4.22 与 `docs/security.md` §12.3 | `apps/broker_ice/test/`（CT **72 例** = `stun_codec_SUITE` 21 + `turn_auth_SUITE` 16 + `stun_server_SUITE` 13 + `turn_allocation_SUITE` 22，全部真实 UDP socket 且 `port => 0`；对手方是手写字节的 `ice_test_client`） |
+| WebRTC 信令（WSS） | **连接层 + 信令内核已支持**（S10-A + S10-B；ICE/STUN/TURN 见下一行） | RFC 6455 over TLS（wss）/明文仅回环；子协议 `webrtc.v1` 强制；路径 `/websocket/<room>` 绑定房间；认证窗口 `auth_timeout_ms`（超时 close **1008**）；空闲窗口 `idle_timeout_ms`（超时 close **1001**，`infinity` 可关）；帧上限 `max_frame_bytes`（超限 close **1009**）；文本 `ping`→`pong` 与原生 opcode 9→10 并存；binary → close **1003**；分片重组 + close 回显；认证 = JSON `{"event":"authenticate",...}` → `broker_security:authenticate_conn/1`（同一张 `users` 表）；`peer_id` 服务端铸造；**五类事件** `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left`；`to` 进程直投（原报文 + `from`、保留 `to`）；房间隔离；ACL（`broker_security:authorize/2`） | **首期 1:1**：`max_peers_per_room` 默认 2，超额 close 1008；**ACL 只能整房间允许/拒绝**（join 与 relay 共用主体）；`peer_id` 仅本次连接有效；未知/跨房间 `to` 同形为 `invalid_message`（不做存在性预言机）；**无 JSON 深度专项防御也不需要**（`json:decode` 不栈溢出，帧大小由 `max_frame_bytes` 兜底）；握手阶段无读超时（缺口，见 `docs/security.md` §12.2 第 13 条）；self-loop 回环投递一次（良性）；**结构化脱敏日志**（`room`/`peer_id`/`bytes`，永不记 `data`）；**aiortc 第三方证据**（非浏览器）；**不写 `broker_metrics`**（冻结键集）；**无压测**（D.6）；默认 `listeners => []`；见 §4.20、§4.21、§4.23 与 `docs/security.md` §12.2 | `apps/broker_proto_webrtc/test/`（S10-A 45 + S10-B 61 = 106，另 S10-D D.3 加 3 + D.4 加 1 安全/可观测例；S10-D 第三方证据在 `test/protocol-compatibility/s10/`） |
+| STUN / TURN（UDP） | **已支持**（S10-C；STUN + TURN over UDP，独立 app `broker_ice`，出厂 `enabled => false`） | STUN Binding（RFC 8489）：`XOR-MAPPED-ADDRESS`、`MESSAGE-INTEGRITY`（SHA-1 长期凭据）、`ERROR-CODE`、`FINGERPRINT`、`UNKNOWN-ATTRIBUTES`/420；TURN over UDP（RFC 5766）：`Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` / `ChannelData` / `Send` / `Data`；每 allocation 一进程；relay 端口从 `relay_port_range` 环绕分配；长期凭据 = `MD5(user ":" realm ":" password)`，与信令**共用同一张 `users` 表**（`broker_security:long_term_key/2`），ACL 走 `authorize/2`（`turn_*` action）；channel number 闭区间 `0x4000-0x7FFF`（已钉边界） | **只 UDP**：`REQUESTED-TRANSPORT ≠ 17` → **442**；TURN over TCP / 5349/TLS / DTLS **不做**；**无 IPv6**（`turn_ip` 非 IPv4 → 启动失败）；无 ICE-lite、无候选配对（本 app 不是 ICE agent）；单节点语义（无跨节点 allocation）；无速率限制（只有 `max_allocations` / `max_permissions` / `max_channels`）；**不写 `broker_metrics`**（ADR-016 冻结键集）；链路无加密（`MESSAGE-INTEGRITY` 只保完整性）；畸形 LIFETIME（非 4 字节）→ 400 且 allocation 存活（健壮性探针）；**aiortc 第三方 TURN 证据**（非浏览器）；**无压测**（D.6）；默认 `enabled => false`；见 §4.22、§4.23 与 `docs/security.md` §12.3 | `apps/broker_ice/test/`（CT **76 例** = `stun_codec_SUITE` 21 + `turn_auth_SUITE` 16 + `stun_server_SUITE` 13 + `turn_allocation_SUITE` 24 + S10-D D.3 加 2，全部真实 UDP socket 且 `port => 0`；对手方是手写字节的 `ice_test_client` + aiortc） |
 
 **S9-F（2026-11-12）真实第三方客户端验证**：三个 agent 协议各用**上游官方 SDK** 跑过端到端证据——
 MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）、A2A `a2a-sdk 1.3.0`
@@ -1839,7 +1839,79 @@ STUN Binding **不做认证**：它就是浏览器在拿到任何凭据之前探
 - **不是 ICE agent**：只做 STUN/TURN 服务端，不做候选配对/连通性检查/选路（那在浏览器侧）。
 - **单节点**：allocation 与 relay 端口都是节点内资源，无跨节点语义。
 - **无速率限制**：只有全局 `max_allocations`（默认 1024）与每 allocation 的 permission/channel 上限。
-- **无真实第三方客户端证据 / 无容量数字**：S10-D 的 D.1 / D.6。
+- **无容量数字**：S10-D 的 D.6（压测）。**aiortc 第三方证据已交付**（S10-D D.1，§4.23.4），非浏览器。
+
+---
+
+## 4.23 S10-D 追加（2026-11-14）：S10 能力 / 限制清单 + 与 ADR-028/029 一致性
+
+S10-A/B/C 已在 §2 与 §4.20/§4.21/§4.22 逐条写清能力。D.5 要求把**整期 S10 的能力与限制收敛成一张总表**，并逐行核对与两个 S10 冻结 ADR 的一致性——本节即这张清单（对应设计稿 §3.9「每裁剪一项都要在能力矩阵里留一行」与 §3.10「S10-D 追加：S10 的能力与限制清单 + 与 ADR-028/029 的一致性」）。
+
+### 4.23.1 能力清单（S10 交付）
+
+| 能力 | 交付 | 冻结依据 | 证据 |
+|---|---|---|---|
+| WebRTC 信令接入（WSS，子协议 `webrtc.v1`） | ✅ | ADR-028 §D1 | CT 45+61 例（§4.20） |
+| 房间绑定 `/websocket/<room>` + 注册表（分片 ETS，内存态） | ✅ | ADR-028 §D4 | `webrtc_room_SUITE` 14 例（§4.21） |
+| 五类服务器事件（`authenticated`/`unauthorized`/`invalid_message`/`joined`/`left`） | ✅ | 设计 §2.3 冻结 | `webrtc_signal_SUITE` 13 例（§4.21.2） |
+| `to` 进程直投 + 房间隔离（不做存在性预言机） | ✅ | ADR-028 §D2/D3 | `webrtc_route_SUITE` 18 例（§4.21.3） |
+| per-room ACL（join + relay 共用主体） | ✅ | ADR-028 §D5 | `webrtc_acl_SUITE` 13 例（§4.21.5） |
+| 信令认证接统一身份表（`authenticate_conn/1`） | ✅ | R-X1 | `webrtc_conn_SUITE` 34 例（§4.20.2） |
+| STUN Binding（RFC 8489，无认证） | ✅ | ADR-029 §D1 | `stun_codec`/`stun_server` 34 例（§4.22.1） |
+| TURN over UDP（RFC 5766 全套） | ✅ | ADR-029 §D2 | `turn_allocation_SUITE` 24 例（§4.22.2） |
+| 长期凭据接同一张 `users` 表（`long_term_key/2`） | ✅ | ADR-029 §D3 | `turn_auth_SUITE` 16 例（§4.22.3） |
+| **真实第三方客户端证据**（aiortc，非浏览器） | ✅ | R-E3 / D.1 | `test/protocol-compatibility/s10/`（§4.23.4） |
+| **不落盘运行时证明** | ✅ | ADR-007 游标语义 | `run_no_persist.sh`（§4.23.4） |
+| **安全专项**（行为探测 + 8 冻结用例 + 缺口留痕） | ✅ | R-X2/R-X4 | D.3（§4.23.2） |
+| **可观测**（结构化脱敏日志，冻结键集不扩容） | ✅ | R-O2 / R-X6 | D.4（§4.23.3） |
+
+### 4.23.2 D.3 安全专项的探测结论（逐条钉死）
+
+S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻结用例」的安全专项，**实现侧未发现需修补的缺陷**，全部如实留痕（含良性行为与不可达边界）：
+
+- **信令面**（`webrtc_route_SUITE` +3 / `webrtc_conn_SUITE` +3）：`to` 为非二进制 → `invalid_message`（类型混淆穿不过寻址层）；单连接连拒 50 条后合法信令仍路由（持续滥用退化探针，证明拒绝是纯状态转移）；self-loop 回环投递一次（良性，无循环无放大）；深嵌套 JSON 数组 → `invalid_message`（`json:decode` 不栈溢出，**无 JSON 深度专项防御也不需要**）；非法 UTF-8 → `invalid_json` → `invalid_message`；超大 `to` 撑爆帧 → 1009。
+- **ICE 面**（`turn_allocation_SUITE` +2）：channel number 闭区间 `0x4000-0x7FFF` 两边界值钉成 `{ok}`（各用独立 peer，一 peer 只绑一 channel）；畸形 LIFETIME（非 4 字节）→ 400 且 allocation 存活。
+- **一处真实缺口（如实留痕、未擅自补）**：`webrtc_conn` 握手阶段无读超时（`auth_timeout_ms` 只在 101 后生效）——修补需动握手路径，按「不改既有语义」纪律只留痕（`docs/security.md` §12.2 第 13 条），未为「握手前静置」加 CT 用例以免把当前行为钉成契约。
+- **三处不可达、不设用例（如实留痕）**：超大单 UDP 报文（单数据报 ≤ ~65507 字节，UDP 协议边界）；permission 过期重放（`PERMISSION_LIFETIME_S=300 s`，CT 等 5 分钟不现实）；负数/非整数 Refresh lifetime（`stun_codec:lifetime/1` 解 32 位无符号，wire 不可达）。
+
+### 4.23.3 D.4 可观测的口径（与 ADR 一致性）
+
+- **日志**：`webrtc_conn` 发结构化 `?LOG_INFO`（`authenticated`/`auth_refused`/`relay`/`signal_refused`/`disconnect`），`turn_allocation` 发 `allocated`/`released`——带 `room`/`peer_id`/`username`/`bytes`/client 5-tuple/relay_port，**永不记 `data`、口令、key、SDP/candidate**（`docs/security.md` §9 日志最小化、R-X6）。`webrtc_route_SUITE:the_log_carries_room_peer_and_bytes_but_never_the_payload` 用 logger handler 捕获断言 payload/口令缺席；`turn_auth_SUITE:no_password_or_key_reaches_the_log` 覆盖 ICE 侧。
+- **`broker_metrics` 冻结键集不扩容**：ADR-016 §16.2 是冻结文本，S10-D 不为信令/ICE 的失败路径加键（沿用 `docs/security.md` §12.1 第 17 条口径）。连接数复用既有 `connections_current`；房间数/信令速率/ICE 分配数/relay 字节数**暂不单独出指标**（避免高基数与语义错配），运维按日志特征盯。
+- **traceparent**：由 `broker_ws` 在握手门口按 opt-in（默认 off）接收并进消息头（W3C 上下文随消息走），连接日志不重复发射——与 S7 `broker_event_trace` 门控一致。
+- **与 ADR-028 一致**：信令面不产生 `#broker_message{}`、不碰 `broker_queue`/`broker_router`、无 cursor/retention、房间是连接态内存（重启清空）。**与 ADR-029 一致**：ICE 面独立 app、出厂零 socket、只 UDP、单节点。
+
+### 4.23.4 真实第三方客户端证据（D.1）
+
+第三方实现是 **aiortc 1.13.0，不是浏览器**（环境无 headless Chromium，已在 `test/protocol-compatibility/s10/README` 标注）：
+
+- 裸 STUN Binding（无库，逐字节 hex + 手工解码 XOR-MAPPED-ADDRESS）；
+- 两 aiortc peer 走 `iceTransportPolicy`（经底层 `aioice` 私有属性设 `RELAY`）→ `connected` + DataChannel 载荷往返一致 + 18 个 `typ srflx` 由我们的 STUN 签发；
+- aiortc TURN：`force_relay_policy` → 正确凭据落在 relay 端口段、错误凭据 0 候选（aioice 从不发 `CreatePermission`，故 relay-to-relay 媒体由 CT 侧 `ice_test_client` 证明，见 §4.22.2）。
+
+跑法：`test/protocol-compatibility/s10/run_evidence.sh`（aiortc 在 `/tmp/opencode/s10-libs`，`PYTHONPATH` 注入）。**逐项限制清单**在 §4.20.5/§4.21.7/§4.22.5 各小节已列；本 §4.23 收敛为 §2 能力矩阵的两行限制列。
+
+### 4.23.5 非目标与裁剪项逐行留痕（D.8）
+
+设计稿 §3.9 要求「每裁剪一项都要在能力矩阵里留一行」，与 S8 对 MQTT-SN / QUIC / WS 的处理一致（§4.11–§4.13）。**S10-D D.8** 把 §1.3 非目标表（9 项）与 R-I6 裁剪项逐条钉在此：**每一条都在能力矩阵有对应行，明确「首期不做」而非「已完成」**。R-I6 点名的 5 项（5349/TLS、TURN over TCP、ICE-lite、Trickle ICE、IPv6）已并入下表的 ICE 面行。
+
+| # | 裁剪项（首期不做 / 不实现） | 来源 | 首期口径 / 落点 |
+|---|---|---|---|
+| 1 | 音视频媒体处理（SFU / MCU / 转码 / 录制 / 混流） | §1.3 非目标 | 媒体 P2P 或经 TURN 中继，Broker 不碰 RTP/RTCP；S10 只做信令 + ICE 辅助。无 SFU/MCU 代码路径 |
+| 2 | SCTP DataChannel 的 Broker 内终结 | §1.3 非目标 | DataChannel 是 P2P；仅 SDP 的 `m=application` 段作为文本被透传，Broker 不终结 SCTP |
+| 3 | SDP / ICE candidate 当业务消息持久化、进队列、建 SubRef cursor | §1.3 非目标 + OQ-2（ADR-028 §D1/D2 冻结） | 信令瞬时、过期即无意义；`webrtc_boundary_SUITE` 断言无 `#broker_message{}`/`broker_queue:`/`.cursors`；D.2 运行时实测三不变（§4.23.4 同源） |
+| 4 | 完整实现 W3C WebRTC 规范 / 浏览器兼容性承诺 | §1.3 非目标 | 只提供信令 + ICE；浏览器行为由第三方证据验证（**诚实口径：证据是 aiortc 不是浏览器**，§4.23.4），不承诺 W3C 逐字兼容 |
+| 5 | TURN over TCP / DTLS 完整矩阵 | §1.3 + R-I6 | 只做 UDP（`REQUESTED-TRANSPORT ≠ 17` → 442）；TURN over TCP / DTLS 不实现 |
+| 6 | TURN-over-TLS `5349` 全套认证模式 | §1.3 + R-I6 | 5349 不监听、无 TLS-terminating TURN；`broker_security_tls` 证书仅复用于 WSS 信令面，不用于 TURN |
+| 7 | ICE-lite | §1.3 + R-I6 | 本 app 是 STUN/TURN **服务端**、不是 ICE agent，不做 ICE-lite 候选配对/连通性检查（那在客户端侧） |
+| 8 | Trickle ICE 全套优化 | §1.3 + R-I6 | 不做候选 trickle 批处理/节流优化；候选在 SDP 里整体交换，服务端逐条透传 |
+| 9 | IPv6 候选 | §1.3 + R-I6 | `turn_ip` 非 IPv4 → 启动失败；STUN/TURN 与 relay 端口只编 IPv4，无 IPv6 监听 |
+| 10 | 多路房间 / 大型会议（>2 人）规模化选路 | §1.3 非目标 + §2.7 | 首期对齐 1:1（`max_peers_per_room` 默认 2，超额 close 1008）；多人房间/选路为 P2 |
+| 11 | 各协议官方 CloudEvents Binding 逐字实现 | §1.3 非目标 + S7 已结案（roadmap §9.1） | S7 已定「不立项」；S10 沿用统一 `ce-*` 项目定义，不做逐字 Binding |
+| 12 | 引入 Cowboy 作为全站 HTTP 框架、替换 ranch | §1.3 非目标 + OQ-3 | 信令面复用 `broker_ws`（ranch），不引入 Cowboy；`syn`/`stun` 亦不需要（D.1 已证 stun hex 包与首期范围冲突） |
+| 13 | OTel 导出层、审计日志签名、外部 KMS | §1.3 非目标 + `docs/security.md` §12 既有待办 | 沿用 `docs/security.md` §12 待办，S10 不扩面；可观测只走 `logger` + 冻结的 `broker_metrics`（D.4） |
+
+上表 13 行覆盖 §1.3 全部 9 项非目标（第 5–9 行是 R-I6 点名的 5 项，其中 TURN over TCP/DTLS 与 5349/TLS 拆开以对应 R-I6 的逐字列举）。**§2 能力矩阵两行（WebRTC / STUN-TURN）的「已知限制」列均引用 §4.23**，其下即本 §4.23.5 逐行清单——与 S8 对 MQTT-SN / QUIC / WS 的处理（§4.11–§4.13）同构。
 
 ---
 

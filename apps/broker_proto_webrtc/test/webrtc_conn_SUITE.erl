@@ -53,10 +53,13 @@ groups() ->
        a_binary_frame_is_ignored_when_configured,
        a_message_without_to_is_invalid_message,
        a_message_with_an_unknown_to_is_invalid_message,
+       a_deeply_nested_json_frame_is_invalid_message,
+       an_invalid_utf8_text_frame_is_invalid_message,
        a_client_close_frame_ends_the_session,
        a_client_close_frame_is_echoed,
        a_reserved_close_code_is_normalized_to_1000,
        an_oversized_frame_closes_with_1009,
+       an_oversized_to_field_closes_with_1009,
        a_reserved_bit_closes_with_1002,
        a_fragmented_authenticate_frame_is_reassembled,
        a_continuation_without_a_start_frame_closes_with_1002]},
@@ -350,6 +353,56 @@ an_oversized_frame_closes_with_1009(Config) ->
     end,
     drain_until_closed(S).
 
+%% S10-D robustness: a text frame holding valid JSON that is deeply nested. The
+%% payload stays under `max_frame_bytes' (4096 here: 1000 levels of `[') so the
+%% frame is accepted, `json:decode' returns a list, and `decode_json/1' maps a
+%% non-object to `not_a_map' -> `invalid_message'. The point is that the decoder
+%% does not recurse-overflow on depth -- there is no JSON-depth-specific DoS
+%% defence because none is needed: `max_frame_bytes' bounds the input size and
+%% the decoder handles the rest. The ping after proves the connection is alive.
+a_deeply_nested_json_frame_is_invalid_message(Config) ->
+    {ok, S} = authed(Config),
+    Deep = deep_array(1000, <<"[">>),
+    ?assert(byte_size(Deep) =< 4096),
+    ok = send_text(S, Deep),
+    #{opcode := 1, payload := P} = recv_frame(S),
+    ?assertEqual(#{<<"event">> => <<"invalid_message">>}, decode(P)),
+    ok = send_text(S, <<"ping">>),
+    #{opcode := 1, payload := Pong} = recv_frame(S),
+    ?assertEqual(<<"pong">>, Pong),
+    close(S).
+
+%% Invalid UTF-8 in a text frame: `json:decode' throws, `decode_json/1' catches
+%% it as `invalid_json' -> `invalid_message'. The connection is not killed by a
+%% malformed payload (R-S5 keeps it up for a retry); the ping proves it.
+an_invalid_utf8_text_frame_is_invalid_message(Config) ->
+    {ok, S} = authed(Config),
+    ok = send_frame(S, 1, <<255, 254, 253, 0>>),
+    #{opcode := 1, payload := P} = recv_frame(S),
+    ?assertEqual(#{<<"event">> => <<"invalid_message">>}, decode(P)),
+    ok = send_text(S, <<"ping">>),
+    #{opcode := 1, payload := Pong} = recv_frame(S),
+    ?assertEqual(<<"pong">>, Pong),
+    close(S).
+
+%% The frame-size limit applies to a structured message too: a `to' field large
+%% enough to push the whole frame past `max_frame_bytes' (4096) is refused at the
+%% frame layer with 1009, before any addressing runs. This is the same size
+%% ceiling as `an_oversized_frame_closes_with_1009', reached through a JSON body
+%% rather than raw bytes -- the bound is on bytes, not on field count.
+an_oversized_to_field_closes_with_1009(Config) ->
+    {ok, S} = authed(Config),
+    Big = binary:copy(<<"x">>, 8192),
+    ok = send_text(S, json:encode(#{event => <<"offer">>, to => Big,
+                                    data => #{}})),
+    case recv_frame(S) of
+        #{opcode := 8, payload := P} ->
+            ?assertEqual(1009, close_code(P));
+        Other ->
+            exit({expected_close_1009, Other})
+    end,
+    drain_until_closed(S).
+
 a_reserved_bit_closes_with_1002(Config) ->
     %% RSV1 set on a text frame: a protocol violation the codec rejects.
     {ok, S} = authed(Config),
@@ -550,6 +603,12 @@ frag_frame(Op, Payload, Fin) ->
     Len = byte_size(Payload),
     FinBit = case Fin of true -> 1; false -> 0 end,
     [<<FinBit:1, 0:3, Op:4, 1:1, Len:7>>, Key, unmask(Key, Payload)].
+
+%% A deeply nested JSON array, built recursively. 1000 levels is ~2000 bytes --
+%% under the 4096 frame limit -- so the frame is accepted and the question is
+%% purely whether the decoder survives the depth.
+deep_array(0, Acc) -> <<Acc/binary, "]">>;
+deep_array(N, Acc) -> deep_array(N - 1, <<Acc/binary, "[">>).
 
 close(S) ->
     catch gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true)),

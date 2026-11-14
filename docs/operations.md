@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）**
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）；S10-D D.1/D.2 交付真实第三方 aiortc 证据与不落盘证明，D.3 交付安全专项（8 冻结用例 + 缺口/不可达留痕），D.4 交付结构化脱敏日志（`webrtc_conn`/`turn_allocation`，永不记 data/口令/SDP，`broker_metrics` 冻结键集不扩容），D.5 更新 §2 能力矩阵两行口径 + 追加 §4.23 S10 能力/限制清单与 ADR-028/029 一致性**
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -429,6 +429,8 @@ listener spec 形状：`#{port => 8084, ip => {127,0,0,1}, num_acceptors => 10, 
 - 房间满 close 1008：`max_peers_per_room`（默认 2）到了；首期按 1:1 设计，多人房间是 P2。
 - 空闲被 close 1001：`idle_timeout_ms` 到了；客户端要按周期发文本 `ping` 保活（服务端回文本 `pong`，同房间 peer 的信令也算活动）。
 
+**日志（S10-D D.4，结构化脱敏）**：`webrtc_conn` 发 `?LOG_INFO`——`authenticated`（`room`/`peer_id`/`username`）、`auth_refused`（带粗粒度 `reason`：`bad_credentials`/`acl_denied`/`{join_refused,_}`）、`relay`（`room`/`from`/`bytes`，**永不记 `data`**）、`signal_refused`、`disconnect`（`room`/`peer_id`/`code`）。排查认证失败看 `auth_refused` 的 `reason`；排查信令量看 `relay` 的 `bytes`。**口令 / SDP / candidate 绝不进日志**（R-X6）。`broker_metrics` 未为这些路径加键（ADR-016 冻结键集不扩容）。
+
 ### 1.7 ICE 辅助服务（STUN / TURN，默认关闭，S10-C）
 
 `broker_ice` 是 WebRTC 的 **ICE 辅助服务**：STUN Binding（给浏览器拿 `srflx` 候选）+ TURN over UDP（中继）。**与信令面互不依赖**（ADR-029 §D1）——`broker_proto_webrtc` 不开也不影响它，反之亦然。出厂 `enabled => false`：app 随 release 装配，但 `config/0` 直接返回 `#{enabled => false}`，**不 bind 任何 socket、不起任何进程**（`supervisor:which_children(broker_ice_sup) → []`）。
@@ -498,6 +500,8 @@ const pc = new RTCPeerConnection({
 - `Allocate` 成功但媒体不通：`turn_ip` 写错（最常见），或 `relay_port_range` 没在防火墙上放行——客户端拿到 relay 候选却连不上。
 - allocation 自己消失（`Refresh` 得到 `437`）：进程是 `temporary`，随崩溃/过期消失，不会自动重建（这是 ADR-029 §D4 的既定语义，客户端应重新 `Allocate`）；`allocation_lifetime_s`（默认 600 s）到期而客户端没 `Refresh` 也会这样。
 - `enabled => false` 时 `broker_ice_udp` 未注册、3478 不被占用——这是出厂状态，不是故障。要确认当前是否开着：`whereis(broker_ice_udp)`，或 `broker_ice_udp:allocations/0` 看快照（`#{client, relay_port, username}`，**不含口令**）。
+
+**日志（S10-D D.4，生命周期）**：`turn_allocation` 发两条 `?LOG_INFO`——`allocated`（`client` 5-tuple + `relay_port` + `username`）与 `released`（同上 + 粗粒度 `reason`：`normal`/`shutdown`/`abnormal`）。**永不记 key / 口令**（key 只在进程状态里）。排查 allocation 为何消失看 `released` 的 `reason`；排查建立速率看 `allocated` 的频率。`turn_auth` 仍是零 `logger` 调用（认证失败照旧纯状态转移）。
 
 ---
 

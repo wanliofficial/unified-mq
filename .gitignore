@@ -120,3 +120,16 @@ spikes/*/.data/
 
 # CLI tool state (not project content)
 /.qoder/
+
+# S10-D WebRTC/STUN-TURN real-third-party-client evidence harness scratch: broker
+# data volume, self-signed certs, boot-module beam, aiortc byte captures, run logs
+/test/protocol-compatibility/s10/data/
+/test/protocol-compatibility/s10/certs/
+/test/protocol-compatibility/s10/_build/
+/test/protocol-compatibility/s10/__pycache__/
+/test/protocol-compatibility/s10/**/*.beam
+/test/protocol-compatibility/s10/**/node.out
+/test/protocol-compatibility/s10/**/node.err
+/test/protocol-compatibility/s10/**/erl_crash.dump
+/test/protocol-compatibility/s10/**/d2-python.out
+/test/protocol-compatibility/s10/**/d2-node.out

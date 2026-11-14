@@ -52,17 +52,21 @@ groups() ->
      {transparency, [sequence],
       [an_offer_sdp_is_relayed_byte_for_byte,
        an_ice_candidate_string_is_relayed_verbatim,
-       an_unknown_event_name_is_relayed_unchanged]},
+       an_unknown_event_name_is_relayed_unchanged,
+       the_log_carries_room_peer_and_bytes_but_never_the_payload]},
      {refusals, [sequence],
       [a_missing_to_is_invalid_message,
        an_unknown_to_is_invalid_message,
        an_empty_to_is_invalid_message,
        a_missing_event_is_invalid_message,
+       a_to_that_is_not_a_binary_is_invalid_message,
+       fifty_refused_signals_still_forward_a_valid_one,
        the_connection_survives_a_refused_signal]},
      {isolation, [sequence],
       [a_to_in_another_room_does_not_leak,
        a_peer_id_from_another_room_is_indistinguishable_from_unknown,
-       a_client_cannot_forge_its_own_from]}].
+       a_client_cannot_forge_its_own_from,
+       a_message_addressed_to_own_peer_id_is_delivered_back_once]}].
 
 %%%_* Delivery --------------------------------------------------------------
 
@@ -155,6 +159,70 @@ an_unknown_event_name_is_relayed_unchanged(Config) ->
         recv_event(B, <<"renegotiate">>),
     close(A), close(B).
 
+%% D.4 / R-O2 / R-X6: the log line for a relayed signal carries room, sender
+%% peer_id and a byte count -- and NOT the payload. A signal's `data' can embed
+%% SDP, ICE candidates (internal addresses) or credentials, so the server must
+%% never put it in the log. This installs a logger handler, runs a real
+%% authenticated + relayed offer carrying a unique sentinel, and proves the
+%% sentinel and the credential are absent while the correlation fields are
+%% present. A future `?LOG_INFO("... ~p", [Message])' fails here.
+the_log_carries_room_peer_and_bytes_but_never_the_payload(Config) ->
+    Primary = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, debug),
+    ok = logger:add_handler(webrtc_log_capture, ?MODULE,
+                            #{config => self(), level => debug}),
+    try
+        Payload = <<"LOG-SENTINEL-9f3a-sdp-must-not-leak">>,
+        Secret = <<"s3cr3t!">>,
+        {A, PeerA, B, PeerB} = pair(Config, <<"route-room-log">>),
+        ok = signal(A, #{event => <<"offer">>, to => PeerB,
+                         data => #{sdp => Payload}}),
+        #{<<"data">> := #{<<"sdp">> := Relayed}} = recv_event(B, <<"offer">>),
+        ?assertEqual(Payload, Relayed),
+        close(A), close(B),
+        %% Give the async logger handler a moment to drain.
+        timer:sleep(100),
+        Log = collect_logs([]),
+        %% Live capture, or the rest proves nothing.
+        ?assertNotEqual(nomatch, search(Log, <<"webrtc_conn:">>)),
+        %% The payload and the credential must be absent.
+        ?assertEqual(nomatch, search(Log, Payload)),
+        ?assertEqual(nomatch, search(Log, Secret)),
+        %% The correlation fields must be present.
+        ?assertNotEqual(nomatch, search(Log, <<"room=route-room-log">>)),
+        ?assertNotEqual(nomatch, search(Log, <<"from=">>)),
+        ?assertNotEqual(nomatch, search(Log, <<"bytes=">>)),
+        %% The sender's peer_id is logged, and it is a real minted id.
+        ?assertNotEqual(nomatch, search(Log, PeerA))
+    after
+        _ = logger:remove_handler(webrtc_log_capture),
+        ok = logger:set_primary_config(level, maps:get(level, Primary, notice))
+    end.
+
+%% A logger handler: every event this node logs lands in the test process's
+%% mailbox. `logger' calls `log/2' on the handler module.
+log(#{level := Level, msg := Msg}, #{config := Pid}) ->
+    Pid ! {log, Level, Msg},
+    ok.
+
+collect_logs(Acc) ->
+    receive
+        {log, _Level, Msg} -> collect_logs([format_log(Msg) | Acc])
+    after 0 ->
+            iolist_to_binary(lists:reverse(Acc))
+    end.
+
+format_log({Format, Args}) ->
+    unicode:characters_to_binary(io_lib:format(Format, Args));
+format_log(Msg) when is_binary(Msg) -> Msg;
+format_log(Msg) when is_list(Msg) -> unicode:characters_to_binary(Msg);
+format_log(Msg) -> unicode:characters_to_binary(io_lib:format("~p", [Msg])).
+
+search(Haystack, Needle) when is_list(Needle) ->
+    search(Haystack, list_to_binary(Needle));
+search(Haystack, Needle) ->
+    binary:match(Haystack, Needle).
+
 %%%_* Refusals -------------------------------------------------------------
 
 %% R-S5: authenticated message without `to' -> `invalid_message', no `data'.
@@ -187,6 +255,44 @@ a_missing_event_is_invalid_message(Config) ->
     ok = send_text(A, json:encode(#{to => PeerB, data => #{}})),
     ?assertEqual(#{<<"event">> => <<"invalid_message">>}, recv_frame_event(A)),
     ?assertEqual(quiet, quiet(B)),
+    close(A), close(B).
+
+%% `to' is read with `is_binary/1' only (webrtc_dispatch:deliver/3): a JSON
+%% number, boolean, null or object is not a peer id, so the signal is refused
+%% exactly like a missing `to'. This is the type-confusion guard -- a client
+%% cannot smuggle a non-string past the addressing layer.
+a_to_that_is_not_a_binary_is_invalid_message(Config) ->
+    {A, _PeerA, B, PeerB} = pair(Config, <<"route-room-type">>),
+    ok = send_text(A, json:encode(#{event => <<"offer">>, to => 42,
+                                     data => #{}})),
+    ?assertEqual(#{<<"event">> => <<"invalid_message">>}, recv_frame_event(A)),
+    ?assertEqual(quiet, quiet(B)),
+    %% A string `to' still routes normally on the same socket: the refusal was
+    %% about the value, not the connection.
+    ok = signal(A, #{event => <<"offer">>, to => PeerB, data => #{}}),
+    #{<<"from">> := From} = recv_event(B, <<"offer">>),
+    ?assertNotEqual(undefined, From),
+    close(A), close(B).
+
+%% R-S5 under sustained abuse: fifty refused signals in a row must not degrade
+%% the connection. A server that leaked state per refusal (a growing buffer, a
+%% half-open dispatch) would eventually stall or crash here; this pins that it
+%% does not, and that a valid signal after the abuse still routes.
+fifty_refused_signals_still_forward_a_valid_one(Config) ->
+    {A, PeerA, B, PeerB} = pair(Config, <<"route-room-fifty">>),
+    lists:foreach(
+      fun(_) ->
+              ok = signal(A, #{event => <<"offer">>, to => <<"nobody">>,
+                               data => #{}}),
+              ?assertEqual(#{<<"event">> => <<"invalid_message">>},
+                           recv_frame_event(A))
+      end, lists:seq(1, 50)),
+    ok = signal(A, #{event => <<"candidate">>, to => PeerB,
+                     data => #{candidate => ?CANDIDATE}}),
+    #{<<"from">> := From,
+      <<"data">> := #{<<"candidate">> := Relayed}} = recv_event(B, <<"candidate">>),
+    ?assertEqual(PeerA, From),
+    ?assertEqual(?CANDIDATE, Relayed),
     close(A), close(B).
 
 %% The whole point of R-S5: a refused signal leaves the connection usable. One
@@ -252,6 +358,25 @@ a_client_cannot_forge_its_own_from(Config) ->
     ?assertEqual(PeerA, From),
     ?assertNotEqual(<<"victim">>, From),
     close(A), close(B).
+
+%% Self-addressing is *not* rejected, and that is the honest behaviour to pin:
+%% the registry resolves your own peer id to your own pid, so the frame is
+%% written straight back to you (with `from' = your own id). It is delivered
+%% exactly once -- a relayed `{text, Frame}' is written out, never re-relayed
+%% (handle_info({text, ...}) does not call relay/2), so there is no loop. This
+%% is benign (no amplification, no crash) but a client should not be surprised
+%% to receive its own message back.
+a_message_addressed_to_own_peer_id_is_delivered_back_once(Config) ->
+    {A, PeerA, _B, _PeerB} = pair(Config, <<"route-room-self">>),
+    ok = signal(A, #{event => <<"offer">>, to => PeerA, data => #{n => 1}}),
+    #{<<"event">> := <<"offer">>,
+      <<"from">> := From,
+      <<"to">> := To} = recv_event(A, <<"offer">>),
+    ?assertEqual(PeerA, From),
+    ?assertEqual(PeerA, To),
+    %% No second copy: the self-delivered frame is not re-relayed.
+    ?assertEqual(quiet, quiet(A)),
+    close(A), close(_B).
 
 %%%_* Fixture ---------------------------------------------------------------
 

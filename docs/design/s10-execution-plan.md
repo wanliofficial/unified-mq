@@ -2,7 +2,7 @@
 
 - **对应设计**：[`docs/design/s10-webrtc-signaling.md`](s10-webrtc-signaling.md) §3（候选需求 R-T/R-S/R-M/R-I/R-X/R-C/R-O/R-E）、§4.2（子阶段）、§4.3（Gate S10）、§4.4（OQ-1~OQ-10）；[`docs/design/s10-0-convergence-report.md`](s10-0-convergence-report.md)（OQ 收敛结论与 ADR-028/029 底稿）；[`docs/roadmap.md`](../roadmap.md) §12.1 / §12.2。
 - **基线（开工前）**：`rebar3 ct` **1063/1063、68 套件**；`dialyzer` 0 warning；`rebar3 release` 装配成功（S9-F 收尾，`fcbf83e`）。
-- **性质**：**计划稿 + S10-A/S10-B/S10-C 交付记录**。S10-A 的实现事实（含 45 例实测与 13 条落地偏差）已回填 §1/§2.1/§4/§5/§7/§8，S10-B 的实现事实（含 61 例实测与 12 条落地偏差）已回填 §1/§2.2/§4.2/§5/§7/§8，S10-C 的实现事实（含 72 例实测与 13 条落地偏差）已回填 §1/§2.3/§4/§5/§7/§8；S10-D 仍是计划值，未勾选。本文件不在 S10-A/B/C 之外开任何端口、不新增任何依赖。
+- **性质**：**计划稿 + S10-A/S10-B/S10-C 交付记录**。S10-A 的实现事实（含 45 例实测与 13 条落地偏差）已回填 §1/§2.1/§4/§5/§7/§8，S10-B 的实现事实（含 61 例实测与 12 条落地偏差）已回填 §1/§2.2/§4.2/§5/§7/§8，S10-C 的实现事实（含 72 例实测与 13 条落地偏差）已回填 §1/§2.3/§4/§5/§7/§8；S10-D 的 D.1（真实第三方客户端证据）、D.2（不落盘运行时证明）、D.3（安全专项：行为探测 + 8 个冻结用例 + 缺口/不可达边界留痕）与 D.4（可观测：结构化脱敏日志 + 冻结键集不扩容）已交付并回填 §1/§2.4/§3/§7/§8，D.5–D.8 仍是计划值。本文件不在 S10-A/B/C/D 之外开任何端口、不新增任何依赖。
 - **范围**：一个不碰消息日志的 **信令接入前端** + 一个与内核解耦的 **ICE 辅助服务**。**媒体面（RTP/RTCP/DataChannel/SFU/录制/转码）明确不做**。
 - **执行约束**（仓库既定规则，全程适用）：编译/测试前 `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"`；`rebar3 ct` 前 `rm -rf _build/test/extras`；Python 一律 `/usr/bin/python3`（3.12）；用例数由各套件 `all/0`（含 `groups/0`）展开后逐个数出；CT 一律 `port => 0`，不动既有 8080/8083/1883/8081/8082；不杀用户进程；ADR 冻结文本不动、偏差处加批注；设计稿原文不改。
 
@@ -21,7 +21,7 @@
 | 0.1 | **ADR-028 落盘**：信令面与消息内核的边界（不进内核 / 进程直投 / `room` 不是 destination / 不构成第二套消息内核的论证 / 边界口径写准） | `docs/adr/028-webrtc-signaling-kernel-boundary.md` | 收敛报告 §3 ADR-028 的 8 条逐条成文 + 反证点写成「触发信号 → 应对」 |
 | 0.2 | **ADR-029 落盘**：ICE 组件归属、端口矩阵、部署边界、TURN 凭据接身份表 | `docs/adr/029-ice-component-and-port-matrix.md` | 同上 |
 | 0.3 | **spike `spikes/s10_0_ws_signal/`**（独立 rebar3 项目，**不进 umbrella**，照 `spikes/s0_*` 惯例：自带 `rebar.config` + `rebar.lock` + `REPORT.md`） | **已交付（2026-11-13）**。`{deps, [{ranch,"2.3.0"}, {broker_ws, {path, "../../apps/broker_ws"}}]}`——**用 path dep 而不是 `_checkouts` 符号链接**（后者在 `_build/test` 下不生效，eunit 会 `undef`；path dep 在 default/test 两个 profile 都稳）。`ws` 与 `wss` 两份脚本都在 `port => 0` 起 listener，Python `websockets 17.4` 跑完：握手 → `authenticate` → 文本 `ping`/`pong` → 原生 opcode 9/10 → 一条 `to` 直投 → binary 1003 | **[`spikes/s10_0_ws_signal/REPORT.md`](../../spikes/s10_0_ws_signal/REPORT.md) + 10 条 eunit 断言全绿**。实测：101 响应 **164 字节**（ws 与 wss 相同）；子协议 `webrtc.v1` 协商成功，无共同子协议 → **400**；会话拿到 **TLSv1.3**（`ranch_ssl` 与 `ranch_tcp` **同一份连接模块**，一行没改）；文本 `ping`→文本 `pong` 与 opcode 9→10 并存；binary → **close 1003**；`to` 直投对端收到 `from`+`to`+原 `data`（SDP 不动）；`peer_id` 服务端 `base64(strong_rand_bytes(9))` 铸造、客户端不可指定 |
-| 0.4 | **OQ-2 证据脚本化**：把「不落盘」的断言写成可复跑脚本 | 记录 `retention_status/0` 各分区 `committed` offset、数据目录字节数、`.cursors` mtime/内容的前后对比 | 脚本退出码 0；S10-D 直接复用 |
+| 0.4 | **OQ-2 证据脚本化**：把「不落盘」的断言写成可复跑脚本 | 记录 `retention_status/0` 各分区 `committed` offset、数据目录字节数、`.cursors` mtime/内容的前后对比 | 脚本退出码 0；S10-D 直接复用。**批注（2026-11-14）**：这一项**在 S10-0 里没有交付**——`spikes/s10_0_ws_signal/` 中没有该脚本（`REPORT.md` 只覆盖握手/帧/`to` 直投）。D.2 因此是**新写**，不是复用，见 §8「S10-D」第 1 条 |
 | 0.5 | 评审签认 + roadmap §12.1 的 S10-0 行改状态；`progress.md` 下一步指向 S10-A | 文档 | 两份 ADR 已被签认（否则 S10-A 不得开工） |
 
 **S10-0 不做**：任何 app 骨架、任何端口、任何 `rebar.config` 改动。
@@ -97,14 +97,14 @@
 
 | # | 任务 | 产出 |
 |---|---|---|
-| D.1 | 真实第三方客户端证据 | `test/protocol-compatibility/s10/`（见 §3） |
-| D.2 | 「不落盘」证明 | 复用 S10-0 的脚本，跑完整 1:1 信令后断言 offset / 字节 / `.cursors` 三不变 |
-| D.3 | 安全专项 | `unauthorized` / ACL 越权 / 跨房间 `to` / 未知 `peer_id` / 伪造 `peer_id` / 超大帧 / 认证窗口超时，逐条用例且**不崩溃**；`docs/security.md` 新增 §12.2（本阶段明确未实现项） |
-| D.4 | 可观测 | ① 日志字段（`room`/`peer_id`/`bytes`/traceparent，**永不记 `data`**）；② 失败事件只 `logger`——**`broker_metrics` 冻结键集默认不扩容**，照 S9-F 的同一结论（`docs/security.md` §12.1 第 17 条），要动就单独走 ADR，不夹在 S10-D 里静默加；③ 房间/成员只读视图：**先按「未排期」处理**，若立项则在 `broker_admin` 的既有只读接口范式上加（读注册表，不进日志），不在本阶段承诺 |
-| D.5 | 能力矩阵 + 限制清单 | `docs/protocol-compatibility.md` §2 新增 WebRTC / STUN-TURN 两行 + §4.20 小节；`docs/security.md` §12.2；`docs/operations.md` 端口表 + 防火墙表 |
+| D.1 | 真实第三方客户端证据 | ✅ **已交付（2026-11-14）**：`test/protocol-compatibility/s10/`（见 §3、§2.4）。aiortc 1.13.0 三段证据全 PASS |
+| D.2 | 「不落盘」证明 | ✅ **已交付（2026-11-14）**：`run_no_persist.sh` + `src/s10_no_persist{,_run}.erl`。跑完整 1:1 通话后 offset / 字节 / `.cursors` 三不变，并带两条负控（见 §2.4、§8） |
+| D.3 | 安全专项 | ✅ **已交付（2026-11-14）**：8 个冻结用例钉住行为探测结论（route +3、conn +3、turn_allocation +2），`docs/security.md` §12.2/§12.3 留痕 |
+| D.4 | 可观测 | ✅ **已交付（2026-11-14）**：`webrtc_conn` 结构化脱敏日志（`room`/`peer_id`/`bytes`，**永不记 `data`**）+ `turn_allocation` 生命周期日志；`broker_metrics` 冻结键集**不扩容**；`webrtc_route_SUITE:the_log_carries_room_peer_and_bytes_but_never_the_payload` 钉住「data/口令不进日志」。③ 房间/成员只读视图：**仍按「未排期」处理**（不在本阶段承诺） |
+| D.5 | 能力矩阵 + 限制清单 | 🟡 **进行中（文档部分已交付 2026-11-14）**：`docs/protocol-compatibility.md` §2 两行口径已更新 + 追加 §4.23 S10 能力/限制清单 + ADR-028/029 一致性；`docs/security.md` §12.2；`docs/operations.md` §1.6/§1.7 端口表 + 防火墙表 + 日志说明；roadmap §12.2 Gate。**待 D.8**：§1.3 非目标 + R-I6 逐行在能力矩阵留痕（§4.23.5） |
 | D.6 | 压测 / 容量 | `docs/benchmarks/<date>-s10-capacity.md` + 原始 JSON：连接数 × 房间数 × 信令速率（顺序 + 并发）；ICE 的 allocation 建立速率与 relay 吞吐 |
 | D.7 | 文档同步 + ADR 定稿说明 | roadmap §12.1 各行 + §12.2 Gate + README 状态行 + progress + architecture（§3.1 app 表 + env 表 + 延期表）+ operations；ADR-028/029 加「定稿说明」批注（冻结文本不改） |
-| D.8 | 非目标逐行留痕 | §1.3 非目标 + R-I6 裁剪项，每条在能力矩阵有一行 |
+| D.8 | 非目标逐行留痕 | ✅ **已交付（2026-11-14）**：`docs/protocol-compatibility.md` §4.23.5 新增「非目标与裁剪项逐行留痕」表——§1.3 全部 9 项非目标 + R-I6 点名 5 项（5349/TLS、TURN over TCP、ICE-lite、Trickle ICE、IPv6）共 **13 行**，每行标「首期不做」口径与落点，与 §2 能力矩阵两行限制列交叉引用 |
 
 ## 2. 测试矩阵
 
@@ -140,15 +140,50 @@
 
 **约束**：全部 `port => 0`；不依赖外部网络；不新增 Umbrella 外进程（真实客户端证据另立 `test/protocol-compatibility/s10/`）。
 
+### 2.4 已交付（S10-D D.1 + D.2 + D.3 + D.4：真实客户端证据、不落盘证明、安全专项、可观测）
+
+这两项**不是 CT 套件**：CT 覆盖协议状态机与门控顺序，这一层覆盖「真实独立实现能不能
+跑通」与「跑通的同时内核有没有写」。放在 `test/protocol-compatibility/s10/`（照
+`amqp/`、`mqtt/`、`nats/` 的兼容性证据目录惯例），由 `run_all.sh` 一键复跑。
+
+| 段 | 脚本 | 断言 | 实测 |
+|---|---|---|---|
+| D.1-1 裸 STUN Binding | `stun_evidence.py`（无库） | 响应 `0x0101`、`tid` 原样、`XOR-MAPPED-ADDRESS` 解码等于服务器看到的源、`FINGERPRINT` 在场 | **PASS**（请求/响应逐字节 hex + 手工解码） |
+| D.1-2 aiortc 信令 + srflx | `webrtc_evidence.py`（aiortc 1.13.0） | 两 peer `connected`、DataChannel 往返一致、SDP 含 `typ srflx` 且由我们的 STUN 签发 | **PASS**（18 个 srflx） |
+| D.1-3 aiortc TURN Allocate | `turn_evidence.py`（aioice，`transport_policy=RELAY`） | 正确凭据 → `typ relay` 落在 `49500-49519`；错凭据 → 0 个 relay 候选 | **PASS**（`49500`；错凭据 0 个） |
+| D.2 不落盘 | `run_no_persist.sh` → `src/s10_no_persist_run.erl` | seed 一条 → 完整 1:1 通话 → `diff` 为 `unchanged`（offsets / wal_bytes / `.cursors`）**且**两条负控都通过 | **PASS**（117 → 117 字节、`moved: []`；负控 A 117→228、负控 B 出现 `.cursors`） |
+
+原始输出：`stun_evidence.jsonl`、`webrtc_signaling.jsonl`、`turn_evidence.jsonl`、
+`no_persistence.jsonl`（最后一次干净跑的原文）。
+
+**D.2 的两个设计点（都不是装饰）**：
+
+1. **必须把 `broker_subscription` 起起来**。它的 100 ms cursor tick 是唯一会写
+   `.cursors` 的东西；不起它，「没有 cursor 文件」就是「没人会写」的同义反复。
+   `s10_node:boot/0` 因此把 subscription kernel 与 WAL 存储一起拉起。
+2. **必须带负控**。一个永远返回 `unchanged` 的快照也能让「不落盘」通过。负控 A（一
+   次 append 必须让 offsets + wal_bytes 都动）证明水位/字节检测器看得见写；负控 B
+   （真订阅 + ack 必须让 `.cursors` 出现）证明 cursor 检测器看得见文件。
+3. **baseline 先 seed 一条消息**。空 WAL 的 `0 == 0` 不构成证据：seed 之后 baseline
+   是 `high=2 / 117 字节`，`unchanged` 才是关于一个活着的写者的观察。
+
 ## 3. 证据计划（真实第三方客户端）
+
+> **状态：D.1 + D.2 已交付（2026-11-14）**，实际落地与下面计划稿的差异见 §8「S10-D」
+> 与 §2.4。计划稿原文保留，偏差处在下文就地加批注。
 
 - **主选：Python `aiortc`**（pip 安装到 `/tmp/opencode/s10-libs`，方式同 S9-F 的官方 SDK；`PYTHONPATH` 注入，**不进提交**）。
   - **信令**：两个 `RTCPeerConnection` 都连 Broker 的 `wss://127.0.0.1:<port>/websocket/<room>`，走完 `offer → answer → candidate`（含 trickle），断言媒体协商完成（不需要真正收发音视频帧，`aiortc` 的 `connectionState` 到位即可）。
+    - **批注（D.1）**：aiortc 1.13.0 走**全 ICE**（候选内联 SDP，**无 trickle**），故「交换 SDP 即驱动 ICE」。证据因此比计划更强一点：不只是 `connectionState` 到位，还开了一条 `RTCDataChannel` 并断言载荷往返一致。
   - **STUN**：`stun:127.0.0.1:3478` 得到 `srflx` candidate；并加一份**裸 UDP Binding 请求/响应原文**（十六进制 + 解码），不依赖任何库。
+    - **批注（D.1）**：`3478` 换成临时端口（`port => 0`）；`strflx` 地址由主机非回环 IPv4 通告（沙箱禁止「非回环源 → 回环目的」UDP，见 §2.4 与 README「诚实偏差」）。
   - **TURN**：`iceTransportPolicy="relay"` + `turn:` 凭据，断言选中的 candidate pair 类型为 `relay`，且 relay 端口落在配置段内。
+    - **批注（D.1）**：aiortc 1.13.0 的公开 `RTCConfiguration` **没有** `iceTransportPolicy`，故越过公开 API 设底层 `aioice.Connection.transport_policy = RELAY`（RFC 9429 §3.5.3 等价）。断言的是 **relay 候选的类型与端口**；relay-to-relay **媒体**未由 aioice 完成（它从不发 `CreatePermission`，被 `broker_ice` 按 RFC 5766 §9 回 403），见 §8。
 - **备选**：环境里有 headless Chromium 时，加一份浏览器侧同样时序（更强的证据）；没有就**如实标注**「以 aiortc 为第三方实现，非浏览器」。
+  - **批注（D.1）**：环境无 headless Chromium，已按计划如实标注「非浏览器」。
 - **落盘**：`test/protocol-compatibility/s10/README.md`（复跑命令 + 前置约束）+ 脚本 + `*.out` / `*.jsonl` 原文；`.gitignore` 加 s10 scratch 段（`__pycache__/`、`data*/`、`node.out`/`node.err`、`*.beam`）。
 - **诚实边界**（写进报告）：证据节点是 `127.0.0.1` 回环，**不声称**公网 NAT 穿透、真实运营商网络、TLS 证书链、浏览器兼容矩阵。
+  - **批注（D.1）**：WSS 信令确实走 `127.0.0.1` 回环 TCP；但 **ICE/STUN/TURN 的 UDP 方向**必须用主机非回环 IPv4（沙箱限制），故「全回环」这句在上行证据里不成立，已在 README 写明。
 
 ## 4. 端口 / 配置 / 依赖表
 
@@ -270,6 +305,17 @@
 
 ## 7. 门禁实测表（逐阶段交付后回填）
 
+**S10-D 部分实测（2026-11-14，D.1 + D.2 + D.3 + D.4）**：
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| 真实第三方客户端证据（D.1） | `./run_evidence.sh`（aiortc 1.13.0，三段） | **三段全 PASS**：裸 STUN Binding（`0x0101` + XOR-MAPPED-ADDRESS 手工解码 + FINGERPRINT）；两 aiortc peer `connected` + DataChannel 载荷往返一致 + 18 个 `typ srflx`；TURN 正确凭据落在 `49500-49519`、错误凭据 0 候选 |
+| 不落盘运行时证明（D.2） | `./run_no_persist.sh` | **PASS**：seed 后 baseline `offsets=[{P1,0,1},{P0,0,2}]`、`wal_bytes=117`、`cursors=[]`；完整 1:1 通话后三者**逐字段不变**（`moved: []`）；负控 A append → `{P0,0,3}` + 228 字节；负控 B 真订阅 + ack → `.cursors` 出现 |
+| 安全专项冻结用例（D.3） | `rebar3 ct`（affected suites） | **全绿**：`webrtc_route_SUITE` 17、`webrtc_conn_SUITE` 34、`webrtc_acl_SUITE` 13、`webrtc_signal_SUITE` 13、`turn_allocation_SUITE` 24；新增 8 例覆盖类型混淆 / 持续滥用退化 / 回环自投 / 深嵌套+非法 UTF-8 健壮性 / 超大 `to` 帧界 / channel 闭区间 / 畸形 LIFETIME 健壮性 |
+| 可观测（D.4） | `rebar3 ct`（route + conn + turn_allocation + turn_auth） | **全绿**：`webrtc_route_SUITE` 18（+1 日志脱敏例）、`webrtc_conn_SUITE` 34、`turn_allocation_SUITE` 24、`turn_auth_SUITE` 16（`no_password_or_key_reaches_the_log` 仍过）；`webrtc_conn` 加结构化脱敏日志、`turn_allocation` 加生命周期日志；`broker_metrics` 键集未动 |
+| 全量 CT / dialyzer / xref / release | 同 S10-C 命令 | **未复跑**（D.5–D.8 完成后一次性复跑，届时回填本表） |
+| 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
+
 **S10-C 实测（2026-11-14）**：
 
 | 门禁 | 命令 | 结果 |
@@ -279,7 +325,7 @@
 | xref | `rebar3 xref` | 全仓**只剩 unused-export**，本 app **20 条**（`stun_codec` 的编解码/属性访问器多数只被测试调用、`broker_ice_udp:port/0`/`allocations/0` 是运维与测试入口、`broker_ice_app:validate/0`/`config/0` 同姿态），与既有 app 的测试入口同性质，零非预期告警 |
 | Release（默认） | `rebar3 release` | 装配成功，`_build/default/rel/unified_mq/lib/broker_ice-0.1.0` 存在 |
 | 出厂 release 启动 | 装配出的 `sys.config`（无 `broker_ice` 段）+ `-pa` 加载后 | `validate/0 → ok`；`config/0 → {ok, #{enabled => false}}`；`ensure_all_started(broker_ice)` 后 `supervisor:which_children(broker_ice_sup) → []`，`whereis(broker_ice_udp) → undefined`、`whereis(turn_allocation_sup) → undefined`；**3478/UDP 仍可被 `gen_udp:open/2` 拿到**（零 socket） |
-| STUN/TURN 证据 | `turn_allocation.py` + 裸 UDP `stun_raw.py` | **未做**（S10-D D.1；本阶段只有 Broker 侧的 socket 级用例，客户端是 `ice_test_client` 手写字节） |
+| STUN/TURN 证据 | `turn_allocation.py` + 裸 UDP `stun_raw.py` | **已由 S10-D D.1 完成**（aiortc 1.13.0，见 §2.4 与 §7 的 S10-D 段）：裸 UDP Binding + aiortc TURN Allocate 均 PASS |
 | 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
 
 **S10-B 实测（2026-11-13）**：
@@ -292,8 +338,8 @@
 | Release（默认） | `rebar3 release` | 装配成功，`_build/default/rel/unified_mq/lib/` 含 `broker_proto_webrtc-0.1.0` |
 | Release（quic profile） | `rebar3 as quic release` | 装配成功，`_build/quic/rel/unified_mq/lib/` 含 `broker_proto_webrtc-0.1.0` |
 | 出厂 release 启动 | 装配出的 `sys.config`（无 `broker_proto_webrtc` 段）+ `-pa` 加载后 | `validate/0 → ok`；`ensure_all_started` 后监督树子进程只有 `webrtc_room_registry`，**零 listener**；`webrtc_room_registry:rooms() → []`；`shard_count() → 16`（= `schedulers_online`） |
-| 信令证据 | `webrtc_peer.py`（aiortc） | **未做**（S10-D D.1；S10-B 只有 Broker 侧的 socket 级用例） |
-| 「不落盘」证明 | S10-0 的 `assert_no_persistence` 脚本 | **未做**（S10-D D.2） |
+| 信令证据 | `webrtc_peer.py`（aiortc） | **已由 S10-D D.1 完成**（`webrtc_evidence.py`，见 §2.4）：两 aiortc peer `connected` + DataChannel 往返 |
+| 「不落盘」证明 | S10-0 的 `assert_no_persistence` 脚本 | **已由 S10-D D.2 完成**（S10-0 的 spike 里并没有这个脚本，见 §8「S10-D」第 1 条）：`run_no_persist.sh` + 两条负控 |
 | 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
 
 **S10-A 实测（2026-11-13）**：
@@ -306,14 +352,85 @@
 | Release（默认） | `rebar3 release` | 装配成功，`_build/default/rel/unified_mq/lib/` 含 `broker_proto_webrtc-0.1.0` |
 | Release（quic profile） | `rebar3 as quic release` | 装配成功，`_build/quic/rel/unified_mq/lib/` 含 `broker_proto_webrtc-0.1.0` |
 | 出厂 release 启动 | 以装配出的 `sys.config` 加载后 `broker_proto_webrtc_app:validate/0` | `ok`；`listeners => []`；`ensure_all_started(broker_proto_webrtc)` → `{ok, [...broker_proto_webrtc]}`，监督树子进程为空（零端口） |
-| 信令证据 | `PYTHONPATH=/tmp/opencode/s10-libs /usr/bin/python3 test/protocol-compatibility/s10/webrtc_peer.py` | **未做**（S10-D；S10-A 无 `to` 转发，1:1 信令走不通） |
-| STUN/TURN 证据 | 同上（`turn_allocation.py` + 裸 UDP `stun_raw.py`） | **未做**（S10-C） |
-| 「不落盘」证明 | S10-0 的 `assert_no_persistence` 脚本 | **未做**（S10-D D.2） |
+| 信令证据 | `PYTHONPATH=/tmp/opencode/s10-libs /usr/bin/python3 test/protocol-compatibility/s10/webrtc_peer.py` | **已由 S10-D D.1 完成**（S10-A 当时无 `to` 转发，1:1 信令走不通；S10-B 补齐后由 D.1 跑通） |
+| STUN/TURN 证据 | 同上（`turn_allocation.py` + 裸 UDP `stun_raw.py`） | **已由 S10-D D.1 完成** |
+| 「不落盘」证明 | S10-0 的 `assert_no_persistence` 脚本 | **已由 S10-D D.2 完成** |
 | 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
 
 ## 8. 落地偏差记录
 
 > 格式照 `docs/design/s9-f-execution-plan.md` §落地偏差记录：每条写「计划 → 实际 → 为什么 → 留痕位置」。设计稿原文不改，偏差只在这里与 ADR 批注里记。
+
+### S10-D（2026-11-14，D.1 + D.2 + D.3 + D.4）
+
+1. **D.2 说的「复用 S10-0 的 `assert_no_persistence` 脚本」并不存在**
+   - 计划：§1 D.2 与 §7 的 S10-A/B/C 三张表都写「S10-0 的 `assert_no_persistence` 脚本」，§3 说「脚本退出码 0；S10-D 直接复用」。
+   - 实际：`spikes/s10_0_ws_signal/` 里**没有**这个脚本，也没有 offset/字节/`.cursors` 的前后对比实现（该 spike 只证明握手、帧、`to` 直投）。S10-0 的 §0.4 这项在 spike 的 `REPORT.md` 里从未交付。D.2 因此是**新写**，不是复用。
+   - 为什么：计划把 §0.4 的计划项当成了既有产出。审计时若按「复用」去找会找不到，所以这里明写。
+   - 留痕：`test/protocol-compatibility/s10/src/s10_no_persist{,_run}.erl` + `run_no_persist.sh`；本节第 2 条说明实现口径。
+
+2. **D.2 必须自己起 `broker_subscription`，否则断言没有意义**
+   - 计划：只写「跑完整 1:1 信令后断言 offset / 字节 / `.cursors` 三不变」。
+   - 实际：`s10_node:boot/0` 把 `broker_subscription`（含其 100 ms cursor tick）和 WAL 存储一起拉起。原 D.1 证据节点只起存储与信令，不起 subscription。
+   - 为什么：不起 subscription，「没有 `.cursors`」就是「没有人会写」的同义反复，不能作为「信令没落盘」的证据。同时**新增两条负控**（一次 append 必须动 offsets+wal_bytes；一次真订阅+ack 必须让 `.cursors` 出现）——一个永远返回 `unchanged` 的快照也能让「不落盘」通过，负控把守卫钉成可证伪的。
+   - 留痕：`s10_node:boot/0`、`s10_no_persist_run:main/0`；README §4「负控为什么必须有」。
+
+3. **D.2 的 baseline 先 seed 一条普通消息**
+   - 计划：直接取 baseline。
+   - 实际：先 `append` 一条 seed（`offsets` 变成 `{P0,0,2}`、`wal_bytes` 117），再取 baseline。
+   - 为什么：空 WAL 上 `0 == 0` 不构成证据。seed 之后 `unchanged` 才是关于一个**活着的写者**的观察。
+   - 留痕：同上；`no_persistence.jsonl` 的 `seed` 行。
+
+4. **D.1 的 aiortc 走全 ICE，没有 trickle**
+   - 计划：§3 写「走完 `offer → answer → candidate`（含 trickle）」。
+   - 实际：aiortc 1.13.0 把候选内联进 SDP，**无 trickle**；证据靠交换 SDP 驱动 ICE。
+   - 为什么：第三方实现的既成行为，不是我们的取舍。证据反而更强一点：除了 `connectionState`，还开 DataChannel 并断言载荷往返。
+   - 留痕：§3 就地批注；`webrtc_signaling.py` 模块 doc。
+
+5. **D.1 的 relay-only 越过 aiortc 公开 API**
+   - 计划：`iceTransportPolicy="relay"`。
+   - 实际：aiortc 1.13.0 的 `RTCConfiguration` **没有** `iceTransportPolicy`；`force_relay_policy` 直接设底层 `aioice.Connection.transport_policy = RELAY`（RFC 9429 §3.5.3 等价）。
+   - 为什么：公开 API 表达不了这个策略；不这么做就只能放弃 TURN 证据。伸手进私有属性这件事写在代码 doc 与 README 里，不隐藏。
+   - 留痕：`webrtc_signaling.py:force_relay_policy/1`；README「诚实偏差」第 1 条；§3 就地批注。
+
+6. **TURN 媒体面（relay-to-relay）未由 aioice 完成——记为发现，不为让它通过而放宽服务器**
+   - 计划：断言「选中的 candidate pair 类型为 `relay`」并暗示 relay 媒体可用。
+   - 实际：aioice 的 TURN 客户端**只用 `ChannelBind`、从不发 `CreatePermission`**；`broker_ice` 按 RFC 5766 §9 对无 permission 的 ChannelBind 回 **403**（CT 冻结用例 `turn_allocation_SUITE:channel_bind_without_a_permission_is_a_403` 钉死）。故 D.1 只证明 Allocate / 凭据 / relay 地址面；permission → channel → ChannelData → peer 的完整路径由 CT 侧的 `ice_test_client` 证明。
+   - 为什么：**刻意没有**为了让 aioice 通过而放宽 403——那会破坏冻结契约并削弱这条 403 本要保护的安全属性。这是 aioice 客户端局限，不是 `broker_ice` 缺陷（真实浏览器会先发 CreatePermission）。
+   - 留痕：README「诚实偏差」第 2 条；`turn_evidence.jsonl` 的 `media_plane_boundary` 行；§3 就地批注。
+
+7. **D.3 安全专项：探测真实行为后冻结用例，含一处如实留痕的缺口**
+   - 计划（§1 D.3 行）：列了「`unauthorized` / ACL 越权 / 跨房间 `to` / 未知 `peer_id` / 伪造 `peer_id` / 超大帧 / 认证窗口超时，逐条用例且不崩溃」。
+   - 实际：上述计划项**大部分在 D.1/S10-B/S10-C 已冻结**（`webrtc_acl_SUITE` 13、`webrtc_route_SUITE` 已含未知/伪造 `to`、`webrtc_conn_SUITE` 已含超大帧 1009 与 `auth_timeout`）。D.3 因此是**行为探测 + 补缺口 + 补健壮性边界**，新增 8 个冻结用例，逐条先探测真实行为再钉死，不改动实现：
+     - 信令面（route +3 / conn +3）：`to` 为非二进制（JSON 数字）→ `invalid_message`（类型混淆穿不过寻址层）；单连接连拒 50 条后合法信令仍路由（持续滥用退化探针，证明拒绝是纯状态转移）；把自己的 `peer_id` 当 `to` → 回环投递一次（良性，无循环无放大）；深嵌套 JSON 数组（2000 层，帧未超限）→ `invalid_message`（`json:decode` 不栈溢出，**无 JSON 深度专项防御也不需要**）；非法 UTF-8 文本帧 → `invalid_json` → `invalid_message`（连接存活）；超大 `to` 字段撑爆帧 → 1009（帧层大小界，非字段数界）。
+     - ICE 面（turn_allocation +2）：channel number 闭区间 `16#4000..16#7FFF` 两边界值（各用独立 peer，因一 peer 只绑一 channel）钉成 `{ok}`、区间外已钉 400；畸形 LIFETIME（非 4 字节）→ 400 且 allocation 存活（健壮性探针）。
+   - **一处真实缺口（如实留痕，未擅自补）**：`webrtc_conn` 握手阶段（`ws_handshake:accept` 无读超时 + `{active, once}` 只武装一次）**无读超时**——连上后不发 / 半截静置不关；`auth_timeout_ms` 只在 101 之后生效。修补需动握手路径，按 S10-D「不改既有语义、偏差须记」纪律只留痕（`docs/security.md` §12.2 第 13 条），并**不**为「握手前静置」加 CT 用例以免把当前行为钉成契约。
+   - **三处探测后判定「不可达、不设用例」的边界（如实留痕）**：超大单 UDP 报文（单数据报 ≤ ~65507 字节，`recbuf_bytes=262144` 撑不爆，UDP 协议边界）；permission 过期重放（`PERMISSION_LIFETIME_S=300 s`，CT 等 5 分钟不现实，改有效期会动既有语义）；负数 / 非整数 Refresh lifetime（`stun_codec:lifetime/1` 解 32 位无符号，wire 不可达，畸形长度走「畸形 LIFETIME」分支）。
+   - 留痕：`docs/security.md` §12.2 第 13 条（D.3 探测总览）、§12.3 第 9 条（TURN 侧）、§12.2 第 2/7 条补充；8 个新 CT 用例的 doc 内联了探测口径。
+
+8. **D.4 只加脱敏日志，不加指标，房间只读视图仍未排期**
+   - 计划（§1 D.4 行）：① 日志字段（`room`/`peer_id`/`bytes`/traceparent，永不记 `data`）；② 失败事件只 `logger`，`broker_metrics` 冻结键集不扩容；③ 房间/成员只读视图「先按未排期」。
+   - 实际：① 在 `webrtc_conn` 加 5 类结构化 `?LOG_INFO`（`authenticated`/`auth_refused`/`relay`/`signal_refused`/`disconnect`），`room`/`peer_id`/`bytes` 齐备、**`data` 永不出现**（relay 只记 `byte_size`），口令/SDP/candidate 不落日志；`turn_allocation` 加两条生命周期日志（`allocated`/`released`，带 client 5-tuple + relay_port + username，永不带 key）。② `broker_metrics` **一行未增**——D.4 只走日志、不走指标，ADR-016 §16.2 冻结键集原样。③ 房间/成员只读视图**没有实现**，按计划保持「未排期」。**traceparent**：没有在连接日志里重新发射——它由 `broker_ws` 在握手门口按 opt-in（默认 off）接收并进消息头（W3C 上下文随消息走，不随连接日志走）；在本阶段连接日志不承担 trace 传播。
+   - 为什么：`data` 是客户端不透明载荷，可能内嵌 SDP/ICE 内网地址或口令，记它就违反了 R-X6 / `docs/security.md` §9 的日志最小化；指标扩容要单独立 ADR，不夹在 S10-D 里静默加。
+   - 留痕：`webrtc_conn` 的 `%% Observability (R-O2 / D.4)` 段与 `log_*` 辅助；`turn_allocation:init/1`/`terminate/2` 的 `?LOG_INFO`；`webrtc_route_SUITE:the_log_carries_room_peer_and_bytes_but_never_the_payload`（logger handler 捕获断言 sentinel/口令缺席）；`turn_auth_SUITE:no_password_or_key_reaches_the_log` 仍覆盖 ICE 侧。
+
+9. **证据机网络/沙箱迫使 ICE 通告地址用主机非回环 IPv4**
+   - 计划：`stun:127.0.0.1:3478`（纯回环）。
+   - 实际：aiortc 把 UDP socket 绑到真实网卡 IP 再发包，沙箱禁止「非回环源 → 回环目的」（`EPERM`）。证据节点因此通告主机主非回环 IPv4（`S10_ICE_IP` 可覆盖），WSS 信令仍走 `127.0.0.1` 回环 TCP。STUN/TURN 端口也是 `port => 0` 而非 3478。
+   - 为什么：纯回环跑不通是环境事实，不是选择。§3 里「证据节点是 `127.0.0.1` 回环」这句对上行的 UDP 证据因此不成立，已在 README 写明。
+   - 留痕：`s10_node:ice_ip/0`；§3 就地批注；README「前置条件」第 3 条。
+
+10. **`broker_subscription.data_dir` 是独立 env 键，证据节点必须显式指同一目录**
+   - 计划：未提。
+   - 实际：`broker_subscription_files:data_dir/0` 读 `broker_subscription.data_dir`（默认 `"data"`，相对 CWD），与 `broker_storage.data_dir` 是两个键。证据节点把两者都指向 `S10_DATA`。
+   - 为什么：不显式设，D.2 的 cursor 快照会去看 `./data` 而永远看到空——一个假阳性陷阱。
+   - 留痕：`s10_node:boot/0` 的 `broker_subscription, data_dir` 那行与注释。
+
+11. **D.2 的 `session_files`（`.subs`/`.inflight`）只记录、不参与判定**
+   - 计划：只列三条不变项，未说 `.subs`/`.inflight`。
+   - 实际：快照记录 `session_files` 供人看，但 `diff/2` 只比 `offsets`/`wal_bytes`/`cursors`。
+   - 为什么：D.2 的契约是那三条；守卫一旦偏离自己的契约就会被关掉。`.subs`/`.inflight` 同属订阅数据面，本次实测也确为空，但不把它塞进判定条件。
+   - 留痕：`s10_no_persist:diff/2` 与模块 doc；`no_persistence.jsonl` 的 snapshot 行。
 
 ### S10-C（2026-11-14）
 

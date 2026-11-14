@@ -20,6 +20,8 @@
 
 -behaviour(gen_server).
 
+-include_lib("kernel/include/logger.hrl").
+
 -export([start_link/1, request/4, send_indication/2, channel_data/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -83,14 +85,31 @@ init(Opts) ->
                      lifetime_s = maps:get(lifetime_s, Opts),
                      max_permissions = maps:get(max_permissions, Opts),
                      max_channels = maps:get(max_channels, Opts)},
+            %% D.4: one line per allocation, never the key or password. The
+            %% client 5-tuple and relay port are already visible via
+            %% broker_ice_udp:allocations/0; this just puts them on the timeline.
+            ?LOG_INFO("turn_allocation: allocated client=~s relay_port=~b username=~s",
+                      [client_str(St#st.client), Port, St#st.username]),
             {ok, schedule(St)};
         {error, Reason} ->
             {stop, Reason}
     end.
 
-terminate(_Reason, #st{relay_socket = Socket}) ->
+terminate(Reason, #st{relay_socket = Socket} = St) ->
     _ = gen_udp:close(Socket),
+    ?LOG_INFO("turn_allocation: released client=~s relay_port=~b reason=~p",
+              [client_str(St#st.client), St#st.relay_port, coarse(Reason)]),
     ok.
+
+%% Only coarse termination causes are logged; the client 5-tuple is already in
+%% the line, so this is about "why did it end", not "who".
+coarse(normal) -> normal;
+coarse({shutdown, _}) -> shutdown;
+coarse(_) -> abnormal.
+
+client_str({Ip, Port}) ->
+    IpStr = inet:ntoa(Ip),
+    iolist_to_binary([IpStr, $:, integer_to_list(Port)]).
 
 handle_call(_Request, _From, St) ->
     {reply, {error, unknown_call}, St}.

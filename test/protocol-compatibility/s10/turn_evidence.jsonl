@@ -1,0 +1,4 @@
+{"event": "turn_allocate_ok", "credential": "alice", "relay_policy_patched": 1, "relay_candidates": 1, "relay_ports": [49500], "relay_lines": ["a=candidate:a16c1f3d3afe682cc4a44bdaa1bb760d 1 udp 16777215 192.168.10.26 49500 typ relay raddr 0.0.0.0 rport 9"], "range": [49500, 49519], "ok": true}
+{"event": "turn_wrong_credential_refused", "credential": "alice", "relay_candidates": 0, "ok": true}
+{"event": "media_plane_boundary", "finding": "aioice relays data only via ChannelBind and never issues CreatePermission; broker_ice correctly refuses a ChannelBind without a permission with 403 (RFC 5766 9.2, pinned by turn_allocation_SUITE:channel_bind_without_a_permission_is_a_403). Relay-to-relay media is therefore not completed with aioice; the permission -> channel -> ChannelData -> peer path is proven CT-side with a spec-compliant client (ice_test_client).", "server_not_modified": true}
+{"event": "verdict", "ok": true}
