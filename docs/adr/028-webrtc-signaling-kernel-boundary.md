@@ -123,3 +123,19 @@ S10 在既有统一消息内核之上新增 WebRTC **信令接入前端**（WSS 
    - 为什么：不在实现里偷偷加第二个 `action` 主体。若将来需要拆分，应当新增一个 `action`（例如 `join_room`）并改 D5 的冻结文本，而不是让 ACL 语义随实现漂移。
    - 留痕：`webrtc_acl_SUITE:a_denied_room_cannot_be_reached_at_all/1` 的注释、`docs/protocol-compatibility.md` §4.21.5、执行计划 §8 第 4/5 条。
    - **冻结文本无需变更**。
+
+### S10-D（2026-11-14）
+
+1. **D7「不落盘实测」由 S10-D D.2 新写证据脚本落地（不是 CT 用例，也不是复用 S10-0 的脚本）**
+   - 计划：D7 写「S10-D 不落盘实测：D1 的三条断言」，判定标准是完整 1:1 会话后 offset 不变、数据目录无增长、`.cursors` 无新增。执行计划 §3 还写「复用 S10-0 的 `assert_no_persistence` 脚本」。
+   - 实际：`spikes/s10_0_ws_signal/` 里**没有**这个脚本（S10-0 的 §0.4 从未交付该项），所以 D.2 是**新写**：`test/protocol-compatibility/s10/run_no_persist.sh` + `src/s10_no_persist{,_run}.erl`。它起一个活的 WAL 与**活的** `broker_subscription`（否则「没有 `.cursors`」是同义反复），seed 一条消息后跑完整 1:1 aiortc 通话，前后 `offsets`/`wal_bytes`/`.cursors` 逐字段不变，并带两条负控（append 必须动 offsets+字节；真订阅+ack 必须让 `.cursors` 出现）证明检测器可证伪。
+   - 为什么：D1 的判定标准需要一个可证伪的守卫，否则「三不变」是空洞断言；同时这一层验证的是「运行时没有写」，与 `webrtc_boundary_SUITE` 的「源码级没有调用点」互补，两者都不能替代对方。它是证据脚本而不是 CT 套件，因此不进 `rebar3 ct` 计数。
+   - 留痕：`test/protocol-compatibility/s10/run_no_persist.sh`、`docs/design/s10-execution-plan.md` §1 D.2 行、§2.4、§7「S10-D 部分实测」第 2 行、§8 第 1~3 条。
+   - **冻结文本无需变更**。
+
+### S10-D 定稿说明（2026-11-14）
+
+- **定稿范围**：ADR-028 的 D1~D8 全部冻结文本**保持不变**，本说明只记录 S10-D 收尾时的最终核对结论与一处实现期缺陷修复，不改任何一条决策。
+- **D1 边界的最终证据**：S10-D D.2 的 `run_no_persist.sh` 给出「信令 + ICE 全路径通话后 WAL/subscription 三不变」的运行时实测；`webrtc_boundary_SUITE` 的源码级守卫（无 `broker_queue:`/`broker_router:` 调用、无 `#broker_message{}`、无 `broker_core` include）作为 D7 的常驻守护。D.6 压测（[`docs/benchmarks/2026-11-14-s10-capacity.md`](../benchmarks/2026-11-14-s10-capacity.md)）在不落盘 tmpfs 证据节点上跑，信令路径零 WAL/零订阅索引的结论与压测数据互不矛盾。
+- **D7 守护的有效性反证**：S10-D D.6 压测戳穿了一个 D1~D8 文本未及、但属于 D3「数据面进程直投」实现范围的真实缺陷——`broker_ice` 的 `turn_allocation:forward_to_peer/4` 把 `gen_udp:send` 的 `ok` 当成 gen_server 新 state 返回，导致 relay 每次分配只中继一帧就 `badrecord` 崩溃（CT 只发一帧、cast 异步，从未暴露）。修复（返回 `St`）+ 回归用例 `consecutive_channel_data_frames_all_relay`（`turn_allocation_SUITE` 25/25）落地。**该缺陷在 ADR-028 的范围外**（属 ADR-029 的 ICE relay 数据面），此处仅交叉留痕，冻结文本不动。
+- **结论**：ADR-028 全部决策在 S10-D 收尾时与实现一致，无待办修订；如未来出现「可回放加入/离开审计 / 跨节点房间 / 持久化订阅者」需求，按 D6 另立 ADR。

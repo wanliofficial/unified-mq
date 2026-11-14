@@ -133,3 +133,15 @@ spikes/*/.data/
 /test/protocol-compatibility/s10/**/erl_crash.dump
 /test/protocol-compatibility/s10/**/d2-python.out
 /test/protocol-compatibility/s10/**/d2-node.out
+
+# S10-D D.6 capacity bench: broker data volume, self-signed certs, compiled
+# beams, node run logs. The raw results/*.json and the harness are committed.
+/test/protocol-compatibility/s10/bench/data/
+/test/protocol-compatibility/s10/bench/certs/
+/test/protocol-compatibility/s10/bench/ebin/
+/test/protocol-compatibility/s10/bench/_build/
+/test/protocol-compatibility/s10/bench/__pycache__/
+/test/protocol-compatibility/s10/bench/*.beam
+/test/protocol-compatibility/s10/bench/node.out
+/test/protocol-compatibility/s10/bench/node.err
+/test/protocol-compatibility/s10/bench/results/*.err

@@ -739,6 +739,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 - 复跑：`python3 tools/bench/s2_bench.py --skip-build`。
 - 快速结论（本机 16 逻辑核 / ext4 / OTP 28）：1 KiB 8 连接约 900 msg/s（fsync 档），吞吐随消息大小下降，1 MiB 约 11 msg/s；`kill -9` 恢复到首个 CONNACK 约 3.4–3.6 s。
 - 容量估算以「持久化 msg/s × 消息大小 ÷ 副本因子 × 安全系数」为起点，必须用目标硬件复测，不要直接外推本机数字。
+- **WebRTC 信令与 ICE 的容量基准**（不落盘路径，与上面持久化口径不可直接比较）：`docs/benchmarks/2026-11-14-s10-capacity.md`，复跑 `test/protocol-compatibility/s10/bench/run_bench.sh`（自带内存守卫与断点续跑，只绑回环临时端口）。快速结论：信令 32 连接并发 1498.7/s（p50 1.6 ms）、ICE allocation 顺序 p50 893 µs、relay 中继约 5.2k datagrams/s。**信令与 ICE 都不写 WAL**，它们的容量不受磁盘 fsync 约束，受 CPU/调度与 socket 缓冲约束；relay 在无上层流控的突发下会丢包（实测送达率 0.77），容量规划必须留余量。
 
 ---
 

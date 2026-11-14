@@ -324,9 +324,14 @@ do_channel_data(Channel, Data, St) ->
         error -> St
     end.
 
-forward_to_peer(Ip, Port, Data, #st{relay_socket = Socket}) ->
+%% Returns the (unchanged) state: `handle_cast' feeds this return value straight
+%% into `reply/1', which treats anything that is not `{stop, _, _}' as the new
+%% state. Returning `gen_udp:send''s `ok' here would replace the `#st{}' record
+%% with the atom `ok', so the *second* ChannelData on the allocation would crash
+%% with `badrecord' -- i.e. a relay that worked exactly once.
+forward_to_peer(Ip, Port, Data, #st{relay_socket = Socket} = St) ->
     _ = gen_udp:send(Socket, Ip, Port, Data),
-    ok.
+    St.
 
 %%%_* Peer -> client --------------------------------------------------------
 

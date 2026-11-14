@@ -2,7 +2,7 @@
 
 - **对应设计**：[`docs/design/s10-webrtc-signaling.md`](s10-webrtc-signaling.md) §3（候选需求 R-T/R-S/R-M/R-I/R-X/R-C/R-O/R-E）、§4.2（子阶段）、§4.3（Gate S10）、§4.4（OQ-1~OQ-10）；[`docs/design/s10-0-convergence-report.md`](s10-0-convergence-report.md)（OQ 收敛结论与 ADR-028/029 底稿）；[`docs/roadmap.md`](../roadmap.md) §12.1 / §12.2。
 - **基线（开工前）**：`rebar3 ct` **1063/1063、68 套件**；`dialyzer` 0 warning；`rebar3 release` 装配成功（S9-F 收尾，`fcbf83e`）。
-- **性质**：**计划稿 + S10-A/S10-B/S10-C 交付记录**。S10-A 的实现事实（含 45 例实测与 13 条落地偏差）已回填 §1/§2.1/§4/§5/§7/§8，S10-B 的实现事实（含 61 例实测与 12 条落地偏差）已回填 §1/§2.2/§4.2/§5/§7/§8，S10-C 的实现事实（含 72 例实测与 13 条落地偏差）已回填 §1/§2.3/§4/§5/§7/§8；S10-D 的 D.1（真实第三方客户端证据）、D.2（不落盘运行时证明）、D.3（安全专项：行为探测 + 8 个冻结用例 + 缺口/不可达边界留痕）与 D.4（可观测：结构化脱敏日志 + 冻结键集不扩容）已交付并回填 §1/§2.4/§3/§7/§8，D.5–D.8 仍是计划值。本文件不在 S10-A/B/C/D 之外开任何端口、不新增任何依赖。
+- **性质**：**计划稿 + S10-A/S10-B/S10-C/S10-D 交付记录**。S10-A 的实现事实（含 45 例实测与 13 条落地偏差）已回填 §1/§2.1/§4/§5/§7/§8，S10-B 的实现事实（含 61 例实测与 12 条落地偏差）已回填 §1/§2.2/§4.2/§5/§7/§8，S10-C 的实现事实（含 72 例实测与 13 条落地偏差）已回填 §1/§2.3/§4/§5/§7/§8；**S10-D 的 D.1–D.8 全部已交付并回填 §1/§2.4/§3/§5/§7/§8（含 16 条落地偏差）**，零回归全量复跑 **1251/1251、79 套件**、`dialyzer` 0 warning、`xref` 只剩 unused-export、`rebar3 release` 装配成功。本文件不在 S10-A/B/C/D 之外开任何端口、不新增任何依赖。
 - **范围**：一个不碰消息日志的 **信令接入前端** + 一个与内核解耦的 **ICE 辅助服务**。**媒体面（RTP/RTCP/DataChannel/SFU/录制/转码）明确不做**。
 - **执行约束**（仓库既定规则，全程适用）：编译/测试前 `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"`；`rebar3 ct` 前 `rm -rf _build/test/extras`；Python 一律 `/usr/bin/python3`（3.12）；用例数由各套件 `all/0`（含 `groups/0`）展开后逐个数出；CT 一律 `port => 0`，不动既有 8080/8083/1883/8081/8082；不杀用户进程；ADR 冻结文本不动、偏差处加批注；设计稿原文不改。
 
@@ -101,9 +101,9 @@
 | D.2 | 「不落盘」证明 | ✅ **已交付（2026-11-14）**：`run_no_persist.sh` + `src/s10_no_persist{,_run}.erl`。跑完整 1:1 通话后 offset / 字节 / `.cursors` 三不变，并带两条负控（见 §2.4、§8） |
 | D.3 | 安全专项 | ✅ **已交付（2026-11-14）**：8 个冻结用例钉住行为探测结论（route +3、conn +3、turn_allocation +2），`docs/security.md` §12.2/§12.3 留痕 |
 | D.4 | 可观测 | ✅ **已交付（2026-11-14）**：`webrtc_conn` 结构化脱敏日志（`room`/`peer_id`/`bytes`，**永不记 `data`**）+ `turn_allocation` 生命周期日志；`broker_metrics` 冻结键集**不扩容**；`webrtc_route_SUITE:the_log_carries_room_peer_and_bytes_but_never_the_payload` 钉住「data/口令不进日志」。③ 房间/成员只读视图：**仍按「未排期」处理**（不在本阶段承诺） |
-| D.5 | 能力矩阵 + 限制清单 | 🟡 **进行中（文档部分已交付 2026-11-14）**：`docs/protocol-compatibility.md` §2 两行口径已更新 + 追加 §4.23 S10 能力/限制清单 + ADR-028/029 一致性；`docs/security.md` §12.2；`docs/operations.md` §1.6/§1.7 端口表 + 防火墙表 + 日志说明；roadmap §12.2 Gate。**待 D.8**：§1.3 非目标 + R-I6 逐行在能力矩阵留痕（§4.23.5） |
-| D.6 | 压测 / 容量 | `docs/benchmarks/<date>-s10-capacity.md` + 原始 JSON：连接数 × 房间数 × 信令速率（顺序 + 并发）；ICE 的 allocation 建立速率与 relay 吞吐 |
-| D.7 | 文档同步 + ADR 定稿说明 | roadmap §12.1 各行 + §12.2 Gate + README 状态行 + progress + architecture（§3.1 app 表 + env 表 + 延期表）+ operations；ADR-028/029 加「定稿说明」批注（冻结文本不改） |
+| D.5 | 能力矩阵 + 限制清单 | ✅ **已交付（2026-11-14）**：`docs/protocol-compatibility.md` §2 两行口径已更新 + 追加 §4.23 S10 能力/限制清单 + ADR-028/029 一致性；`docs/security.md` §12.2/§12.3；`docs/operations.md` §1.6/§1.7 端口表 + 防火墙表 + 日志说明；roadmap §12.2 Gate。D.8 的 §4.23.5 非目标逐行留痕（13 行）同批落地。③ 房间/成员只读视图：**仍按「未排期」处理**（不在本阶段承诺） |
+| D.6 | 压测 / 容量 | ✅ **已交付（2026-11-14）**：`docs/benchmarks/2026-11-14-s10-capacity.md` + `test/protocol-compatibility/s10/bench/results/*.json`（14 信令 + 1 ICE）。信令：1–32 房（2–64 连接）顺序/并发 × 速率扫描 10–500/s + 不限速，走生产 `broker_proto_webrtc` 全路径（Python `SignalingClient`）。ICE：allocation 顺序 50/50（p50 893 µs）+ 并发 12/12（p50 3.2 ms，`max_allocations=16` 内）；relay ChannelData 突发 5000 帧 0.77 送达（~5.2k datagrams/s、1.28 MB/s）。**过程中发现并修复真实缺陷**：`turn_allocation:forward_to_peer/4` 返回 `ok` 污染 gen_server state，导致 relay 每次分配只中继一帧就 `badrecord` 崩溃（CT 只发一帧未暴露）；已修（返回 `St`）+ 回归用例 `consecutive_channel_data_frames_all_relay`（`turn_allocation_SUITE` 25/25） |
+| D.7 | 文档同步 + ADR 定稿说明 | ✅ **已交付（2026-11-14）**：`docs/roadmap.md` §12 标题 + §12.1 各行 + §12.2 Gate S10 勾选 + 状态口径；`README.md` 状态行；`progress.md`；`docs/architecture.md`（版本行 v1.4、§1 目录树、§3.1 app 表两行、§5 env 表、§9 延期表新增 TURN 流控一行、§10 证据口径 1251/79）；`docs/operations.md`（§9 追加 WebRTC/ICE 容量基准段）；`docs/design/s10-execution-plan.md`（§2.4 D.6 段 + §7 门禁表 + 勾选清单）。ADR-028/029 各加「S10-D 定稿说明」批注（**冻结文本 D1~D8 / D1~D6 一字未改**）。**零回归全量复跑**：`rm -rf _build/test/extras && rebar3 ct` → **1251/1251、79 套件、零 FAILED、零 Skipped**（S10-C 基线 1241/79 + S10-D 在既有套件内的 10 例：`webrtc_route_SUITE` 14→18〔D.3 三例 + D.4 日志脱敏一例〕、`webrtc_conn_SUITE` 31→34、`turn_allocation_SUITE` 22→25〔D.3 两例 + D.6 relay 多帧回归一例〕= 1251，套件数不变）；`dialyzer` **0 warning**；`xref` 只剩 unused-export（285 条，其中 `broker_ice` 20 / `broker_proto_webrtc` 14，无 undefined/deprecated）；`rebar3 release` 装配成功，`lib/` 含 `broker_ice-0.1.0` 与 `broker_proto_webrtc-0.1.0`。**复跑留痕**：本机带外部负载（load average 一度 45–58 / 16 核），前两次全量跑各出现 1 例与本阶段无关的偶发失败（`broker_cluster_dist_SUITE` 的 epmd 未就绪、`mqtt_ws_conn_SUITE` / `broker_subscription_SUITE` 的 socket/定时抖动），三者单独复跑均全绿，第四次全量跑取得 1251/1251 干净结果 |
 | D.8 | 非目标逐行留痕 | ✅ **已交付（2026-11-14）**：`docs/protocol-compatibility.md` §4.23.5 新增「非目标与裁剪项逐行留痕」表——§1.3 全部 9 项非目标 + R-I6 点名 5 项（5349/TLS、TURN over TCP、ICE-lite、Trickle ICE、IPv6）共 **13 行**，每行标「首期不做」口径与落点，与 §2 能力矩阵两行限制列交叉引用 |
 
 ## 2. 测试矩阵
@@ -140,7 +140,7 @@
 
 **约束**：全部 `port => 0`；不依赖外部网络；不新增 Umbrella 外进程（真实客户端证据另立 `test/protocol-compatibility/s10/`）。
 
-### 2.4 已交付（S10-D D.1 + D.2 + D.3 + D.4：真实客户端证据、不落盘证明、安全专项、可观测）
+### 2.4 已交付（S10-D D.1 + D.2 + D.3 + D.4 + D.6：真实客户端证据、不落盘证明、安全专项、可观测、压测/容量）
 
 这两项**不是 CT 套件**：CT 覆盖协议状态机与门控顺序，这一层覆盖「真实独立实现能不能
 跑通」与「跑通的同时内核有没有写」。放在 `test/protocol-compatibility/s10/`（照
@@ -166,6 +166,36 @@
    （真订阅 + ack 必须让 `.cursors` 出现）证明 cursor 检测器看得见文件。
 3. **baseline 先 seed 一条消息**。空 WAL 的 `0 == 0` 不构成证据：seed 之后 baseline
    是 `high=2 / 117 字节`，`unchanged` 才是关于一个活着的写者的观察。
+
+**D.6 压测 / 容量（2026-11-14 交付）**：
+
+报告 [`docs/benchmarks/2026-11-14-s10-capacity.md`](../benchmarks/2026-11-14-s10-capacity.md)，
+原始 JSON 在 `test/protocol-compatibility/s10/bench/results/`（14 个 `webrtc_*.json` +
+`ice_bench.json`），一键复跑 `bench/run_bench.sh`。它同样**不是 CT 套件**：`run_bench.sh`
+自己起证据节点、跑矩阵、拆节点，只绑回环临时端口。
+
+| 段 | 脚本 | 断言 | 实测 |
+|---|---|---|---|
+| D.6-1 信令矩阵 | `bench/webrtc_bench.py`（Python `SignalingClient`，生产 `broker_proto_webrtc` 全路径） | 连接数 × 房间数 × 速率（顺序 + 并发）下的吞吐 / p50 / p99，`signals_relayed == signals_sent`、`errors == 0` | **PASS**：32 连接并发 1498.7/s（p50 1.6 ms）；顺序稳定 ~46/s（p50 1.4 ms）；速率扫描 10–500/s + 不限速（6346.8/s，但 p50 冲到 276 ms，如实标出） |
+| D.6-2 ICE allocation 速率 | `bench/ice_bench.erl` → `ice_test_client` | 顺序 50 次 + 并发 12 路（`max_allocations=16` 内）全成功，逐次 `Refresh(0)` 释放 | **PASS**：50/50（p50 893 µs）、12/12（p50 3.2 ms） |
+| D.6-3 relay 吞吐 | `bench/ice_bench.erl`（ChannelData 经绑定信道，256 B 载荷） | 5000 帧突发的送达率与 datagrams/s | **PASS（如实标丢包）**：3836/5000 送达（0.77）、5238 datagrams/s、1.28 MB/s |
+
+**D.6 的三个设计点（都不是装饰）**：
+
+1. **allocation 必须显式 `Refresh(0)` 释放**。关客户端 socket **不**释放 broker 端的
+   allocation（它活到 `allocation_lifetime_s = 600`），顺序测若不释放会撞满
+   `max_allocations` 并让后面全部失败。这与 RFC 5766 §7.2 以及 ADR-029 D4 一致。
+2. **relay 送达率如实给出，不抹平**。客户端不节流地连续发，回环 UDP 接收缓冲（1 MiB）
+   装不下就丢。报表用「首包 → 末包」时间跨度算速率，`delivered_ratio` 直接写 0.77——
+   这既证明 relay 路径能 sustain ~5k datagrams/s，也证明它**没有**上层流控（属非目标）。
+3. **harness 带内存守卫与断点续跑**。机器在外部负载下可用内存会掉到几百 MB 并把压测
+   进程 OOM-kill；`run_sig` 在每例前等可用内存 ≥ 800 MB（`LC_ALL=C free` 解析，本机
+   locale 是 zh_CN），并按「`webrtc_<tag>.json` 已存在即跳过」续跑。
+
+**D.6 顺带修复的真实缺陷**（详见 §8 与 ADR-029「S10-D 定稿说明」）：
+`turn_allocation:forward_to_peer/4` 曾把 `gen_udp:send` 的 `ok` 当 gen_server 新 state
+返回，使 relay 每次 allocation **只中继一帧**就 `badrecord` 崩溃。CT 只发一帧、cast 又
+是异步的，从未暴露；只有多帧中继的压测能戳穿。修复后 `turn_allocation_SUITE` 25/25。
 
 ## 3. 证据计划（真实第三方客户端）
 
@@ -280,14 +310,15 @@
 - [x] 出厂姿态：`enabled => false` → `config/0 = {ok, #{enabled => false}}`、监督树空、`broker_ice_udp`/`turn_allocation_sup` 未注册、3478 仍可被 `gen_udp:open/2` 拿到
 - [x] 既有 `rebar3 ct` 零回归：**1241/1241、79 套件**（S10-B 基线 1169/75 + 本阶段 72 例 / 4 套件）；`dialyzer` **0 warning**；`xref` 只剩 unused-export（本 app 20 条，全部是只被测试或运维调用的导出）；`rebar3 release` 装配成功，`lib/broker_ice-0.1.0` 存在
 
-**Gate S10 剩余（未勾选）**：
+**Gate S10 剩余项（S10-D 已全部收口）**：
 
-- [ ] 一份**真实第三方客户端**证据落盘 `test/protocol-compatibility/s10/`：`RTCPeerConnection` 完成 offer/answer/candidate 全时序 + STUN/TURN 连通性；一行能力矩阵 + 逐项限制清单
-- [ ] 信令「瞬时转发、不落盘」由 ADR-028 冻结并有测试证明（分区 `committed` offset 不变、数据目录无增长、`.cursors` 不写）
-- [ ] STUN/TURN 认证接身份表、凭据轮换、日志脱敏有专项用例；端口矩阵与防火墙要求写入 `docs/operations.md`
-- [ ] 压测 / 容量报告落盘，数字全部来自实测
-- [ ] ADR-028/029 定稿说明；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
-- [ ] §1.3 非目标与 §3.9 裁剪项在能力矩阵中逐行留痕
+- [x] 一份**真实第三方客户端**证据落盘 `test/protocol-compatibility/s10/`：`RTCPeerConnection` 完成 offer/answer/candidate 全时序 + STUN/TURN 连通性；一行能力矩阵 + 逐项限制清单 — **D.1 + D.5 已交付**
+- [x] 信令「瞬时转发、不落盘」由 ADR-028 冻结并有测试证明（分区 `committed` offset 不变、数据目录无增长、`.cursors` 不写）— **D.2 已交付**
+- [x] STUN/TURN 认证接身份表、凭据轮换、日志脱敏有专项用例；端口矩阵与防火墙要求写入 `docs/operations.md` — **D.3 + D.4 + D.5 已交付**
+- [x] 压测 / 容量报告落盘，数字全部来自实测（`docs/benchmarks/2026-11-14-s10-capacity.md` + 15 个原始 JSON〔14 信令 + 1 ICE〕）— **D.6 已交付**
+- [x] ADR-028/029 定稿说明；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步 — **D.7 已交付**
+- [x] §1.3 非目标与 §3.9 裁剪项在能力矩阵中逐行留痕 — **D.8 已交付**
+- [x] 既有 `rebar3 ct` 零回归（**1251/1251、79 套件**，2026-11-14 S10-D 收尾复跑；S10-C 基线 1241/79）；`dialyzer` 0 warning；`xref` 只剩 unused-export；`rebar3 release` 装配成功 — **D.7 已交付**
 
 ## 6. 风险与回退
 
@@ -311,10 +342,10 @@
 |---|---|---|
 | 真实第三方客户端证据（D.1） | `./run_evidence.sh`（aiortc 1.13.0，三段） | **三段全 PASS**：裸 STUN Binding（`0x0101` + XOR-MAPPED-ADDRESS 手工解码 + FINGERPRINT）；两 aiortc peer `connected` + DataChannel 载荷往返一致 + 18 个 `typ srflx`；TURN 正确凭据落在 `49500-49519`、错误凭据 0 候选 |
 | 不落盘运行时证明（D.2） | `./run_no_persist.sh` | **PASS**：seed 后 baseline `offsets=[{P1,0,1},{P0,0,2}]`、`wal_bytes=117`、`cursors=[]`；完整 1:1 通话后三者**逐字段不变**（`moved: []`）；负控 A append → `{P0,0,3}` + 228 字节；负控 B 真订阅 + ack → `.cursors` 出现 |
-| 安全专项冻结用例（D.3） | `rebar3 ct`（affected suites） | **全绿**：`webrtc_route_SUITE` 17、`webrtc_conn_SUITE` 34、`webrtc_acl_SUITE` 13、`webrtc_signal_SUITE` 13、`turn_allocation_SUITE` 24；新增 8 例覆盖类型混淆 / 持续滥用退化 / 回环自投 / 深嵌套+非法 UTF-8 健壮性 / 超大 `to` 帧界 / channel 闭区间 / 畸形 LIFETIME 健壮性 |
-| 可观测（D.4） | `rebar3 ct`（route + conn + turn_allocation + turn_auth） | **全绿**：`webrtc_route_SUITE` 18（+1 日志脱敏例）、`webrtc_conn_SUITE` 34、`turn_allocation_SUITE` 24、`turn_auth_SUITE` 16（`no_password_or_key_reaches_the_log` 仍过）；`webrtc_conn` 加结构化脱敏日志、`turn_allocation` 加生命周期日志；`broker_metrics` 键集未动 |
-| 全量 CT / dialyzer / xref / release | 同 S10-C 命令 | **未复跑**（D.5–D.8 完成后一次性复跑，届时回填本表） |
-| 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
+| 安全专项冻结用例（D.3） | `rebar3 ct`（affected suites） | **全绿**：`webrtc_route_SUITE` 17、`webrtc_conn_SUITE` 34、`webrtc_acl_SUITE` 13、`webrtc_signal_SUITE` 13、`turn_allocation_SUITE` 24（D.6 后为 25，见下行）；新增 8 例覆盖类型混淆 / 持续滥用退化 / 回环自投 / 深嵌套+非法 UTF-8 健壮性 / 超大 `to` 帧界 / channel 闭区间 / 畸形 LIFETIME 健壮性 |
+| 可观测（D.4） | `rebar3 ct`（route + conn + turn_allocation + turn_auth） | **全绿**：`webrtc_route_SUITE` 18（+1 日志脱敏例）、`webrtc_conn_SUITE` 34、`turn_allocation_SUITE` 24（D.6 后为 25）、`turn_auth_SUITE` 16（`no_password_or_key_reaches_the_log` 仍过）；`webrtc_conn` 加结构化脱敏日志、`turn_allocation` 加生命周期日志；`broker_metrics` 键集未动 |
+| 全量 CT / dialyzer / xref / release | 同 S10-C 命令 | **已复跑（2026-11-14）**：`rebar3 ct` → **1251/1251、79 套件、零 FAILED、零 Skipped**（S10-C 基线 1241/79 + S10-D 在既有套件内的 10 例：`webrtc_route_SUITE` 14→18、`webrtc_conn_SUITE` 31→34、`turn_allocation_SUITE` 22→25；套件数不变）；`dialyzer` **0 warning**；`xref` 285 条全部 unused-export（无 undefined/deprecated），`broker_ice` 20 / `broker_proto_webrtc` 14；`rebar3 release` 装配成功且 `lib/` 含 `broker_ice-0.1.0` 与 `broker_proto_webrtc-0.1.0` |
+| 压测 | 见 `docs/benchmarks/2026-11-14-s10-capacity.md` §1 | **已由 S10-D D.6 完成**：信令 32 连接并发 1498.7/s（p50 1.6 ms）；ICE allocation 顺序 p50 893 µs / 并发 12 路 p50 3.2 ms；relay ~5.2k datagrams/s（0.77 送达，如实标出）。报告 + 14 信令 JSON + 1 ICE JSON 落盘 |
 
 **S10-C 实测（2026-11-14）**：
 
@@ -326,7 +357,7 @@
 | Release（默认） | `rebar3 release` | 装配成功，`_build/default/rel/unified_mq/lib/broker_ice-0.1.0` 存在 |
 | 出厂 release 启动 | 装配出的 `sys.config`（无 `broker_ice` 段）+ `-pa` 加载后 | `validate/0 → ok`；`config/0 → {ok, #{enabled => false}}`；`ensure_all_started(broker_ice)` 后 `supervisor:which_children(broker_ice_sup) → []`，`whereis(broker_ice_udp) → undefined`、`whereis(turn_allocation_sup) → undefined`；**3478/UDP 仍可被 `gen_udp:open/2` 拿到**（零 socket） |
 | STUN/TURN 证据 | `turn_allocation.py` + 裸 UDP `stun_raw.py` | **已由 S10-D D.1 完成**（aiortc 1.13.0，见 §2.4 与 §7 的 S10-D 段）：裸 UDP Binding + aiortc TURN Allocate 均 PASS |
-| 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
+| 压测 | 见 `docs/benchmarks/2026-11-14-s10-capacity.md` §1 | **已由 S10-D D.6 完成**：信令 32 连接并发 1498.7/s（p50 1.6 ms）；ICE allocation 顺序 p50 893 µs / 并发 12 路 p50 3.2 ms；relay ~5.2k datagrams/s（0.77 送达，如实标出）。报告 + 14 信令 JSON + 1 ICE JSON 落盘 |
 
 **S10-B 实测（2026-11-13）**：
 
@@ -340,7 +371,7 @@
 | 出厂 release 启动 | 装配出的 `sys.config`（无 `broker_proto_webrtc` 段）+ `-pa` 加载后 | `validate/0 → ok`；`ensure_all_started` 后监督树子进程只有 `webrtc_room_registry`，**零 listener**；`webrtc_room_registry:rooms() → []`；`shard_count() → 16`（= `schedulers_online`） |
 | 信令证据 | `webrtc_peer.py`（aiortc） | **已由 S10-D D.1 完成**（`webrtc_evidence.py`，见 §2.4）：两 aiortc peer `connected` + DataChannel 往返 |
 | 「不落盘」证明 | S10-0 的 `assert_no_persistence` 脚本 | **已由 S10-D D.2 完成**（S10-0 的 spike 里并没有这个脚本，见 §8「S10-D」第 1 条）：`run_no_persist.sh` + 两条负控 |
-| 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
+| 压测 | 见 `docs/benchmarks/2026-11-14-s10-capacity.md` §1 | **已由 S10-D D.6 完成**：信令 32 连接并发 1498.7/s（p50 1.6 ms）；ICE allocation 顺序 p50 893 µs / 并发 12 路 p50 3.2 ms；relay ~5.2k datagrams/s（0.77 送达，如实标出）。报告 + 14 信令 JSON + 1 ICE JSON 落盘 |
 
 **S10-A 实测（2026-11-13）**：
 
@@ -355,13 +386,13 @@
 | 信令证据 | `PYTHONPATH=/tmp/opencode/s10-libs /usr/bin/python3 test/protocol-compatibility/s10/webrtc_peer.py` | **已由 S10-D D.1 完成**（S10-A 当时无 `to` 转发，1:1 信令走不通；S10-B 补齐后由 D.1 跑通） |
 | STUN/TURN 证据 | 同上（`turn_allocation.py` + 裸 UDP `stun_raw.py`） | **已由 S10-D D.1 完成** |
 | 「不落盘」证明 | S10-0 的 `assert_no_persistence` 脚本 | **已由 S10-D D.2 完成** |
-| 压测 | 见 `docs/benchmarks/<date>-s10-capacity.md` §1 | **未做**（S10-D D.6） |
+| 压测 | 见 `docs/benchmarks/2026-11-14-s10-capacity.md` §1 | **已由 S10-D D.6 完成**：信令 32 连接并发 1498.7/s（p50 1.6 ms）；ICE allocation 顺序 p50 893 µs / 并发 12 路 p50 3.2 ms；relay ~5.2k datagrams/s（0.77 送达，如实标出）。报告 + 14 信令 JSON + 1 ICE JSON 落盘 |
 
 ## 8. 落地偏差记录
 
 > 格式照 `docs/design/s9-f-execution-plan.md` §落地偏差记录：每条写「计划 → 实际 → 为什么 → 留痕位置」。设计稿原文不改，偏差只在这里与 ADR 批注里记。
 
-### S10-D（2026-11-14，D.1 + D.2 + D.3 + D.4）
+### S10-D（2026-11-14，D.1 + D.2 + D.3 + D.4 + D.6 + D.7）
 
 1. **D.2 说的「复用 S10-0 的 `assert_no_persistence` 脚本」并不存在**
    - 计划：§1 D.2 与 §7 的 S10-A/B/C 三张表都写「S10-0 的 `assert_no_persistence` 脚本」，§3 说「脚本退出码 0；S10-D 直接复用」。
@@ -431,6 +462,36 @@
    - 实际：快照记录 `session_files` 供人看，但 `diff/2` 只比 `offsets`/`wal_bytes`/`cursors`。
    - 为什么：D.2 的契约是那三条；守卫一旦偏离自己的契约就会被关掉。`.subs`/`.inflight` 同属订阅数据面，本次实测也确为空，但不把它塞进判定条件。
    - 留痕：`s10_no_persist:diff/2` 与模块 doc；`no_persistence.jsonl` 的 snapshot 行。
+
+12. **D.6 压测戳穿一个真实的 relay 缺陷：每次 allocation 只中继一帧就崩**
+   - 计划：D.6 只要求「ICE allocation 速率 + relay 吞吐」两组数字，未预期发现实现缺陷。
+   - 实际：`turn_allocation:handle_cast({forward_to_peer, ...})` 把 `forward_to_peer/4` 的返回值直接当新 state，而该函数原本 `return gen_udp:send(...)` 的 `ok`——`#st{}` 记录被原子 `ok` 顶替，**第二个 ChannelData 到达即 `badrecord` 崩溃**，relay 每次 allocation 只工作一帧。CT（`channel_data_*`）只发一帧、cast 又是异步的，所以从未暴露；只有连续多帧的压测能戳穿。修复：`forward_to_peer/4` 返回 `St`；回归用例 `consecutive_channel_data_frames_all_relay`（5 帧顺序中继后 `broker_ice_udp:allocations()` 仍为 1），`turn_allocation_SUITE` 24→25。
+   - 为什么：这是数据面正确性缺陷，不是测量口径问题。修在实现里（一行），不改 ADR-029 D4 的决策文本（「每 allocation 一进程 + ChannelData 中继」未变，修的是让它在多帧下真正成立的 state 传递）。
+   - 留痕：`apps/broker_ice/src/turn_allocation.erl:forward_to_peer/4`、`turn_allocation_SUITE:consecutive_channel_data_frames_all_relay/1`、ADR-029「S10-D 定稿说明」第 1 条、`docs/benchmarks/2026-11-14-s10-capacity.md` §4。
+
+13. **D.6 的 relay 送达率如实是 0.77，不是 1.0**
+   - 计划：只说「relay 吞吐」。
+   - 实际：客户端不节流连续发 5000 帧（256 B），回环 UDP 接收缓冲（1 MiB）装不下就丢，实收 3836 帧（0.77）。报表用「首包 → 末包」时间跨度算速率（5238 datagrams/s、1.28 MB/s），`delivered_ratio` 直接写 0.77。
+   - 为什么：抹平成「平均吞吐」会把「无流控会丢」这个事实藏起来。relay 是 RFC 5766 §14 应用数据中继，丢包交给上层（DTLS/SCTP/RTP）；给 TURN 加窗口/ACK 属明确非目标。数字按实际写，容量规划才能留够余量。
+   - 留痕：容量报告 §2/§5；`ice_bench:relay_throughput/5` 的 `delivered_ratio`。
+
+14. **D.6 的 allocation 计时必须显式 `Refresh(0)`，否则顺序测会撞满配额**
+   - 计划：只说「allocation 建立速率」。
+   - 实际：关客户端 socket **不**释放 broker 端 allocation（`allocation_lifetime_s = 600`），顺序测 50 次若不释放会先撞 `max_allocations`。harness 对每个 allocation 建立后立即 `Refresh(0)`。
+   - 为什么：这是 RFC 5766 §7.2 的语义（allocation 要显式释放），也是 ADR-029 D4 冻结的生命周期边界；harness 必须顺着它实现，不能靠「关 socket 应该会释放」的错觉。
+   - 留痕：`bench/ice_bench.erl:time_alloc/1`；容量报告 §2 前置说明；`ice_test_client:refresh/3`。
+
+15. **D.6 的 harness 需要内存守卫与断点续跑（机器带外部负载）**
+   - 计划：未提。
+   - 实际：机器在外部负载下可用内存会掉到几百 MB，第一次全量矩阵把 python 信令进程 OOM-kill。`run_bench.sh` 因此加两件事：① 每个信令用例前等可用内存 ≥ 800 MB（`LC_ALL=C free -m` 解析——本机 locale 是 zh_CN，`/^Mem:/` 在本地化输出下匹配不上）；② 按「`webrtc_<tag>.json` 已存在即跳过」断点续跑。
+   - 为什么：压测的负载不该包括「把压测进程自己 OOM 掉」。这是对测量环境的诚实处理，不是放宽测项。
+   - 留痕：`bench/run_bench.sh` 的 `run_sig()` 与 `.gitignore` 注释（scratch 排除、harness 与 results 提交）。
+
+16. **D.7 的零回归复跑有两次环境性偶发失败（如实记录，不是回归）**
+   - 计划：一次跑出「全绿 + 零 Skipped」。
+   - 实际：本机在该时段带外部负载（16 核上 load average 一度 45–58，另一项目的 C++ 编译 + 多个 JVM/Gradle 守护进程），前两次全量跑各出现 1 例与本阶段无关的失败：第一次是 `broker_cluster_dist_SUITE` 的 `init_per_suite`（epmd 尚未启动，`net_kernel:start` 失败 → 全 4 例 auto-skip；epmd 起来后单跑 4/4 通过），第二次是 `mqtt_ws_conn_SUITE:subprotocol_mqtt_is_negotiated`（`raw_handshake_on` 读超时）与第三次 `broker_subscription_SUITE:retry_progress_survives_a_restart`（`{badmatch,{ok,1}}`，cursor tick 与 `timer:sleep(150)` 在负载下竞态）。三者都是既有套件、`git diff` 确认未被 S10-D 触碰，单跑全部通过。第四次全量跑取得 **1251/1251、79 套件、零 FAILED、零 Skipped**。
+   - 为什么：把环境性抖动写成「回归」会误导；把失败悄悄抹掉更糟。三者都单跑复验，并在此记录负载条件与失败点。
+   - 留痕：本条；`docs/roadmap.md` §12.1 S10-D 行；`progress.md` 的 S10-D 交付段。
 
 ### S10-C（2026-11-14）
 

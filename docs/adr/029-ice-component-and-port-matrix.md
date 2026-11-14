@@ -102,3 +102,28 @@ S10 的第二个组件是为浏览器 `RTCPeerConnection` 提供 STUN/TURN 辅�
    - 计划 → 实际：`broker_ice_udp` 是唯一 socket owner，持 `{ClientIp, ClientPort, udp} => #{pid, relay_port, username}` 索引并 `monitor` 每个 allocation；`turn_allocation_sup` 只管进程归属（`one_for_one` + 每 allocation 一条 `temporary` child spec，`simple_one_for_one` 在 OTP 27 起废弃）。
    - 为什么：5-tuple 的归属判定必须在收包路径上、且必须与 socket 同生灭；放进独立注册表进程会多一次 RPC 且引入「注册表活着、socket 死了」的半死状态。
    - 留痕：`broker_ice_udp.erl` 的 `#st{}` 注释、`turn_allocation_sup.erl` 模块注释。
+
+### S10-D 定稿说明（2026-11-14）
+
+> 冻结文本（D1~D6：app 边界、端口矩阵、裁剪项、单节点语义）**全部不变**，本说明只记录 S10-D 收尾时的核对结论与一处数据面实现缺陷修复。
+
+1. **D4 relay 数据面缺陷修复：每次分配只中继一帧就崩（已修 + 回归）**
+   - 计划：D4 冻结「每 allocation 一个 `temporary` 进程，ChannelData 中继」；CT 与 D.1 证据均只发单帧，`badrecord` 从未暴露。
+   - 实际：`turn_allocation:handle_cast({forward_to_peer, ...})` 把 `forward_to_peer/4` 的返回值直接当新 state，而该函数原 `return gen_udp:send(...)` 的 `ok`——于是 `#st{}` 记录被原子 `ok` 顶替，**第二个 ChannelData 到达即 `badrecord` 崩溃**，relay 只工作一帧。修复：`forward_to_peer/4` 返回 `St`（`gen_udp:send` 的 `ok` 被丢弃）。
+   - 为什么：gen_server 的 `handle_cast` 回调必须返回新 state；返回 I/O 结果会把记录换成原子。这是 relay 路径的核心正确性 bug，属 D4 数据面实现范围（不是 D2 端口矩阵、不是 D3 认证）。
+   - 留痕：`apps/broker_ice/src/turn_allocation.erl` `forward_to_peer/4`、回归用例 `turn_allocation_SUITE:consecutive_channel_data_frames_all_relay/1`（5 帧顺序中继后 `broker_ice_udp:allocations()` 仍为 1）、`docs/benchmarks/2026-11-14-s10-capacity.md` §4。
+   - **D4 冻结文本无需变更**：决策「每 allocation 一个进程、ChannelData 中继」未变，修复的是让该决策在多帧下真正成立的 state 传递。
+
+2. **D4 生命周期边界的实测确认**
+   - 计划：D4 冻结「每 allocation 一个 `temporary` 进程，生命周期默认 600 s，`Refresh(0)` 删除」。
+   - 实际：D.6 压测的 allocation 计时必须**每个 allocation 建立后立即 `Refresh(0)` 释放**——否则关客户端 socket 不释放 broker 端 allocation（活到 600 s），顺序测会撞满 `max_allocations`。这与 D4 的「客户端关 socket ≠ 释放 allocation，需显式 Refresh(0)」一致（RFC 5766 §7.2），压测 harness 据此如实实现。
+   - 留痕：`test/protocol-compatibility/s10/bench/ice_bench.erl` 的 `time_alloc/1`、`docs/benchmarks/2026-11-14-s10-capacity.md` §2/§3。
+   - **冻结文本无需变更**。
+
+3. **D6 relay 吞吐口径的如实标注**
+   - 计划：D6 要求 relay 吞吐写进容量报告。
+   - 实际：D.6 测的是 **RFC 5766 §14 应用数据中继（ChannelData）**，非 RTP/SRTP/DTLS 媒体面（媒体面 R-I6 明确不做）。无流控的突发中继送达率 0.77，如实标出（回环缓冲被打满的丢包），不外推。
+   - 留痕：`docs/benchmarks/2026-11-14-s10-capacity.md` §2/§5。
+   - **冻结文本无需变更**。
+
+- **结论**：ADR-029 全部决策在 S10-D 收尾时与实现一致；relay 单帧缺陷已修并回归，D1~D6 无待办修订。

@@ -22,7 +22,7 @@
          allocate/3, allocate_with/4,
          request/5, refresh/4, create_permission/4,
          channel_bind/5, channel_data/4, send_indication/4,
-         recv/1, recv/2, recv_data/1,
+         recv/1, recv/2, recv_data/1, recv_data/2,
          key/3, sign/2, xaddr/2, transaction_id/0]).
 
 -define(TIMEOUT, 3000).
@@ -140,7 +140,10 @@ recv(Socket, Timeout) ->
 
 %% @doc Wait for one relayed payload: either ChannelData or a Data indication.
 recv_data(Socket) ->
-    case recv(Socket) of
+    recv_data(Socket, ?TIMEOUT).
+
+recv_data(Socket, Timeout) ->
+    case recv(Socket, Timeout) of
         timeout ->
             timeout;
         {ok, <<Channel:16, Len:16, Rest/binary>>} when Channel >= 16#4000 ->

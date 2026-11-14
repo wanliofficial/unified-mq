@@ -44,6 +44,7 @@ all() ->
      without_a_permission_a_send_is_dropped,
      channel_bind_without_a_permission_is_a_403,
      channel_data_reaches_the_peer,
+     consecutive_channel_data_frames_all_relay,
      peer_data_arrives_as_a_channel_data_frame,
      peer_data_without_a_binding_arrives_as_a_data_indication,
      peer_data_without_a_permission_is_dropped,
@@ -454,6 +455,38 @@ channel_data_reaches_the_peer(_Config) ->
         ok = ice_test_client:channel_data(Socket, Port, ?CHANNEL,
                                           <<"over the channel">>),
         ?assertEqual({ok, <<"over the channel">>}, peer_recv(Peer))
+    after
+        ice_test_client:close(Socket),
+        ice_test_client:close(Peer)
+    end.
+
+consecutive_channel_data_frames_all_relay(_Config) ->
+    %% A relay only works if the allocation survives *more than one* frame.
+    %% `handle_cast' feeds `forward_to_peer''s return value straight into the
+    %% gen_server state; if that call returned `ok' (what `gen_udp:send'
+    %% yields) the `#st{}' record would be replaced by the atom `ok' and the
+    %% *second* ChannelData would crash the allocation with `badrecord'. So the
+    %% real assertion is "N frames in, N payloads out", and the allocation is
+    %% still listed afterwards.
+    Socket = ice_test_client:open(),
+    Peer = peer_socket(),
+    try
+        Alloc = allocate(Socket),
+        Port = broker_ice_udp:port(),
+        PeerAddr = peer_addr(Peer),
+        {ok, _} = ice_test_client:create_permission(Socket, Port, Alloc,
+                                                    [PeerAddr]),
+        {ok, _} = ice_test_client:channel_bind(Socket, Port, Alloc, ?CHANNEL,
+                                               PeerAddr),
+        [ice_test_client:channel_data(Socket, Port, ?CHANNEL,
+                                      list_to_binary(integer_to_list(N)))
+         || N <- lists:seq(1, 5)],
+        Received = [peer_recv(Peer) || _ <- lists:seq(1, 5)],
+        ?assertEqual([{ok, <<"1">>}, {ok, <<"2">>}, {ok, <<"3">>},
+                       {ok, <<"4">>}, {ok, <<"5">>}], Received),
+        %% The allocation is still registered: it did not self-destruct after
+        %% the first frame.
+        ?assertEqual(1, length(broker_ice_udp:allocations()))
     after
         ice_test_client:close(Socket),
         ice_test_client:close(Peer)

@@ -1,0 +1,22 @@
+{
+  "rooms": 16,
+  "peers_per_room": 2,
+  "connections": 32,
+  "rate_per_pair": 0,
+  "total_per_pair": 200,
+  "mode": "concurrent",
+  "wall_seconds": 0.5042,
+  "signals_sent": 3200,
+  "signals_relayed": 3200,
+  "errors": 0,
+  "aggregate_throughput_per_s": 6346.8,
+  "per_pair_throughput_per_s": 396.7,
+  "latency_us": {
+    "count": 3200,
+    "mean": 269582.1,
+    "p50": 276317.8,
+    "p95": 375465.8,
+    "p99": 381996.2,
+    "max": 383956.5
+  }
+}
