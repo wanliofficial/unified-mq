@@ -54,7 +54,15 @@
 | [028](028-webrtc-signaling-kernel-boundary.md) | WebRTC 信令面边界：进程直投、不产生 `#broker_message{}`、无 cursor/retention/SubRef；「不落盘」是契约且 ACP 式 transient 不落盘前提不成立；`room` 不是 destination；注册表单节点无 Mnesia；ACL 的 `destination` 仅模式主体；守护 = 源码级守卫测试 + 评审 + 不落盘实测（xref 证明不了调用边） | webrtc-server §2.3/§2.4；`broker_queue:append/3` 无 transient 旁路；`broker_security:authorize/2` 键集合；ADR-001/002/007/009/010/013/015/016/021/025 |
 | [029](029-ice-component-and-port-matrix.md) | ICE 组件：`broker_ice` 独立 app（不依赖 ranch/kernel 之外的任何新包，手写 STUN/TURN 编解码）；端口矩阵 3478/UDP + relay 49152-65535/UDP，5349/TCP-TLS/DTLS 首期不做；TURN 长期凭据接身份表、口令不进日志；单节点，集群另立 ADR | IANA 3478/49152-65535；RFC 8489/5766；webrtc-server README 与 `add_listener(3478, udp, ...)`；hex 元数据 cowboy `ranch ~> 1.4.0` / `stun` 拖 `fast_tls`；ADR-007/016/021/027/028 |
 
-> S9 决策只冻结抽象与边界，S9-A~S9-F 的代码与 Gate 证据尚未产出（roadmap §11.1）；结论与证据汇总见 [`docs/design/s9-0-convergence-report.md`](../design/s9-0-convergence-report.md)。
+### S10 / S11 决策（已采纳，2026-11-13 ~ 2026-11-15 冻结）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [028](028-webrtc-signaling-kernel-boundary.md) | WebRTC 信令面边界：进程直投、不产生 `#broker_message{}`、无 cursor/retention/SubRef；「不落盘」是契约且 ACP 式 transient 不落盘前提不成立；`room` 不是 destination；注册表单节点无 Mnesia；ACL 的 `destination` 仅模式主体；守护 = 源码级守卫 + 评审 + 不落盘实测 | webrtc-server §2.3/§2.4；`broker_queue:append/3` 无 transient 旁路；`broker_security:authorize/2`；ADR-001/002/007/009/010/013/015/016/021/025 |
+| [029](029-ice-component-and-port-matrix.md) | ICE 组件：`broker_ice` 独立 app（手写 STUN/TURN 编解码、零新依赖）；端口 3478/UDP + relay 49152-65535/UDP，5349/TCP-TLS/DTLS 首期不做；TURN 长期凭据接身份表、口令不进日志；单节点，集群另立 ADR | IANA 3478/49152-65535；RFC 8489/5766；webrtc-server README 与 `add_listener(3478, udp, ...)`；hex cowboy `ranch ~> 1.4.0`；ADR-007/016/021/027/028 |
+| [030](030-s11-protocol-pool-screening.md) | S11 候选池筛选：**仅 CoAP 进入实现评审**（S11-A/B/C），不写第二套内核；归并 lorawan-server（桥接后端 Connector）/ processone/stun（复用 S10 ICE）/ apns4erl（归并 S9 出站）；SIP 一组**并入 ADR-028 信令面**评估、不单独立项；发现面（mdns/dnssd/rbeacon/erldns + DHT 两仓）**保留为延迟候选**（不关闭不实现）；mtproto_proxy / dhtcrawler / yxa 明确不做；可靠性显式分档、不替代 S4 Membership、无外部守护进程、无 CloudEvents 逐字 Binding、不预承诺数字 | 14 仓三段式立项稿（9 深挖 + 5 索引级）；[`s11-protocol-candidates.md`](../design/s11-protocol-candidates.md) §1/§3/§4.4；RFC 7252/7641/6690（CoAP）、RFC 6763（DNS-SD）、SIP RFC 3261（部分）；ADR-001/007/009/013/016/021/027/028/029 |
+
+> S10 决策只冻结抽象与边界，S10-0~S10-D 已交付（S10-D 于 2026-11-14 收口，`rebar3 ct` 1251/1251）；S11 决策只冻结候选池筛选结论，S11-0 无代码、S11-A/B/C 尚未开工（roadmap §13）。
 
 ## Gate S0 验收清单（roadmap §2）
 

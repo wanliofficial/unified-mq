@@ -479,7 +479,7 @@ S7 有两项交付：
 
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
-| S11-0 候选池筛选 | ⬜ 未开工 | 14 仓「立项 / 归并 / 参考 / 不做」结论 + ADR；发现面 / DHT / SIP 三组统一裁决；5 份索引级稿的深挖去向 | 本总览 + 14 份立项稿 + 评审签认；**不新增 app / 端口 / 代码路径** |
+| S11-0 候选池筛选 | ✅ **已交付（2026-11-15，ADR-030）** | 14 仓「立项 / 归并 / 参考 / 不做」结论 + ADR-030；发现面 / DHT / SIP 三组统一裁决；5 份索引级稿的深挖去向 | **ADR-030 + 14 份立项稿 + 评审签认**（S11-0 纯文档，无代码）；**仅 CoAP 进入实现评审**，SIP 并入 ADR-028，发现面保留为延迟候选 |
 | S11-A CoAP 前端与编解码 | ⬜ 未开工 | 仅当 S11-0 通过：UDP/DTLS 前端 + 报文编解码 + 资源路由 + `.well-known/core` | libcoap 真实客户端 GET/PUT 用例；既有 823/823 零回归 |
 | S11-B CoAP Observe 与内核映射 | ⬜ 未开工 | Observe 订阅 / 通知 / 取消 + `broker_message` 映射 + 可靠性分档 | Observe 全流程 + 崩溃恢复用例；映射 ADR |
 | S11-C CoAP 安全与一致性收口 | ⬜ 未开工 | 身份表 / ACL / 限流 / 能力矩阵 / 压测 / 文档同步 / ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 + 安全专项用例 |
@@ -498,7 +498,7 @@ S7 有两项交付：
 - [ ] S11 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
 - [ ] 非目标与裁剪项在能力矩阵中逐行留痕
 
-**状态口径**：**S11 全部「⬜ 未开工」，Gate S11 全未勾选，无任何「已实测」数字**；S11 排在 S10 之后但不阻塞 S10。README / `progress.md` / `architecture.md` 的「S0–S8 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——本阶段只新增文档，没有新增 app、端口或代码路径，待 S11-0 通过且有首个代码交付时统一同步，避免把计划读成现状。**当前建议仅 CoAP 进入实现评审**（总览 §3.1 A 档），其余按「归并 / 参考 / 明确不做」收口。
+**状态口径**：**S11-0 已交付（2026-11-15，ADR-030 冻结候选池筛选结论，纯文档无代码）；S11-A/B/C 全部「⬜ 未开工」，Gate S11 除 S11-0 外全未勾选，无任何「已实测」数字**。ADR-030 裁决：**仅 CoAP 进入实现评审**（S11-A/B/C），SIP 一组并入 ADR-028 信令面评估，发现面保留为延迟候选，lorawan-server / processone/stun / apns4erl 归并既有阶段，mtproto_proxy / dhtcrawler / yxa 明确不做。README / `progress.md` / `architecture.md` 的「S0–S10 已实现」状态行与 `docs/security.md` §12 清单**本阶段仍不改动**——S11-0 无代码交付，待 S11-A 有首个代码交付时统一同步，避免把计划读成现状。
 
 ---
 
