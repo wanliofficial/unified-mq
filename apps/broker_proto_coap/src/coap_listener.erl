@@ -66,7 +66,8 @@
     %% (a coap_observe:relationship()). Bounded by `max_observes'.
     observes = #{} :: map(),
     %% Un-acked CON notifications awaiting an ACK: {IP,Port,Token} ->
-    %% {Bytes, RetransLeft, TimerRef}. Reused by the dedup/Block1-free path.
+    %% {Bytes, TimerRef}. The retransmit budget is carried by the timer itself
+    %% (observe_ack_timeout_ms), so no separate counter is stored.
     pending = #{} :: map()
 }).
 
@@ -431,18 +432,23 @@ register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
     end.
 
 %% Called by respond/5 for a GET with Observe=1. Drops the relationship and
-%% unsubscribes from the kernel. Always succeeds (RFC 7641 §3.5: deregistering a
-%% relationship that is not there is not an error).
+%% unsubscribes that one subscription from the kernel. Always succeeds (RFC 7641
+%% §3.5: deregistering a relationship that is not there is not an error).
+%%
+%% NOTE granularity: `broker_subscription:unsubscribe/2' removes exactly one
+%% subscription, but `detach/2' tears down the WHOLE client session (every
+%% `<<"coap">>' subscription). Because all observations share one anonymous
+%% ClientId, detach is only safe once the LAST relationship is gone -- see
+%% `maybe_detach/1'.
 deregister_observe(IP, Port, Token, #st{observes = Obs} = St) ->
     Key = {IP, Port, Token},
     case coap_observe:deregister(Key, Obs) of
         {undefined, Obs1} ->
-            St#st{observes = Obs1, pending = maps:remove(Key, St#st.pending)};
+            cancel_pending(Key, St#st{observes = Obs1});
         {Rel, Obs1} ->
             _ = (catch broker_subscription:unsubscribe(
                    ?COAP_CLIENT, coap_observe:filter(maps:get(dest, Rel)))),
-            _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
-            St#st{observes = Obs1, pending = maps:remove(Key, St#st.pending)}
+            maybe_detach(cancel_pending(Key, St#st{observes = Obs1}))
     end.
 
 %% The kernel delivered a message to an attached subscription (ADR-031 §D2:
@@ -459,26 +465,35 @@ dispatch_notifications(#broker_message{} = Msg,
 
 %% Send one notification. The relationship's `req_type' decides CON (reliable:
 %% retransmit until ACKed, tracked in `pending') vs NON (at-most-once: fire once).
-notify_one(Key, Rel, Msg, Cfg, #st{pending = Pend} = St) ->
+notify_one({IP, Port, Token} = Key, Rel, Msg, Cfg,
+           #st{pending = Pend, observes = Obs} = St) ->
     Type = maps:get(req_type, Rel, con),
-    Token = element(3, Key),
     Now = now_ms(),
     {Seq, Rel1} = coap_observe:next_seq(Rel, Now),
     Note = coap_observe:notify_message(Type, Seq, Token, Msg),
     Bytes = coap_codec:encode(Note#{id => next_id()}),
-    IP = element(1, Key),
-    Port = element(2, Key),
     _ = gen_udp:send(St#st.socket, IP, Port, Bytes),
     case Type of
         con ->
             Timeout = maps:get(observe_ack_timeout_ms, Cfg, 2000),
-            Ref = erlang:start_timer(Timeout, self(), observe_ack),
             Left = maps:get(observe_max_retrans, Cfg, 3),
-            St#st{observes = maps:put(Key, Rel1, St#st.observes),
-                  pending = maps:put(Key, {Bytes, Left, Ref}, Pend)};
+            {Bytes1, Ref} = arm_retransmit(Key, Bytes, Pend, Timeout),
+            St#st{observes = maps:put(Key, Rel1, Obs),
+                  pending = maps:put(Key, {Bytes1, Left, Ref}, Pend)};
         non ->
-            St#st{observes = maps:put(Key, Rel1, St#st.observes)}
+            St#st{observes = maps:put(Key, Rel1, Obs)}
     end.
+
+%% (Re)arm the retransmit timer for one relationship, cancelling any previous one
+%% so a same-key refresh never leaves an orphaned timer firing later. The retransmit
+%% budget is the `RetransLeft' counter stored alongside the bytes (ADR-031 §D3
+%% upper bound); this only manages the timer.
+arm_retransmit(Key, Bytes, Pend, Timeout) ->
+    case maps:find(Key, Pend) of
+        {ok, {_Old, _OldLeft, OldRef}} -> _ = erlang:cancel_timer(OldRef);
+        error -> ok
+    end,
+    {Bytes, erlang:start_timer(Timeout, self(), observe_ack)}.
 
 %% The 1 s refill tick also drops relationships silent longer than their own
 %% Max-Age window. Side-effecting (it unsubscribes), so it cannot live in the
@@ -493,45 +508,68 @@ sweep_observes(#st{observes = Obs, cfg = Cfg} = St) ->
                       _ = (catch broker_subscription:unsubscribe(
                              ?COAP_CLIENT,
                              coap_observe:filter(maps:get(dest, Rel)))),
-                      _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
-                      Acc#st{observes = maps:remove(Key, Acc#st.observes),
-                             pending = maps:remove(Key, Acc#st.pending)};
+                      maybe_detach(cancel_pending(Key, Acc#st{
+                                         observes = maps:remove(Key, Acc#st.observes)}));
                   false ->
                       Acc
               end
       end, St, maps:to_list(Obs)).
 
-%% A CON notification went un-acked: resend each pending CON once and count the
-%% retransmit down; at zero it unsubscribes and drops the relationship.
+%% A CON notification went un-acked: resend it once, counting the retransmit down;
+%% at zero give up and tear the relationship down. Every timer fired here is
+%% cancelled (it either re-arms a fresh one or the entry is dropped).
 retransmit_observes(#st{pending = Pend} = St) ->
     lists:foldl(
-      fun({Key, {Bytes, Left, _Ref}}, Acc) ->
-              IP = element(1, Key),
-              Port = element(2, Key),
-              _ = gen_udp:send(Acc#st.socket, IP, Port, Bytes),
+      fun({Key, {Bytes, Left, Ref}}, Acc) ->
+              _ = erlang:cancel_timer(Ref),
+              _ = gen_udp:send(Acc#st.socket, element(1, Key), element(2, Key),
+                               Bytes),
               case Left - 1 of
                   0 ->
                       drop_relationship(Key, Acc);
                   Left1 ->
-                      Timeout = maps:get(observe_ack_timeout_ms, Acc#st.cfg, 2000),
-                      Ref = erlang:start_timer(Timeout, self(), observe_ack),
-                      Acc#st{pending = maps:put(Key, {Bytes, Left1, Ref},
+                      Timeout = maps:get(observe_ack_timeout_ms, Acc#st.cfg,
+                                         2000),
+                      {Bytes1, Ref1} =
+                          arm_retransmit(Key, Bytes, Acc#st.pending, Timeout),
+                      Acc#st{pending = maps:put(Key, {Bytes1, Left1, Ref1},
                                                  Acc#st.pending)}
               end
       end, St, maps:to_list(Pend)).
 
-%% Give up on a relationship: unsubscribe, detach, forget it.
+%% Give up on one relationship: unsubscribe it and forget it.
 drop_relationship(Key, #st{observes = Obs, pending = Pend} = St) ->
     case maps:find(Key, Obs) of
         {ok, Rel} ->
             _ = (catch broker_subscription:unsubscribe(
-                   ?COAP_CLIENT,
-                   coap_observe:filter(maps:get(dest, Rel)))),
-            _ = (catch broker_subscription:detach(?COAP_CLIENT, self()));
+                   ?COAP_CLIENT, coap_observe:filter(maps:get(dest, Rel))));
         error ->
             ok
     end,
-    St#st{observes = maps:remove(Key, Obs), pending = maps:remove(Key, Pend)}.
+    St1 = St#st{observes = maps:remove(Key, Obs),
+                pending = maps:remove(Key, Pend)},
+    maybe_detach(St1).
+
+%% Cancel one relationship's retransmit timer and drop its `pending' entry.
+cancel_pending(Key, #st{pending = Pend} = St) ->
+    case maps:take(Key, Pend) of
+        {{_Bytes, Ref}, Rest} ->
+            _ = erlang:cancel_timer(Ref),
+            St#st{pending = Rest};
+        error ->
+            St
+    end.
+
+%% Detach the shared `<<"coap">>' session only when the relationship table is
+%% empty: `detach/2' would otherwise tear down every remaining observation.
+maybe_detach(#st{observes = Obs} = St) ->
+    case maps:size(Obs) of
+        0 ->
+            _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
+            St;
+        _ ->
+            St
+    end.
 
 %% Monotonic ms. The clock is read here (the listener is the only process that
 %% needs it) and passed into coap_observe, which is pure.
