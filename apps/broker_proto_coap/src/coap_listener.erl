@@ -32,6 +32,12 @@
 
 -behaviour(gen_server).
 
+-include_lib("broker_core/include/broker_message.hrl").
+
+%% `register_observe/6' is wired into `respond/5' by the follow-up Observe=0/1
+%% task; until then it has no caller and the build treats that as an error.
+-compile({nowarn_unused_function, [{register_observe, 6}]}).
+
 -export([start_link/1, port/1, stop/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
@@ -55,7 +61,13 @@
     %% {IP, Port, Token, Destination} -> {Assembled, Total, AtMs} for a Block1
     %% stream. The token identifies the transfer (RFC 7959 draft §2.1); the
     %% Message ID changes from block to block and must not be the key.
-    block1 = #{} :: map()
+    block1 = #{} :: map(),
+    %% RFC 7641 Observe relationships: {IP,Port,Token} -> relationship()
+    %% (a coap_observe:relationship()). Bounded by `max_observes'.
+    observes = #{} :: map(),
+    %% Un-acked CON notifications awaiting an ACK: {IP,Port,Token} ->
+    %% {Msg, RetransLeft, TimerRef}. Reused by the dedup/Block1-free path.
+    pending = #{} :: map()
 }).
 
 start_link(Spec) ->
@@ -100,7 +112,11 @@ config(Spec) ->
                  block_size => env(block_size, 1024),
                  max_block1_bytes => env(max_block1_bytes, 262144),
                  resources => env(resources, []),
-                 recbuf_bytes => env(recbuf_bytes, 65536)},
+                 recbuf_bytes => env(recbuf_bytes, 65536),
+                 max_observes => env(max_observes, 4096),
+                 observe_ack_timeout_ms => env(observe_ack_timeout_ms, 2000),
+                 observe_max_retrans => env(observe_max_retrans, 3),
+                 observe_max_age_s => env(observe_max_age_s, 30)},
     maps:merge(Defaults, Spec).
 
 env(Key, Default) ->
@@ -114,16 +130,41 @@ handle_call(_Req, _From, St) ->
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
-%% The one-second maintenance tick. Rate tokens are computed lazily on the
-%% datagram path, so the tick only has to forget what has expired: CON replies
-%% past EXCHANGE_LIFETIME, abandoned Block1 streams, and endpoints whose bucket
-%% is full again (a full bucket is what a fresh entry would be anyway).
-handle_info({timeout, _Ref, refill}, St) ->
-    {noreply, prune(St), {continue, refill}};
+%% The kernel delivered a message to an attached subscription (ADR-031 §D2:
+%% the listener is the notify pid). Turn it into Observe notifications.
+handle_info({broker_deliver, <<"coap">>, _MaxQoS, _Matched, {_P, _O, Msg}},
+            #st{} = St) ->
+    {noreply, dispatch_notifications(Msg, St)};
 
-handle_info({udp, _Socket, IP, Port, Bin}, #st{} = St0) ->
-    St1 = on_datagram(IP, Port, Bin, St0),
-    {noreply, St1};
+%% An ACK for a CON notification cancels its retransmit. (The seq was already
+%% advanced when the notification was sent, so nothing to do but cancel.)
+handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
+    try coap_codec:decode(Bin) of
+        {ok, #{type := ack, token := Token}} ->
+            Key = {IP, Port, Token},
+            case maps:find(Key, Pend) of
+                {ok, {_Bytes, _Left, Ref}} ->
+                    _ = erlang:cancel_timer(Ref),
+                    {noreply, St0#st{pending = maps:remove(Key, Pend)}};
+                error ->
+                    {noreply, on_datagram(IP, Port, Bin, St0)}
+            end;
+        {ok, _Msg} ->
+            {noreply, on_datagram(IP, Port, Bin, St0)};
+        {error, _} ->
+            {noreply, on_datagram(IP, Port, Bin, St0)}
+    catch
+        _:_ -> {noreply, on_datagram(IP, Port, Bin, St0)}
+    end;
+
+%% A CON notification went un-acked: retransmit it, or give up after
+%% `observe_max_retrans' tries and tear the relationship down.
+handle_info({timeout, _Ref, observe_ack}, #st{} = St) ->
+    {noreply, retransmit_observes(St)};
+
+%% The 1 s refill tick also sweeps expired Observe relationships.
+handle_info({timeout, _Ref, refill}, St) ->
+    {noreply, sweep_observes(prune(St)), {continue, refill}};
 
 %% `{active, N}' is a budget, not a mode: when it runs out the socket goes
 %% passive and must be re-armed, or the listener silently stops reading. The
@@ -206,23 +247,29 @@ dispatch(IP, Port, Bin, Cfg, St) ->
     end.
 
 handle_message(IP, Port, Msg, Cfg, #st{dedup = Dedup} = St) ->
-    Id = coap_codec:id(Msg),
     case coap_codec:type(Msg) of
+        ack ->
+            %% Cancels a pending CON notification; the udp clause already matched
+            %% it against `pending'. Not a request: no response owed.
+            St;
+        rst ->
+            %% Ends the observation relationship (RFC 7641 §3.6). Not a request:
+            %% no response owed.
+            deregister_observe(IP, Port, coap_codec:token(Msg), St);
         con ->
             %% Already answered this exact CON? Re-send the cached bytes without
             %% re-executing (RFC 7252 §4.8.2).
-            case maps:find({IP, Port, Id}, Dedup) of
+            case maps:find({IP, Port, coap_codec:id(Msg)}, Dedup) of
                 {ok, {Cached, _At}} ->
                     send(IP, Port, Cached, St),
                     St;
                 error ->
                     {Reply, St1} = respond(IP, Port, Msg, Cfg, St),
                     send(IP, Port, Reply, St1),
-                    remember(IP, Port, Id, Reply, Cfg, St1)
+                    remember(IP, Port, coap_codec:id(Msg), Reply, Cfg, St1)
             end;
         _Non ->
-            %% NON/RST/ACK: no piggybacked reply is owed. A NON request still
-            %% gets the resource's answer, as a separate NON response.
+            %% A NON request still gets the resource's answer, as a separate NON.
             {Reply, St1} = respond(IP, Port, Msg, Cfg, St),
             send(IP, Port, Reply, St1),
             St1
@@ -341,6 +388,147 @@ run_resource(Req, Cfg, Endpoint) ->
         _ ->
             {{response, 5, 0}, [], <<>>}
     end.
+
+%%%_* Observe (RFC 7641) ----------------------------------------------------
+
+-define(COAP_CLIENT, <<"coap">>).
+
+%% Called by respond/5 when a GET with Observe=0 has been answered 2.05. It
+%% mints the kernel subscription (ADR-031 §D2) and records the relationship.
+%% Returns {St, Rel} on success, or {St, undefined} when the bounded table is at
+%% capacity -- the caller then answers 4.03 instead of the 2.05.
+register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
+    Dest = coap_codec:destination(Req),
+    Tenant = broker_security:default_tenant(),
+    MaxAge = coap_codec:option(max_age, Req, 30),
+    Cap = maps:get(max_observes, Cfg, 4096),
+    case maps:size(Obs) >= Cap of
+        true ->
+            {St, undefined};
+        false ->
+            case broker_subscription:subscribe(?COAP_CLIENT,
+                                               coap_observe:filter(Dest), 0,
+                                               Tenant) of
+                {ok, SubRef} ->
+                    ok = broker_subscription:attach(?COAP_CLIENT, self(), false),
+                    Rel = coap_observe:register(Dest, Tenant, SubRef, MaxAge,
+                                                now_ms()),
+                    Rel1 = Rel#{req_type => coap_codec:type(Req)},
+                    Key = {IP, Port, Token},
+                    {St#st{observes = maps:put(Key, Rel1, Obs)}, Rel};
+                {error, _} ->
+                    {St, undefined}
+            end
+    end.
+
+%% Called by respond/5 for a GET with Observe=1. Drops the relationship and
+%% unsubscribes from the kernel. Always succeeds (RFC 7641 §3.5: deregistering a
+%% relationship that is not there is not an error).
+deregister_observe(IP, Port, Token, #st{observes = Obs} = St) ->
+    Key = {IP, Port, Token},
+    case coap_observe:deregister(Key, Obs) of
+        {undefined, Obs1} ->
+            St#st{observes = Obs1, pending = maps:remove(Key, St#st.pending)};
+        {Rel, Obs1} ->
+            _ = (catch broker_subscription:unsubscribe(
+                   ?COAP_CLIENT, coap_observe:filter(maps:get(dest, Rel)))),
+            _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
+            St#st{observes = Obs1, pending = maps:remove(Key, St#st.pending)}
+    end.
+
+%% The kernel delivered a message to an attached subscription (ADR-031 §D2:
+%% the listener is the notify pid). Turn it into Observe notifications.
+dispatch_notifications(#broker_message{} = Msg,
+                       #st{observes = Obs, cfg = Cfg} = St) ->
+    lists:foldl(
+      fun({Key, Rel}, Acc) ->
+              case maps:get(dest, Rel) =:= Msg#broker_message.destination of
+                  true -> notify_one(Key, Rel, Msg, Cfg, Acc);
+                  false -> Acc
+              end
+      end, St, maps:to_list(Obs)).
+
+%% Send one notification. The relationship's `req_type' decides CON (reliable:
+%% retransmit until ACKed, tracked in `pending') vs NON (at-most-once: fire once).
+notify_one(Key, Rel, Msg, Cfg, #st{pending = Pend} = St) ->
+    Type = maps:get(req_type, Rel, con),
+    Token = element(3, Key),
+    Now = now_ms(),
+    {Seq, Rel1} = coap_observe:next_seq(Rel, Now),
+    Note = coap_observe:notify_message(Type, Seq, Token, Msg),
+    Bytes = coap_codec:encode(Note#{id => next_id()}),
+    IP = element(1, Key),
+    Port = element(2, Key),
+    _ = gen_udp:send(St#st.socket, IP, Port, Bytes),
+    case Type of
+        con ->
+            Timeout = maps:get(observe_ack_timeout_ms, Cfg, 2000),
+            Ref = erlang:start_timer(Timeout, self(), observe_ack),
+            Left = maps:get(observe_max_retrans, Cfg, 3),
+            St#st{observes = maps:put(Key, Rel1, St#st.observes),
+                  pending = maps:put(Key, {Bytes, Left, Ref}, Pend)};
+        non ->
+            St#st{observes = maps:put(Key, Rel1, St#st.observes)}
+    end.
+
+%% The 1 s refill tick also drops relationships silent longer than their own
+%% Max-Age window. Side-effecting (it unsubscribes), so it cannot live in the
+%% pure prune/1.
+sweep_observes(#st{observes = Obs, cfg = Cfg} = St) ->
+    Cap = maps:get(observe_max_age_s, Cfg, 30),
+    Now = now_ms(),
+    lists:foldl(
+      fun({Key, Rel}, Acc) ->
+              case coap_observe:expired(Rel, Now, Cap) of
+                  true ->
+                      _ = (catch broker_subscription:unsubscribe(
+                             ?COAP_CLIENT,
+                             coap_observe:filter(maps:get(dest, Rel)))),
+                      _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
+                      Acc#st{observes = maps:remove(Key, Acc#st.observes),
+                             pending = maps:remove(Key, Acc#st.pending)};
+                  false ->
+                      Acc
+              end
+      end, St, maps:to_list(Obs)).
+
+%% A CON notification went un-acked: resend each pending CON once and count the
+%% retransmit down; at zero it unsubscribes and drops the relationship.
+retransmit_observes(#st{pending = Pend} = St) ->
+    lists:foldl(
+      fun({Key, {Bytes, Left, _Ref}}, Acc) ->
+              IP = element(1, Key),
+              Port = element(2, Key),
+              _ = gen_udp:send(Acc#st.socket, IP, Port, Bytes),
+              case Left - 1 of
+                  0 ->
+                      drop_relationship(Key, Acc);
+                  Left1 ->
+                      Timeout = maps:get(observe_ack_timeout_ms, Acc#st.cfg, 2000),
+                      Ref = erlang:start_timer(Timeout, self(), observe_ack),
+                      Acc#st{pending = maps:put(Key, {Bytes, Left1, Ref},
+                                                 Acc#st.pending)}
+              end
+      end, St, maps:to_list(Pend)).
+
+%% Give up on a relationship: unsubscribe, detach, forget it.
+drop_relationship(Key, #st{observes = Obs, pending = Pend} = St) ->
+    case maps:find(Key, Obs) of
+        {ok, Rel} ->
+            _ = (catch broker_subscription:unsubscribe(
+                   ?COAP_CLIENT,
+                   coap_observe:filter(maps:get(dest, Rel)))),
+            _ = (catch broker_subscription:detach(?COAP_CLIENT, self()));
+        error ->
+            ok
+    end,
+    St#st{observes = maps:remove(Key, Obs), pending = maps:remove(Key, Pend)}.
+
+%% Monotonic ms. The clock is read here (the listener is the only process that
+%% needs it) and passed into coap_observe, which is pure.
+now_ms() -> erlang:monotonic_time(millisecond).
+
+next_id() -> erlang:unique_integer([positive]) rem 65536.
 
 %%%_* Bounded tables -------------------------------------------------------
 

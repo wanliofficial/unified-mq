@@ -37,7 +37,8 @@ all() ->
      block1_reassembles_a_multidatagram_body,
      token_bucket_bounds_a_flood,
      oversized_datagram_is_dropped,
-     malformed_datagram_is_dropped].
+     malformed_datagram_is_dropped,
+     observe_ack_and_rst_are_not_requests].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -225,6 +226,17 @@ request(Type, Method, Id, Options) ->
 request(Type, Method, Id, Options, Payload) ->
     (coap_codec:request(Type, Method, Id, Options))#{payload => Payload}.
 
+%% An empty ACK that echoes a notification's token and Message ID. The codec's
+%% own `ack/1' drops the token, which would miss the `pending' match.
+ack_of(Note) ->
+    #{type => ack, code => empty, id => coap_codec:id(Note),
+      token => coap_codec:token(Note), options => [], payload => <<>>}.
+
+%% An RST carrying the token of the observation being ended (RFC 7641 §3.6).
+rst_of(Token, Id) ->
+    #{type => rst, code => empty, id => Id, token => Token,
+      options => [], payload => <<>>}.
+
 %%%_* Cases -----------------------------------------------------------------
 
 %% A CON GET is answered with a piggybacked ACK that echoes the request's type,
@@ -366,4 +378,15 @@ malformed_datagram_is_dropped(Config) ->
     %% A well-formed datagram from the same socket is still answered.
     send(S, Port, request(con, put, 1, [{uri_path, <<"ok">>}], <<"v">>)),
     #{type := ack, code := {response, 2, 4}} = expect(S, ack, {response, 2, 4}),
+    close(S).
+
+%% A bare ACK and a bare RST are transport control messages, not requests: the
+%% listener must not answer either (no 2.05/4.04 in flight).
+observe_ack_and_rst_are_not_requests(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, ack_of(#{id => 4242, token => <<"nobody">>})),
+    send(S, Port, rst_of(<<"nobody">>, 4243)),
+    refute(S, ack, {response, 2, 5}, 300),
+    refute(S, ack, {response, 4, 4}, 300),
     close(S).
