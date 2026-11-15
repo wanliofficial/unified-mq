@@ -1,8 +1,8 @@
 # 协议兼容矩阵（Protocol Compatibility）
 
 - **文档版本**：v1.3
-- **最近一次追加**：2026-11-14——新增 §4.22：STUN / TURN（S10-C，独立 app `broker_ice`；手写编解码、长期凭据接同一张 `users` 表、CT 72 例，**仍无真实第三方客户端证据**）；2026-11-13 的 §4.21（S10-B 信令内核）与 §4.20（S10-A 连接层）保留为当时事实。此前一次：2026-11-13——新增 §4.20：WebRTC 信令前端（S10-A，只有连接层；CT 45 例）。再此前：2026-11-11——新增 §4.12：MQTT over QUIC（S8-D，EMQX `emqtt` 1.16.1 真实客户端 8/8 + CT 17 例）。再此前：2026-11-10——§4.11 MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）；再此前：§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。§4/§4.1~§4.10 原文保留为当时事实
-- **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定、§10 S8 三条 MQTT 传输（MQTT-SN / MQTT over QUIC / MQTT over WebSocket）、§11 S9 三协议 agent 前端、§12 S10 WebRTC 信令面与 ICE 面
+- **最近一次追加**：2026-11-15——新增 §4.24：CoAP（S11-A，新 app `broker_proto_coap`；自写编解码、资源路径直映射 `broker_router` destination、CON 级 dedup + Block1 重组，CT 73 例，**仍无 libcoap 真实客户端证据**，Observe / DTLS 留 S11-B/C）；2026-11-14 的 §4.22（STUN / TURN，S10-C）与 §4.23（S10 能力/限制清单）保留为当时事实。此前一次：2026-11-14——新增 §4.22：STUN / TURN（S10-C，独立 app `broker_ice`；手写编解码、长期凭据接同一张 `users` 表、CT 72 例，**仍无真实第三方客户端证据**）；2026-11-13 的 §4.21（S10-B 信令内核）与 §4.20（S10-A 连接层）保留为当时事实。再此前：2026-11-13——新增 §4.20：WebRTC 信令前端（S10-A，只有连接层；CT 45 例）。再此前：2026-11-11——新增 §4.12：MQTT over QUIC（S8-D，EMQX `emqtt` 1.16.1 真实客户端 8/8 + CT 17 例）。再此前：2026-11-10——§4.11 MQTT-SN 1.2（S8-C，`mqtt-sn-tools` 0.0.7 真实客户端 10/10 + CT 84 例）；再此前：§4.13 MQTT over WebSocket（S8-B，paho-mqtt 2.1.0 `transport="websockets"` 8/8 + CT 19 例）。§4/§4.1~§4.10 原文保留为当时事实
+- **对应 Roadmap**：§7 S5 协议扩展、§9 S7 身份统一与事件绑定、§10 S8 三条 MQTT 传输（MQTT-SN / MQTT over QUIC / MQTT over WebSocket）、§11 S9 三协议 agent 前端、§12 S10 WebRTC 信令面与 ICE 面、§13 S11 CoAP 前端
 - **对应 README**：11.1 协议兼容矩阵（验证维度）
 - **S5 协议顺序**：MQTT → WebSocket → NATS → AMQP → Kafka → Pulsar
 
@@ -42,7 +42,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 
 ---
 
-## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行，S10-A/B 追加 WebRTC 信令行，S10-C 追加 STUN/TURN 行，S10-D 更新这两行口径 + 追加 §4.23 能力/限制清单）
+## 2. 能力矩阵（S5 完成态；S8-B 追加 MQTT over WebSocket 行，S8-C 追加 MQTT-SN 行，S8-D 追加 MQTT over QUIC 行，S9-D 追加 MCP 行，S9-F 追加 A2A 行，S10-A/B 追加 WebRTC 信令行，S10-C 追加 STUN/TURN 行，S10-D 更新这两行口径 + 追加 §4.23 能力/限制清单，S11-A 追加 CoAP 行）
 
 每个协议一行，逐条能力与限制以对应 §4.x 为准。
 
@@ -62,6 +62,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | ACP（v1，stdio） | 支持子集（S9-E，**Broker 作 Client**） | ACP v1：Broker 作 **Client**、agent 是本地子进程；`initialize`/`session/new`/`session/prompt` 由 Broker 主动发起；`session/request_permission` 是唯一实现的 Client 回调（默认拒绝 + allowlist + 超时 + 每次审计）；`session/cancel` 转发；`session/update` 折叠为 turn 投影写 `$acp/session/<id>`（含 `stopReason`）；prompt 经 `$acp/in/<agent>` 异步回读；`protocolVersion` 只接受 1 | **仅 stdio**（无 HTTP/WS listener、无 `listeners`）、无远程建连、无 `session/load`/`resume`/`list`/`authenticate`、`fs/*`/`terminal/*`/`elicitation/*` 全回 `-32601`（保持会话）、`clientCapabilities={}`、stdio 不做认证（进程即凭据）、跨节点 reply 不支持；见 §4.18 | `apps/broker_proto_acp/test/`、`test/protocol-compatibility/acp/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/acp/`） |
 | WebRTC 信令（WSS） | **连接层 + 信令内核已支持**（S10-A + S10-B；ICE/STUN/TURN 见下一行） | RFC 6455 over TLS（wss）/明文仅回环；子协议 `webrtc.v1` 强制；路径 `/websocket/<room>` 绑定房间；认证窗口 `auth_timeout_ms`（超时 close **1008**）；空闲窗口 `idle_timeout_ms`（超时 close **1001**，`infinity` 可关）；帧上限 `max_frame_bytes`（超限 close **1009**）；文本 `ping`→`pong` 与原生 opcode 9→10 并存；binary → close **1003**；分片重组 + close 回显；认证 = JSON `{"event":"authenticate",...}` → `broker_security:authenticate_conn/1`（同一张 `users` 表）；`peer_id` 服务端铸造；**五类事件** `authenticated`/`unauthorized`/`invalid_message`/`joined`/`left`；`to` 进程直投（原报文 + `from`、保留 `to`）；房间隔离；ACL（`broker_security:authorize/2`） | **首期 1:1**：`max_peers_per_room` 默认 2，超额 close 1008；**ACL 只能整房间允许/拒绝**（join 与 relay 共用主体）；`peer_id` 仅本次连接有效；未知/跨房间 `to` 同形为 `invalid_message`（不做存在性预言机）；**无 JSON 深度专项防御也不需要**（`json:decode` 不栈溢出，帧大小由 `max_frame_bytes` 兜底）；握手阶段无读超时（缺口，见 `docs/security.md` §12.2 第 13 条）；self-loop 回环投递一次（良性）；**结构化脱敏日志**（`room`/`peer_id`/`bytes`，永不记 `data`）；**aiortc 第三方证据**（非浏览器）；**不写 `broker_metrics`**（冻结键集）；**容量见 D.6 报告**（[`docs/benchmarks/2026-11-14-s10-capacity.md`](benchmarks/2026-11-14-s10-capacity.md)）；默认 `listeners => []`；见 §4.20、§4.21、§4.23 与 `docs/security.md` §12.2 | `apps/broker_proto_webrtc/test/`（S10-A 45 + S10-B 61 = 106，另 S10-D D.3 加 6〔`webrtc_route` +3、`webrtc_conn` +3〕+ D.4 加 1〔`webrtc_route` 日志脱敏〕= 113；S10-D 第三方证据在 `test/protocol-compatibility/s10/`） |
 | STUN / TURN（UDP） | **已支持**（S10-C；STUN + TURN over UDP，独立 app `broker_ice`，出厂 `enabled => false`） | STUN Binding（RFC 8489）：`XOR-MAPPED-ADDRESS`、`MESSAGE-INTEGRITY`（SHA-1 长期凭据）、`ERROR-CODE`、`FINGERPRINT`、`UNKNOWN-ATTRIBUTES`/420；TURN over UDP（RFC 5766）：`Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` / `ChannelData` / `Send` / `Data`；每 allocation 一进程；relay 端口从 `relay_port_range` 环绕分配；长期凭据 = `MD5(user ":" realm ":" password)`，与信令**共用同一张 `users` 表**（`broker_security:long_term_key/2`），ACL 走 `authorize/2`（`turn_*` action）；channel number 闭区间 `0x4000-0x7FFF`（已钉边界） | **只 UDP**：`REQUESTED-TRANSPORT ≠ 17` → **442**；TURN over TCP / 5349/TLS / DTLS **不做**；**无 IPv6**（`turn_ip` 非 IPv4 → 启动失败）；无 ICE-lite、无候选配对（本 app 不是 ICE agent）；单节点语义（无跨节点 allocation）；无速率限制（只有 `max_allocations` / `max_permissions` / `max_channels`）；**不写 `broker_metrics`**（ADR-016 冻结键集）；链路无加密（`MESSAGE-INTEGRITY` 只保完整性）；畸形 LIFETIME（非 4 字节）→ 400 且 allocation 存活（健壮性探针）；**aiortc 第三方 TURN 证据**（非浏览器）；**容量见 D.6 报告**；默认 `enabled => false`；见 §4.22、§4.23 与 `docs/security.md` §12.3 | `apps/broker_ice/test/`（CT **75 例** = `stun_codec_SUITE` 21 + `turn_auth_SUITE` 16 + `stun_server_SUITE` 13 + `turn_allocation_SUITE` 25（S10-C 22 + D.3 加 2 + D.6 relay 多帧回归 1），全部真实 UDP socket 且 `port => 0`；对手方是手写字节的 `ice_test_client` + aiortc） |
+| CoAP（UDP） | **已支持（S11-A：GET/PUT/POST/DELETE + `/.well-known/core`，出厂 `enabled => false` 零 socket）** | RFC 7252 over UDP（默认 5683，CT 用 `port => 0`）：4 字节头 + TKL 0-8 + 全部 option 的 delta/length 两种扩展编码 + payload marker；报文类型 CON/NON/ACK/RST；方法 GET/PUT/POST/DELETE；CON 请求回 piggybacked ACK（回显 Message ID 与 token），NON 请求只回 separate NON 响应；CON 去重（同 `{IP,Port,Id}` 在 `dedup_window_ms` 内重发缓存 ACK、不重复执行）；资源路径**直接**是 `broker_router` destination（`a/b/c`，不新开 `$coap/` 命名空间）；PUT=retain+2.04、POST=不 retain+2.01、GET 只读 retained、DELETE 幂等；CoRE Link Format 的 `/.well-known/core` 列出 retained 目的地 + 静态 `resources`；Block1 重组（`draft-ietf-core-block-18`，2.31 Continue / 4.13 / 4.08）；每端点令牌桶 + `max_endpoints` 上限 + `max_message_bytes` 上限；`broker_metrics` 只 inc 既有键（`bytes_in` / `frame_decode_errors` / `protocol_errors`） | **无 DTLS**（明文 UDP；D5 的 DTLS 接线留 S11-C）；**无 Observe 通知**（RFC 7641 归 `broker_subscription` + cursor，S11-B）；**无 Block2 服务端分块**（只重组请求方向的 Block1）；**无 multicast、无 CoAP over TCP/WebSocket**（RFC 8323 非目标）；**Block-wise 是草案 `draft-ietf-core-block-18`，不是 RFC 7959**（ADR-031 §D7）；**无 libcoap 真实客户端证据**（Gate S11 该项未勾选）；无 `If-Match`/`ETag` 条件请求、无 OSCORE；畸形报文静默丢弃（UDP 上回错误只会放大攻击面）；见 §4.24 | `apps/broker_proto_coap/test/`（CT **73 例** = `coap_codec_SUITE` 48 + `coap_resource_SUITE` 13 + `coap_listener_SUITE` 7 + `coap_app_SUITE` 5；前三套纯函数/真实 UDP socket 且 `port => 0`，第四套 app 启动姿态（零 socket、`require_auth` 门控与负控） |
 
 **S9-F（2026-11-12）真实第三方客户端验证**：三个 agent 协议各用**上游官方 SDK** 跑过端到端证据——
 MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）、A2A `a2a-sdk 1.3.0`
@@ -1911,6 +1912,83 @@ S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻�
 | 13 | OTel 导出层、审计日志签名、外部 KMS | §1.3 非目标 + `docs/security.md` §12 既有待办 | 沿用 `docs/security.md` §12 待办，S10 不扩面；可观测只走 `logger` + 冻结的 `broker_metrics`（D.4） |
 
 上表 13 行覆盖 §1.3 全部 9 项非目标（第 5–9 行是 R-I6 点名的 5 项，其中 TURN over TCP/DTLS 与 5349/TLS 拆开以对应 R-I6 的逐字列举）。**§2 能力矩阵两行（WebRTC / STUN-TURN）的「已知限制」列均引用 §4.23**，其下即本 §4.23.5 逐行清单——与 S8 对 MQTT-SN / QUIC / WS 的处理（§4.11–§4.13）同构。
+
+---
+
+## 4.24 S11-A 追加（2026-11-15）：CoAP（`broker_proto_coap`，RFC 7252 over UDP）
+
+**是什么**：一个**独立 app** `broker_proto_coap`，把 CoAP（RFC 7252）的请求/响应面接进消息内核：UDP 前端 + 自写报文编解码 + 资源路由 + `/.well-known/core`。出厂 `enabled => false`，装配进 release 但**零 socket**、零 listener 子进程（ADR-031 §D6）。**不 vendor 上游 `gen_coap`**：OQ-3 的构建 spike 实测它在 OTP 28.3.1 上编译通过但运行时核心不可用（`http_uri` / `pg2` 已移除），因此自写 `coap_codec`，**净新增运行时依赖 0**（ADR-031 §D1）。
+
+**边界一句话**：CoAP 的 CON/ACK 是**datagram 级**确认（重传窗口内不重复执行），不是 MQTT QoS 1 的端到端可靠投递（ADR-031 §D3）；资源路径**就是** `broker_router` 的 destination，没有第二套命名空间（§D4）。
+
+**证据**：CT **73 例** = `coap_codec_SUITE` 48（纯函数：字节 ↔ 报文）+ `coap_resource_SUITE` 13（方法映射，真实 retain/queue/event 内核）+ `coap_listener_SUITE` 7（真实 UDP socket，`port => 0`，对手方是「用 `coap_codec` 编解码的裸 UDP 客户端」）+ `coap_app_SUITE` 5（app 启动姿态：disabled 零 children / enabled 一个 listener + 端口 / `coap`、`coaps` 的 `require_auth` 拒绝 / 负控）。全量 `rebar3 ct` **1324/1324、83 套件**（S10-D 基线 1251/1251、79 套件 + 本 app 73 例/4 套件，零回归）。`rebar3 dialyzer` **0 warning**；`rebar3 xref` 302 条**全部是 unused-export**（与既有 285 条同类，没有 undefined/unreachable）。**真实第三方客户端（libcoap）证据尚未产出**，Gate S11 该项未勾选。
+
+### 4.24.1 编解码（`coap_codec`）
+
+| 项 | 行为 |
+|---|---|
+| 首部 | 4 字节：`ver(2)=1` + `type(2)` + `TKL(4)` + code(8) + Message ID(16)；TKL 0–8，9–15 是保留值 → `{error, reserved_token_length}` |
+| code | `0.01` GET / `0.02` POST / `0.03` PUT / `0.04` DELETE / `0.00` empty / `x.yy` 响应；解码统一成 `{method, M}` 或 `{response, Class, Detail}` |
+| option 编码 | delta/length 各 4 bit，13/14 两种扩展（14 → 后面 1/2 字节，值 = 扩展值 + 13 / 269）；**编码侧按 option number 升序**（delta 天然单调），重复 option 按写入顺序保序 |
+| option 值 | 已知 uint 类 option（`observe` / `block1` / `block2` / `size1` …）解码成整数、**前导 0 字节丢弃**（0 编成空字节）；`uri_path` / `uri_query` 是二进制分段 |
+| `block1`/`block2` | `block_value(Num, More, Size) -> {Num, More, Size}`（`Size` 是 16/32/…/1024 的字面值，内部编码为 SZX 0–6） |
+| `uri_path` / `destination` | 所有 `uri_path` 分段按 `/` 连接成一个二进制；`a/b/c` → `<<"a/b/c">>` |
+| CoRE Link Format | `link_format/1`：`</path>;rt="…";if="…"`，属性值是字符串或整数，特殊字节按 RFC 6690 百分号转义 |
+| 拒绝的畸形 | 短于 4 字节、版本 ≠ 1、保留 TKL、空报文却带 payload marker、option nibble `0xF`、截断的 option、长度不匹配 → 全部 `{error, Reason}`（listener 静默丢弃） |
+| 刻意不做 | 不拒绝 option number 0（delta 编码天然单调，加防御性检查是死代码）；不把「未按升序排列的重复 option」当错误——结构上不可能出现 |
+
+### 4.24.2 资源映射（`coap_resource`）
+
+| 方法 | 行为 | 成功码 |
+|---|---|---|
+| `GET /a/b` | 只读 retained 表示（`broker_retain:lookup/1`）；不读日志、不是「日志尾巴」 | `2.05 Content`（带 `content_format`，若写入时记过）+ 不存在 `4.04` |
+| `PUT /a/b` | 发布 + retain（ADR-018 的 append → retain → dispatch 顺序）；空 payload = 删除 retained | `2.04 Changed` |
+| `POST /a/b` | 发布，**不** retain（事件语义） | `2.01 Created` |
+| `DELETE /a/b` | 删除 retained；**幂等**，目标不存在也回 `2.02` | `2.02 Deleted` |
+| `GET /.well-known/core` | CoRE Link Format：静态 `resources` + 所有 retained destination | `2.05`（`content_format = 40`） |
+| 空 destination | 根路径不是合法发布目标 → `4.00` | — |
+| 超过 `broker_limits:max_message_bytes/0` | 写路径先于任何工作拒绝 → `4.13` | — |
+| ACL | `broker_security:authorize/2`：GET 用 `subscribe`、写用 `publish`；匿名（`principal => undefined`）在 `acl => allow` 下放行 | 拒绝 → `4.03` |
+
+写入构造的是普通 `#broker_message{}`（`proto_meta` 记 `client => <<"coap">>`、`content_format`、`retain`、`method`），因此路由、事件策略、订阅投递、retain 全部复用既有层——**没有 CoAP 专属存储或投递分支**。
+
+### 4.24.3 listener（`coap_listener`）
+
+| 项 | 行为 |
+|---|---|
+| socket | 每个 listener spec 一个 UDP socket（`gen_udp:open`，`binary` + `{active, N}`（N=100）+ `reuseaddr`）；收满预算后 socket 转 passive，由 1 s 维护 tick 重 arm `{active, N}`（与 `mqtt_sn_listener` 同姿态，`{active, true}` 会让洪泛填满邮箱）；`port => 0` 时由内核分配，`coap_listener:port/1` 读回；绑定失败 = 启动失败（`{bind_failed, Port, Reason}`） |
+| 配置 | app env 是默认值（`max_message_bytes` / `dedup_window_ms` / `max_dedup_entries` / `max_requests_per_second` / `max_endpoints` / `block_size` / `max_block1_bytes` / `resources` / `recbuf_bytes`），listener spec 可逐项覆盖 |
+| CON | 回 piggybacked ACK，**回显请求的 type/Message ID/token**（RFC 7252 §5.2.1） |
+| CON 去重 | `{IP, Port, Message ID}` → 缓存**原始回复字节**；窗口（`dedup_window_ms`，默认 247 s = EXCHANGE_LIFETIME）内重复 CON 直接重发缓存、**不重复执行**（§4.8.2） |
+| NON | 不回 piggybacked ACK；资源的回答作为独立 NON 响应发出（at-most-once，§D3） |
+| Block1 | 按 `{IP, Port, token, destination}` 重组（token 标识一次传输，Message ID 每块都变）；`M=1` → `2.31 Continue` + 下一个块号；最后一块拼好后交给资源层；超过 `max_block1_bytes` → `4.13`；中间块找不到流 → `4.08` |
+| 限流 | 每端点令牌桶（`max_requests_per_second`，按秒回填），**在解码前**扣减；端点表超过 `max_endpoints` 时拒绝新来源（不驱逐已有桶） |
+| 超长 | 原始 datagram 超过 `max_message_bytes` → 解码前丢弃 |
+| 畸形 | `coap_codec:decode/1` 返回 `{error, _}` → 静默丢弃、不崩、不影响后续 datagram |
+| 有界状态 | 三张表（dedup / endpoints / block1）都在 1 s tick 上按 `dedup_window_ms` 清理；dedup 另受 `max_dedup_entries` 上限约束（超限丢三分之一） |
+| 指标 | 只 inc 既有键：`bytes_in`（收到即计）、`frame_decode_errors`（超长或解码失败）、`protocol_errors`（限流拒绝）——**不扩冻结键集**（ADR-016） |
+
+### 4.24.4 已声明的限制 / 边界
+
+- **无 DTLS**：明文 UDP。D5 的「接 `broker_security`、默认不自签」留 S11-C；当前 `principal` 恒 `undefined`，ACL 只在 `acl => allow` 下有意义。
+- **无 Observe 通知**：`observe` option 解析得出来，但没有注册/通知/取消（RFC 7641 属 S11-B，按 ADR-031 §D2 归 `broker_subscription` + cursor，禁止 `pg2` 扇出）。
+- **只有 Block1（请求方向）**：服务端**不做 Block2 分块响应**；大响应受 `max_message_bytes`（UDP 65535）限制。
+- **Block-wise 是草案**：对齐 `draft-ietf-core-block-18`，**不是 RFC 7959**（ADR-031 §D7）；与 libcoap 的互操作未验证。
+- **无 multicast、无 CoAP over TCP/WebSocket**（RFC 8323 非目标）、无 OSCORE、无 `If-Match`/`ETag` 条件请求、无 CoAP 专属的服务发现资源（只有 `/.well-known/core`）。
+- **无真实第三方客户端证据**：Gate S11「真实第三方客户端证据落盘」未勾选；`test/protocol-compatibility/` 下没有 CoAP 目录。
+- **每端点限流不识别身份**：UDP 源地址可伪造；令牌桶只限速、不做认证（与 MQTT-SN 同姿态）。
+- **单节点**：CoAP 前端只在本节点读写 retained/日志；跨节点语义与其它协议一致，由既有层决定。
+
+### 4.24.5 本套件抓到的真实缺陷
+
+首轮 CT 全红，四个都是**实现缺陷**而不是测试写错，且都由「真实 socket + 真实字节」暴露：
+
+1. `coap_resource` 的尺寸上限写成 `Payload =< broker_limits_limit()`——binary 与 integer 比较在 Erlang term order 里恒为 `false`，于是**每个写请求都回 4.13**。改为 `byte_size(Payload) =< …`。
+2. `coap_listener` 的回复只回显了 token，**漏回显 Message ID**，所有 ACK 的 ID 都是 0：客户端无法把响应配到请求上，去重也失去可观测性。
+3. `coap_listener` 把 `gen_server` 状态写成 `send/4` 的返回值 `ok`（去重命中与 NON 两条路径），下一轮维护 tick 直接 `function_clause` 崩溃。改为「发包后返回 State」。
+4. 令牌桶**计算了剩余令牌却从不写回**，于是限流形同虚设（洪泛用例里第三个请求照样被应答）。改为扣减并落表。
+
+另有三处是**测试自身的字节对齐错误**（TKL 位、空 payload marker、扩展 delta/length 的构造），修的是套件不是生产代码——列出来是因为它们说明「自编客户端 + 自编服务端」会互相掩盖错误，真实第三方客户端（Gate 的 libcoap 项）不能用自编对端替代。
 
 ---
 

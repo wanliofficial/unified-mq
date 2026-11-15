@@ -1,0 +1,40 @@
+{application, broker_proto_coap, [
+    {description, "CoAP (RFC 7252) front-end: UDP listener, own codec, resource routing"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {broker_proto_coap_app, []}},
+    %% ADR-031 §D6: same app family as `broker_proto_mqtt_sn' -- the message
+    %% kernel facades plus `broker_security'. Deliberately NOT dependent on
+    %% `ranch' (CoAP here is UDP, like MQTT-SN) nor on the signalling apps.
+    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics,
+                    broker_router, broker_queue, broker_subscription,
+                    broker_event, broker_security, broker_retain]},
+    {env, [{%% ADR-031 §D5/§D6: the ship default. No socket is opened, and no
+            %% listener spec is read, until an operator turns it on.
+            enabled, false},
+           %% `[#{port => 5683}]'; CT uses `#{port => 0}' so the kernel picks.
+           {listeners, []},
+           %% A CoAP datagram larger than this is dropped before decoding. UDP
+           %% itself caps at 65535; the default matches.
+           {max_message_bytes, 65535},
+           %% CON request dedup window. RFC 7252 §4.8.2 puts EXCHANGE_LIFETIME
+           %% at 247 s, which is how long a duplicate CON may still arrive.
+           {dedup_window_ms, 247000},
+           {max_dedup_entries, 4096},
+           %% Per-endpoint token bucket (R-X3, amplification defence). UDP has
+           %% no handshake, so the source address is unverifiable and a flood is
+           %% only observable as a rate.
+           {max_requests_per_second, 100},
+           {max_endpoints, 4096},
+           %% Block-wise payload unit (RFC 7959 §2.2; the app follows
+           %% draft-ietf-core-block-18 per ADR-031 §D7).
+           {block_size, 1024},
+           %% Ceiling for a Block1 reassembly buffer, per endpoint.
+           {max_block1_bytes, 262144},
+           %% Statically declared resources, listed by `/.well-known/core' in
+           %% CoRE Link Format: `[#{path => <<"a/b">>, attrs => [{rt, <<"x">>}]}]'.
+           %% Retained destinations are advertised automatically; this list is
+           %% for resources that hold no retained state.
+           {resources, []},
+           {recbuf_bytes, 65536}]}
+]}.

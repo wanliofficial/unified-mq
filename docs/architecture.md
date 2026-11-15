@@ -30,7 +30,7 @@
 
 ## 2. 应用划分
 
-### 2.1 28 个应用
+### 2.1 29 个应用
 
 ```
 apps/
@@ -62,6 +62,7 @@ apps/
 ├── broker_proto_acp/     S9-E：ACP v1 前端（仅 stdio，Broker 作 Client、agent 是本地子进程；主动发 initialize/session/new/session/prompt，实装 session/request_permission 权限策略），出厂 `agents => []`
 ├── broker_proto_webrtc/  S10-A/B/D：WebRTC 信令前端（WSS 连接层 + 房间注册表 + `to` 进程直投；复用 broker_ws 的 ws_handshake/ws_frame，子协议 webrtc.v1 强制、认证窗口、保活、帧上限、五类事件、ACL），默认 `listeners => []`
 └── broker_ice/           S10-C/D：STUN Binding + TURN over UDP（手写 stun_codec、长期凭据接 broker_security、每 allocation 一进程、relay 端口环绕分配），默认 `enabled => false` 零 socket；与信令面互不依赖
+├── broker_proto_coap/    S11-A：CoAP（RFC 7252）UDP 前端（自写 coap_codec、资源路径直映射 broker_router destination、CON 去重 + Block1 重组），默认 `enabled => false` 零 socket
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
@@ -94,6 +95,7 @@ apps/
 | `broker_proto_acp` | kernel, stdlib, sasl, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_acp_sup`（`one_for_one`）+ 每个配置的 agent 一个 `acp_agent` gen_server（spawn 并扮演 ACP Client） | `acp_transport`（行为）+ `acp_port`（生产子进程传输，`spawn_executable`）+ `acp_fake_transport`（测试态内存传输）+ `acp_frame`（newline 分帧 + JSON-RPC 信封）+ `acp_policy`（权限裁决）+ `acp_turn`（turn 折叠）+ `acp_session`（纯状态机）+ `acp_event`（`$acp/*` 目的地）+ `acp_agent`（每连接主循环） | 每个 agent 子进程的 stdin/stdout 句柄与握手/会话状态（进程内，不持久化）；`$acp/in/<agent>`、`$acp/session/<id>`、`$acp/permission` 上的消息是普通 `#broker_message{}`，归 `broker_storage`/`broker_queue`；无 Mnesia 表、无 listener |
 | `broker_proto_webrtc` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics（**不含 `broker_core`**——ADR-028 §D8：不调用、不 include，只经 `broker_security` 传递进来） | `broker_proto_webrtc_sup`（`one_for_one`）+ `webrtc_room_registry`（`one_for_all` 分片 supervisor，S10-B）+ 每条配置的 listener（`ranch:child_spec`，`restart => transient`，默认零条）+ 每连接一个 `webrtc_conn` gen_server | `webrtc_listener`（`ranch_protocol`，`start_link/3` 直接返回连接 pid）、`webrtc_conn`（握手 → 认证窗口 → 帧循环）、`webrtc_room_registry` / `webrtc_room_shard`（房间分片 + protected ETS）、`webrtc_signal`（五类事件）、`webrtc_dispatch`（`to` 直投）、`webrtc_server`（服务端 API）、`broker_proto_webrtc_app:validate/0`（六类启动门控 + `check_rooms/0`） | 每连接 socket、握手缓冲、子协议、`peer_id`、认证/空闲两个计时器（进程内，**不持久化**）；房间成员在分片 ETS（**不持久化、无 boot replay**）；**不产生 `#broker_message{}`、不调 `broker_queue`/`broker_router`**（`webrtc_boundary_SUITE` 源码级守卫）；无 Mnesia 表。日志（S10-D D.4）只记 `room`/`peer_id`/`username`/`bytes`/粗粒度 `reason`，**永不记 `data`（SDP/candidate）/口令** |
 | `broker_ice` | kernel, stdlib, sasl, crypto, broker_security, broker_metrics（**不含 `ranch` / `broker_ws` / `broker_core`**——ADR-029 §D1：与信令面、与消息内核全部解耦，不构造 `#broker_message{}`） | `broker_ice_sup`（`one_for_all`；`enabled => false` 时 child 列表为空）+ `broker_ice_udp`（唯一 UDP socket owner）+ `turn_allocation_sup`（`one_for_one`，每 allocation 一条 `temporary` child spec）+ 每 allocation 一个 `turn_allocation` gen_server | `broker_ice_app:config/0`（单点解析并下发 config map，其它模块不再读 env）与 `validate/0`；运维面 `broker_ice_udp:port/0`、`allocations/0` | 5-tuple → allocation 索引（socket owner 进程内，**不持久化**）、每 allocation 一个 relay UDP socket 与 peer 地址 / permission 表（以 peer IP 为键，300 s）/ channel 绑定表；**内存 ETS**；`broker_metrics` 只在 `applications` 里列着、**代码零调用**（ADR-016 冻结键集，ADR-029 §D1） |
+| `broker_proto_coap` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain （**不含 `ranch`**——CoAP 这里只做 UDP，照 `broker_proto_mqtt_sn` 的 socket 自持模型；不含 `crypto`） | `broker_proto_coap_sup`（`one_for_all`；`enabled => false` 时 child 列表为空）+ 每条配置的 `coap_listener`（默认零条；`restart => transient`） | `coap_codec`（4 字节头 + 全部 option 的 delta/length 扩展 + CoRE Link Format，自写）、`coap_resource`（GET/PUT/POST/DELETE + `/.well-known/core` → `broker_retain`/`broker_router`/`broker_event`）、`coap_listener`（唯一 UDP socket owner，CON 去重 + 令牌桶 + Block1 重组） | 每 listener 三张**有界内存表**：`{IP,Port,Message ID}` → 已发出的 ACK 字节（`dedup_window_ms`）、`{IP,Port}` → 令牌桶、`{IP,Port,Token,Destination}` → Block1 重组缓冲（`max_block1_bytes`），全部在 1 s tick 上清扫；**不持久化**、无 ETS、无 Mnesia；retained / 日志 / 订阅 / 游标都在下层 app |
 
 ### 2.2 `broker_event` 的真实状态（S3 已实现）
 
@@ -133,7 +135,7 @@ S9 的额外约束：三个 agent 前端（A2A / MCP / ACP）**彼此不引用**
 
 ### 3.1 顶层结构
 
-系统**没有伞形 `broker_app_sup`**：除 `broker_core`（纯类型）、`broker_ws`（纯库）与 `broker_proto_agent_rpc`（纯库，S9-A）外的 **24 个 app 各有自己的顶层 supervisor**，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
+系统**没有伞形 `broker_app_sup`**：除 `broker_core`（纯类型）、`broker_ws`（纯库）与 `broker_proto_agent_rpc`（纯库，S9-A）外的 **26 个 app 各有自己的顶层 supervisor**，跨 app 的启动顺序交给 OTP 的 `applications` 拓扑序（设计文档 §6 的 T1 批注）。
 
 ```
 broker_metrics_app ────► broker_metrics_sup                        one_for_one, 5/10s
@@ -228,16 +230,19 @@ broker_ice_app ────────► broker_ice_sup                       
                            ├── turn_allocation_sup                  one_for_one, 1/5s
                            │   └── turn_allocation × N（每 allocation 一个 temporary gen_server + 自己的 relay UDP socket）
                            └── broker_ice_udp（唯一 UDP socket owner，`{active, once}` + 每包重 arm）
+
+broker_proto_coap_app ─► broker_proto_coap_sup                     one_for_all, 1/5s（`enabled => false` 时 child 列表为空）
+                           └── coap_listener × N                    transient（每 spec 一个 UDP socket）
 ```
 
-25 个顶层 supervisor（`broker_core` / `broker_ws` / `broker_proto_agent_rpc` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。28 个 app 减去这 3 个纯类型/纯库 app = 25，逐个核对过 `apps/*/src/*_sup.erl`。
+26 个顶层 supervisor（`broker_core` / `broker_ws` / `broker_proto_agent_rpc` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。29 个 app 减去这 3 个纯类型/纯库 app = 26，逐个核对过 `apps/*/src/*_sup.erl`。
 
 ### 3.2 重启策略与理由
 
 | 进程 | 策略 | 理由 | 崩溃后的可见行为 |
 |---|---|---|---|
 | `broker_metrics_sup` / `broker_metrics_server` | `one_for_one`, 5 次/10 s | 上报进程崩溃不应连累任何数据面；指标数组在进程外，重启不丢计数 | 最多丢一个上报周期，计数继续累积 |
-| `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN 的 listener 一死，它背后的连接/会话就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
+| `broker_storage_sup`、`broker_router_sup`、`broker_proto_mqtt_sup`、`broker_security_sup`、`broker_proto_mqtt_quic_sup`、`broker_proto_mqtt_sn_sup`、`broker_proto_coap_sup` | `one_for_all`, 1 次/5 s | 子系统内的进程共享一个装配前提（如索引 store 必须先于读路径；QUIC/SN/CoAP 的 listener 一死，它背后的连接/会话/端点状态就没有可读端口） | 超过强度则整个 app 退出；若是 boot 期失败，application 起不来 |
 | `broker_proto_mqtt_ws_sup` | `one_for_one`, 1 次/5 s | MQTT over WebSocket 只有 listener 一类子进程，没有需要一起重启的兄弟 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
 | `broker_proto_ws_sup` / `broker_proto_nats_sup` | `one_for_one`, 1 次/5 s | 同 `broker_proto_mqtt_ws_sup`：只有 listener 一类子进程 | listener 重启；live 连接由 ranch conns sup 随 listener 一起收掉 |
 | `broker_proto_a2a_sup` | `one_for_one`, 1 次/5 s | 只有两类子进程，且 registry 必须早于 listener（boot 契约，ADR-026 §D4）；registry 自己崩了由 `one_for_one` 单独重启整棵 registry 子树，不必连累 listener | listener 重启时 live 连接被收掉；registry 重启 = 全量重放重建投影，正在处理的 Task 请求收到 `internal_error` |
@@ -556,6 +561,32 @@ turn_allocation（每 allocation 一个 temporary gen_server，持有自己的 r
 
 **没有持久化状态，也不写指标。** allocation、permission、channel 全在进程内存；`broker_metrics` 出现在 `.app.src` 的 `applications` 里但代码零调用（ADR-016 冻结键集，ADR-029 §D1 明确不借语义不符的键）。
 
+### 3.18 CoAP 前端的单 socket / 无会话模型（S11-A）
+
+```
+broker_proto_coap_sup (one_for_all, 1/5s)
+└── coap_listener × N              % 每个 listener spec 一个；打开 UDP socket，{active, 100}
+```
+
+**CoAP 比 MQTT-SN 还少一层：没有会话进程。** MQTT-SN 至少要为每个已 CONNECT 的端点维持 topic id 表与 in-flight 窗口，所以它有 `mqtt_sn_conn`；CoAP 的每条 datagram 自带 Message ID、token 和全部 option，一次请求-响应在 `coap_listener` 进程里就结束了，不需要为任何对端建进程。listener 因此是**唯一的 socket owner，也是唯一的状态持有者**。
+
+**三张表，全部有界，全部在 1 s tick 上清扫。** CoAP 的「连接」只是 UDP 四元组，任何跨 datagram 的状态都可能被伪造源地址撑爆，所以每一张表都有硬上限：
+
+| 表 | 键 | 值 | 上限 / 过期 |
+|---|---|---|---|
+| CON 去重 | `{IP, Port, Message ID}` | 已发出的回复**字节** | `max_dedup_entries`（默认 4096，超限丢 1/3）+ `dedup_window_ms`（默认 247 s = EXCHANGE_LIFETIME） |
+| 端点令牌桶 | `{IP, Port}` | 剩余令牌 + 上次回填时刻 | `max_endpoints`（默认 4096）；表满时**拒绝新来源**而不是驱逐已有桶；令牌满且闲置超过窗口即丢弃 |
+| Block1 重组 | `{IP, Port, token, destination}` | 已拼装字节 + 累计长度 + 时刻 | 累计长度 `max_block1_bytes`（默认 256 KiB）；闲置超过窗口即丢弃 |
+
+**去重键是 Message ID，Block1 键是 token——这不是不一致。** 去重的对象是「同一个 CON 报文被重传」，RFC 7252 §4.8.2 的重复判定就是 Message ID + 端点；Block1 的对象是「一次请求的分块序列」，RFC 7959 草案 §2.1 用 **token** 标识这次请求，而每个分块都有自己的 Message ID。用 Message ID 做分块键会让每个分块都开一条新流，重组永远只剩最后一块（`coap_listener_SUITE` 的 `block1_reassembles_a_multidatagram_body` 特意让两个分块用不同 Message ID、同一 token 来钉死这一点）。
+
+**回复回显 Message ID 与 token。** piggybacked ACK 必须能让客户端配到请求上（§5.2.1），所以 `coap_codec:response/3` 造出的空壳会先被填上 `id` 与 `token` 再编码；NON 请求的回包同理（只是 type 是 NON）。`coap_listener_SUITE` 的 `con_get_returns_piggybacked_content` 直接断言 `id` 回显。
+
+**限流在解码前。** 令牌桶的扣减发生在 `coap_codec:decode/1` 之前：UDP 没有握手，源地址不可验证，如果先解码再限流，洪泛已经买到了 CPU。同理 `max_message_bytes` 的检查也在解码前——一个超长 datagram 连读都不该读。
+
+**没有持久化，也不扩指标键集。** listener 的三张表全在 gen_server 状态里，重启即空——这是正确的：socket 关掉之后，任何「重传窗口内」的承诺都已经过期。指标只 inc 既有键（`bytes_in` / `frame_decode_errors` / `protocol_errors`），不新增 CoAP 专属计数器（ADR-016 冻结键集，ADR-031 §D6）。
+
+
 ---
 
 ## 4. 启动顺序与 boot steps
@@ -587,6 +618,16 @@ sasl → broker_core → broker_metrics → broker_storage
 
 **S10-A/B 也不在这条链上，且比 S9 更轻。** `broker_proto_webrtc` 的 `applications` 只有 `kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics`——**连 `broker_core` 都不列**（ADR-028 §D8，不调用不 include，只经 `broker_security` 传递进来）。它**不读 MQTT 的数据目录、不参与任何 boot step、不建表**；`listeners => []` 时监督树下只有一个 `webrtc_room_registry`（房间分片，全在内存），零 listener。实测（以装配出的出厂 `sys.config`）：
 `application:ensure_all_started(broker_proto_webrtc)` → `{ok, [sasl, crypto, asn1, public_key, ssl, ranch, broker_ws, broker_core, broker_security, broker_metrics, broker_proto_webrtc]}`，`supervisor:which_children(broker_proto_webrtc_sup)` → 仅 `webrtc_room_registry`（及其 N 个分片），`webrtc_room_registry:rooms() → []`、`shard_count() → 16`（= `schedulers_online`）。注意 `broker_core` 仍出现在启动列表里，但那是 `broker_security` 拉进来的，不是本 app 声明的。
+
+**S11-A 也不在这条链上，且出厂不开端口。** `broker_proto_coap` 的 `applications` 是内核 6 app + `broker_security` / `broker_retain`，**不含 `ranch`**（CoAP 这里只做 UDP，socket 由 listener 自己开，照 §3.11 的 MQTT-SN 模型）。实测：
+
+```erlang
+%% 实测（分区已带外创建）：application:ensure_all_started(broker_proto_coap)
+[broker_router, crypto, asn1, public_key, ssl, broker_security, broker_queue,
+ broker_subscription, broker_event, broker_retain, broker_proto_coap]
+```
+
+`enabled => false`（出厂）时 `broker_proto_coap_sup` 的 child 列表为空——`supervisor:which_children/1` 实测 `[]`，**零 socket**。打开后每个 listener spec 自查端口：绑定失败即 `init/1` 返回 `{stop, {bind_failed, Port, Reason}}`，整个 app 起不来（ADR-031 §D6）。
 
 ### 4.2 四个 boot step
 

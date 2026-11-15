@@ -353,3 +353,16 @@ S10-C 交付 STUN Binding + TURN over UDP。下表逐条留痕本阶段**真实�
     - **超大 UDP 报文不可达（如实留痕，不设用例）**：`recbuf_bytes=262144` 看着像上限，但**单个 UDP 数据报本身最大 ~65507 字节**（IP 20 + UDP 8 头后），且客户端 `gen_udp:send` 发更大的报就返回 `{error, emsgsize}`。所以 relay 前端的 recbuf 永远不会被单个合法数据报撑爆——这是 UDP 协议本身的边界，不是本实现能测到的路径，故不设「超大报文」用例，只在此留痕。
     - **permission 过期重放不可达（如实留痕，不设用例）**：permission 有效期 `?PERMISSION_LIFETIME_S=300 s`，要构造「过期后重放」需在 CT 里等 5 分钟，不现实；本地无法在不改实现（把有效期改短会动既有语义）的前提下触发该分支，故不设用例，只在此留痕。
     - **`Refresh` lifetime 越界（已覆盖，非新增）**：`99999 → 600` 钳制已由既有 `a_refresh_keeps_the_allocation_alive` 钉住；负数/非整数 lifetime 在 wire 上不可达（`stun_codec:lifetime/1` 解的是 32 位无符号，永远是 0..4294967295 的整数，`refresh/2` 的 `case` 已覆盖 0 与正整数），畸形长度走上面的「畸形 LIFETIME」分支。
+
+### 12.4 S11-A CoAP 面明确未实现项（2026-11-15 立）
+
+S11-A 交付了 CoAP（RFC 7252）的请求/响应面：自写编解码、资源映射、UDP listener。下表逐条留痕本阶段**真实没有**的东西（不作为 Gate 依据；`docs/protocol-compatibility.md` §4.24 是同一份事实的协议口径，ADR-031 是本期的冻结合同）。
+
+1. **无 DTLS**：只有明文 UDP（默认 5683）。`principal` 恒 `undefined`，`broker_security:authorize/2` 只在 `acl => allow` 下放行；没有 PSK / 证书 / 自签路径（ADR-031 §D5 明确「默认不自签」，接线在 S11-C）。后果：CoAP 端口与 1883 一样是明文端口，跨不可信网段部署需自行封装。
+2. **无 Observe（RFC 7641）**：`observe` option 能解析，但没有注册、通知、取消。ADR-031 §D2 已冻结做法（归 `broker_subscription` + cursor，禁止 `pg2` 扇出、禁止把 `{Port, IP}` 当会话键），实现留 S11-B。后果：CoAP 客户端拿不到推送，只能轮询 GET。
+3. **只有 Block1（请求方向）**：服务端**不做 Block2 分块响应**。大响应受 `max_message_bytes`（UDP 本身 65535）限制，没有分块编码路径。
+4. **Block-wise 是草案**：对齐 `draft-ietf-core-block-18`，**不是 RFC 7959**（ADR-031 §D7）。与 libcoap 现行实现是否互通**未验证**——这正是 Gate S11 尚未勾选的「真实第三方客户端证据」。
+5. **无 multicast、无 CoAP over TCP/WebSocket（RFC 8323）、无 OSCORE、无 `If-Match`/`ETag` 条件请求**：均在 ADR-031 的非目标或后续阶段里。
+6. **限流不识别身份，且源地址可伪造**：令牌桶按 `{IP, Port}` 计（`max_requests_per_second` 默认 100），`max_endpoints`（默认 4096）满时**拒绝新来源**而不是驱逐已有桶——这是抗伪造源地址洪泛的取舍，代价是 NAT 后的多个客户端共享一个桶。
+7. **不写 CoAP 专属指标、无协议层日志**：沿用 ADR-016 冻结键集，只 inc 既有 `bytes_in` / `frame_decode_errors` / `protocol_errors`；没有「哪个目的地被写了几次」这类观测面，需要时只能看内核层的 retain/queue 统计。
+8. **单节点**：listener 的三张表（dedup / 令牌桶 / Block1）全在进程内存、不持久化，也不跨节点；retained 与日志语义完全由既有层决定。

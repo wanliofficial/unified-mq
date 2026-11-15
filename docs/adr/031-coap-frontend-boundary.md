@@ -91,3 +91,39 @@ ADR-030 §D1 把 CoAP 定为 S11 唯一进入实现评审的协议。`s11-coap.m
    - 留痕：本 ADR D2、`docs/design/s11-coap.md` §3.2 R-O2/R-O3。
 
 - **结论**：ADR-031 的 D1~D7 在 S11-A 开工前冻结；S11-A 的首个代码交付须逐条对照本 ADR，任何偏离记入本节。
+
+### S11-A 首个代码交付（2026-11-15）
+
+> 新 app `broker_proto_coap` 落地（`coap_codec` / `coap_resource` / `coap_listener` / `broker_proto_coap_app`），CT 73 例、全量 `rebar3 ct` 1324/1324 零回归、dialyzer 0 warning。**D1~D7 逐条成立**，没有需要推翻的边界；以下是 D 条文没写死、实现时必须选择的地方，以及本期**没有**落地的 D 条目。
+
+1. **D7 的 Block1 重组键：`{IP, Port, token, destination}`，不是 Message ID**
+   - 计划（D7）：只说「按 `draft-ietf-core-block-18` 实现分块重组」，没有指定流的键。
+   - 实际：键是**请求 token + 目的地**（再加端点四元组）。Message ID 每个分块都变，用它当键会让每个分块各开一条流，重组永远只剩最后一块。
+   - 为什么：草案 §2.1 用 token 标识一次 block-wise 请求；这也是 `coap_listener_SUITE` 的分块用例特意让两块用**不同 Message ID、同一 token** 的原因（自编对端用同一 ID 会把这个错误藏起来）。
+   - 留痕：`apps/broker_proto_coap/src/coap_listener.erl` 的 `block1_stream/5`、`docs/protocol-compatibility.md` §4.24.3。
+
+2. **D6 的「有界簿记」具体化为三张表 + 1 s tick**
+   - 计划（D6）：只要求「出厂零 socket、metrics 不扩容、同 MQTT-SN 族的 app 依赖」；ADR 正文提到 dedup/Block1 是 listener 内的有界状态，但没有给出界的形式。
+   - 实际：CON dedup（`max_dedup_entries` + `dedup_window_ms`）、端点令牌桶（`max_requests_per_second` + `max_endpoints`，表满时**拒绝新来源**而不是驱逐已有桶）、Block1 缓冲（`max_block1_bytes`）；三张表都在 1 s tick 上按 `dedup_window_ms` 清扫。
+   - 为什么：UDP 源地址可伪造，任何以源地址为键的表都必须有硬上限，否则一个伪造源地址的洪泛就能把 listener 的堆吃干净（与 §3.11 的 `{active, N}` 同一判断）。
+   - 留痕：`coap_listener.erl` 的 `allowed/4`、`remember/6`、`prune/1`；`docs/architecture.md` §3.18。
+
+3. **listener 不注册进程名（原计划是 `coap_listener_<Port>`）**
+   - 计划：按 MQTT-SN/TCP listener 的习惯给子进程注册一个以端口命名的原子。
+   - 实际：**不注册名字**，`start_link/1` 直接 `gen_server:start_link(?MODULE, Spec, [])`；测试从 `supervisor:which_children/1` 取 pid 后调 `coap_listener:port/1` 读回实际端口。
+   - 为什么：`port => 0` 时每个 listener 都想要 `coap_listener_0`，第二个就 `already_started`；而端口在 `gen_udp:open/2` 之后才知道，名字里没法写真实端口。**运维面没有因此丢信息**——`port/1` 一直存在。
+   - 留痕：`coap_listener.erl` 的 `start_link/1`；`coap_listener_SUITE.erl` 的 `listener_port/0`。
+
+4. **分块流的拒绝码：超限 `4.13`，中间块无流可续 `4.08`**
+   - 计划（D7）：草案允许「拒绝过大的 body」，但没指定「收到 Num>0 却没有流」时怎么办。
+   - 实际：超 `max_block1_bytes` → `4.13 Request Entity Too Large` 且丢弃该流；Num>0 且找不到流 → `4.08 Request Entity Incomplete`，**不**把这一块当成完整 body 去发布。
+   - 为什么：把半截 body 当完整消息发布，比拒绝更糟——客户端以为成功，订阅者收到截断数据。两种拒绝都在草案的错误码集合内。
+   - 留痕：`coap_listener.erl` 的 `block1_stream/5`、`assemble/11`。
+
+5. ~~D5（DTLS 接 `broker_security`、默认不自签）在 S11-A 未落地~~ —— **不是偏差，是分期**
+   - 计划（D5）：DTLS 接 `broker_security`，默认不自签。
+   - 实际（S11-A）：只有明文 UDP，`principal` 恒 `undefined`，ACL 只在 `acl => allow` 下有意义。
+   - 为什么：ADR 把 DTLS 放在 S11-C 的收口范围；本期的验收面是「编解码 + 资源映射 + UDP listener」，把 DTLS 一起做会让首个交付无法在一天内形成可核对的证据。**能力矩阵已如实写「无 DTLS」**，没有把计划读成现状。
+   - 留痕：`docs/protocol-compatibility.md` §4.24.4、[`docs/roadmap.md`](../roadmap.md) §13.1 S11-C 行。
+
+- **对照结论**：D1（自写编解码）、D2（Observe 归订阅层，本期未实现通知）、D3（CON/ACK 是 datagram 级、NON 不产生 piggybacked ACK）、D4（资源路径直映射 destination，不新开 `$coap/`）、D6（零 socket 出厂、依赖同族、metrics 不扩容）在首个交付里成立；D5 与 D7 的 Observe/互操作两半分别留 S11-C 与 S11-B/第三方证据。**冻结文本未改**，本节只追加落地事实。
