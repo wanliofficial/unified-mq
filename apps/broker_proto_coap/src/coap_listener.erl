@@ -66,7 +66,7 @@
     %% (a coap_observe:relationship()). Bounded by `max_observes'.
     observes = #{} :: map(),
     %% Un-acked CON notifications awaiting an ACK: {IP,Port,Token} ->
-    %% {Msg, RetransLeft, TimerRef}. Reused by the dedup/Block1-free path.
+    %% {Bytes, RetransLeft, TimerRef}. Reused by the dedup/Block1-free path.
     pending = #{} :: map()
 }).
 
@@ -137,10 +137,20 @@ handle_info({broker_deliver, <<"coap">>, _MaxQoS, _Matched, {_P, _O, Msg}},
     {noreply, dispatch_notifications(Msg, St)};
 
 %% An ACK for a CON notification cancels its retransmit. (The seq was already
-%% advanced when the notification was sent, so nothing to do but cancel.)
+%% advanced when the notification was sent, so nothing to do but cancel.) The
+%% decode is guarded on its own so a malformed datagram cannot turn into a
+%% double `on_datagram/4' via the catch.
 handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
-    try coap_codec:decode(Bin) of
-        {ok, #{type := ack, token := Token}} ->
+    Decoded =
+        try coap_codec:decode(Bin) of
+            {ok, #{type := ack, token := T}} -> {ack, T};
+            {ok, _Msg} -> other;
+            {error, _} -> other
+        catch
+            _:_ -> other
+        end,
+    case Decoded of
+        {ack, Token} ->
             Key = {IP, Port, Token},
             case maps:find(Key, Pend) of
                 {ok, {_Bytes, _Left, Ref}} ->
@@ -149,12 +159,8 @@ handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
                 error ->
                     {noreply, on_datagram(IP, Port, Bin, St0)}
             end;
-        {ok, _Msg} ->
-            {noreply, on_datagram(IP, Port, Bin, St0)};
-        {error, _} ->
+        other ->
             {noreply, on_datagram(IP, Port, Bin, St0)}
-    catch
-        _:_ -> {noreply, on_datagram(IP, Port, Bin, St0)}
     end;
 
 %% A CON notification went un-acked: retransmit it, or give up after
@@ -410,7 +416,10 @@ register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
                                                coap_observe:filter(Dest), 0,
                                                Tenant) of
                 {ok, SubRef} ->
-                    ok = broker_subscription:attach(?COAP_CLIENT, self(), false),
+                    %% A single anonymous listener taking over the `<<"coap">>'
+                    %% attachment is intended; the previous pid is irrelevant.
+                    {ok, _Prev} = broker_subscription:attach(?COAP_CLIENT, self(),
+                                                             false),
                     Rel = coap_observe:register(Dest, Tenant, SubRef, MaxAge,
                                                 now_ms()),
                     Rel1 = Rel#{req_type => coap_codec:type(Req)},
