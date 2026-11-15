@@ -480,7 +480,7 @@ S7 有两项交付：
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
 | S11-0 候选池筛选 | ✅ **已交付（2026-11-15，ADR-030）** | 14 仓「立项 / 归并 / 参考 / 不做」结论 + ADR-030；发现面 / DHT / SIP 三组统一裁决；5 份索引级稿的深挖去向 | **ADR-030 + 14 份立项稿 + 评审签认**（S11-0 纯文档，无代码）；**仅 CoAP 进入实现评审**，SIP 并入 ADR-028，发现面保留为延迟候选 |
-| S11-A CoAP 前端与编解码 | ⬜ 未开工 | 仅当 S11-0 通过：UDP/DTLS 前端 + 报文编解码 + 资源路由 + `.well-known/core` | libcoap 真实客户端 GET/PUT 用例；既有 823/823 零回归 |
+| S11-A CoAP 前端与编解码 | 🟡 设计已冻结（ADR-031），实现未开工 | 仅当 S11-0 通过：UDP/DTLS 前端 + 报文编解码 + 资源路由 + `.well-known/core` | **ADR-031 + OQ-3 构建 spike 已落盘**（[`docs/benchmarks/2026-11-15-s11a-gen-coap-spike.md`](benchmarks/2026-11-15-s11a-gen-coap-spike.md)：实测 `gen_coap` 在 OTP 28 运行时不可用 → 决定自写编解码）；libcoap 真实客户端 GET/PUT 用例待实现后产�出；既有 1251/1251 零回归待实现后复跑 |
 | S11-B CoAP Observe 与内核映射 | ⬜ 未开工 | Observe 订阅 / 通知 / 取消 + `broker_message` 映射 + 可靠性分档 | Observe 全流程 + 崩溃恢复用例；映射 ADR |
 | S11-C CoAP 安全与一致性收口 | ⬜ 未开工 | 身份表 / ACL / 限流 / 能力矩阵 / 压测 / 文档同步 / ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 + 安全专项用例 |
 
@@ -606,7 +606,10 @@ S7 有两项交付：
 | `docs/design/s10-0-convergence-report.md` | S10-0（已完成 2026-11-13；OQ-1~OQ-10 收敛 + ADR-028/029 底稿 + 反证点） | 4.1、12.1 |
 | `docs/design/s10-execution-plan.md` | S10-A / S10-B / S10-C（已完成 2026-11-13 / 2026-11-14；任务拆分 / 实测测试矩阵 / 证据计划 / 端口·配置·依赖表 / 门禁实测表 / 落地偏差记录：S10-A 13 条 + S10-B 12 条 + S10-C 13 条） | 4.1、12.1 |
 | `docs/design/s11-protocol-candidates.md` | S11（总览 / 立项规划稿，2026-11-11；14 仓候选池全表 + 优先级结论 + Gate + OQ-1~OQ-9） | 4.1、11.1 |
-| `docs/design/s11-coap.md` | S11（深挖立项稿，2026-11-11；CoAP / `gen_coap`；**A 档建议立项**） | 4.1、11.1 |
+| `docs/design/s11-coap.md` | S11（深挖立项稿，2026-11-11；CoAP / `gen_coap`；**A 档建议立项**；OQ-1~OQ-6 已由 ADR-031 冻结） | 4.1、11.1 |
+| `docs/adr/030-s11-protocol-pool-screening.md` | S11-0（已完成 2026-11-15，文档；14 仓四档结论 + OQ-1~OQ-9 收敛；仅 CoAP 进入实现评审） | 4.1、11.1 |
+| `docs/adr/031-coap-frontend-boundary.md` | S11-A 前置（已完成 2026-11-15，文档；CoAP 前端边界 + OQ-1~OQ-6 冻结：自写编解码 / Observe 归订阅层 / CON 为 datagram 级确认） | 4.1、11.1 |
+| `docs/benchmarks/2026-11-15-s11a-gen-coap-spike.md` | S11-A（构建 spike，2026-11-15；`gen_coap` × OTP 28.3.1 实测：编译通过但 `http_uri`/`pg2` 运行时移除 → 不 vendor） | 4.1、11.1 |
 | `docs/design/s11-lorawan.md` | S11（深挖立项稿；LoRaWAN / `lorawan-server`，收窄为桥接） | 4.1、11.1 |
 | `docs/design/s11-stun.md` | S11（深挖 / 依赖级复核；`processone/stun` 归并 S10 ICE 组件，不重复立项） | 4.1、11.1 |
 | `docs/design/s11-erldns.md` | S11（深挖立项稿；DNS 权威 / `erldns`，P2 参考） | 4.1、11.1 |

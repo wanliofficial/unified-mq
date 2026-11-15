@@ -187,7 +187,7 @@ README 自述的互操作验证对象：C `libcoap`（develop 分支）与 `coap
 |---|---|---|---|
 | R-E1 | 关键不确定性在 S11-0 收敛并以 ADR 落盘，冻结后再写实现 | roadmap §0 第 2 条 | P0 |
 | R-E2 | 需一份**真实第三方客户端**证据落盘 `test/protocol-compatibility/`（libcoap / coap.me 等价物）+ 能力矩阵与限制清单 | roadmap §10.2 / S8 惯例 | P0 |
-| R-E3 | 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功 | 项目惯例 | P0 |
+| R-E3 | 既有 `rebar3 ct` 零回归（基线 1251/1251、79 套件，S10-D 收口）；dialyzer / xref 干净；`rebar3 release` 装配成功 | 项目惯例 | P0 |
 | R-E4 | 所有性能 / 容量数字必须来自落盘实测，不得预先承诺 | README §11.4 | P0 |
 | R-E5 | 文档同步：roadmap / architecture / operations / security / README / progress / protocol-compatibility | roadmap §10.2 | P1 |
 
@@ -222,18 +222,20 @@ CoAP 候选**不引入新的内核抽象**：复用 S3（`ce-*` 通道）、S6/S
 | B Observe 与内核映射 | Observe 订阅 / 通知 / 取消 + `broker_message` 映射 + 可靠性分档 | Observe 订阅全流程 + 崩溃恢复用例 |
 | C 安全与收口 | 身份表接线、逐资源 ACL、限流、能力矩阵、压测、文档同步 | 全量 CT + dialyzer/xref + 容量报告 |
 
-**Gate（结案条件）**：真实第三方客户端证据落盘；Observe 映射由 ADR 冻结且无第二套内核；`401`/`403` 与 ACL 越权专项用例通过；UDP 放大攻击防护用例通过；既有 `rebar3 ct` 零回归（823/823、52 套件）；数字全部来自实测；非目标逐行留痕。
+**Gate（结案条件）**：真实第三方客户端证据落盘；Observe 映射由 ADR 冻结且无第二套内核；`401`/`403` 与 ACL 越权专项用例通过；UDP 放大攻击防护用例通过；既有 `rebar3 ct` 零回归（1251/1251、79 套件，S10-D 收口基线）；数字全部来自实测；非目标逐行留痕。
 
 ### 4.3 未决问题（S11-0 必须收敛）
 
-| 编号 | 问题 | 收敛方式 |
+> **已由 [ADR-031](../adr/031-coap-frontend-boundary.md) 冻结（2026-11-15）**。OQ-3 的构建 spike 实测见 [`docs/benchmarks/2026-11-15-s11a-gen-coap-spike.md`](../benchmarks/2026-11-15-s11a-gen-coap-spike.md)。
+
+| 编号 | 问题 | 冻结结论（ADR-031） |
 |---|---|---|
-| OQ-1 | Observe 订阅状态落到哪里：进程 / ETS / 控制面？与 ADR-013 cursor 归属如何共存 | spike + ADR（参照 ADR-013 论证） |
-| OQ-2 | CON/ACK 与 Broker 业务 ACK 如何分档，是否落盘、绑定哪档可靠性 | ADR-007 显式分档，禁止含糊表述 |
-| OQ-3 | `gen_coap` 旧式 rebar / OTP 19.2 DTLS 代码与当前 OTP 28.3.1 / rebar3 3.27 的兼容性；是否 vendor | 构建 spike + 依赖审计 |
-| OQ-4 | `draft-ietf-core-block-18` 与 RFC 7959 的偏差是否影响互操作 | libcoap 真实客户端分块用例 |
-| OQ-5 | 资源路径与六协议 destination 命名空间的冲突（`/` 层级 vs topic 过滤器） | 与 `docs/architecture.md` §2.1 对齐 |
-| OQ-6 | DTLS 凭据（PSK / 证书）与统一身份表的绑定方式 | 与 `docs/security.md` §2.1 对齐 |
+| OQ-1 | Observe 订阅状态落到哪里：进程 / ETS / 控制面？与 ADR-013 cursor 归属如何共存 | **归订阅层 + cursor**（D2）：`Observe=0` → 一次 `broker_subscription` 订阅 + cursor，adapter 只持会话↔SubRef 映射；禁止照搬上游 `pg2` 观察者扇出 |
+| OQ-2 | CON/ACK 与 Broker 业务 ACK 如何分档，是否落盘、绑定哪档可靠性 | **datagram 级确认**（D3）：NON = 至多一次；CON = adapter 负责报文重传（RFC 7252 §4.2），只保证到达 adapter，业务可靠性仍由内核 ADR-007 那一档决定；禁止等价 QoS 1 |
+| OQ-3 | `gen_coap` 与 OTP 28.3.1 / rebar3 3.27 的兼容性；是否 vendor | **不 vendor**（D1）：实测编译通过但运行时 `http_uri`×4 + `pg2`×6 全部 `undef`、无客户端 Observe API；自写 `coap_codec`，规模对齐 `stun_codec`/`mqtt_sn_codec` |
+| OQ-4 | `draft-ietf-core-block-18` 与 RFC 7959 的偏差是否影响互操作 | **如实标注草案**（D7）：首期按草案实现，能力矩阵写明非 RFC 7959；互操作由 S11-A 真实第三方客户端证据证明，不预设 |
+| OQ-5 | 资源路径与六协议 destination 命名空间的冲突（`/` 层级 vs topic 过滤器） | **直接映射 `broker_router` destination**（D4）：`a/b/c` → `<<"a/b/c">>`，不新开 `$coap/`；撞名即同一路由，需隔离用 ACL |
+| OQ-6 | DTLS 凭据（PSK / 证书）与统一身份表的绑定方式 | **接 `broker_security`**（D5）：证书/PSK 用既有 TLS 材料，默认不自签；出厂 `enabled => false` 零 socket |
 
 ### 4.4 口径说明
 
