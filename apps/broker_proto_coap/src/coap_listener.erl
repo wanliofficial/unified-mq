@@ -165,22 +165,44 @@ handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
                     {noreply, on_datagram(IP, Port, Bin, St0)}
             end;
         {rst, Rid} ->
-            case maps:find({IP, Port, Rid}, Pend) of
-                {ok, {Token, _Bytes, _Left, Ref}} ->
-                    _ = erlang:cancel_timer(Ref),
-                    St1 = St0#st{pending = maps:remove({IP, Port, Rid}, Pend)},
-                    {noreply, deregister_observe(IP, Port, Token, St1)};
-                error ->
-                    {noreply, on_datagram(IP, Port, Bin, St0)}
+            %% A CON notification's retransmit is keyed by its Message ID in
+            %% `pending'; if its timer is still armed, cancel it and drop the
+            %% entry. If not (already ACKed, superseded by NSTART=1, or not yet
+            %% recorded because the notification is dispatched asynchronously), no
+            %% timer to cancel.
+            St1 =
+                case maps:take({IP, Port, Rid}, Pend) of
+                    {{_Token, _Bytes, _Left, Ref}, Rest} ->
+                        _ = erlang:cancel_timer(Ref),
+                        St0#st{pending = Rest};
+                    error ->
+                        St0
+                end,
+            %% End the relationship whose CURRENT notification carries this ID. A
+            %% conformant empty RST has no token, so the relationship is found by
+            %% scanning `observes' for a matching notification id (RFC 7641
+            %% §4.5) -- this works whether or not the notification is still in
+            %% `pending', so a client may RST immediately.
+            case observe_by_notify_id(Rid, St1#st.observes) of
+                undefined ->
+                    %% No such notification: a stray/late RST. Not a request, no
+                    %% response owed (RFC 7252 §4.3).
+                    {noreply, St1};
+                {_, _, _} = Key ->
+                    {noreply, deregister_observe(element(1, Key), element(2, Key),
+                                                 element(3, Key), St1)}
             end;
         other ->
             {noreply, on_datagram(IP, Port, Bin, St0)}
     end;
 
-%% A CON notification went un-acked: retransmit it, or give up after
-%% `observe_max_retrans' tries and tear the relationship down.
-handle_info({timeout, _Ref, observe_ack}, #st{} = St) ->
-    {noreply, retransmit_observes(St)};
+%% A CON notification went un-acked: retransmit exactly that one (the timer
+%% message carries its `pending' key) or give up after `observe_max_retrans'
+%% tries. Aiming at the fired entry by key -- rather than folding the whole
+%% `pending' table -- is what stops one relationship's timer from resending (and
+%% spending the retransmit budget of) every other relationship's notification.
+handle_info({timeout, Ref, {observe_ack, IdKey}}, #st{} = St) ->
+    {noreply, retransmit_one(IdKey, Ref, St)};
 
 %% The 1 s refill tick also sweeps expired Observe relationships.
 handle_info({timeout, _Ref, refill}, St) ->
@@ -506,11 +528,30 @@ register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
                               end,
                     Rel1 = Rel#{req_type => ReqType},
                     St1 = St#st{observes = maps:put(Key, Rel1, Obs)},
-                    {cancel_pending_for(Token, St1), Rel1};
+                    {cancel_pending_for(Key, St1), Rel1};
                 {error, _} ->
                     {St, undefined}
             end
     end.
+
+%% Find the observe relationship (identified by its `{IP,Port,Token}' key) whose
+%% MOST RECENT notification carries Message ID `Id'. A conformant empty RST has no
+%% token, so this scan of `observes' is how a client's RST is matched to a
+%% relationship (RFC 7641 §4.5). Returns the relationship key, or `undefined' when
+%% no live relationship has such a notification (a stray/late RST).
+observe_by_notify_id(Id, Observes) ->
+    lists:foldl(
+      fun({Key, #{req_id := Id0}}, Found) ->
+              case Found of
+                  undefined ->
+                      case Id0 =:= Id of
+                          true -> Key;
+                          false -> undefined
+                      end;
+                  _ ->
+                      Found
+              end
+      end, undefined, maps:to_list(Observes)).
 
 %% Called by respond/5 for a GET with Observe=1, and by the udp clause for an
 %% RST correlated by Message ID. Drops the relationship and unsubscribes that one
@@ -527,11 +568,11 @@ deregister_observe(IP, Port, Token, St) ->
     Key = {IP, Port, Token},
     case coap_observe:deregister(Key, St#st.observes) of
         {undefined, Obs1} ->
-            cancel_pending_for(Token, St#st{observes = Obs1});
+            cancel_pending_for(Key, St#st{observes = Obs1});
         {Rel, Obs1} ->
             St1 = maybe_unsubscribe(maps:get(dest, Rel),
                                     St#st{observes = Obs1}),
-            St2 = cancel_pending_for(Token, St1),
+            St2 = cancel_pending_for(Key, St1),
             maybe_detach(St2)
     end.
 
@@ -549,9 +590,14 @@ dispatch_notifications(#broker_message{} = Msg,
 
 %% Send one notification. The relationship's `req_type' decides CON (reliable:
 %% retransmit until ACKed, tracked in `pending') vs NON (at-most-once: fire once).
-%% `pending' is keyed by the notification's Message ID (a conformant empty
-%% ACK/RST echoes the ID, not the token) and stores the observe token so an RST
-%% can find and end the relationship.
+%%
+%% `pending' is keyed by `{IP,Port,MessageId}': a conformant empty ACK/RST carries
+%% no token, only the echoed Message ID, so that is the only key an incoming ACK
+%% can match. Each entry ALSO stores the relationship key `{IP,Port,Token}`, so an
+%% ACK/RST (and teardown) can find the relationship it belongs to. NSTART=1
+%% (RFC 7641 §4.5.1): a new CON notification for a relationship replaces any still
+%% outstanding one instead of queueing behind it, which keeps `pending' bounded by
+%% the number of relationships and keeps each relationship to a single budget.
 notify_one({IP, Port, Token} = ObsKey, Rel, Msg, Cfg,
            #st{pending = Pend, observes = Obs} = St) ->
     Type = maps:get(req_type, Rel, con),
@@ -565,25 +611,40 @@ notify_one({IP, Port, Token} = ObsKey, Rel, Msg, Cfg,
         con ->
             Timeout = maps:get(observe_ack_timeout_ms, Cfg, 2000),
             Left = maps:get(observe_max_retrans, Cfg, 3),
-            {_Bytes1, Ref} = arm_retransmit({IP, Port, Id}, Bytes, Pend, Timeout),
-            St#st{observes = maps:put(ObsKey, Rel1, Obs),
-                  pending = maps:put({IP, Port, Id},
-                                     {Token, Bytes, Left, Ref}, Pend)};
+            IdKey = {IP, Port, Id},
+            %% Drop any still-outstanding notification for THIS relationship first
+            %% (NSTART=1), so one slow ACK cannot stack up notifications.
+            Pend1 = cancel_pending_map(ObsKey, Pend),
+            Ref = arm_retransmit(IdKey, Timeout),
+            Rel2 = Rel1#{req_id => Id},
+            St#st{observes = maps:put(ObsKey, Rel2, Obs),
+                  pending = maps:put(IdKey, {ObsKey, Bytes, Left, Ref}, Pend1)};
         non ->
-            St#st{observes = maps:put(ObsKey, Rel1, Obs)}
+            %% At-most-once: no retransmit state at all (RFC 7641 §4.5).
+            St#st{observes = maps:put(ObsKey, Rel1#{req_id => Id}, Obs)}
     end.
 
-%% (Re)arm the retransmit timer for one notification (keyed by Message ID),
-%% cancelling any previous one so a same-id refresh never leaves an orphaned timer
-%% firing later. The retransmit budget is the `RetransLeft' counter stored
-%% alongside the bytes (ADR-031 §D3 upper bound); this only manages the timer.
-arm_retransmit(IdKey, Bytes, Pend, Timeout) ->
-    case maps:find(IdKey, Pend) of
-        {ok, {_Tok, _Old, _OldLeft, OldRef}} ->
-            _ = erlang:cancel_timer(OldRef);
-        error -> ok
-    end,
-    {Bytes, erlang:start_timer(Timeout, self(), observe_ack)}.
+%% Arm the retransmit timer for one pending notification. The timer message carries
+%% its `pending' key so a firing timer acts on exactly that entry, never on the
+%% whole table (one relationship's timer must not spend another's budget).
+arm_retransmit(IdKey, Timeout) ->
+    erlang:start_timer(Timeout, self(), {observe_ack, IdKey}).
+
+%% Drop (and cancel the timers of) every pending notification belonging to one
+%% relationship. Scoped by the full `{IP,Port,Token}' key, so a teardown on one
+%% endpoint never cancels another endpoint's notification that happens to share a
+%% token (the empty token is the common case: most clients use none).
+cancel_pending_map(ObsKey, Pend) ->
+    maps:fold(
+      fun(_IdKey, {ObsKey0, _Bytes, _Left, Ref}, Acc) when ObsKey0 =:= ObsKey ->
+              _ = erlang:cancel_timer(Ref),
+              Acc;
+         (IdKey, Val, Acc) ->
+              maps:put(IdKey, Val, Acc)
+      end, #{}, Pend).
+
+cancel_pending_for(ObsKey, #st{pending = Pend} = St) ->
+    St#st{pending = cancel_pending_map(ObsKey, Pend)}.
 
 %% The 1 s refill tick also drops relationships silent longer than their own
 %% Max-Age window. Side-effecting (it unsubscribes), so it cannot live in the
@@ -592,73 +653,57 @@ sweep_observes(#st{observes = Obs, cfg = Cfg} = St) ->
     Cap = maps:get(observe_max_age_s, Cfg, 30),
     Now = now_ms(),
     lists:foldl(
-      fun({{_IP, _Port, Token} = Key, Rel}, Acc) ->
+      fun({Key, Rel}, Acc) ->
               case coap_observe:expired(Rel, Now, Cap) of
                   true ->
                       Obs1 = maps:remove(Key, Acc#st.observes),
                       St1 = maybe_unsubscribe(maps:get(dest, Rel),
                                               Acc#st{observes = Obs1}),
-                      St2 = cancel_pending_for(Token, St1),
+                      St2 = cancel_pending_for(Key, St1),
                       maybe_detach(St2);
                   false ->
                       Acc
               end
       end, St, maps:to_list(Obs)).
 
-%% A CON notification went un-acked: resend it once, counting the retransmit down;
-%% at zero give up and tear the relationship down. Every timer fired here is
-%% cancelled (it either re-arms a fresh one or the entry is dropped).
-retransmit_observes(#st{pending = Pend} = St) ->
-    lists:foldl(
-      fun({IdKey, {Token, Bytes, Left, Ref}}, Acc) ->
-              _ = erlang:cancel_timer(Ref),
-              _ = gen_udp:send(Acc#st.socket, element(1, IdKey),
-                               element(2, IdKey), Bytes),
-              case Left - 1 of
-                  0 ->
-                      give_up_relationship(IdKey, Token, Acc);
-                  Left1 ->
-                      Timeout = maps:get(observe_ack_timeout_ms, Acc#st.cfg,
-                                         2000),
-                      {_Bytes1, Ref1} =
-                          arm_retransmit(IdKey, Bytes, Acc#st.pending, Timeout),
-                      Acc#st{pending = maps:put(IdKey, {Token, Bytes, Left1, Ref1},
-                                                 Acc#st.pending)}
-              end
-      end, St, maps:to_list(Pend)).
+%% A CON notification went un-acked. Act on EXACTLY the entry whose timer fired
+%% (matched by key AND timer ref, so a stale timer for a superseded notification
+%% is ignored): resend it once, counting the retransmit down; at zero give up on
+%% the relationship.
+retransmit_one(IdKey, Ref, #st{pending = Pend} = St) ->
+    case maps:find(IdKey, Pend) of
+        {ok, {ObsKey, Bytes, Left, Ref}} ->
+            IP = element(1, IdKey),
+            Port = element(2, IdKey),
+            _ = gen_udp:send(St#st.socket, IP, Port, Bytes),
+            Pend1 = maps:remove(IdKey, Pend),
+            case Left - 1 of
+                0 ->
+                    give_up_relationship(ObsKey, St#st{pending = Pend1});
+                Left1 ->
+                    Timeout = maps:get(observe_ack_timeout_ms, St#st.cfg, 2000),
+                    Ref1 = arm_retransmit(IdKey, Timeout),
+                    St#st{pending = maps:put(IdKey, {ObsKey, Bytes, Left1, Ref1},
+                                             Pend1)}
+            end;
+        _ ->
+            %% Already ACKed, superseded, or torn down: a stale timer, ignore it.
+            St
+    end.
 
-%% Give up on one relationship after its retransmit budget is spent: unsubscribe
-%% its filter (unless another live relationship still needs it), forget it from
-%% `observes' and `pending', and detach the shared session once the table is empty.
-give_up_relationship(IdKey, Token,
-                     #st{observes = Obs, pending = Pend} = St) ->
-    IP = element(1, IdKey),
-    Port = element(2, IdKey),
-    ObsKey = {IP, Port, Token},
-    St1 = St#st{pending = maps:remove(IdKey, Pend)},
+%% Give up on one relationship after its retransmit budget is spent: cancel its
+%% pending notification, unsubscribe its filter (unless another live relationship
+%% still needs it), and detach the shared session once the table is empty.
+give_up_relationship(ObsKey, #st{observes = Obs} = St) ->
+    St1 = cancel_pending_for(ObsKey, St),
     case maps:take(ObsKey, Obs) of
         {Rel, Obs1} ->
             St2 = maybe_unsubscribe(maps:get(dest, Rel), St1#st{observes = Obs1}),
             maybe_detach(St2);
         error ->
             %% Already gone (e.g. deregistered by an RST in the meantime).
-            St1#st{observes = maps:remove(ObsKey, Obs)}
+            St1
     end.
-
-%% Cancel every un-acked CON notification belonging to one relationship
-%% (identified by its observe token) and drop those `pending' entries. `pending'
-%% is keyed by Message ID, not token, so this scans the stored tokens. Used when a
-%% relationship goes away (deregister / RST / sweep / refresh) to avoid leaving
-%% orphaned retransmit timers firing for a token nobody observes any more.
-cancel_pending_for(Token, #st{pending = Pend} = St) ->
-    Kept = maps:fold(
-             fun(_IdKey, {Tok, _Bytes, _Left, Ref}, Acc) when Tok =:= Token ->
-                     _ = erlang:cancel_timer(Ref),
-                     Acc;
-                (IdKey, Val, Acc) ->
-                     maps:put(IdKey, Val, Acc)
-             end, #{}, Pend),
-    St#st{pending = Kept}.
 
 %% Unsubscribe a destination's shared filter, but only when no OTHER live
 %% relationship on that destination still needs it. Every CoAP observation shares

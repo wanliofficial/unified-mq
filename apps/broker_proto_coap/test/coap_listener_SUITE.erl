@@ -516,6 +516,10 @@ observe_deregister_with_observe_1(Config) ->
 observe_rst_deregisters(Config) ->
     Port = ?config(port, Config),
     S = open(),
+    %% CON notifications retransmit on the ACK-timeout; pin it short so the RST
+    %% below lands well before a retransmit (which would arrive as a second
+    %% notification the test does not expect).
+    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
     Token = <<"rsttok">>,
     send(S, Port, request(con, put, 1, [{uri_path, <<"rst1">>}], <<"a">>)),
     _ = expect(S, ack, {response, 2, 4}),
@@ -524,7 +528,10 @@ observe_rst_deregisters(Config) ->
     send(S, Port, request(con, put, 3, [{uri_path, <<"rst1">>}], <<"b">>)),
     _ = expect(S, ack, {response, 2, 4}),
     Note = expect(S, con, {response, 2, 5}),
-    %% A conformant empty RST echoes the rejected notification's Message ID.
+    %% A conformant empty RST echoes the rejected notification's Message ID. It
+    %% must arrive before any ACK (an ACK would cancel the retransmit and leave
+    %% nothing for the RST to act on); the RST cancels the timer AND ends the
+    %% relationship in one step.
     send(S, Port, rst_of(coap_codec:id(Note))),
     send(S, Port, request(con, put, 4, [{uri_path, <<"rst1">>}], <<"c">>)),
     _ = expect(S, ack, {response, 2, 4}),
