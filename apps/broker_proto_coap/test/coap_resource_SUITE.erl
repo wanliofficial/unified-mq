@@ -51,8 +51,7 @@ all() ->
      non_write_dispatches_without_appending,
      get_reads_only_retained_not_the_log,
      observe_option_is_ignored_not_rejected,
-     observe_1_on_get_answers_2_01,
-     observe_0_on_get_still_reads_retained].
+     observe_1_returns_representation_without_option].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -208,21 +207,16 @@ observe_option_is_ignored_not_rejected(_) ->
     {reply, {response, 2, 5}, _, <<"t0">>} =
         coap_resource:handle(Req, ?CFG, ?CTX).
 
-%% Observe=1 deregisters; the resource layer itself only owns the answer (2.01
-%% "Created", RFC 7641 §3.5: deregistering is benign). The listener drops the
-%% subscription -- this module stays a pure function.
-observe_1_on_get_answers_2_01(_Config) ->
-    Req = request(con, get, 9, [{uri_path, <<"z">>}, {observe, 1}]),
-    {reply, {response, 2, 1}, [], <<>>} = coap_resource:handle(Req, ?CFG, ?CTX).
-
-%% Observe=0 does not change what the resource reads: still the retained
-%% representation, read exactly like a plain GET (the listener adds Observe: 0
-%% and mints the subscription around this answer).
-observe_0_on_get_still_reads_retained(_Config) ->
+%% Observe=1 deregisters (the listener drops the relationship), but the resource
+%% layer still answers the GET as usual: the current representation with NO
+%% Observe option of its own (RFC 7641 §4.1) -- not a bare 2.01 "Created". This
+%% module stays a pure function; the listener owns the subscription.
+observe_1_returns_representation_without_option(_Config) ->
     put(<<"z">>, <<"v">>),
-    Req = request(con, get, 10, [{uri_path, <<"z">>}, {observe, 0}]),
-    {reply, {response, 2, 5}, _Options, <<"v">>} =
-        coap_resource:handle(Req, ?CFG, ?CTX).
+    Req = request(con, get, 9, [{uri_path, <<"z">>}, {observe, 1}]),
+    {reply, {response, 2, 5}, Options, <<"v">>} =
+        coap_resource:handle(Req, ?CFG, ?CTX),
+    ?assertNot(lists:keymember(observe, 1, Options)).
 
 %%%_* Helpers ---------------------------------------------------------------
 

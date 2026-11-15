@@ -22,7 +22,12 @@
                           sub_ref := broker_subscription:sub_ref(),
                           max_age := non_neg_integer(),
                           seq := non_neg_integer(),
-                          last_notified := integer()}.
+                          last_notified := integer(),
+                          %% The registering request's type (CON or NON), which
+                          %% decides the notification type (RFC 7641 §3.4/§4.1), set
+                          %% by the listener when it records the relationship. A GET is
+                          %% never an ACK/RST, so when present it is always `con|non'.
+                          req_type => con | non}.
 -type observes() :: #{key() => relationship()}.
 
 %% The CoAP-Observe filter: the resource path IS the broker destination

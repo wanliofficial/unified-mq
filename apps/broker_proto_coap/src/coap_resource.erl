@@ -20,10 +20,11 @@
 %% Observe (RFC 7641) is handled in two halves. This module owns only the
 %% *answer*: a GET with `Observe: 0' reads the representation exactly like a
 %% plain GET (a 4.04 means there is nothing to observe), and a GET with
-%% `Observe: 1' answers 2.01 because deregistering is benign (§3.5). The
-%% subscription itself is minted by the listener, which owns the socket and the
-%% relationship table -- keeping this module a pure function of its inputs.
-%% Non-GET methods ignore Observe entirely (§3.1).
+%% `Observe: 1' deregisters and is answered as a plain GET too -- the current
+%% representation with NO Observe option (§4.1). The subscription itself is minted
+%% by the listener, which owns the socket and the relationship table -- keeping
+%% this module a pure function of its inputs. Non-GET methods ignore Observe
+%% entirely (§3.1).
 %%
 %% Reliability (ADR-031 §D3) is per-datagram, never per-message-kind:
 %%
@@ -78,10 +79,13 @@ get(Req, Cfg, Ctx) ->
                     %% observe yet.
                     read_resource(Destination, Ctx);
                 1 ->
-                    %% Deregister: the listener drops the relationship. Answer
-                    %% 2.01 "Created" (RFC 7641 §3.5 -- deregistering a
-                    %% relationship that is not there is benign).
-                    {reply, {response, 2, 1}, [], <<>>};
+                    %% Deregister (RFC 7641 §4.1): the listener drops the
+                    %% relationship; the response is the GET processed as usual --
+                    %% the current representation with NO Observe option (a 2.05,
+                    %% or 4.04 if there is nothing to read). A bare 2.01 "Created"
+                    %% would be wrong: nothing was created, and the client asked
+                    %% for a representation it should get one last time.
+                    read_resource(Destination, Ctx);
                 _ObsVal ->
                     %% Any other Observe value is malformed; treat as a plain read.
                     read_resource(Destination, Ctx)

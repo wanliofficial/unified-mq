@@ -45,8 +45,9 @@ all() ->
      observe_deregister_with_observe_1,
      observe_rst_deregisters,
      observe_bounded_table_refuses,
-     observe_acl_denied,
-     observe_max_age_expires_relationship].
+     observe_plain_udp_principal_is_allowed,
+     observe_max_age_expires_relationship,
+     observe_two_observers_same_dest_both_notified].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -120,6 +121,10 @@ case_env(oversized_datagram_is_dropped, _Config) ->
 case_env(observe_con_retries_then_gives_up, _Config) ->
     ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
     ok = application:set_env(broker_proto_coap, observe_max_retrans, 2);
+case_env(observe_con_notifies_and_acks, _Config) ->
+    %% Pin a short ACK timeout so the post-ACK silence window can actually catch a
+    %% broken retransmit-cancel (the default 2000 ms would mask it).
+    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300);
 %% The bounded-table case shrinks the relationship table to a single slot.
 case_env(observe_bounded_table_refuses, _Config) ->
     ok = application:set_env(broker_proto_coap, max_observes, 1);
@@ -254,16 +259,15 @@ request(Type, Method, Id, Options) ->
 request(Type, Method, Id, Options, Payload) ->
     (coap_codec:request(Type, Method, Id, Options))#{payload => Payload}.
 
-%% An empty ACK that echoes a notification's token and Message ID. The codec's
-%% own `ack/1' drops the token, which would miss the `pending' match.
+%% A conformant empty ACK: TKL 0, echoing the notification's Message ID (RFC 7252
+%% §4.1 / RFC 7641 §4.5). The listener correlates a CON notification's ACK by ID,
+%% not token, so this is exactly what a real client sends.
 ack_of(Note) ->
-    #{type => ack, code => empty, id => coap_codec:id(Note),
-      token => coap_codec:token(Note), options => [], payload => <<>>}.
+    coap_codec:ack(Note).
 
-%% An RST carrying the token of the observation being ended (RFC 7641 §3.6).
-rst_of(Token, Id) ->
-    #{type => rst, code => empty, id => Id, token => Token,
-      options => [], payload => <<>>}.
+%% A conformant empty RST: TKL 0, echoing the rejected notification's Message ID.
+rst_of(Id) ->
+    coap_codec:reset(#{id => Id}).
 
 %%%_* Cases -----------------------------------------------------------------
 
@@ -413,8 +417,8 @@ malformed_datagram_is_dropped(Config) ->
 observe_ack_and_rst_are_not_requests(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    send(S, Port, ack_of(#{id => 4242, token => <<"nobody">>})),
-    send(S, Port, rst_of(<<"nobody">>, 4243)),
+    send(S, Port, ack_of(#{id => 4242})),
+    send(S, Port, rst_of(4243)),
     refute(S, ack, {response, 2, 5}, 300),
     refute(S, ack, {response, 4, 4}, 300),
     close(S).
@@ -438,7 +442,9 @@ observe_con_notifies_and_acks(Config) ->
     ?assertEqual(Token, coap_codec:token(Note)),
     ?assertEqual(1, coap_codec:option(observe, Note)),
     send(S, Port, ack_of(Note)),
-    refute(S, con, {response, 2, 5}, 400),
+    %% ACK timeout is pinned to 300 ms (see case_env); a broken cancel would
+    %% retransmit at 300 ms, so the silence window must exceed that to catch it.
+    refute(S, con, {response, 2, 5}, 700),
     send(S, Port, request(con, put, 4, [{uri_path, <<"o">>}], <<"v2">>)),
     _ = expect(S, ack, {response, 2, 4}),
     Note2 = expect(S, con, {response, 2, 5}),
@@ -497,8 +503,10 @@ observe_deregister_with_observe_1(Config) ->
     _ = expect(S, ack, {response, 2, 4}),
     _ = expect(S, con, {response, 2, 5}),
     send(S, Port, request(con, get, 4, [{uri_path, <<"d1">>}, {observe, 1}])),
-    ?assertEqual({response, 2, 1},
-                 coap_codec:code(expect(S, ack, {response, 2, 1}))),
+    %% Deregister processes the GET as usual: the current representation, no
+    %% Observe option (RFC 7641 §4.1) -- 2.05 here, since the dest has state.
+    ?assertEqual({response, 2, 5},
+                 coap_codec:code(expect(S, ack, {response, 2, 5}))),
     send(S, Port, request(con, put, 5, [{uri_path, <<"d1">>}], <<"c">>)),
     _ = expect(S, ack, {response, 2, 4}),
     refute(S, con, {response, 2, 5}, 400),
@@ -515,8 +523,9 @@ observe_rst_deregisters(Config) ->
     _ = expect(S, ack, {response, 2, 5}),
     send(S, Port, request(con, put, 3, [{uri_path, <<"rst1">>}], <<"b">>)),
     _ = expect(S, ack, {response, 2, 4}),
-    _ = expect(S, con, {response, 2, 5}),
-    send(S, Port, rst_of(Token, 9)),
+    Note = expect(S, con, {response, 2, 5}),
+    %% A conformant empty RST echoes the rejected notification's Message ID.
+    send(S, Port, rst_of(coap_codec:id(Note))),
     send(S, Port, request(con, put, 4, [{uri_path, <<"rst1">>}], <<"c">>)),
     _ = expect(S, ack, {response, 2, 4}),
     refute(S, con, {response, 2, 5}, 400),
@@ -532,11 +541,22 @@ observe_bounded_table_refuses(Config) ->
     _ = expect(S, ack, {response, 2, 4}),
     send(S, Port, request(con, put, 2, [{uri_path, <<"b2">>}], <<"y">>)),
     _ = expect(S, ack, {response, 2, 4}),
-    send(S, Port, request(con, get, 3, [{uri_path, <<"b1">>}, {observe, 0}])),
+    %% Distinct tokens => distinct relationships, so the second is a NEW key that
+    %% the full table must refuse (a shared empty token would be the same key and
+    %% read as a refresh).
+    T1 = <<"b1tok">>,
+    T2 = <<"b2tok">>,
+    send(S, Port, (request(con, get, 3, [{uri_path, <<"b1">>}, {observe, 0}]))
+                   #{token => T1}),
     _ = expect(S, ack, {response, 2, 5}),
-    send(S, Port, request(con, get, 4, [{uri_path, <<"b2">>}, {observe, 0}])),
+    send(S, Port, (request(con, get, 4, [{uri_path, <<"b2">>}, {observe, 0}]))
+                   #{token => T2}),
     ?assertEqual({response, 4, 3},
                  coap_codec:code(expect(S, ack, {response, 4, 3}))),
+    %% The refused registration did not disturb the first observation.
+    send(S, Port, request(con, put, 5, [{uri_path, <<"b1">>}], <<"z">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    ?assertEqual(T1, coap_codec:token(expect(S, con, {response, 2, 5}))),
     close(S).
 
 %% ADR-031 §D5: plain UDP carries no credential, so the CoAP principal is
@@ -547,9 +567,9 @@ observe_bounded_table_refuses(Config) ->
 %% can produce is capacity, not authorization (`observe_bounded_table_refuses').
 %%
 %% Pinned here so the posture is a decision and not an accident: an
-%% ACL-restricted deployment still observes, and the relationship is live (a
-%% later PUT notifies).
-observe_acl_denied(Config) ->
+%% ACL-restricted deployment still observes (the principal is `undefined', not
+%% refused), and the relationship is live (a later PUT notifies).
+observe_plain_udp_principal_is_allowed(Config) ->
     Port = ?config(port, Config),
     S = open(),
     ok = application:set_env(broker_security, acl, all),
@@ -581,9 +601,48 @@ observe_max_age_expires_relationship(Config) ->
     %% 1 s Max-Age window the tick at +1 s can land a few milliseconds short of
     %% the window (it fires at boot+N s, the notification happened just after
     %% boot), so the sweep that actually matches is the one at +2 s. Sleep past
-    %% that second tick rather than trusting the first.
-    timer:sleep(2300),
+    %% that second tick rather than trusting the first. Sleep past it with margin
+    %% so a sub-300 ms scheduling stall of the listener cannot flake the case.
+    timer:sleep(3200),
     send(S, Port, request(con, put, 4, [{uri_path, <<"mx">>}], <<"b">>)),
     _ = expect(S, ack, {response, 2, 4}),
     refute(S, con, {response, 2, 5}, 400),
+    close(S).
+
+%% Two observers on the SAME destination (distinct tokens, one socket) share one
+%% exclusive kernel subscription. Deregistering one must NOT starve the other:
+%% the shared filter survives while any relationship on the destination is live
+%% (the `maybe_unsubscribe/2' guard -- regression for the per-relationship
+%% unsubscribe that would otherwise tear the subscription out from under the
+%% second observer). NON observations keep this timer-free and deterministic.
+observe_two_observers_same_dest_both_notified(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(non, put, 1, [{uri_path, <<"two">>}], <<"init">>)),
+    _ = expect(S, non, {response, 2, 4}),
+    T1 = <<"ta">>,
+    T2 = <<"tb">>,
+    send(S, Port, (request(non, get, 2, [{uri_path, <<"two">>}, {observe, 0}]))
+                   #{token => T1}),
+    First = expect(S, non, {response, 2, 5}),
+    ?assertEqual(T1, coap_codec:token(First)),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, Port, (request(non, get, 3, [{uri_path, <<"two">>}, {observe, 0}]))
+                   #{token => T2}),
+    Second = expect(S, non, {response, 2, 5}),
+    ?assertEqual(T2, coap_codec:token(Second)),
+    %% One publish fans out to BOTH observers.
+    send(S, Port, request(non, put, 4, [{uri_path, <<"two">>}], <<"v1">>)),
+    N1 = expect(S, non, {response, 2, 5}),
+    ?assertEqual(T1, coap_codec:token(N1)),
+    N2 = expect(S, non, {response, 2, 5}),
+    ?assertEqual(T2, coap_codec:token(N2)),
+    %% T1 deregisters (Observe=1): T2 must keep receiving.
+    send(S, Port, (request(non, get, 5, [{uri_path, <<"two">>}, {observe, 1}]))
+                   #{token => T1}),
+    _ = expect(S, non, {response, 2, 5}),
+    send(S, Port, request(non, put, 6, [{uri_path, <<"two">>}], <<"v2">>)),
+    N3 = expect(S, non, {response, 2, 5}),
+    ?assertEqual(T2, coap_codec:token(N3)),
+    ?assertEqual(2, coap_codec:option(observe, N3)),
     close(S).
