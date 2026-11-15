@@ -10,41 +10,60 @@
 
 all() ->
     [filter_is_the_destination,
-     register_seeds_seq_zero,
+     register_stores_sub_ref_and_clock,
      next_seq_wraps_at_2pow24,
-     notify_message_carries_sequence_and_payload,
-     deregister_removes_the_token].
+     notify_message_carries_sequence_token_and_code,
+     notify_message_mirrors_content_format,
+     deregister_returns_the_removed_relationship].
 
 filter_is_the_destination(_) ->
     ?assertEqual(<<"a/b/c">>, coap_observe:filter(<<"a/b/c">>)).
 
-register_seeds_seq_zero(_) ->
-    R = coap_observe:register(<<"a/b">>, <<"t0">>, 30),
-    ?assertEqual(0, coap_observe:relationship_value(R)),
-    ?assertEqual(<<"a/b">>, maps:get(dest, R)).
+register_stores_sub_ref_and_clock(_) ->
+    SubRef = make_ref(),
+    %% Negative on purpose: the clock is a caller argument, not a sentinel.
+    Now = -100,
+    R = coap_observe:register(<<"a/b">>, <<"t0">>, SubRef, 30, Now),
+    ?assertEqual(0, coap_observe:seq(R)),
+    ?assertEqual(<<"a/b">>, maps:get(dest, R)),
+    ?assertEqual(SubRef, maps:get(sub_ref, R)),
+    ?assertEqual(-100, maps:get(last_notified, R)).
 
 next_seq_wraps_at_2pow24(_) ->
-    R0 = coap_observe:register(<<"d">>, <<"t0">>, 30),
+    R0 = coap_observe:register(<<"d">>, <<"t0">>, make_ref(), 30, 0),
     R1 = R0#{seq => 16#FFFFFF},
     {16#000000, R2} = coap_observe:next_seq(R1),
     ?assertEqual(16#000000, maps:get(seq, R2)).
 
-notify_message_carries_sequence_and_payload(_) ->
+notify_message_carries_sequence_token_and_code(_) ->
+    Token = <<"tok">>,
     Msg = #broker_message{payload = <<"hello">>},
-    Non = coap_observe:notify_message(non, 7, Msg),
+    Non = coap_observe:notify_message(non, 7, Token, Msg),
     ?assertEqual(non, coap_codec:type(Non)),
+    ?assertEqual({response, 2, 5}, coap_codec:code(Non)),
+    ?assertEqual(Token, coap_codec:token(Non)),
     ?assertEqual(7, coap_codec:option(observe, Non)),
     ?assertEqual(<<"hello">>, coap_codec:payload(Non)),
-    Con = coap_observe:notify_message(con, 3, Msg),
+    ?assertEqual(undefined, coap_codec:option(content_format, Non)),
+    Con = coap_observe:notify_message(con, 3, Token, Msg),
     ?assertEqual(con, coap_codec:type(Con)),
     ?assertEqual(3, coap_codec:option(observe, Con)).
 
-deregister_removes_the_token(_) ->
+notify_message_mirrors_content_format(_) ->
+    Msg = #broker_message{payload = <<"{}">>, proto_meta = #{content_format => 50}},
+    Note = coap_observe:notify_message(non, 1, <<"tok">>, Msg),
+    ?assertEqual(50, coap_codec:option(content_format, Note)),
+    ?assertEqual(1, coap_codec:option(observe, Note)).
+
+deregister_returns_the_removed_relationship(_) ->
     Key = {{127,0,0,1}, 5000, <<"tok">>},
-    Table = maps:put(Key, coap_observe:register(<<"d">>, <<"t0">>, 30), #{}),
-    ?assert(maps:is_key(Key, Table)),
-    Table2 = coap_observe:deregister(Key, Table),
-    ?assertNot(maps:is_key(Key, Table2)).
+    R = coap_observe:register(<<"d">>, <<"t0">>, make_ref(), 30, -100),
+    Table = maps:put(Key, R, #{}),
+    {Removed, Table2} = coap_observe:deregister(Key, Table),
+    ?assertEqual(R, Removed),
+    ?assertNot(maps:is_key(Key, Table2)),
+    {undefined, Table3} = coap_observe:deregister(Key, Table2),
+    ?assertEqual(#{}, Table3).
 
 %%%_* Fixtures (standard shape; this suite needs no kernel app) -----------
 init_per_suite(Config) -> Config.
