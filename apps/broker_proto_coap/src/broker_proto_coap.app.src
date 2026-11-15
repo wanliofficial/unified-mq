@@ -36,5 +36,11 @@
            %% Retained destinations are advertised automatically; this list is
            %% for resources that hold no retained state.
            {resources, []},
-           {recbuf_bytes, 65536}]}
+           {recbuf_bytes, 65536},
+           %% RFC 7641 Observe (S11-B). Bounded relationship table + the
+           %% datagram-level CON retransmit timers (ADR-031 §D2/§D3).
+           {max_observes, 4096},
+           {observe_ack_timeout_ms, 2000},
+           {observe_max_retrans, 3},
+           {observe_max_age_s, 30}]}
 ]}.
