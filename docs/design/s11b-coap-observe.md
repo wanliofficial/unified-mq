@@ -30,7 +30,7 @@ UDP 无连接，没有持久会话。**在途 CON 请求**与**活跃 Observe �
 - **活跃 Observe 会话表**（listener state 新字段 `observes = #{{IP,Port,Token} => #{sub_ref, dest, tenant, principal, max_age, seq}}`）：
   - 键 `{IP,Port,Token}` 是**一次 Observe 关系**的标识，不是「会话」——对端不发 RST 就一直在，这与 RFC 7641 一致（观察关系由 `Observe` 注册/注销或超时终止）。
   - 生命周期：注册（收到 `Observe=0`）→ 活跃 → 注销（收到 `Observe=1`/RST，或客户端 CON 进程 DOWN，或 `Max-Age`/非确认超时）。
-  - **清理口径**：listener 是 notify pid，`broker_subscription:attach/3` 已 `monitor` listener；**反过来** listener 需要感知对端消失——CoAP UDP 无连接，无法直接感知对端进程，因此用**非确认超时**：CON 通知在 `ACK_TIMEOUT` 内无匹配 ACK 重传 `MAX_RETX` 次后，放弃该 token 的活跃关系并 `unsubscribe`/`detach`；NON 通知只发一次不超时（至多一次，D3）。
+  - **清理口径**：listener 是 notify pid，`broker_subscription:attach/3` 已 `monitor` listener；**反过来** listener 需要感知对端消失——CoAP UDP 无连接，无法直接感知对端进程，因此用**非确认超时**：CON 通知在 `ACK_TIMEOUT` 内无匹配 ACK 重传 `MAX_RETX` 次后，放弃该 token 的活跃关系并 `unsubscribe`（仅当 observes 表清空时才 `detach`，见 §5）；NON 通知只发一次不超时（至多一次，D3）。
 
 **不变量**：`observes` 表与 `dedup`/`endpoints`/`block1` 一样**有界**（`max_observes`，默认 4096；满时拒绝新的 `Observe=0` 注册并回 `4.03 Service Unavailable`），在 1 s tick 上按 `Max-Age`/非确认超时清扫。与 §3.18 的三张表同一姿态。
 
@@ -64,8 +64,11 @@ UDP 无连接，没有持久会话。**在途 CON 请求**与**活跃 Observe �
   → 收到 {udp,_,IP,Port,ACK}：匹配 {IP,Port,Token} 的 pending → 取消 timer，seq 推进
 
 注销：GET(Observe=1, token=T) 或 收到 RST(token=T)
-  → broker_subscription:unsubscribe/2 + detach/3
-  → 取消该 token 的所有 pending timer，observes 移除该键
+  → broker_subscription:unsubscribe/2（只退订该 token 那一条 filter）
+  → 取消该 token 的 pending timer，observes 移除该键
+  → **仅当 observes 表清空时**才 broker_subscription:detach/2
+    （detach/2 拆的是整个 <<"coap">> 会话 = 所有订阅，而所有观察共用一个匿名 ClientId，
+      故按 token 逐个 detach 会把同会话的其它观察一起误删 —— 见 ADR-031 落地偏差记录 S11-B-⑥）
 ```
 
 ## 6. 组件改动清单

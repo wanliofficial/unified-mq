@@ -44,7 +44,6 @@
 Task 1 已实现并提交（`d1dbc7e` → `40aa366` → `58bd7dc`），规格复审 + 代码质量复审通过。质量复审提出 4 项重要问题并已全部落地，因此 **Task 2/3 请以下面这份最终 API 为准**，Task 1 小节里的旧代码片段（`register/3`、`relationship_value/1`、`next_seq/1`、`notify_message/3`、`deregister/2 -> map()`）**不要照抄**。
 
 ### `coap_observe` 最终 API（8 个导出）
-
 ```erlang
 -export([filter/1, register/5, seq/1, next_seq/2,
          sweep_window_ms/2, expired/3, notify_message/4, deregister/2]).
@@ -243,6 +242,19 @@ cd /home/wanli/workspace/unified-mq
 git add apps/broker_proto_coap/src/broker_proto_coap.app.src apps/broker_proto_coap/src/coap_observe.erl apps/broker_proto_coap/test/coap_observe_SUITE.erl
 git commit -q -m "feat(broker_proto_coap): S11-B coap_observe 订阅生命周期纯函数 + env 键"
 ```
+
+---
+
+## ⚠️ Task 2 已交付 + 代码质量复审定稿（Task 3 按此对接）
+
+Task 2 已交付（`62317c6` → `b225100` attach 修复 → `ad27dcc` 定时器/detach 粒度返工）。规格复审 + 代码质量复审通过。以下 listener 侧**最终落地形态**覆盖本文档 Task 2 小节里的旧代码片段，Task 3 请照此写：
+
+- **每关系独立重传 timer**：`pending` 表项 = `{Bytes, RetransLeft, TimerRef}`（存**已编码字节**，重传原样重发，Message ID 稳定）。`arm_retransmit/4` 在（重）装 timer 前**先 cancel 同 Key 旧 timer**，避免孤儿 timer。`notify_one/5` 装 `{Bytes, observe_max_retrans, Ref}`；`retransmit_observes/1` 每 tick cancel→重发→`Left-1`，到 0 走 `drop_relationship/2`。**没有**「按全局预算重传所有 pending」的逻辑。
+- **会话 detach 粒度（关键）**：`broker_subscription:detach/2` 会拆掉**整个** `<<"coap">>` 会话（所有订阅），而所有观察共用一个匿名 ClientId。故单个关系注销/超时/重传耗尽**只能 `unsubscribe/2` 那一条**，仅当 `observes` 表**清空**时才 `detach/2`。落地为 `maybe_detach/1`（`maps:size(Obs) =:= 0` 时 detach）。`deregister_observe/4`、`sweep_observes/1`、`drop_relationship/2` 都经 `cancel_pending/2` + `maybe_detach/1`。**切勿**在每个关系路径直接 `detach`。
+- **ACK 关联用 token（成立）**：CON 通知经 `coap_observe:notify_message/4` **带上了请求 Token**，客户端回的空 ACK 会带回该 Token，故 `handle_info({udp,...})` 的 `#{type := ack, token := Token}` 命中 `{IP,Port,Token}` 成立。（`coap_codec:ack/1` 本身丢 token 只影响测试助手 `ack_of/1`，线上客户端 ACK 带 token。）
+- **bucket-before-decode 不回归**：新 `{udp,...}` 子句只为查 pending 解码一次；真正 `on_datagram`（含 token bucket）在 miss 时才走。重传自己的通知队列不应被入站 token bucket 限速，正确。
+- **`register_observe/6` 返回 `{St, Rel}`**，`Rel` 已含 `req_type`。Task 3 的 `reply_observe/5` 见 Task 3 小节。
+- **`register_observe/6` 的 `-nowarn_unused_function`**：Task 2 用 `-compile({nowarn_unused_function,[{register_observe,6}]})` 压着（唯一调用点 `respond/5` 在 Task 3 才接）。**Task 3 接上后删掉这行**。
 
 ---
 
