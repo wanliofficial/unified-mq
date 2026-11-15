@@ -34,10 +34,6 @@
 
 -include_lib("broker_core/include/broker_message.hrl").
 
-%% `register_observe/6' is wired into `respond/5' by the follow-up Observe=0/1
-%% task; until then it has no caller and the build treats that as an error.
--compile({nowarn_unused_function, [{register_observe, 6}]}).
-
 -export([start_link/1, port/1, stop/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
@@ -66,8 +62,8 @@
     %% (a coap_observe:relationship()). Bounded by `max_observes'.
     observes = #{} :: map(),
     %% Un-acked CON notifications awaiting an ACK: {IP,Port,Token} ->
-    %% {Bytes, TimerRef}. The retransmit budget is carried by the timer itself
-    %% (observe_ack_timeout_ms), so no separate counter is stored.
+    %% {Bytes, RetransLeft, TimerRef}. The bytes are the encoded datagram, so a
+    %% retransmit resends the same Message ID.
     pending = #{} :: map()
 }).
 
@@ -288,13 +284,57 @@ handle_message(IP, Port, Msg, Cfg, #st{dedup = Dedup} = St) ->
 respond(IP, Port, Msg, Cfg, St) ->
     case block1_stream(IP, Port, Msg, Cfg, St) of
         {single, Req, St1} ->
-            {resource_reply(Req, Cfg, {IP, Port}), St1};
+            reply_observe(IP, Port, Req, Cfg, St1);
         {done, Req, St1} ->
-            {resource_reply(Req, Cfg, {IP, Port}), St1};
+            reply_observe(IP, Port, Req, Cfg, St1);
         {streaming, Continue, St1} ->
             {coap_codec:encode(Continue), St1};
         {refused, Refusal, St1} ->
             {coap_codec:encode(Refusal), St1}
+    end.
+
+%% GET with Observe=0 registers a relationship and answers the initial 2.05 with
+%% `Observe: 0' (RFC 7641 §3.4); Observe=1 deregisters it and answers 2.01
+%% (§3.5). Everything else ignores Observe entirely. The registration lives
+%% here, not in `coap_resource', because the listener owns the socket, the
+%% relationship table and the kernel attachment.
+reply_observe(IP, Port, Req, Cfg, St) ->
+    case observe_action(Req) of
+        none ->
+            {resource_reply(Req, Cfg, {IP, Port}), St};
+        register ->
+            {Code, Options, Payload} = run_resource(Req, Cfg, {IP, Port}),
+            case Code of
+                {response, 2, 5} ->
+                    case register_observe(IP, Port, coap_codec:token(Req), Req,
+                                          Cfg, St) of
+                        {St2, undefined} ->
+                            %% Bounded table full (or the kernel refused the
+                            %% subscription): refuse the observation.
+                            {encode_reply(Req, reply_type(Req), {response, 4, 3},
+                                          [], <<>>), St2};
+                        {St2, Rel} ->
+                            Opts = [{observe, coap_observe:seq(Rel)} | Options],
+                            {encode_reply(Req, reply_type(Req), Code, Opts,
+                                          Payload), St2}
+                    end;
+                _ ->
+                    %% 4.04 / 5.xx: nothing to observe, answer as-is, no
+                    %% registration.
+                    {encode_reply(Req, reply_type(Req), Code, Options, Payload),
+                     St}
+            end;
+        deregister ->
+            St2 = deregister_observe(IP, Port, coap_codec:token(Req), St),
+            {resource_reply(Req, Cfg, {IP, Port}), St2}
+    end.
+
+%% Observe only applies to GET (RFC 7641 §3.1): 0 registers, 1 deregisters.
+observe_action(Req) ->
+    case {coap_codec:code(Req), coap_codec:option(observe, Req)} of
+        {{method, get}, 0} -> register;
+        {{method, get}, 1} -> deregister;
+        _ -> none
     end.
 
 send(IP, Port, Bin, #st{socket = Socket}) ->
@@ -553,7 +593,7 @@ drop_relationship(Key, #st{observes = Obs, pending = Pend} = St) ->
 %% Cancel one relationship's retransmit timer and drop its `pending' entry.
 cancel_pending(Key, #st{pending = Pend} = St) ->
     case maps:take(Key, Pend) of
-        {{_Bytes, Ref}, Rest} ->
+        {{_Bytes, _Left, Ref}, Rest} ->
             _ = erlang:cancel_timer(Ref),
             St#st{pending = Rest};
         error ->

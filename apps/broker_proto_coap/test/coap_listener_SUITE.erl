@@ -38,7 +38,15 @@ all() ->
      token_bucket_bounds_a_flood,
      oversized_datagram_is_dropped,
      malformed_datagram_is_dropped,
-     observe_ack_and_rst_are_not_requests].
+     observe_ack_and_rst_are_not_requests,
+     observe_con_notifies_and_acks,
+     observe_con_retries_then_gives_up,
+     observe_non_is_at_most_once,
+     observe_deregister_with_observe_1,
+     observe_rst_deregisters,
+     observe_bounded_table_refuses,
+     observe_acl_denied,
+     observe_max_age_expires_relationship].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -66,7 +74,11 @@ init_per_testcase(Case, Config0) ->
               require_auth => env(broker_security, require_auth),
               users => env(broker_security, users),
               max_rps => env(broker_proto_coap, max_requests_per_second),
-              max_msg => env(broker_proto_coap, max_message_bytes)},
+              max_msg => env(broker_proto_coap, max_message_bytes),
+              max_observes => env(broker_proto_coap, max_observes),
+              ack_timeout => env(broker_proto_coap, observe_ack_timeout_ms),
+              max_retrans => env(broker_proto_coap, observe_max_retrans),
+              max_age => env(broker_proto_coap, observe_max_age_s)},
     DataDir = filename:join([?config(priv_dir, Config0), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -104,6 +116,16 @@ case_env(token_bucket_bounds_a_flood, _Config) ->
 %% crosses it without building a 64 KiB datagram.
 case_env(oversized_datagram_is_dropped, _Config) ->
     ok = application:set_env(broker_proto_coap, max_message_bytes, 16);
+%% The retry case pins a short retransmit timeout so it does not sit on 2 s.
+case_env(observe_con_retries_then_gives_up, _Config) ->
+    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
+    ok = application:set_env(broker_proto_coap, observe_max_retrans, 2);
+%% The bounded-table case shrinks the relationship table to a single slot.
+case_env(observe_bounded_table_refuses, _Config) ->
+    ok = application:set_env(broker_proto_coap, max_observes, 1);
+%% The max-age case sweeps after one second instead of thirty.
+case_env(observe_max_age_expires_relationship, _Config) ->
+    ok = application:set_env(broker_proto_coap, observe_max_age_s, 1);
 case_env(_Case, _Config) ->
     ok.
 
@@ -111,12 +133,18 @@ env(App, Key) ->
     application:get_env(App, Key, undefined).
 
 restore_env(#{acl := Acl, require_auth := Auth, users := Users,
-              max_rps := Rps, max_msg := MaxMsg}) ->
+              max_rps := Rps, max_msg := MaxMsg,
+              max_observes := MaxObs, ack_timeout := AckTO,
+              max_retrans := MaxRetrans, max_age := MaxAge}) ->
     set_or_unset(broker_security, acl, Acl),
     set_or_unset(broker_security, require_auth, Auth),
     set_or_unset(broker_security, users, Users),
     set_or_unset(broker_proto_coap, max_requests_per_second, Rps),
     set_or_unset(broker_proto_coap, max_message_bytes, MaxMsg),
+    set_or_unset(broker_proto_coap, max_observes, MaxObs),
+    set_or_unset(broker_proto_coap, observe_ack_timeout_ms, AckTO),
+    set_or_unset(broker_proto_coap, observe_max_retrans, MaxRetrans),
+    set_or_unset(broker_proto_coap, observe_max_age_s, MaxAge),
     ok.
 
 set_or_unset(_App, _Key, undefined) -> ok;
@@ -389,4 +417,173 @@ observe_ack_and_rst_are_not_requests(Config) ->
     send(S, Port, rst_of(<<"nobody">>, 4243)),
     refute(S, ack, {response, 2, 5}, 300),
     refute(S, ack, {response, 4, 4}, 300),
+    close(S).
+
+%% CON Observe=0 -> piggybacked 2.05 with Observe: 0; a later PUT -> a CON
+%% notification with Observe: 1; ACK it -> no retransmit; a further PUT -> the
+%% second notification.
+observe_con_notifies_and_acks(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    Token = <<"ob1">>,
+    send(S, Port, request(con, put, 1, [{uri_path, <<"o">>}], <<"init">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, (request(con, get, 2, [{uri_path, <<"o">>}, {observe, 0}]))#{token => Token}),
+    First = expect(S, ack, {response, 2, 5}),
+    ?assertEqual(Token, coap_codec:token(First)),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"o">>}], <<"v1">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    Note = expect(S, con, {response, 2, 5}),
+    ?assertEqual(Token, coap_codec:token(Note)),
+    ?assertEqual(1, coap_codec:option(observe, Note)),
+    send(S, Port, ack_of(Note)),
+    refute(S, con, {response, 2, 5}, 400),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"o">>}], <<"v2">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    Note2 = expect(S, con, {response, 2, 5}),
+    ?assertEqual(2, coap_codec:option(observe, Note2)),
+    close(S).
+
+%% A CON notification that is never ACKed is retransmitted (same Message ID) and
+%% finally given up: the relationship is torn down and no further notification
+%% arrives.
+observe_con_retries_then_gives_up(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(con, get, 1, [{uri_path, <<"r">>}])),
+    _ = expect(S, ack, {response, 4, 4}),
+    send(S, Port, request(con, put, 2, [{uri_path, <<"r">>}], <<"x">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    %% The Observe registration itself needs a 2.05 first.
+    send(S, Port, request(con, get, 3, [{uri_path, <<"r">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"r">>}], <<"y">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    N1 = expect(S, con, {response, 2, 5}),
+    N2 = expect(S, con, {response, 2, 5}),
+    ?assertEqual(coap_codec:id(N1), coap_codec:id(N2)),
+    N3 = expect(S, con, {response, 2, 5}),
+    ?assertEqual(coap_codec:id(N1), coap_codec:id(N3)),
+    send(S, Port, request(con, put, 5, [{uri_path, <<"r">>}], <<"z">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 600),
+    close(S).
+
+%% A NON Observe=0 gets at most one notification: no retransmit timer, no retry.
+observe_non_is_at_most_once(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(non, put, 1, [{uri_path, <<"n">>}], <<"init">>)),
+    _ = expect(S, non, {response, 2, 4}),
+    send(S, Port, request(non, get, 2, [{uri_path, <<"n">>}, {observe, 0}])),
+    First = expect(S, non, {response, 2, 5}),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, Port, request(non, put, 3, [{uri_path, <<"n">>}], <<"y">>)),
+    Note = expect(S, non, {response, 2, 5}),
+    ?assertEqual(1, coap_codec:option(observe, Note)),
+    refute(S, non, {response, 2, 5}, 400),
+    close(S).
+
+%% Observe=1 deregisters: a later PUT notifies nobody.
+observe_deregister_with_observe_1(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"d1">>}], <<"a">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"d1">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"d1">>}], <<"b">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    send(S, Port, request(con, get, 4, [{uri_path, <<"d1">>}, {observe, 1}])),
+    ?assertEqual({response, 2, 1},
+                 coap_codec:code(expect(S, ack, {response, 2, 1}))),
+    send(S, Port, request(con, put, 5, [{uri_path, <<"d1">>}], <<"c">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 400),
+    close(S).
+
+%% An RST carrying the observation's token ends it (RFC 7641 §3.6).
+observe_rst_deregisters(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    Token = <<"rsttok">>,
+    send(S, Port, request(con, put, 1, [{uri_path, <<"rst1">>}], <<"a">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, (request(con, get, 2, [{uri_path, <<"rst1">>}, {observe, 0}]))#{token => Token}),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"rst1">>}], <<"b">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    send(S, Port, rst_of(Token, 9)),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"rst1">>}], <<"c">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 400),
+    close(S).
+
+%% A full relationship table refuses the observation with 4.03.
+observe_bounded_table_refuses(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    %% Both destinations need retained state: Observe=0 only registers once the
+    %% resource answers 2.05, so the PUTs must carry a (non-empty) payload.
+    send(S, Port, request(con, put, 1, [{uri_path, <<"b1">>}], <<"x">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, put, 2, [{uri_path, <<"b2">>}], <<"y">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 3, [{uri_path, <<"b1">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, get, 4, [{uri_path, <<"b2">>}, {observe, 0}])),
+    ?assertEqual({response, 4, 3},
+                 coap_codec:code(expect(S, ack, {response, 4, 3}))),
+    close(S).
+
+%% ADR-031 §D5: plain UDP carries no credential, so the CoAP principal is
+%% `undefined' and `broker_security:authorize/2' allows it outright -- an `acl'
+%% rule set and `require_auth' cannot refuse a *datagram* until S11-C's DTLS
+%% client identity exists (the front-end even refuses to boot with
+%% `require_auth' listing coap: see `coap_app_SUITE'). The refusal this stage
+%% can produce is capacity, not authorization (`observe_bounded_table_refuses').
+%%
+%% Pinned here so the posture is a decision and not an accident: an
+%% ACL-restricted deployment still observes, and the relationship is live (a
+%% later PUT notifies).
+observe_acl_denied(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    ok = application:set_env(broker_security, acl, all),
+    ok = application:set_env(broker_security, require_auth, [<<"coap">>]),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"x">>}], <<"v">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"x">>}, {observe, 0}])),
+    First = expect(S, ack, {response, 2, 5}),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"x">>}], <<"w">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    ?assertEqual(1, coap_codec:option(observe, expect(S, con, {response, 2, 5}))),
+    close(S).
+
+%% A relationship silent longer than Max-Age is swept on the tick: a later PUT
+%% notifies nobody (the client is expected to re-Observe).
+observe_max_age_expires_relationship(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"mx">>}], <<"init">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"mx">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"mx">>}], <<"a">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    %% The sweep runs on the 1 s refill tick, whose phase is set when the
+    %% listener boots -- not when this relationship was last notified. With a
+    %% 1 s Max-Age window the tick at +1 s can land a few milliseconds short of
+    %% the window (it fires at boot+N s, the notification happened just after
+    %% boot), so the sweep that actually matches is the one at +2 s. Sleep past
+    %% that second tick rather than trusting the first.
+    timer:sleep(2300),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"mx">>}], <<"b">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 400),
     close(S).

@@ -17,10 +17,13 @@
 %% make GET depend on a cursor, and a cursor is what Observe (S11-B) will own --
 %% inventing one here would be the second subscription mechanism ADR-013 forbids.
 %%
-%% Observe is not implemented at this stage. RFC 7641 §2 says a server that does
-%% not support the option simply answers with the plain response and no
-%% `Observe' option, which is precisely the behaviour below: the option is
-%% ignored, not rejected, so a client that asked for it still gets its content.
+%% Observe (RFC 7641) is handled in two halves. This module owns only the
+%% *answer*: a GET with `Observe: 0' reads the representation exactly like a
+%% plain GET (a 4.04 means there is nothing to observe), and a GET with
+%% `Observe: 1' answers 2.01 because deregistering is benign (§3.5). The
+%% subscription itself is minted by the listener, which owns the socket and the
+%% relationship table -- keeping this module a pure function of its inputs.
+%% Non-GET methods ignore Observe entirely (§3.1).
 %%
 %% Reliability (ADR-031 §D3) is per-datagram, never per-message-kind:
 %%
@@ -65,7 +68,24 @@ get(Req, Cfg, Ctx) ->
             {reply, {response, 2, 5},
              [{content_format, coap_codec:content_format_id(link_format)}], Body};
         Destination ->
-            read_resource(Destination, Ctx)
+            case coap_codec:option(observe, Req) of
+                undefined ->
+                    read_resource(Destination, Ctx);
+                0 ->
+                    %% The subscription is minted by the listener (it owns the
+                    %% socket and the relationship table). Here we just read the
+                    %% current representation; a 4.04 means there is nothing to
+                    %% observe yet.
+                    read_resource(Destination, Ctx);
+                1 ->
+                    %% Deregister: the listener drops the relationship. Answer
+                    %% 2.01 "Created" (RFC 7641 §3.5 -- deregistering a
+                    %% relationship that is not there is benign).
+                    {reply, {response, 2, 1}, [], <<>>};
+                _ObsVal ->
+                    %% Any other Observe value is malformed; treat as a plain read.
+                    read_resource(Destination, Ctx)
+            end
     end.
 
 read_resource(Destination, Ctx) ->

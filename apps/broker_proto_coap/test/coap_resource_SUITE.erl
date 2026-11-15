@@ -50,7 +50,9 @@ all() ->
      well_known_includes_static_resources,
      non_write_dispatches_without_appending,
      get_reads_only_retained_not_the_log,
-     observe_option_is_ignored_not_rejected].
+     observe_option_is_ignored_not_rejected,
+     observe_1_on_get_answers_2_01,
+     observe_0_on_get_still_reads_retained].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -198,11 +200,28 @@ get_reads_only_retained_not_the_log(_) ->
     {reply, {response, 4, 4}, _, _} = coap_resource:handle(GetReq, ?CFG, ?CTX).
 
 observe_option_is_ignored_not_rejected(_) ->
-    %% RFC 7641 §2: a server that does not support Observe answers with the plain
-    %% response and no Observe option, so a client that asked still gets content.
+    %% The resource layer itself answers the plain representation and adds no
+    %% Observe option; adding `Observe: 0' and minting the subscription is the
+    %% listener's job (RFC 7641 §3.4, covered by `coap_listener_SUITE').
     put(<<"clock">>, <<"t0">>),
     Req = request(con, get, 1, [{uri_path, <<"clock">>}, {observe, 0}]),
     {reply, {response, 2, 5}, _, <<"t0">>} =
+        coap_resource:handle(Req, ?CFG, ?CTX).
+
+%% Observe=1 deregisters; the resource layer itself only owns the answer (2.01
+%% "Created", RFC 7641 §3.5: deregistering is benign). The listener drops the
+%% subscription -- this module stays a pure function.
+observe_1_on_get_answers_2_01(_Config) ->
+    Req = request(con, get, 9, [{uri_path, <<"z">>}, {observe, 1}]),
+    {reply, {response, 2, 1}, [], <<>>} = coap_resource:handle(Req, ?CFG, ?CTX).
+
+%% Observe=0 does not change what the resource reads: still the retained
+%% representation, read exactly like a plain GET (the listener adds Observe: 0
+%% and mints the subscription around this answer).
+observe_0_on_get_still_reads_retained(_Config) ->
+    put(<<"z">>, <<"v">>),
+    Req = request(con, get, 10, [{uri_path, <<"z">>}, {observe, 0}]),
+    {reply, {response, 2, 5}, _Options, <<"v">>} =
         coap_resource:handle(Req, ?CFG, ?CTX).
 
 %%%_* Helpers ---------------------------------------------------------------
