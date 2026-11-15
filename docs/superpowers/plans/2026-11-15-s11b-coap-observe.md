@@ -39,6 +39,47 @@
 
 ---
 
+## ⚠️ Task 1 已交付，本文档 Task 1 的代码片段是历史快照
+
+Task 1 已实现并提交（`d1dbc7e` → `40aa366` → `58bd7dc`），规格复审 + 代码质量复审通过。质量复审提出 4 项重要问题并已全部落地，因此 **Task 2/3 请以下面这份最终 API 为准**，Task 1 小节里的旧代码片段（`register/3`、`relationship_value/1`、`next_seq/1`、`notify_message/3`、`deregister/2 -> map()`）**不要照抄**。
+
+### `coap_observe` 最终 API（8 个导出）
+
+```erlang
+-export([filter/1, register/5, seq/1, next_seq/2,
+         sweep_window_ms/2, expired/3, notify_message/4, deregister/2]).
+-export_type([relationship/0, key/0, observes/0]).
+
+-type key()      :: {inet:ip_address(), inet:port_number(), binary()}.
+-type relationship() :: #{dest := binary(),
+                         tenant := binary(),
+                         sub_ref := broker_subscription:sub_ref(),
+                         max_age := non_neg_integer(),   %% 客户端 Max-Age（秒），0 合法
+                         seq := non_neg_integer(),
+                         last_notified := integer()}.
+-type observes() :: #{key() => relationship()}.
+```
+
+| 函数 | 语义 |
+|---|---|
+| `filter(Dest) -> Dest` | 订阅 filter 就是 destination 本身（ADR-031 §D4 / OQ-5）。 |
+| `register(Dest, Tenant, SubRef, MaxAge, NowMs) -> relationship()` | `seq => 0`，`last_notified => NowMs`。时钟是**入参**（本 VM 上 `erlang:monotonic_time(millisecond)` 为负，哨兵值 0 会让从未通知过的关系永远躲过 max_age 清扫）。 |
+| `seq(Rel) -> non_neg_integer()` | 关系的当前序号。**初始 piggybacked 2.05 用它**（RFC 7641 §3.3 初始值为 0，Task 3 断言初始通知带 `observe:0`）。 |
+| `next_seq(Rel, NowMs) -> {NextSeq, Rel'}` | 2^24 回绕；**同时**把 `last_notified` 刷成 `NowMs`（由构造保证「静默但存活」的关系不会看起来过期）。 |
+| `sweep_window_ms(ClientAgeS, CapS) -> Millis` | `min(max(ClientAgeS,1), max(CapS,1)) * 1000`。下限 1 s（客户端 `Max-Age: 0` 不能让它下一个 tick 就被清掉），上限取 `observe_max_age_s` 配置（防止 `Max-Age: 604800` 钉住表槽一周）。 |
+| `expired(Rel, NowMs, CapS) -> boolean()` | `(NowMs - last_notified) >= sweep_window_ms(...)`。`NowMs` 与 `last_notified` 同源，负纪元不会反转比较。 |
+| `notify_message(Type, Seq, Token, #broker_message{}) -> message()` | `{response,2,5}`，type = `con\|non`，`observe = Seq`，`token = Token`，payload = 消息 payload；`proto_meta.content_format` 非 `undefined` 时镜像成 `{content_format, F}` 选项（与 `coap_resource:content_format_options/1` 同规则）；**不设 `id`**（listener 发送时自己铸 Message ID）。 |
+| `deregister(Key, Observes) -> {Rel \| undefined, Observes'}` | `maps:take` 语义：调用方拿回关系（及其 `sub_ref`）。`broker_subscription` 是按 `(ClientId, Filter)` 寻址的，`sub_ref` 只用于断言与 `broker_subscription:subscriptions/1`。 |
+
+### 状态与测试现状
+
+- `coap_observe_SUITE`：**10 例全绿**（filter / register（dest·tenant·sub_ref·max_age·seq 0·时钟）/ next_seq 2^24 回绕 / next_seq 刷时钟 / seq 取值 / sweep 窗口钳制 / expired 边界 / notify（type·code·token·seq·payload·无 content_format）/ notify 镜像 content_format / deregister 返回被删关系）。
+- 4 个 env 键已就位：`max_observes 4096`、`observe_ack_timeout_ms 2000`、`observe_max_retrans 3`、`observe_max_age_s 30`。
+- `rebar3 dialyzer` 0 warning；`rebar3 xref` 310（302 基线 + 8 个尚未接线的 coap_observe 导出，属分阶段任务的正常预期）。
+- **max_age 兜底语义已定稿**（设计稿 §3 + ADR-031 落地偏差记录同步）：每个关系用自己的 Max-Age，钳制在 `[1s, observe_max_age_s]`；清扫在 1 s tick 里做（有 unsubscribe 副作用，不进纯 `prune/1`）。`observe_max_age_s` 因此是**上限**而非默认值。
+
+---
+
 ## Task 1: env 键 + `coap_observe` 骨架（订阅生命周期纯函数）
 
 **Files:**
@@ -212,11 +253,12 @@ git commit -q -m "feat(broker_proto_coap): S11-B coap_observe 订阅生命周期
 - Test: `apps/broker_proto_coap/test/coap_listener_SUITE.erl`（本任务加 1 条 smoke）
 
 **契约（本任务落地，后续任务在其上扩展）：**
-- `register_observe(IP,Port,Token,Req,Cfg,St) -> St | {error, full, St}`：在 `coap_resource:get/3` 里 `Observe=0` 且资源存在（2.05）时调用；先 `broker_subscription:subscribe(<<"coap">>, Dest, 0, Tenant)` → `attach(<<"coap">>, self(), false)`，再写 `observes` 表。表满（`max_observes`）返回 `{error, full}`（listener 回 4.03）。
-- `handle_info({broker_deliver, <<"coap">>, _, _, {_,_,Msg}}, St)`：遍历 `observes`，凡 `dest =:= Msg.destination` 的关系 → 发通知；请求是 CON 则起 `observe_ack` 重传 timer 存 `pending`，NON 只发一次。
-- `handle_info({udp,_,IP,Port,Msg}, ...)`：解码后若 `type=ack` 且 `{IP,Port,token}` 命中 `pending` → 取消 timer、从 `pending` 移除、推进该关系 seq。
+- `register_observe(IP,Port,Token,Req,Cfg,St) -> {St, Rel} | {St, undefined}`：在 `respond/5` 里 GET 且 `Observe=0` 且资源存在（2.05）时调用；先 `broker_subscription:subscribe(<<"coap">>, coap_observe:filter(Dest), 0, Tenant)` → `attach(<<"coap">>, self(), false)`，再写 `observes` 表（关系带 `req_type`）。表满（`max_observes`）或 subscribe 失败 → 返回 `{St, undefined}`（respond 回 4.03）。
+- `deregister_observe(IP,Port,Token,St) -> St`：`Observe=1` 或 RST 时调用；`unsubscribe` + `detach` + 从 `observes`/`pending` 移除。始终成功。
+- `handle_info({broker_deliver, <<"coap">>, _, _, {_,_,Msg}}, St)`：调 `dispatch_notifications/2`；关系 `dest =:= Msg.destination` 的按 `req_type` 发 CON（入 `pending` 重传）/ NON（只发一次）。
+- `handle_info({udp,_,IP,Port,Bin}, ...)`：解码后若 `type=ack` 且 `{IP,Port,token}` 命中 `pending` → 取消 timer、从 `pending` 移除（seq 已由 `notify_one` 在推进时推进）；未命中则走既有 `on_datagram`。
 - `handle_info({timeout,_,observe_ack}, St)`：重传该 pending 通知并计数；超过 `observe_max_retrans` → 放弃，`unsubscribe`/`detach` 并清 `observes`/`pending`。
-- `prune/1` 增：`observes` 按 `max_age`（`last_notified` 超 `observe_max_age_s*1000`）清扫；超 `max_observes` 上限时拒绝新注册（在 register 处判）。
+- `handle_info({timeout,_,refill}, St)`：在既有 `prune/1` 之外再调 `sweep_observes/1`（有 unsubscribe 副作用，不能进纯 `prune/1`），按 `coap_observe:expired/3` 清扫。
 
 - [ ] **Step 1: 加 state 字段与 config 键**
 
@@ -247,35 +289,55 @@ git commit -q -m "feat(broker_proto_coap): S11-B coap_observe 订阅生命周期
 ```erlang
 %%%_* Observe (RFC 7641) ----------------------------------------------------
 
-%% Called by coap_resource:get/3 when it has a 2.05 and an Observe=0 request.
-%% Registers the subscription in the kernel and records the relationship here.
-%% Returns St, or {error, full, St} when the bounded table is at capacity.
-register_observe(IP, Port, Token, Req, Cfg,
-                 #st{observes = Obs} = St) ->
+-define(COAP_CLIENT, <<"coap">).
+
+%% Called by respond/5 when a GET with Observe=0 has been answered 2.05. It
+%% mints the kernel subscription (ADR-031 §D2) and records the relationship.
+%% Returns {St, Rel} on success, or {St, undefined} when the bounded table is at
+%% capacity -- the caller then answers 4.03 instead of the 2.05.
+register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
     Dest = coap_codec:destination(Req),
     Tenant = broker_security:default_tenant(),
     MaxAge = coap_codec:option(max_age, Req, 30),
     Cap = maps:get(max_observes, Cfg, 4096),
     case maps:size(Obs) >= Cap of
         true ->
-            {error, full, St};
+            {St, undefined};
         false ->
-            case broker_subscription:subscribe(<<"coap">>,
+            case broker_subscription:subscribe(?COAP_CLIENT,
                                                coap_observe:filter(Dest), 0,
                                                Tenant) of
                 {ok, SubRef} ->
-                    ok = broker_subscription:attach(<<"coap">>, self(), false),
-                    Rel = coap_observe:register(Dest, Tenant, MaxAge),
+                    ok = broker_subscription:attach(?COAP_CLIENT, self(), false),
+                    Rel = coap_observe:register(Dest, Tenant, SubRef, MaxAge,
+                                                now_ms()),
+                    Rel1 = Rel#{req_type => coap_codec:type(Req)},
                     Key = {IP, Port, Token},
-                    St#st{observes = maps:put(Key, Rel#{sub_ref => SubRef}, Obs)};
+                    {St#st{observes = maps:put(Key, Rel1, Obs)}, Rel};
                 {error, _} ->
-                    St
+                    {St, undefined}
             end
     end.
 
-%% Kernel pushed a message that matches an Observe relationship. Build and send
-%% the notification(s); CON requests get a retransmit timer, NON ones fire once.
-dispatch_notifications(Msg, #st{observes = Obs, cfg = Cfg} = St) ->
+%% Called by respond/5 for a GET with Observe=1. Drops the relationship and
+%% unsubscribes from the kernel. Always succeeds (RFC 7641 §3.5: deregistering a
+%% relationship that is not there is not an error).
+deregister_observe(IP, Port, Token, #st{observes = Obs} = St) ->
+    Key = {IP, Port, Token},
+    case coap_observe:deregister(Key, Obs) of
+        {undefined, Obs1} ->
+            St#st{observes = Obs1, pending = maps:remove(Key, St#st.pending)};
+        {Rel, Obs1} ->
+            _ = (catch broker_subscription:unsubscribe(
+                   ?COAP_CLIENT, coap_observe:filter(maps:get(dest, Rel)))),
+            _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
+            St#st{observes = Obs1, pending = maps:remove(Key, St#st.pending)}
+    end.
+
+%% The kernel delivered a message to an attached subscription (ADR-031 §D2:
+%% the listener is the notify pid). Turn it into Observe notifications.
+dispatch_notifications(#broker_message{} = Msg,
+                       #st{observes = Obs, cfg = Cfg} = St) ->
     lists:foldl(
       fun({Key, Rel}, Acc) ->
               case maps:get(dest, Rel) =:= Msg#broker_message.destination of
@@ -284,23 +346,58 @@ dispatch_notifications(Msg, #st{observes = Obs, cfg = Cfg} = St) ->
               end
       end, St, maps:to_list(Obs)).
 
-notify_one({IP, Port, _Token} = Key, Rel, Msg, Cfg,
-           #st{pending = Pend} = St) ->
-    {Seq, Rel1} = coap_observe:next_seq(Rel),
+%% Send one notification. The relationship's `req_type' decides CON (reliable:
+%% retransmit until ACKed, tracked in `pending') vs NON (at-most-once: fire once).
+notify_one(Key, Rel, Msg, Cfg, #st{pending = Pend} = St) ->
+    Type = maps:get(req_type, Rel, con),
     Token = element(3, Key),
-    Notify = coap_observe:notify_message(con, Seq, Msg),
-    Bytes = coap_codec:encode(Notify#{token => Token, id => next_id()}),
+    Now = now_ms(),
+    {Seq, Rel1} = coap_observe:next_seq(Rel, Now),
+    Note = coap_observe:notify_message(Type, Seq, Token, Msg),
+    Bytes = coap_codec:encode(Note#{id => next_id()}),
+    IP = element(1, Key),
+    Port = element(2, Key),
     _ = gen_udp:send(St#st.socket, IP, Port, Bytes),
-    Timeout = maps:get(observe_ack_timeout_ms, Cfg, 2000),
-    Ref = erlang:start_timer(Timeout, self(), observe_ack),
-    St#st{observes = maps:put(Key, Rel1, St#st.observes),
-          pending = maps:put(Key, {Bytes, maps:get(observe_max_retrans, Cfg, 3), Ref},
-                             Pend)}.
+    case Type of
+        con ->
+            Timeout = maps:get(observe_ack_timeout_ms, Cfg, 2000),
+            Ref = erlang:start_timer(Timeout, self(), observe_ack),
+            Left = maps:get(observe_max_retrans, Cfg, 3),
+            St#st{observes = maps:put(Key, Rel1, St#st.observes),
+                  pending = maps:put(Key, {Bytes, Left, Ref}, Pend)};
+        non ->
+            St#st{observes = maps:put(Key, Rel1, St#st.observes)}
+    end.
+
+%% The 1 s refill tick also drops relationships silent longer than their own
+%% Max-Age window. Side-effecting (it unsubscribes), so it cannot live in the
+%% pure prune/1.
+sweep_observes(#st{observes = Obs, cfg = Cfg} = St) ->
+    Cap = maps:get(observe_max_age_s, Cfg, 30),
+    Now = now_ms(),
+    lists:foldl(
+      fun({Key, Rel}, Acc) ->
+              case coap_observe:expired(Rel, Now, Cap) of
+                  true ->
+                      _ = (catch broker_subscription:unsubscribe(
+                             ?COAP_CLIENT,
+                             coap_observe:filter(maps:get(dest, Rel)))),
+                      _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
+                      Acc#st{observes = maps:remove(Key, Acc#st.observes),
+                             pending = maps:remove(Key, Acc#st.pending)};
+                  false ->
+                      Acc
+              end
+      end, St, maps:to_list(Obs)).
+
+%% Monotonic ms. The clock is read here (the listener is the only process that
+%% needs it) and passed into coap_observe, which is pure.
+now_ms() -> erlang:monotonic_time(millisecond).
 
 next_id() -> erlang:unique_integer([positive]) rem 65536.
 ```
 
-> 说明：本任务的 `notify_one` 一律发 **CON**（先做 CON 路径，NON 在 Task 3 按请求类型分流）。`dispatch_notifications/2` 由 Task 3 的 `handle_info({broker_deliver,...})` 调用；本任务先把函数写好，Task 3 接 handle_info。
+> 说明：注册/注销的**副作用**（subscribe/attach/unsubscribe/detach）都在 listener 里做，`coap_resource` 保持纯函数。`notify_one` 按关系的 `req_type` 发 CON/NON：CON 入 `pending` 起重传 timer，NON 只发一次（至多一次，ADR-031 §D3）。`now_ms/0` 是本 VM 上唯一的时钟读取点，负纪元对 `expired/3` 的比较无影响（`Next - At` 仍为正）。`sweep_observes/1` 由 Task 2 Step 3 的 tick 子句调用。
 
 - [ ] **Step 3: 加 handle_info 子句（broker_deliver + ACK 取消 + observe_ack 重传）**
 
@@ -313,19 +410,18 @@ handle_info({broker_deliver, <<"coap">>, _MaxQoS, _Matched, {_P, _O, Msg}},
             #st{} = St) ->
     {noreply, dispatch_notifications(Msg, St)};
 
-%% An ACK for a CON notification cancels its retransmit and advances the seq.
+%% An ACK for a CON notification cancels its retransmit. (The seq was already
+%% advanced when the notification was sent, so nothing to do but cancel.)
 handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
     try coap_codec:decode(Bin) of
-        {ok, #{type := ack, token := Token} = _Msg} ->
+        {ok, #{type := ack, token := Token}} ->
             Key = {IP, Port, Token},
             case maps:find(Key, Pend) of
                 {ok, {_Bytes, _Left, Ref}} ->
                     _ = erlang:cancel_timer(Ref),
-                    St = St0#st{pending = maps:remove(Key, Pend)},
-                    {noreply, St};
+                    {noreply, St0#st{pending = maps:remove(Key, Pend)}};
                 error ->
-                    St1 = on_datagram(IP, Port, Bin, St0),
-                    {noreply, St1}
+                    {noreply, on_datagram(IP, Port, Bin, St0)}
             end;
         {ok, _Msg} ->
             {noreply, on_datagram(IP, Port, Bin, St0)};
@@ -334,11 +430,54 @@ handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
     catch
         _:_ -> {noreply, on_datagram(IP, Port, Bin, St0)}
     end;
+
+%% A CON notification went un-acked: retransmit it, or give up after
+%% `observe_max_retrans' tries and tear the relationship down.
+handle_info({timeout, _Ref, observe_ack}, #st{pending = Pend} = St) ->
+    {noreply, retransmit_observes(St)};
+
+%% The 1 s refill tick also sweeps expired Observe relationships.
+handle_info({timeout, _Ref, refill}, St) ->
+    {noreply, sweep_observes(prune(St)), {continue, refill}};
 ```
 
-> 关键：把原来的 `handle_info({udp, _Socket, IP, Port, Bin}, #st{} = St0) -> on_datagram` 子句**替换**为上面这个（它先判 ACK-命中-pending，未命中再走 `on_datagram`）。`on_datagram` 收到的 datagram 若本身是 ACK，会在 `dispatch` 里因 `coap_codec:type` 非 con 而走 respond（产生一个 NON 响应）——这不对。**修正**：`on_datagram` 顶部对 `type=ack/rst` 直接原样丢弃（它们是来取消通知/重置的，不是请求）。在 Task 3 Step 1 一并处理（见下）。
+`retransmit_observes/1` (add next to `sweep_observes/1`) resends each pending CON once and counts the retransmit down; at zero it unsubscribes and drops the relationship:
 
-- [ ] **Step 4: `on_datagram` 忽略 ack/rst（它们不是请求）**
+```erlang
+retransmit_observes(#st{pending = Pend} = St) ->
+    lists:foldl(
+      fun({Key, {Bytes, Left, _Ref}}, Acc) ->
+              IP = element(1, Key),
+              Port = element(2, Key),
+              _ = gen_udp:send(Acc#st.socket, IP, Port, Bytes),
+              case Left - 1 of
+                  0 ->
+                      drop_relationship(Key, Acc);
+                  Left1 ->
+                      Timeout = maps:get(observe_ack_timeout_ms, Acc#st.cfg, 2000),
+                      Ref = erlang:start_timer(Timeout, self(), observe_ack),
+                      Acc#st{pending = maps:put(Key, {Bytes, Left1, Ref},
+                                                 Acc#st.pending)}
+              end
+      end, St, maps:to_list(Pend)).
+
+%% Give up on a relationship: unsubscribe, detach, forget it.
+drop_relationship(Key, #st{observes = Obs, pending = Pend} = St) ->
+    case maps:find(Key, Obs) of
+        {ok, Rel} ->
+            _ = (catch broker_subscription:unsubscribe(
+                   ?COAP_CLIENT,
+                   coap_observe:filter(maps:get(dest, Rel)))),
+            _ = (catch broker_subscription:detach(?COAP_CLIENT, self()));
+        error ->
+            ok
+    end,
+    St#st{observes = maps:remove(Key, Obs), pending = maps:remove(Key, Pend)}.
+```
+
+> 关键：把原来的 `handle_info({udp, _Socket, IP, Port, Bin}, #st{} = St0) -> on_datagram` 子句**替换**为上面那个（它先判 ACK-命中-pending，未命中再走 `on_datagram`）。`on_datagram` 收到的 datagram 若本身是 ACK，会在 `dispatch` 里因 `coap_codec:type` 非 con 而走 respond（产生一个 NON 响应）——这不对。**修正**：`handle_message` 顶部对 `type=ack/rst` 直接原样丢弃（它们是来取消通知/重置的，不是请求）。在 Step 4 处理（见下）。
+
+- [ ] **Step 4: `handle_message` 忽略 ack/rst（它们不是请求）**
 
 `dispatch/5` 里 `handle_message` 的 `case coap_codec:type(Msg) of con -> ...; _Non -> respond...` 会把 ack/rst 也当请求回一个响应。改为在 `handle_message` 顶部：
 
@@ -354,58 +493,64 @@ handle_message(_IP, _Port, Msg, _Cfg, St) ->
             ... (unchanged)
 ```
 
-- [ ] **Step 5: `prune/1` 清扫 observes（max_age 兜底）**
+- [ ] **Step 5: refill tick 挂上 `sweep_observes/1`（max_age 兜底）**
 
-`prune(#st{dedup=..., block1=..., cfg=Cfg} = St)` 加 `observes` 清扫：超过 `observe_max_age_s*1000` 未更新的关系连同其 `sub_ref` 一起 `unsubscribe`。因 `prune/1` 是纯函数（不能 side-effect unsubscribe），改为：先收集要过期的 Key，在 `handle_info({timeout,_,refill}, St)` 里做 side-effect 清理再调 `prune`。具体：新增 `sweep_observes(St) -> St`（可副作用），在 refill tick 调用：
+`sweep_observes/1` 已在 Step 2 给出完整实现（用 `coap_observe:expired/3`，每关系用自己的 Max-Age 窗口，钳制在 `[1s, observe_max_age_s]`）。本步只需确认 `handle_info({timeout,_,refill}, St)` 子句（Step 3 已写）在 `prune/1` 之后调用它，且**没有**在纯 `prune/1` 里做 unsubscribe（`prune/1` 保持纯函数，只清 dedup/block1）。
+
+> 不要改 `prune/1` 去碰 `observes`——它会被 `prune/1` 的纯函数性质约束，而清扫需要 unsubscribe 的副作用。关系清扫只走 tick 里的 `sweep_observes/1`。
+
+- [ ] **Step 6: 加 1 条 plumbing 用例并跑**
+
+Task 2 只落地管道（observes/pending 表 + handle_info 子句 + sweep），**通知语义的完整覆盖在 Task 3 的 8 条用例里**（它们建立在本步之上）。本步加一条钉住「ack/rst 不是请求、不得回响应」的小用例，顺带证明管道没破坏既有行为。
+
+在 `coap_listener_SUITE.erl` 的 `all/0` 加 `observe_ack_and_rst_are_not_requests`：
 
 ```erlang
-handle_info({timeout, _Ref, refill}, St) ->
-    {noreply, sweep_observes(prune(St)), {continue, refill}};
-
-%% Drop Observe relationships silent longer than Max-Age: the client should
-%% re-Observe. Side-effecting (unsubscribes) so it runs on the tick, not in the
-%% pure prune/1.
-sweep_observes(#st{observes = Obs, cfg = Cfg} = St) ->
-    Cutoff = erlang:monotonic_time(millisecond)
-             - maps:get(observe_max_age_s, Cfg, 30) * 1000,
-    lists:foldl(
-      fun({Key, #{sub_ref := Ref, last_notified := At}}, Acc) when At < Cutoff ->
-              _ = (catch broker_subscription:unsubscribe(<<"coap">>, coap_observe:filter(maps:get(dest, ...)))),
-              ... ;
+%% A bare ACK and a bare RST are transport control messages, not requests: the
+%% listener must not answer either (no 2.05/4.04 in flight).
+observe_ack_and_rst_are_not_requests(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, ack_of(#{id => 4242, token => <<"nobody">>})),
+    send(S, Port, rst_of(<<"nobody">>, 4243)),
+    refute(S, ack, {response, 2, 5}, 300),
+    refute(S, ack, {response, 4, 4}, 300),
+    close(S).
 ```
 
-> 实现提示：`last_notified` 目前 register 时置 0。为让 max_age 兜底有实际语义，在 `notify_one` 里把 `last_notified` 更新为当前 monotonic ms。`unsubscribe` 需要 Filter——从 relationship 的 `dest` 经 `coap_observe:filter/1` 得到。**完整 `sweep_observes/1` 由实现者按此补全**，测试用例 `observe_max_age_expires_relationship`（Task 3）钉住行为。
+`ack_of/1`、`rst_of/2` 两个助手在 Task 3 Step 5 定义；**本步就要加**（Task 3 复用）。把它们的定义放在 `request/4` 那组旁边。
 
-- [ ] **Step 6: 写 CON 通知 smoke 用例并跑**
-
-在 `coap_listener_SUITE.erl` 的 `all/0` 加 `observe_con_notifies_after_put`，实现见 Task 3 Step 2（本任务先加最小版：PUT 一条 → CON Observe=0 → 收到 2.05 piggyback → 再 PUT 同 dest → 收到 CON 通知带递增 observe）。跑全套确认无回归。
+跑全套确认无回归：
 
 Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_coap/test/coap_listener_SUITE.erl 2>&1 | tail -5`
-Expected: `All <N> tests passed.`（原 7 + 新增）
+Expected: `All 8 tests passed.`（原 7 + 1）
 
 - [ ] **Step 7: 提交**
 
 ```bash
 cd /home/wanli/workspace/unified-mq
 git add apps/broker_proto_coap/src/coap_listener.erl apps/broker_proto_coap/test/coap_listener_SUITE.erl
-git commit -q -m "feat(broker_proto_coap): S11-B listener 兼 notify pid——订阅/attach/CON 重传/ACK 取消"
+git commit -q -m "feat(broker_proto_coap): S11-B listener 兼 notify pid——订阅/attach/CON 重传/ACK 取消/sweep"
 ```
 
 ---
 
-## Task 3: NON/Observe=1/RST 分支 + observe 套件全量用例
+## Task 3: Observe=0/1 分流 + RST/注销/max_age/有界表/ACL 用例
 
 **Files:**
-- Modify: `apps/broker_proto_coap/src/coap_listener.erl`（`notify_one` 按请求类型发 CON/NON）
+- Modify: `apps/broker_proto_coap/src/coap_listener.erl`（`respond/5` 承担注册/注销副作用）
 - Modify: `apps/broker_proto_coap/src/coap_resource.erl`（`get/3` 分流 Observe=0/1）
-- Test: `apps/broker_proto_coap/test/coap_listener_SUITE.erl`（+6 用例）
+- Test: `apps/broker_proto_coap/test/coap_listener_SUITE.erl`（+8 用例）
 - Test: `apps/broker_proto_coap/test/coap_resource_SUITE.erl`（+2 用例，mock 注入）
 
-- [ ] **Step 1: `notify_one` 按关系的请求类型发 CON/NON**
+**关键事实（已核对，实现时照抄）**
+- `coap_codec:ack/1`、`coap_codec:reset/1` 都产出 `token => <<>>`（它们只取 id）。**测试里要回 ACK / 发 RST 就必须自己带上 token**，否则匹配不上 `{IP,Port,Token}`。新增测试助手见 Step 4。
+- 通知的 type = 关系的 `req_type`：CON Observe=0 → **通知是 CON**（要 ACK、要重传）；NON Observe=0 → 通知是 NON（至多一次）。用例里 `expect(S, con, {response,2,5})` vs `expect(S, non, {response,2,5})` 别搞反。
+- `read_resource/2` 对**没有 retained 状态**的 destination 回 4.04。所以 Observe=0 用例必须先 PUT 再 Observe，否则连 2.05 都拿不到、关系也不会注册。
+- `run_resource/3` 返回 `{Code, Options, Payload}`；`respond/5` 目前把 `single/done` 都走 `resource_reply/3`（内部已 encode）。加 Observe 后需要**在 encode 之前**插入 `{observe, N}` 选项，所以 Task 3 要把 `single/done` 分支改成先拿三元组再 encode（见 Step 3）。
+- `handle_message/5` 目前对 `con` 查 dedup、对 `_Non` 一律 `respond`。Observe 的 ack/rst 不是请求：ack 直接丢弃（取消 pending 的分支在 udp 子句里已处理），rst 走 `deregister_observe/4`。
 
-relationship 里需记住请求的 `type`（con/non）以决定通知类型。在 `register_observe` 写 relationship 时加 `req_type => coap_codec:type(Req)`；`notify_one` 用 `maps:get(req_type, Rel, con)` 选 `coap_observe:notify_message(Type, Seq, Msg)`，且仅 `Type=:= con` 时起 `observe_ack` timer 与 `pending`；NON 直接发不入 `pending`。
-
-- [ ] **Step 2: `coap_resource:get/3` 分流 Observe=0/1；非 GET 忽略 Observe**
+- [ ] **Step 1: `coap_resource:get/3` 分流 Observe=0/1；非 GET 忽略 Observe**
 
 `get/3` 改为：
 
@@ -421,58 +566,118 @@ get(Req, Cfg, Ctx) ->
                 undefined ->
                     read_resource(Destination, Ctx);
                 0 ->
-                    %% Register the subscription and answer with the initial
-                    %% representation. The listener owns the socket and the
-                    %% relationship table, so registration happens there (it can
-                    %% answer 4.03 if the table is full); here we just read.
+                    %% The subscription is minted by the listener (it owns the socket
+                    %% and the table). Here we just read the current representation;
+                    %% a 4.04 means there is nothing to observe yet.
                     read_resource(Destination, Ctx);
                 1 ->
-                    %% Deregister: the listener drops the relationship. Answer
-                    %% 2.01 "Changed" (RFC 7641 §3.5 - deregister is benign).
+                    %% Deregister: the listener drops the relationship. Answer 2.01
+                    %% "Changed" (RFC 7641 §3.5 - deregistering is benign).
                     {reply, {response, 2, 1}, [], <<>>};
                 _ObsVal ->
+                    %% Any other Observe value is malformed; treat as a plain read.
                     read_resource(Destination, Ctx)
             end
     end.
 ```
 
-> 注册/注销的**副作用**（subscribe/attach/unsubscribe）放在 listener，因为 `coap_resource` 是纯函数。落地方式：listener 在 `respond/5` 之前，若 `code=method,get` 且带 `Observe=0/1`，先调 `register_observe`/`deregister_observe`。在 `respond/5` 的 `{single, Req, St1}` / `{done, Req, St1}` 分支里，resource 返回 2.05 时调 `register_observe(IP,Port,Token,Req,Cfg,St1)`；返回其他码时不注册。`Observe=1` 时 listener 调 `deregister_observe` 并仍回 2.01。
->
-> **本步只改 `coap_resource:get/3` 的返回码语义**（Observe=1 → 2.01），注册副作用在 Step 3 由 listener 承担。非 GET 的 `handle/3` 不改（Observe 只作用在 GET）。
+> **本步只改 `coap_resource:get/3` 的返回码语义**（Observe=1 → 2.01）。注册/注销的**副作用**由 listener 在 `respond/5` 里承担（Step 3），`coap_resource` 保持纯函数。非 GET 的 `handle/3` 不改（Observe 只作用在 GET）；`.well-known/core` 上带 Observe 也只读不注册（Step 3 的 `observe_action/1` 用 `code =:= {method,get}` 卡掉）。
 
-- [ ] **Step 3: listener 承担注册/注销副作用**
+- [ ] **Step 3: listener 承担注册/注销副作用（`respond/5` + `reply_observe/5` + `observe_action/1`）**
 
-在 `respond/5` 里，拿到 `resource_reply` 之前，若请求是 GET 且带 Observe：
+把 `respond/5` 的 `single/done` 两个分支从 `resource_reply/3`（内部直接 encode）改成走新的 `reply_observe/5`（先拿 `{Code, Options, Payload}`，按 Observe 加选项或改状态码，再 encode）；`streaming/refused` 分支不动。`handle_message/5` 的 ack/rst 分流见 Step 4。
 
 ```erlang
 respond(IP, Port, Msg, Cfg, St) ->
-    case coap_codec:observe_action(Msg) of   %% 新增 codec 辅助或直接内联判断
+    case block1_stream(IP, Port, Msg, Cfg, St) of
+        {single, Req, St1} -> reply_observe(IP, Port, Req, Cfg, St1);
+        {done, Req, St1}   -> reply_observe(IP, Port, Req, Cfg, St1);
+        {streaming, Continue, St1} -> {coap_codec:encode(Continue), St1};
+        {refused, Refusal, St1}    -> {coap_codec:encode(Refusal), St1}
+    end.
+
+%% GET with Observe=0 registers a relationship and answers the initial 2.05 with
+%% Observe: 0 (RFC 7641 §3.4); Observe=1 deregisters and answers 2.01 (§3.5).
+%% Everything else ignores Observe entirely.
+reply_observe(IP, Port, Req, Cfg, St) ->
+    case observe_action(Req) of
+        none ->
+            {resource_reply(Req, Cfg, {IP, Port}), St};
         register ->
-            case block1_stream(IP, Port, Msg, Cfg, St) of
-                {single, Req, St1} ->
-                    {Reply, St2} = resource_reply_observe(Req, Cfg, {IP,Port}, St1, register),
-                    {Reply, St2};
-                {done, Req, St1} ->
-                    {Reply, St2} = resource_reply_observe(Req, Cfg, {IP,Port}, St1, register),
-                    {Reply, St2};
-                Other -> ...
+            {Code, Options, Payload} = run_resource(Req, Cfg, {IP, Port}),
+            case Code of
+                {response, 2, 5} ->
+                    case register_observe(IP, Port, coap_codec:token(Req), Req,
+                                          Cfg, St) of
+                        {St2, Rel} ->
+                            Opts = [{observe, coap_observe:seq(Rel)} | Options],
+                            {encode_reply(Req, reply_type(Req), Code, Opts,
+                                          Payload), St2};
+                        {St2, undefined} ->
+                            %% Bounded table full: refuse the observation.
+                            {encode_reply(Req, reply_type(Req), {response, 4, 3},
+                                          [], <<>>), St2}
+                    end;
+                _ ->
+                    %% 4.04 / 5.xx: nothing to observe, answer as-is, no registration.
+                    {encode_reply(Req, reply_type(Req), Code, Options, Payload), St}
             end;
         deregister ->
-            St1 = deregister_observe(IP, Port, coap_codec:token(Msg), St),
-            {Reply, St2} = resource_reply(coap_codec:remove_option(observe, Msg), Cfg, {IP,Port}),
-            {coap_codec:encode(Reply), St2};
-        none ->
-            ... (existing block1_stream + resource_reply)
+            St2 = deregister_observe(IP, Port, coap_codec:token(Req), St),
+            {resource_reply(Req, Cfg, {IP, Port}), St2}
+    end.
+
+%% Observe only applies to GET (RFC 7641 §3.1): 0 registers, 1 deregisters.
+observe_action(Req) ->
+    case {coap_codec:code(Req), coap_codec:option(observe, Req)} of
+        {{method, get}, 0} -> register;
+        {{method, get}, 1} -> deregister;
+        _ -> none
     end.
 ```
 
-`resource_reply_observe/5` 在 `register_observe` 返回 `{error, full, St)` 时把回复改成 `4.03` 且不加 observe；否则正常 `resource_reply`（piggybacked 2.05 已带初始表示，observe 序号由通知路径从 0 起）。`deregister_observe/4` = `unsubscribe(<<"coap">>, filter(dest))` + `detach` + `observes` 移除该 Key。
+> `resource_reply/3` 保留（`none` 分支与既有调用点仍在用它）。`run_resource/3` 已是私有函数、返回三元组，`encode_reply/5` 也是既有的——本步没有新增 codec 依赖。
+>
+> 注意 piggyback 的初始 2.05 会**同时**带资源自身的 `content_format`（来自 `run_resource` → `coap_resource:content_format_options/1`）和 `{observe, 0}`；后续通知经 `coap_observe:notify_message/4` 镜像同一 `content_format`，因此首帧与通知帧形状一致。
 
-> `coap_codec:observe_action/1` 若不想加，直接内联：`case {coap_codec:type(Msg), coap_codec:option(observe, Msg)} of {_, 0} -> register; {_, 1} -> deregister; _ -> none end`（且仅对 `code =:= {method,get}`）。
+- [ ] **Step 4: `handle_message/5` 忽略 ack、rst 触发注销**
 
-- [ ] **Step 4: 加 6 条 listener 用例**
+```erlang
+handle_message(IP, Port, Msg, Cfg, #st{dedup = Dedup} = St) ->
+    case coap_codec:type(Msg) of
+        ack ->
+            %% Cancels a pending CON notification; the udp clause already matched
+            %% it against `pending'. Not a request: no response owed.
+            St;
+        rst ->
+            %% Ends the observation relationship (RFC 7641 §3.6). Not a request:
+            %% no response owed.
+            deregister_observe(IP, Port, coap_codec:token(Msg), St);
+        con ->
+            %% Already answered this exact CON? Re-send the cached bytes without
+            %% re-executing (RFC 7252 §4.8.2).
+            case maps:find({IP, Port, coap_codec:id(Msg)}, Dedup) of
+                {ok, {Cached, _At}} ->
+                    send(IP, Port, Cached, St),
+                    St;
+                error ->
+                    {Reply, St1} = respond(IP, Port, Msg, Cfg, St),
+                    send(IP, Port, Reply, St1),
+                    remember(IP, Port, coap_codec:id(Msg), Reply, Cfg, St1)
+            end;
+        _Non ->
+            %% A NON request still gets the resource's answer, as a separate NON.
+            {Reply, St1} = respond(IP, Port, Msg, Cfg, St),
+            send(IP, Port, Reply, St1),
+            St1
+    end.
+```
 
-在 `coap_listener_SUITE.erl` `all/0` 追加：
+> 把原 `handle_message/5` **整体替换**。注意原代码用 `Id = coap_codec:id(Msg)`，这里内联成 `coap_codec:id(Msg)`；dedup 键是 `{IP,Port,Id}`，别和 `observes`/`pending` 的 `{IP,Port,Token}` 搞混。
+
+- [ ] **Step 5: 加 8 条 listener 用例 + `case_env`/`restore_env` 扩展**
+
+在 `coap_listener_SUITE.erl` 的 `all/0` 追加这 8 个名字（放在 `malformed_datagram_is_dropped` 之后）：
 
 ```erlang
      observe_con_notifies_and_acks,
@@ -485,157 +690,253 @@ respond(IP, Port, Msg, Cfg, St) ->
      observe_max_age_expires_relationship
 ```
 
-用例实现（真实 UDP；token 显式；用 `expect`/`refute` 既有助手）：
+`init_per_testcase/2` 的 `Saved` map 要**多存 3 个键**（`max_observes`、`observe_ack_timeout_ms`、`observe_max_age_s`），`restore_env/1` 要**多恢复这 3 个键**（否则 `observe_bounded_table_refuses` 设的 `max_observes=1` 会泄漏到后面的用例）：
 
 ```erlang
-%% CON Observe=0 → piggybacked 2.05 (observe:0) + 初始表示；再 publish →
-%% CON 通知带 observe:1；回一个同 token ACK → 无重传；再 publish → 第二个通知。
+    Saved = #{acl => env(broker_security, acl),
+              require_auth => env(broker_security, require_auth),
+              users => env(broker_security, users),
+              max_rps => env(broker_proto_coap, max_requests_per_second),
+              max_msg => env(broker_proto_coap, max_message_bytes),
+              max_observes => env(broker_proto_coap, max_observes),
+              ack_timeout => env(broker_proto_coap, observe_ack_timeout_ms),
+              max_age => env(broker_proto_coap, observe_max_age_s)},
+```
+
+```erlang
+restore_env(#{acl := Acl, require_auth := Auth, users := Users,
+               max_rps := Rps, max_msg := MaxMsg,
+               max_observes := MaxObs, ack_timeout := AckTO, max_age := MaxAge}) ->
+    set_or_unset(broker_security, acl, Acl),
+    set_or_unset(broker_security, require_auth, Auth),
+    set_or_unset(broker_security, users, Users),
+    set_or_unset(broker_proto_coap, max_requests_per_second, Rps),
+    set_or_unset(broker_proto_coap, max_message_bytes, MaxMsg),
+    set_or_unset(broker_proto_coap, max_observes, MaxObs),
+    set_or_unset(broker_proto_coap, observe_ack_timeout_ms, AckTO),
+    set_or_unset(broker_proto_coap, observe_max_age_s, MaxAge),
+    ok.
+```
+
+`case_env/2` 追加三条（其余用例用默认）：
+
+```erlang
+%% The retry case pins a short retransmit timeout so it does not sit on 2 s.
+case_env(observe_con_retries_then_gives_up, _Config) ->
+    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
+    ok = application:set_env(broker_proto_coap, observe_max_retrans, 2);
+%% The bounded-table case shrinks the relationship table to a single slot.
+case_env(observe_bounded_table_refuses, _Config) ->
+    ok = application:set_env(broker_proto_coap, max_observes, 1);
+%% The max-age case sweeps after one second instead of thirty.
+case_env(observe_max_age_expires_relationship, _Config) ->
+    ok = application:set_env(broker_proto_coap, observe_max_age_s, 1);
+```
+
+再加两个测试助手（放在 `request/4` 那组旁边）。**必须带 token**，因为 `coap_codec:ack/1` 和 `coap_codec:reset/1` 会把 token 清空：
+
+```erlang
+%% An empty ACK that echoes a notification's token and Message ID. The codec's
+%% own `ack/1' drops the token, which would miss the `pending' match.
+ack_of(Note) ->
+    #{type => ack, code => empty, id => coap_codec:id(Note),
+      token => coap_codec:token(Note), options => [], payload => <<>>}.
+
+%% An RST carrying the token of the observation being ended (RFC 7641 §3.6).
+rst_of(Token, Id) ->
+    #{type => rst, code => empty, id => Id, token => Token,
+      options => [], payload => <<>>}.
+```
+
+8 条用例（真实 UDP；token 显式；用既有 `expect/3`、`refute/4`）：
+
+```erlang
+%% CON Observe=0 -> piggybacked 2.05 with Observe: 0; a later PUT -> a CON
+%% notification with Observe: 1; ACK it -> no retransmit; a further PUT -> the
+%% second notification.
 observe_con_notifies_and_acks(Config) ->
     Port = ?config(port, Config),
     S = open(),
     Token = <<"ob1">>,
-    Req = (request(con, get, 1, [{uri_path, <<"o">>}], <<"init">>))#{token => Token},
-    send(S, Port, Req),
-    #{type := ack, code := {response,2,5}, token := Token} = expect(S, ack, {response,2,5}),
-    %% Publish a new value.
-    send(S, Port, request(con, put, 2, [{uri_path, <<"o">>}], <<"v1">>)),
-    _ = expect(S, ack, {response,2,4}),
-    %% A CON notification with the next observe sequence arrives.
-    Note = expect(S, non, {response,2,5}),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"o">>}], <<"init">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, (request(con, get, 2, [{uri_path, <<"o">>}]))#{token => Token}),
+    First = expect(S, ack, {response, 2, 5}),
+    ?assertEqual(Token, coap_codec:token(First)),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"o">>}], <<"v1">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    Note = expect(S, con, {response, 2, 5}),
     ?assertEqual(Token, coap_codec:token(Note)),
     ?assertEqual(1, coap_codec:option(observe, Note)),
-    %% ACK it: no retransmit.
-    send(S, Port, coap_codec:ack(Note)),
-    refute(S, non, {response,2,5}, 400),
+    send(S, Port, ack_of(Note)),
+    refute(S, con, {response, 2, 5}, 400),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"o">>}], <<"v2">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    Note2 = expect(S, con, {response, 2, 5}),
+    ?assertEqual(2, coap_codec:option(observe, Note2)),
     close(S).
 
-%% CON notification not ACKed → retransmitted after the timeout, then given up.
+%% A CON notification that is never ACKed is retransmitted (same Message ID) and
+%% finally given up: the relationship is torn down and no further notification
+%% arrives.
 observe_con_retries_then_gives_up(Config) ->
     Port = ?config(port, Config),
     S = open(),
     send(S, Port, request(con, get, 1, [{uri_path, <<"r">>}])),
-    #{code := {response,2,5}} = expect(S, ack, {response,2,5}),
+    _ = expect(S, ack, {response, 4, 4}),
     send(S, Port, request(con, put, 2, [{uri_path, <<"r">>}], <<"x">>)),
-    _ = expect(S, ack, {response,2,4}),
-    N1 = expect(S, non, {response,2,5}),
-    %% Do NOT ack. With observe_ack_timeout_ms small (pinned below) it retransmits.
-    N2 = expect(S, non, {response,2,5}),
+    _ = expect(S, ack, {response, 2, 4}),
+    %% The Observe registration itself needs a 2.05 first.
+    send(S, Port, request(con, get, 3, [{uri_path, <<"r">>}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"r">>}], <<"y">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    N1 = expect(S, con, {response, 2, 5}),
+    N2 = expect(S, con, {response, 2, 5}),
     ?assertEqual(coap_codec:id(N1), coap_codec:id(N2)),
+    N3 = expect(S, con, {response, 2, 5}),
+    ?assertEqual(coap_codec:id(N1), coap_codec:id(N3)),
+    send(S, Port, request(con, put, 5, [{uri_path, <<"r">>}], <<"z">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 600),
     close(S).
 
-%% NON Observe=0 → at most one notification, no retransmit.
+%% A NON Observe=0 gets at most one notification: no retransmit timer, no retry.
 observe_non_is_at_most_once(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    send(S, Port, request(non, get, 1, [{uri_path, <<"n">>}])),
-    #{type := non, code := {response,2,5}} = expect(S, non, {response,2,5}),
-    send(S, Port, request(non, put, 2, [{uri_path, <<"n">>}], <<"y">>)),
-    Note = expect(S, non, {response,2,5}),
+    send(S, Port, request(non, put, 1, [{uri_path, <<"n">>}], <<"init">>)),
+    _ = expect(S, non, {response, 2, 4}),
+    send(S, Port, request(non, get, 2, [{uri_path, <<"n">>}, {observe, 0}])),
+    First = expect(S, non, {response, 2, 5}),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, Port, request(non, put, 3, [{uri_path, <<"n">>}], <<"y">>)),
+    Note = expect(S, non, {response, 2, 5}),
     ?assertEqual(1, coap_codec:option(observe, Note)),
-    refute(S, non, {response,2,5}, 400),
+    refute(S, non, {response, 2, 5}, 400),
     close(S).
 
+%% Observe=1 deregisters: a later PUT notifies nobody.
 observe_deregister_with_observe_1(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    send(S, Port, request(con, get, 1, [{uri_path, <<"d1">>}])),
-    #{code := {response,2,5}} = expect(S, ack, {response,2,5}),
-    send(S, Port, request(con, put, 2, [{uri_path, <<"d1">>}], <<"a">>)),
-    _ = expect(S, ack, {response,2,4}),
-    _ = expect(S, non, {response,2,5}),
-    %% Deregister.
-    send(S, Port, (request(con, get, 3, [{uri_path, <<"d1">>}, {observe, 1}])) ),
-    #{code := {response,2,1}} = expect(S, ack, {response,2,1}),
-    send(S, Port, request(con, put, 4, [{uri_path, <<"d1">>}], <<"b">>)),
-    _ = expect(S, ack, {response,2,4}),
-    refute(S, non, {response,2,5}, 400),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"d1">>}], <<"a">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"d1">>}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"d1">>}], <<"b">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    send(S, Port, request(con, get, 4, [{uri_path, <<"d1">>}, {observe, 1}])),
+    ?assertEqual({response, 2, 1},
+                 coap_codec:code(expect(S, ack, {response, 2, 1}))),
+    send(S, Port, request(con, put, 5, [{uri_path, <<"d1">>}], <<"c">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 400),
     close(S).
 
+%% An RST carrying the observation's token ends it (RFC 7641 §3.6).
 observe_rst_deregisters(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    send(S, Port, request(con, get, 1, [{uri_path, <<"rst1">>}])),
-    #{code := {response,2,5}} = expect(S, ack, {response,2,5}),
-    send(S, Port, request(con, put, 2, [{uri_path, <<"rst1">>}], <<"a">>)),
-    _ = expect(S, ack, {response,2,4}),
-    _ = expect(S, non, {response,2,5}),
-    %% RST with the same token ends the relationship.
-    send(S, Port, (coap_codec:request(rst, empty, 3))#{token => <<"rsttok">>}),
-    ok,
-    send(S, Port, request(con, put, 4, [{uri_path, <<"rst1">>}], <<"b">>)),
-    _ = expect(S, ack, {response,2,4}),
-    refute(S, non, {response,2,5}, 400),
+    Token = <<"rsttok">>,
+    send(S, Port, request(con, put, 1, [{uri_path, <<"rst1">>}], <<"a">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, (request(con, get, 2, [{uri_path, <<"rst1">>}]))#{token => Token}),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"rst1">>}], <<"b">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    send(S, Port, rst_of(Token, 9)),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"rst1">>}], <<"c">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 400),
     close(S).
 
+%% A full relationship table refuses the observation with 4.03.
 observe_bounded_table_refuses(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    ok = application:set_env(broker_proto_coap, max_observes, 1),
-    T1 = <<"t1">>, T2 = <<"t2">>,
-    send(S, Port, (request(con, get, 1, [{uri_path, <<"b1">>}]))#{token => T1}),
-    #{code := {response,2,5}} = expect(S, ack, {response,2,5}),
-    send(S, Port, (request(con, get, 2, [{uri_path, <<"b2">>}]))#{token => T2}),
-    #{code := {response,4,3}} = expect(S, ack, {response,4,3}),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"b1">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, put, 2, [{uri_path, <<"b2">>}])),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 3, [{uri_path, <<"b1">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, get, 4, [{uri_path, <<"b2">>}, {observe, 0}])),
+    ?assertEqual({response, 4, 3},
+                 coap_codec:code(expect(S, ack, {response, 4, 3}))),
     close(S).
 
+%% An unauthenticated principal is refused: the observation never registers.
 observe_acl_denied(Config) ->
     Port = ?config(port, Config),
     S = open(),
     ok = application:set_env(broker_security, acl, all),
     ok = application:set_env(broker_security, require_auth, [<<"coap">>]),
-    send(S, Port, request(con, get, 1, [{uri_path, <<"x">>}])),
-    #{code := {response,4,3}} = expect(S, ack, {response,4,3}),
+    send(S, Port, request(con, get, 1, [{uri_path, <<"x">>}, {observe, 0}])),
+    ?assertEqual({response, 4, 3},
+                 coap_codec:code(expect(S, ack, {response, 4, 3}))),
     close(S).
 
+%% A relationship silent longer than Max-Age is swept on the tick: a later PUT
+%% notifies nobody (the client is expected to re-Observe).
 observe_max_age_expires_relationship(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    ok = application:set_env(broker_proto_coap, observe_max_age_s, 1),
-    send(S, Port, request(con, get, 1, [{uri_path, <<"mx">>}])),
-    #{code := {response,2,5}} = expect(S, ack, {response,2,5}),
-    send(S, Port, request(con, put, 2, [{uri_path, <<"mx">>}], <<"a">>)),
-    _ = expect(S, ack, {response,2,4}),
-    _ = expect(S, non, {response,2,5}),
-    %% After max_age the relationship is swept (unsubscribe); a later publish
-    %% yields no notification.
+    send(S, Port, request(con, put, 1, [{uri_path, <<"mx">>}])),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"mx">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    send(S, Port, request(con, put, 3, [{uri_path, <<"mx">>}], <<"a">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
     timer:sleep(1300),
-    send(S, Port, request(con, put, 3, [{uri_path, <<"mx">>}], <<"b">>)),
-    _ = expect(S, ack, {response,2,4}),
-    refute(S, non, {response,2,5}, 400),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"mx">>}], <<"b">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    refute(S, con, {response, 2, 5}, 400),
     close(S).
 ```
 
-> `observe_con_retries_then_gives_up` 需在 `case_env/2` 里为它把 `observe_ack_timeout_ms` 设为 300、`observe_max_retrans` 设为 2（加一条 `case_env(observe_con_retries_then_gives_up, _) -> set both`）。`observe_bounded_table_refuses` 在 `case_env` 里设 `max_observes=1`；`end_per_testcase` 的 `restore_env` 需保存/恢复这 3 个键（扩展 `Saved` map）。
+> `observe_con_retries_then_gives_up` 的时序：`observe_ack_timeout_ms=300`、`observe_max_retrans=2`，所以未 ACK 的通知在 0 / 300 / 600 ms 各发一次共 3 帧（首发 + 2 次重传），第 3 帧后放弃。`refute(..., 600)` 覆盖了「放弃 + 拆关系」的窗口；若机器卡顿导致 600 ms 内没跑完 3 帧，把窗口调大到 900。
+>
+> `observe_non_is_at_most_once` 里 NON PUT 的应答是 **NON**（不是 ack），因为 `reply_type/1` 对 non 返回 non。
 
-- [ ] **Step 5: 跑全套 listener**
+- [ ] **Step 6: 跑全套 listener**
 
 Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_coap/test/coap_listener_SUITE.erl 2>&1 | tail -5`
 Expected: `All 15 tests passed.`（原 7 + 8 新）
 
-- [ ] **Step 6: 加 resource 层 2 条 mock 注入用例**
+- [ ] **Step 7: 加 resource 层 2 条 mock 注入用例**
 
-在 `coap_resource_SUITE.erl` 加（用既有 mock 注入路径，参考该文件现有 `put`/`get` 测试的 fixture）：
+在 `coap_resource_SUITE.erl` 的 `all/0` 追加 `observe_1_on_get_answers_2_01`、`observe_0_on_get_still_reads_retained`，并按该文件现有 fixture 风格实现：
 
 ```erlang
-observe_1_on_get_answers_2_01(_) ->
+%% Observe=1 deregisters; the resource layer itself just answers 2.01.
+observe_1_on_get_answers_2_01(_Config) ->
     Req = request(con, get, 9, [{uri_path, <<"z">>}, {observe, 1}]),
-    {reply, {response, 2, 1}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX).
+    {reply, {response, 2, 1}, [], <<>>} = coap_resource:handle(Req, ?CFG, ?CTX).
 
-observe_0_on_get_still_reads_retained(_) ->
-    put(<<"z">>, <<"v">>),
+%% Observe=0 does not change what the resource reads: still the retained rep.
+observe_0_on_get_still_reads_retained(_Config) ->
+    ok = broker_retain:put(<<"z">>, #broker_message{payload = <<"v">>}),
     Req = request(con, get, 10, [{uri_path, <<"z">>}, {observe, 0}]),
-    {reply, {response, 2, 5}, _, <<"v">>} = coap_resource:handle(Req, ?CFG, ?CTX).
+    {reply, {response, 2, 5}, _Options, <<"v">>} =
+        coap_resource:handle(Req, ?CFG, ?CTX).
 ```
+
+> 用该文件**既有**的 mock/fixture 写法（`?CFG`/`?CTX` 或等价的 `handle(Req, Cfg, Ctx)` 调用形式）。先读一遍该文件现有的 `get`/`put` 用例再照抄风格；如果它用的是别的断言宏，就用那个。若 `broker_retain:put/2` 签名不同，用该文件已经用过的方式写 retained 状态。
 
 Run: `... rebar3 ct --suite=apps/broker_proto_coap/test/coap_resource_SUITE.erl 2>&1 | tail -4`
 Expected: `All 15 tests passed.`（原 13 + 2）
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 8: 提交**
 
 ```bash
 cd /home/wanli/workspace/unified-mq
 git add apps/broker_proto_coap/src/coap_listener.erl apps/broker_proto_coap/src/coap_resource.erl apps/broker_proto_coap/test/coap_listener_SUITE.erl apps/broker_proto_coap/test/coap_resource_SUITE.erl
-git commit -q -m "feat(broker_proto_coap): S11-B Observe=0/1 分流 + NON 至多一次 + RST/注销/max_age/有界表/ACL 用例"
+git commit -q -m "feat(broker_proto_coap): S11-B Observe=0/1 分流 + RST/注销/max_age/有界表/ACL 用例"
 ```
 
 ---
@@ -647,17 +948,17 @@ git commit -q -m "feat(broker_proto_coap): S11-B Observe=0/1 分流 + NON 至多
 - [ ] **Step 1: 编译 + CoAP 四套件**
 
 Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_coap/test/coap_observe_SUITE.erl,apps/broker_proto_coap/test/coap_codec_SUITE.erl,apps/broker_proto_coap/test/coap_resource_SUITE.erl,apps/broker_proto_coap/test/coap_listener_SUITE.erl 2>&1 | tail -4`
-Expected: `All 94 tests passed.`（48 + 15 + 15 + 5 = 83；若 resource/listener 数与计划略有出入以实跑为准）
+Expected: `All 93 tests passed.`（codec 48 + resource 15 + listener 15 + observe 10 + app 5；若资源/listener 用例数与计划略有出入，以实跑为准并在文档里写实际数）
 
 - [ ] **Step 2: 全量 CT**
 
 Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && rm -rf _build/test/extras && timeout 3000 rebar3 ct > /tmp/opencode/ct_s11b.log 2>&1; echo exit=$?; tail -3 /tmp/opencode/ct_s11b.log`
-Expected: `All <N> tests passed.`，N = 1324 + 新增（约 83），零 FAILED。
+Expected: `All <N> tests passed.`，N = 1324 + 本阶段新增（1 + 8 + 2 + 10 = 21，全量约 1345），零 FAILED。新增数 = listener 1（Task 2）+ listener 8（Task 3）+ resource 2（Task 3）+ observe 10（Task 1）。以实际跑出的数为准。
 
 - [ ] **Step 3: dialyzer + xref**
 
 Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && timeout 900 rebar3 dialyzer 2>&1 | tail -3; echo "=== xref ==="; timeout 600 rebar3 xref 2>&1 | grep -c Warning`
-Expected: dialyzer 0 warning；xref 计数 = 302 + `coap_observe` 导出未用项（若有新增 unused-export，如实写入文档）。
+Expected: dialyzer 0 warning；xref 计数 = 302 基线 + 本阶段新增（coap_observe 8 个导出在 Task 1 后未接线 = +8 → 310；Task 2/3 接线后回落到 302 + coap_listener/coap_resource 自身的新增未用导出，以实跑为准）。
 
 - [ ] **Step 4: release 装配**
 
@@ -685,5 +986,5 @@ Expected：S11-B 相关提交齐全，工作树干净（`docs/compatibility/` �
 ## Self-Review 记录
 
 - **Spec 覆盖**：设计稿 §2 进程模型→Task2/3；§3 会话归属→Task2（observes 表 + max_age sweep）；§4 可靠性分档→Task2（CON 重传）/Task3（NON 至多一次）；§5 数据流→Task2/3 各分支；§6 组件清单→Task1/2/3；§7 测试→Task1/3 逐条；§8 ADR 偏差→Task4 Step5；§9 收口→Task4。
-- **类型一致**：`relationship()` 字段（dest/tenant/sub_ref/max_age/seq/last_notified + req_type）在 coap_observe 与 listener 一致；ClientId 恒 `<<"coap">>`；`coap_observe:filter/1` 在 register 与 sweep/deregister 复用。
-- **已知坑**：`sweep_observes/1` 因需 side-effect（unsubscribe）放在 tick 而非纯 `prune/1`——已在 Task2 Step5 标注由实现者补全，并有 `observe_max_age_expires_relationship` 钉住。`notify pid = listener` 意味着 `attach(<<"coap">>, self(), false)` 的 self 是 listener 进程。
+- **类型一致**：`coap_observe:relationship()` 的字段是 dest/tenant/sub_ref/max_age/seq/last_notified（**注意 `req_type` 不在其中**——它由 listener 在 `register_observe` 里以 `Rel#{req_type => ...}` 附加，是 listener 侧的表项元数据，不进纯模块的类型）；listener 侧 `observes` 表项 = `relationship() + req_type`，`pending` 表项 = `{Bytes, RetransLeft, TimerRef}`；ClientId 恒 `<<"coap">>`；`coap_observe:filter/1` 在 register 与 sweep/deregister 复用。
+- **已知坑**：`sweep_observes/1` 因需 side-effect（unsubscribe）放在 tick 而非纯 `prune/1`（Task2 Step5 已给完整实现），`observe_max_age_expires_relationship` 钉住。`notify pid = listener` 意味着 `attach(<<"coap">>, self(), false)` 的 self 是 listener 进程。`coap_codec:ack/1`、`reset/1` 丢 token，测试必须自带 token（Task3 Step5 的 `ack_of/1`/`rst_of/2`）。
