@@ -35,6 +35,7 @@ all() ->
      duplicate_con_is_answered_with_the_original_ack,
      non_put_dispatches_without_a_response,
      block1_reassembles_a_multidatagram_body,
+     block1_keyed_by_request_tag_across_changing_tokens,
      token_bucket_bounds_a_flood,
      oversized_datagram_is_dropped,
      malformed_datagram_is_dropped,
@@ -336,8 +337,11 @@ non_put_dispatches_without_a_response(Config) ->
 %% and is dispatched to the resource layer.
 %%
 %% The blocks carry the SAME token but DIFFERENT Message IDs, as a real client
-%% sends them: a transfer is one request, so reassembly must be keyed by the
-%% token, not by the per-datagram Message ID.
+%% sends them: a transfer is one request, so reassembly must not be keyed by the
+%% per-datagram Message ID.
+%%
+%% The 2.31 Continue echoes the block number it RECEIVED (RFC 7959 §3.2
+%% Figure 7: request `1:0/1/128' is answered `1:0/1/128'), not the next one.
 block1_reassembles_a_multidatagram_body(Config) ->
     Port = ?config(port, Config),
     S = open(),
@@ -351,10 +355,10 @@ block1_reassembles_a_multidatagram_body(Config) ->
     Req1 = (request(con, put, 1, [{uri_path, <<"big">>}, {block1, Block1First}],
                     Chunk1))#{token => Token},
     send(S, Port, Req1),
-    %% The listener answers 2.31 Continue with the next block number (1).
+    %% The listener answers 2.31 Continue acknowledging block 0.
     Continue = expect(S, ack, {response, 2, 31}),
     ?assertEqual(Token, coap_codec:token(Continue)),
-    ?assertEqual({1, true, 16}, coap_codec:block(block1, Continue)),
+    ?assertEqual({0, true, 16}, coap_codec:block(block1, Continue)),
     %% Send the last block with a new Message ID and the same token.
     Req2 = (request(con, put, 2, [{uri_path, <<"big">>}, {block1, Block1Last}],
                     Chunk2))#{token => Token},
@@ -363,6 +367,33 @@ block1_reassembles_a_multidatagram_body(Config) ->
     %% The assembled body is what was retained: a GET returns both chunks.
     send(S, Port, request(con, get, 3, [{uri_path, <<"big">>}])),
     #{payload := <<1, 2, 3, 4, 5, 6>>} = expect(S, ack, {response, 2, 5}),
+    close(S).
+
+%% A real client is free to change the token between blocks -- libcoap v4.3.5
+%% sends block 0 with an empty token and block 1 with an eight-byte one, and ties
+%% the transfer together with `Request-Tag' (RFC 9175 §3.1, option 292). Keying
+%% reassembly on the token alone silently dropped every such body: the PUT was
+%% answered 2.04 while nothing was retained. This case is that regression.
+block1_keyed_by_request_tag_across_changing_tokens(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    Chunk1 = <<"first-half">>,
+    Chunk2 = <<"second-half">>,
+    Tag = <<"reqtag01">>,
+    %% Distinct tokens per block, exactly as libcoap emits them.
+    Req1 = (request(con, put, 11,
+                    [{uri_path, <<"tagged">>}, {block1, {0, true, 16}},
+                     {292, Tag}], Chunk1))#{token => <<>>},
+    send(S, Port, Req1),
+    Continue = expect(S, ack, {response, 2, 31}),
+    ?assertEqual({0, true, 16}, coap_codec:block(block1, Continue)),
+    Req2 = (request(con, put, 12,
+                    [{uri_path, <<"tagged">>}, {block1, {1, false, 16}},
+                     {292, Tag}], Chunk2))#{token => <<2, 0, 0, 0, 0, 0, 2>>},
+    send(S, Port, Req2),
+    #{type := ack, code := {response, 2, 4}} = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 13, [{uri_path, <<"tagged">>}])),
+    #{payload := <<"first-halfsecond-half">>} = expect(S, ack, {response, 2, 5}),
     close(S).
 
 %% R-X3: the per-endpoint token bucket bounds a flood. With the limit pinned to

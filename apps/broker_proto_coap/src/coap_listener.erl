@@ -63,6 +63,10 @@
 %% passive; same budget as `mqtt_sn_listener' (ADR-022).
 -define(ACTIVE_N, 100).
 
+%% RFC 9175 §3.1: `Request-Tag' (option 292) names a block-wise request
+%% independently of the token, which a client is free to change between blocks.
+-define(REQUEST_TAG, 292).
+
 -record(st, {
     %% The plain-UDP socket, or `undefined' when this listener speaks DTLS (the
     %% listen socket then lives in `dtls_listen'). Keeping them separate avoids
@@ -75,9 +79,10 @@
     dedup = #{} :: map(),
     %% {IP, Port} -> token-bucket state.
     endpoints = #{} :: map(),
-    %% {IP, Port, Token, Destination} -> {Assembled, Total, AtMs} for a Block1
-    %% stream. The token identifies the transfer (RFC 7959 draft §2.1); the
-    %% Message ID changes from block to block and must not be the key.
+    %% {IP, Port, Tag, Destination} -> {Assembled, Total, AtMs} for a Block1
+    %% stream. `Tag' is the Request-Tag when the client sends one, else the
+    %% token (RFC 9175 §3.1 / RFC 7959 §2.1); the Message ID changes from block
+    %% to block and must not be the key.
     block1 = #{} :: map(),
     %% RFC 7641 Observe relationships: {IP,Port,Token} -> relationship()
     %% (a coap_observe:relationship()). Bounded by `max_observes'.
@@ -651,7 +656,13 @@ block1_stream(IP, Port, Msg, Cfg, #st{block1 = Streams} = St) ->
         undefined ->
             {single, Msg, St};
         {Num, More, Size} ->
-            Key = {IP, Port, coap_codec:token(Msg), coap_codec:destination(Msg)},
+            %% RFC 7959 §2.1 says the token identifies a block-wise transfer,
+            %% but RFC 9175 §3.1 adds `Request-Tag' precisely because a client
+            %% may let the token change between blocks (libcoap does: block 0
+            %% carries an empty token, block 1 an 8-byte one). libcoap sends a
+            %% stable Request-Tag, so that is the identity when present; the
+            %% token stays the fallback for clients that keep it fixed.
+            Key = {IP, Port, block1_tag(Msg), coap_codec:destination(Msg)},
             Chunk = coap_codec:payload(Msg),
             Ceiling = maps:get(max_block1_bytes, Cfg, 262144),
             Now = erlang:monotonic_time(millisecond),
@@ -672,6 +683,14 @@ block1_stream(IP, Port, Msg, Cfg, #st{block1 = Streams} = St) ->
             end
     end.
 
+%% The stable identity of a Block1 transfer (RFC 9175 §3.1): `Request-Tag'
+%% when the client sends it, otherwise the token (RFC 7959 §2.1).
+block1_tag(Msg) ->
+    case coap_codec:option(?REQUEST_TAG, Msg) of
+        undefined -> {token, coap_codec:token(Msg)};
+        Tag       -> {request_tag, Tag}
+    end.
+
 assemble(Msg, Num, More, Size, Assembled, PrevTotal, Ceiling, Streams, Key, Now,
          St) ->
     Total = PrevTotal + byte_size(coap_codec:payload(Msg)),
@@ -683,7 +702,7 @@ assemble(Msg, Num, More, Size, Assembled, PrevTotal, Ceiling, Streams, Key, Now,
         false ->
             case More of
                 true ->
-                    Continue = continue_reply(Msg, Size, Num + 1),
+                    Continue = continue_reply(Msg, Size, Num),
                     {streaming, Continue,
                      St#st{block1 = maps:put(Key, {Assembled, Total, Now}, Streams)}};
                 false ->
@@ -692,12 +711,14 @@ assemble(Msg, Num, More, Size, Assembled, PrevTotal, Ceiling, Streams, Key, Now,
             end
     end.
 
-%% The 2.31 Continue echoes the request's type/id/token and the *next* block
-%% number with M=1, telling the client "send me block N+1".
-continue_reply(Msg, Size, NextNum) ->
+%% The 2.31 Continue echoes the request's type/id/token and the *received*
+%% block number with M=1, as RFC 7959 §3.2 Figure 7 shows: a request carrying
+%% `1:0/1/128' is answered `1:0/1/128', not `1:1/1/128'. NUM acknowledges the
+%% block just stored; the client infers the next number (NUM+1) itself.
+continue_reply(Msg, Size, Num) ->
     Resp = refusal_base(Msg, {response, 2, 31}),
     coap_codec:put_option(block1,
-                         coap_codec:block_value(NextNum, true, Size), Resp).
+                         coap_codec:block_value(Num, true, Size), Resp).
 
 refusal(Msg, Code) ->
     refusal_base(Msg, Code).
