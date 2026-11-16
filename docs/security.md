@@ -367,6 +367,8 @@ S11-A 交付了 CoAP（RFC 7252）的请求/响应面：自写编解码、资源
 7. **不写 CoAP 专属指标、无协议层日志**：沿用 ADR-016 冻结键集，只 inc 既有 `bytes_in` / `frame_decode_errors` / `protocol_errors`；没有「哪个目的地被写了几次」这类观测面，需要时只能看内核层的 retain/queue 统计。
 8. **单节点**：listener 的三张表（dedup / 令牌桶 / Block1）全在进程内存、不持久化，也不跨节点；retained 与日志语义完全由既有层决定。（S11-B 又加了 `observes` / `pending` 两张，同姿态，见 §12.5 第 1 条。）
 
+**S11-C 收口（2026-11-16）**：上面第 1 条「无 DTLS」已关闭（§4.24.8 交付 DTLS-PSK）；第 6 条「限流不识别身份」在 `coaps` 上已有身份（ACL 生效），但明文 UDP listener 的令牌桶仍按 `{IP,Port}` 计；第 2 条 Observe 已由 S11-B 关闭；第 3/4 条（无 Block2、草案 Block-wise）与第 5 条（无 OSCORE/multicast/8323）仍成立；第 7 条「不写 CoAP 专属指标」仍成立（ADR-016 冻结键集）；第 8 条「单节点 / 不持久化」在 DTLS 会话表上同样成立（§12.6 第 4 条）。
+
 ### 12.5 S11-B CoAP Observe 面明确未实现项（2026-11-15 立）
 
 S11-B 交付了 Observe（RFC 7641）：`Observe=0` 注册、内核 dispatch → 通知、`Observe=1`/RST 注销，全部映射到 `broker_subscription` + ADR-013 cursor。下表逐条留痕本阶段**真实没有**的东西（不作为 Gate 依据；`docs/protocol-compatibility.md` §4.24.4/§4.24.6 是同一份事实的协议口径，ADR-031「落地偏差记录」是本期的冻结落点）。
@@ -381,3 +383,18 @@ S11-B 交付了 Observe（RFC 7641）：`Observe=0` 注册、内核 dispatch →
 8. **共享匿名会话带来的观测面缺口**：所有观察共用一个 `<<"coap">>` ClientId，因此 `broker_subscription:subscriptions/1` 里看不到「是哪个 UDP 端点在看哪个目的地」；`max_observes` 是**全局**上限，不是每用户/每 IP。没有 CoAP 专属指标（ADR-016 冻结键集），没有观察关系的生命周期日志——运维只能靠 `coap_listener` 的进程状态与内核层 retain/queue 统计间接判断。
 9. **`max_observes` 满时只拒绝新的 `Observe=0`**：刷新一条已有观察（同 token re-GET）**不**占新槽、**不**会被拒；也就是说一个已经建立的关系无法被容量压力驱逐，只有 `Max-Age`/重传耗尽/主动注销能让它退出。占满表的攻击者优先于后来者——这是有界表「拒绝新来源而不是驱逐已有」的一贯取舍（与 §12.4 第 6 条同姿态）。
 
+**S11-C 收口（2026-11-16）**：上面第 4、5 两条已被 S11-C 部分关闭——`transport => dtls` 的 listener（`coaps`）现在有真实客户端身份（PSK identity → `principal`/`tenant`），因此 **ACL 在 `coaps` 上真正生效**（`acl_denies_on_dtls` / `tenant_isolation_on_dtls`）；`require_auth` 也不再一刀切拒启，而是分协议门控（`coap` 拒启、`coaps` 允许，见 §12.6）。**未关闭的部分仍成立**：明文 UDP listener 上 `principal` 恒 `undefined`、ACL 无法拒绝一条 datagram；Observe 依旧无跨节点/崩溃恢复，通知依旧不是 QoS 1，服务端依旧不做 Block2；OSCORE 未做。DTLS 面自身的未实现项见 §12.6。
+
+### 12.6 S11-C DTLS（`coaps`）面明确未实现项（2026-11-16 立）
+
+S11-C 交付了 CoAP over DTLS 1.2（PSK-only）：真实 PSK 客户端握手、身份 → `principal`/`tenant`、ACL 生效、会话/每主体双上限、关闭清理、诱饵密钥挡用户名枚举。下表逐条留痕本阶段**真实没有**的东西（不作为 Gate 依据；`docs/protocol-compatibility.md` §4.24.8/§4.24.9 是同一份事实的协议口径，ADR-031「落地偏差记录」是本期的冻结落点）。
+
+1. **只有 PSK，没有证书，也没有 mTLS**：`ssl:listen` 不加载任何证书，服务端从不证明自己，客户端凭 `psk_identity` + 共享密钥证明自己。**没有**证书链校验、**没有**双向证书、**没有**按证书 SAN/CN 做的主体映射、**没有** CRL/OCSP。想用 X.509 的设备接不进来——这是范围决定（D5 只做 PSK），不是缺陷；要证书需另开阶段，且 `broker_security_tls`（TCP TLS 的证书配置）不被复用（realm 放在独立的 `broker_security.coaps`）。
+2. **一个 listener 一份 realm，没有 per-listener 多租户 PSK 域**：`coaps` 配置是单个 `#{realm => binary()}`，所有 `coaps` listener 共用一个 realm（除非分别起在不同节点/不同 app env）。PSK 派生绑定 `(Identity, Realm, Password)`，换 realm 等于换整张 PSK 表；**没有**按 listener 配不同 realm 的能力。
+3. **串行握手是硬上限（约 41 次/秒）**：一个 acceptor 进程串行 `transport_accept → handshake`。原因是身份归属——PSK identity 只在 `user_lookup_fun` 的同步回调里可见，并发握手时无法判断一条 identity 消息属于哪条连接（实测会串身份）。**直接后果**：同时冷启动的设备会落入 DTLS 客户端重传退避（1/3/7/15 s），实测同时 32 个仅 5 个在 20 s 内成功（错开 150 ms 则 32/32，容量报告 §3.5）。这是**连接延迟**而非请求吞吐（预热后零错误），但对「大批设备同时上线」是真实约束，运维必须错峰。**没有**并发握手、**没有** acceptor 池、**没有**握手排队公平性保证。
+4. **会话上限是内存计数，不跨节点**：`max_dtls_sessions` / `dtls_max_sessions_per_principal` 都在 listener 的 `gen_server` 状态里；listener 重启（或 one_for_all 重启）即归零，多节点部署下各节点各算各的。**没有**集群级会话配额、**没有**会话迁移。
+5. **没有会话恢复 / 重放窗口之外的保护**：DTLS 1.2 的会话票据（session ticket）与 session resumption 未启用/未配置；**没有**跨重启的会话保持（重启即要求全部客户端重新握手，而重连风暴见第 3 条）。DTLS 自带的重放窗口（record 层）仍在，但**没有** CoAP 层的重放保护、**没有** OSCORE——decrypted 之后的报文在 listener 内部仍可被重放到 dedup 窗口之外（CON 去重只覆盖 `dedup_window_ms`）。
+6. **口令仍是共享秘密，没有前向保密语义上的承诺**：PSK 模式下握手的机密性依赖「口令不泄露」；一旦 `users` 表或其派生 PSK 泄露，历史流量在攻击者保存了密文时可被解密（无 (EC)DHE 的纯 PSK 套件尤其如此；本实现优先选 `ecdhe_psk`/`dhe_psk` 套件，但这是套件顺序而非强制）。**没有**密钥轮换 API、**没有** PSK 版本号/吊销列表——换口令需要客户端同步更新。
+7. **诚实的边界：密码与 PSK 不落日志，但没有专门的 PSK 审计事件**：`redacted_config/0` 不暴露口令/PSK；`broker_security:credential_capable/0` 含 `<<"coaps">>` 使安全审计面能识别「该协议可带凭据」。但**没有**「某身份在某时刻从某地址用 PSK 建了会话」的专用审计日志——运维只能靠 listener 进程状态与 `broker_metrics` 既有键（`bytes_in`/`frame_decode_errors`/`protocol_errors`，ADR-016 冻结键集，**未扩容**）间接推断。
+8. **诱饵密钥是缓解而非消除**：未知身份回诱饵 PSK（而非 alert）消除了「时延/错误形态可区分」这一枚举 oracle，使未知用户与错口令在客户端看来一致。但**这不是**恒定时间保证——派生本身是 SHA-256（快），真正的握手失败仍发生在 Finished 校验；对能观测网络层重传模式的主动攻击者，理论上仍有细微信号。这一条的定位是「把明显的 oracle 关掉」，不是「证明不可枚举」。
+9. **DTLS 只在 `coaps` listener 上；明文 listener 不会升级**：同进程可以同时有 `transport => udp` 与 `transport => dtls` 的 listener，但明文 listener 的 datagram 永远不带身份。**没有**「明文进来、按源地址升级到 DTLS」的机制，也**没有**自动重定向（HTTP 式的 301 到 coaps）——客户端必须自己选 `coaps`。

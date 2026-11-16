@@ -62,7 +62,7 @@ apps/
 ├── broker_proto_acp/     S9-E：ACP v1 前端（仅 stdio，Broker 作 Client、agent 是本地子进程；主动发 initialize/session/new/session/prompt，实装 session/request_permission 权限策略），出厂 `agents => []`
 ├── broker_proto_webrtc/  S10-A/B/D：WebRTC 信令前端（WSS 连接层 + 房间注册表 + `to` 进程直投；复用 broker_ws 的 ws_handshake/ws_frame，子协议 webrtc.v1 强制、认证窗口、保活、帧上限、五类事件、ACL），默认 `listeners => []`
 └── broker_ice/           S10-C/D：STUN Binding + TURN over UDP（手写 stun_codec、长期凭据接 broker_security、每 allocation 一进程、relay 端口环绕分配），默认 `enabled => false` 零 socket；与信令面互不依赖
-├── broker_proto_coap/    S11-A/B：CoAP（RFC 7252）UDP 前端（自写 coap_codec、资源路径直映射 broker_router destination、CON 去重 + Block1 重组）+ Observe（RFC 7641：注册/通知/取消、CON datagram 级重传、NON 至多一次、Max-Age 兜底），默认 `enabled => false` 零 socket
+├── broker_proto_coap/    S11-A/B/C：CoAP（RFC 7252）UDP 前端（自写 coap_codec、资源路径直映射 broker_router destination、CON 去重 + Block1 重组）+ Observe（RFC 7641：注册/通知/取消、CON datagram 级重传、NON 至多一次、Max-Age 兜底）+ DTLS 1.2 PSK（S11-C：`transport => dtls` + `coap_dtls_acceptor` 串行握手、身份→principal/tenant、ACL、会话/每主体双上限），默认 `enabled => false` 零 socket
 ```
 
 | 应用 | 依赖（`.app.src`） | 自己的进程 | 对外入口 | 拥有什么状态 |
@@ -95,7 +95,7 @@ apps/
 | `broker_proto_acp` | kernel, stdlib, sasl, broker_core, broker_security, broker_meta, broker_router, broker_queue, broker_proto_agent_rpc | `broker_proto_acp_sup`（`one_for_one`）+ 每个配置的 agent 一个 `acp_agent` gen_server（spawn 并扮演 ACP Client） | `acp_transport`（行为）+ `acp_port`（生产子进程传输，`spawn_executable`）+ `acp_fake_transport`（测试态内存传输）+ `acp_frame`（newline 分帧 + JSON-RPC 信封）+ `acp_policy`（权限裁决）+ `acp_turn`（turn 折叠）+ `acp_session`（纯状态机）+ `acp_event`（`$acp/*` 目的地）+ `acp_agent`（每连接主循环） | 每个 agent 子进程的 stdin/stdout 句柄与握手/会话状态（进程内，不持久化）；`$acp/in/<agent>`、`$acp/session/<id>`、`$acp/permission` 上的消息是普通 `#broker_message{}`，归 `broker_storage`/`broker_queue`；无 Mnesia 表、无 listener |
 | `broker_proto_webrtc` | kernel, stdlib, sasl, ssl, ranch, crypto, broker_ws, broker_security, broker_metrics（**不含 `broker_core`**——ADR-028 §D8：不调用、不 include，只经 `broker_security` 传递进来） | `broker_proto_webrtc_sup`（`one_for_one`）+ `webrtc_room_registry`（`one_for_all` 分片 supervisor，S10-B）+ 每条配置的 listener（`ranch:child_spec`，`restart => transient`，默认零条）+ 每连接一个 `webrtc_conn` gen_server | `webrtc_listener`（`ranch_protocol`，`start_link/3` 直接返回连接 pid）、`webrtc_conn`（握手 → 认证窗口 → 帧循环）、`webrtc_room_registry` / `webrtc_room_shard`（房间分片 + protected ETS）、`webrtc_signal`（五类事件）、`webrtc_dispatch`（`to` 直投）、`webrtc_server`（服务端 API）、`broker_proto_webrtc_app:validate/0`（六类启动门控 + `check_rooms/0`） | 每连接 socket、握手缓冲、子协议、`peer_id`、认证/空闲两个计时器（进程内，**不持久化**）；房间成员在分片 ETS（**不持久化、无 boot replay**）；**不产生 `#broker_message{}`、不调 `broker_queue`/`broker_router`**（`webrtc_boundary_SUITE` 源码级守卫）；无 Mnesia 表。日志（S10-D D.4）只记 `room`/`peer_id`/`username`/`bytes`/粗粒度 `reason`，**永不记 `data`（SDP/candidate）/口令** |
 | `broker_ice` | kernel, stdlib, sasl, crypto, broker_security, broker_metrics（**不含 `ranch` / `broker_ws` / `broker_core`**——ADR-029 §D1：与信令面、与消息内核全部解耦，不构造 `#broker_message{}`） | `broker_ice_sup`（`one_for_all`；`enabled => false` 时 child 列表为空）+ `broker_ice_udp`（唯一 UDP socket owner）+ `turn_allocation_sup`（`one_for_one`，每 allocation 一条 `temporary` child spec）+ 每 allocation 一个 `turn_allocation` gen_server | `broker_ice_app:config/0`（单点解析并下发 config map，其它模块不再读 env）与 `validate/0`；运维面 `broker_ice_udp:port/0`、`allocations/0` | 5-tuple → allocation 索引（socket owner 进程内，**不持久化**）、每 allocation 一个 relay UDP socket 与 peer 地址 / permission 表（以 peer IP 为键，300 s）/ channel 绑定表；**内存 ETS**；`broker_metrics` 只在 `applications` 里列着、**代码零调用**（ADR-016 冻结键集，ADR-029 §D1） |
-| `broker_proto_coap` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain （**不含 `ranch`**——CoAP 这里只做 UDP，照 `broker_proto_mqtt_sn` 的 socket 自持模型；不含 `crypto`） | `broker_proto_coap_sup`（`one_for_all`；`enabled => false` 时 child 列表为空）+ 每条配置的 `coap_listener`（默认零条；`restart => transient`） | `coap_codec`（4 字节头 + 全部 option 的 delta/length 扩展 + CoRE Link Format，自写）、`coap_resource`（GET/PUT/POST/DELETE + `/.well-known/core` → `broker_retain`/`broker_router`/`broker_event`）、`coap_observe`（RFC 7641 关系簿记纯函数：filter/seq/next_seq/notify_message/expired）、`coap_listener`（唯一 UDP socket owner，兼 notify pid，CON 去重 + 令牌桶 + Block1 重组 + Observe 关系） | 每 listener 五张**有界内存表**：`{IP,Port,Message ID}` → 已发出的 ACK 字节（`dedup_window_ms`）、`{IP,Port}` → 令牌桶、`{IP,Port,Token,Destination}` → Block1 重组缓冲（`max_block1_bytes`）、`{IP,Port,Token}` → Observe 关系（`observes`，`max_observes` 上限 + `Max-Age` 兜底，1 s tick 上清扫）、`{IP,Port,MsgId}` → 未确认 CON 通知（`pending`，NSTART=1 ≤ 关系数，由 ACK/RST/重传 timer 自收，非 tick 清扫）；**不持久化**、无 ETS、无 Mnesia；retained / 日志 / 订阅 / 游标都在下层 app |
+| `broker_proto_coap` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain （**不含 `ranch`**——CoAP 这里只做 UDP，照 `broker_proto_mqtt_sn` 的 socket 自持模型；不含 `crypto`） | `broker_proto_coap_sup`（`one_for_all`；`enabled => false` 时 child 列表为空）+ 每条配置的 `coap_listener`（默认零条；`restart => transient`） | `coap_codec`（4 字节头 + 全部 option 的 delta/length 扩展 + CoRE Link Format，自写）、`coap_resource`（GET/PUT/POST/DELETE + `/.well-known/core` → `broker_retain`/`broker_router`/`broker_event`）、`coap_observe`（RFC 7641 关系簿记纯函数：filter/seq/next_seq/notify_message/expired）、`coap_dtls_acceptor`（**S11-C 新模块**：仅 `transport => dtls` 的 listener 起一个，串行 `transport_accept → handshake → drain identity → offer → controlling_process → 移交`）、`coap_listener`（唯一 socket owner〔UDP 或 DTLS〕，兼 notify pid，CON 去重 + 令牌桶 + Block1 重组 + Observe 关系 + DTLS 会话/身份四表） | 每 listener 九张**有界内存表**（S11-B 五张 + S11-C 的 `peers`/`socks`/`idents`/`principal_sessions` 四张 DTLS 会话/身份表）：`{IP,Port,Message ID}` → 已发出的 ACK 字节（`dedup_window_ms`）、`{IP,Port}` → 令牌桶、`{IP,Port,Token,Destination}` → Block1 重组缓冲（`max_block1_bytes`）、`{IP,Port,Token}` → Observe 关系（`observes`，`max_observes` 上限 + `Max-Age` 兜底，1 s tick 上清扫）、`{IP,Port,MsgId}` → 未确认 CON 通知（`pending`，NSTART=1 ≤ 关系数，由 ACK/RST/重传 timer 自收，非 tick 清扫）；**不持久化**、无 ETS、无 Mnesia；retained / 日志 / 订阅 / 游标都在下层 app |
 
 ### 2.2 `broker_event` 的真实状态（S3 已实现）
 
@@ -232,7 +232,8 @@ broker_ice_app ────────► broker_ice_sup                       
                            └── broker_ice_udp（唯一 UDP socket owner，`{active, once}` + 每包重 arm）
 
 broker_proto_coap_app ─► broker_proto_coap_sup                     one_for_all, 1/5s（`enabled => false` 时 child 列表为空）
-                           └── coap_listener × N                    transient（每 spec 一个 UDP socket）
+                           └── coap_listener × N                    transient（每 spec 一个 UDP 或 DTLS socket）
+                               └── coap_dtls_acceptor            transient（仅 transport => dtls；串行握手）
 ```
 
 26 个顶层 supervisor（`broker_core` / `broker_ws` / `broker_proto_agent_rpc` 没有）+ 1 个嵌套的 `broker_storage_wal_sup` + ranch 自己的子树。29 个 app 减去这 3 个纯类型/纯库 app = 26，逐个核对过 `apps/*/src/*_sup.erl`。
@@ -561,19 +562,20 @@ turn_allocation（每 allocation 一个 temporary gen_server，持有自己的 r
 
 **没有持久化状态，也不写指标。** allocation、permission、channel 全在进程内存；`broker_metrics` 出现在 `.app.src` 的 `applications` 里但代码零调用（ADR-016 冻结键集，ADR-029 §D1 明确不借语义不符的键）。
 
-### 3.18 CoAP 前端的单 socket / 无会话模型（S11-A）+ Observe 状态（S11-B）
+### 3.18 CoAP 前端的单 socket / 无会话模型（S11-A）+ Observe 状态（S11-B）+ DTLS 会话（S11-C）
 
 ```
 broker_proto_coap_sup (one_for_all, 1/5s)
 └── coap_listener × N              % 每个 listener spec 一个；打开 UDP socket，{active, 100}
-                                   % S11-B 起同一个进程兼任 Observe 的 notify pid
+    │                              % S11-B 起同一个进程兼任 Observe 的 notify pid
+    └── coap_dtls_acceptor         % 仅 transport => dtls 的 listener；串行握手，S11-C
 ```
 
 **CoAP 比 MQTT-SN 还少一层：没有会话进程。** MQTT-SN 至少要为每个已 CONNECT 的端点维持 topic id 表与 in-flight 窗口，所以它有 `mqtt_sn_conn`；CoAP 的每条 datagram 自带 Message ID、token 和全部 option，一次请求-响应在 `coap_listener` 进程里就结束了，不需要为任何对端建进程。listener 因此是**唯一的 socket owner，也是唯一的状态持有者**。
 
 **listener 自己就是 notify pid（S11-B，ADR-031 §D2）。** `Observe=0` 的 GET 会 `broker_subscription:subscribe(<<"coap">>, Destination, 0, Tenant)` 后再 `attach(listener, persist=false)`；内核 dispatch 命中时投递 `{broker_deliver, <<"coap">>, _, _, {P,O,Msg}}`，listener 在 `handle_info` 里对 destination 匹配的每条关系各发一条通知。**不为每条观察单开进程**：通知发送只是一次 `gen_udp:send`，CON 重传的 timer 状态用 map 存在 listener state 里就够；`{active,100}` 的收包预算也不受影响（通知是发送不是接收）。代价是所有通知的 UDP 编码在 listener 串行——通知速率受对端窗口与 `max_requests_per_second` 约束，在受限设备场景不构成瓶颈。
 
-**五张表，全部有界。** CoAP 的「连接」只是 UDP 四元组，任何跨 datagram 的状态都可能被伪造源地址撑爆，所以每一张表都有硬上限。四张（`dedup`/`endpoints`/`block1`/`observes`）在 1 s `refill` tick 上清扫；`pending` **不按 tick 清扫**，而是由 NSTART=1 与每条通知的重传 timer 在 ≤ 关系数内自收（ACK/RST/替换/重传耗尽即出表）：
+**九张表，全部有界**（S11-B 五张 + S11-C 四张 DTLS 会话/身份表）。 CoAP 的「连接」只是 UDP 四元组，任何跨 datagram 的状态都可能被伪造源地址撑爆，所以每一张表都有硬上限。四张（`dedup`/`endpoints`/`block1`/`observes`）在 1 s `refill` tick 上清扫；`pending` **不按 tick 清扫**，而是由 NSTART=1 与每条通知的重传 timer 在 ≤ 关系数内自收（ACK/RST/替换/重传耗尽即出表）：
 
 | 表 | 键 | 值 | 上限 / 过期 |
 |---|---|---|---|
@@ -582,6 +584,8 @@ broker_proto_coap_sup (one_for_all, 1/5s)
 | Block1 重组 | `{IP, Port, token, destination}` | 已拼装字节 + 累计长度 + 时刻 | 累计长度 `max_block1_bytes`（默认 256 KiB）；闲置超过窗口即丢弃 |
 | Observe 关系（S11-B） | `{IP, Port, token}` | `#{dest, tenant, sub_ref, max_age, seq, last_notified, req_type, req_id}` | `max_observes`（默认 4096）；满时**拒绝新的 `Observe=0`** 回 `4.03`（刷新已有关系不占新槽）；静默超过该关系的 `Max-Age` 窗口即清扫 |
 | 未确认 CON 通知（S11-B） | `{IP, Port, Message ID}` | `{关系键, 已发字节, 剩余重传次数, timer}` | **≤ 关系数**（NSTART=1：同关系新通知替换旧的）；`observe_max_retrans`（默认 3）次未确认即放弃该关系 |
+| DTLS 会话（S11-C） | `ssl` socket（`sslsocket()`） | `{IP, Port}`（`peers`）+ 反向 `{IP,Port} → socket`（`socks`） | `max_dtls_sessions`（默认 4096）；关闭即释放 |
+| DTLS 身份（S11-C） | `ssl` socket | `{Principal, Tenant}`（`idents`）+ 每主体计数（`principal_sessions`） | `dtls_max_sessions_per_principal`（默认 4096）；**每主体**一槽，防单身份占满全局表 |
 
 **`observes` 的键是「一次观察关系」，不是「会话」。** UDP 没有连接可挂，`{IP,Port,token}` 只是 RFC 7641 观察关系的标识：对端不发 `Observe=1`/RST 就一直在，直到 `Max-Age` 兜底窗口或 CON 重传预算耗尽。`pending` 的键**必须是 Message ID 而不是 token**：符合 RFC 的空 ACK（§4.1）与空 RST（§4.5）都是 TKL=0、**不带 token**，只有回显的 Message ID 能把它们配到某条通知上；值里再存关系键，才能在 RST 时注销对应关系。同理，RST 的查找**限定在发送者端点** `{IP,Port,_}` 内——16-bit Message ID 空间可枚举，不限定就允许任一客户端拆掉别人的观察。
 
@@ -593,7 +597,15 @@ broker_proto_coap_sup (one_for_all, 1/5s)
 
 **限流在解码前。** 令牌桶的扣减发生在 `coap_codec:decode/1` 之前：UDP 没有握手，源地址不可验证，如果先解码再限流，洪泛已经买到了 CPU。同理 `max_message_bytes` 的检查也在解码前——一个超长 datagram 连读都不该读。
 
-**没有持久化，也不扩指标键集。** listener 的五张表全在 gen_server 状态里，重启即空——这是正确的：socket 关掉之后，任何「重传窗口内」的承诺都已经过期，**观察关系也不会跨重启恢复**（对端只能在 `Max-Age` 内收不到通知后自己重新 `Observe=0`）。指标只 inc 既有键（`bytes_in` / `frame_decode_errors` / `protocol_errors`），不新增 CoAP 专属计数器（ADR-016 冻结键集，ADR-031 §D6）。
+**DTLS 只换 socket 来源，不换内核路径（S11-C）。** `transport => dtls` 的 listener 在 `init/1` 里 `ssl:listen` 并 `spawn_link` 一个 `coap_dtls_acceptor`；acceptor 串行跑 `transport_accept → handshake → drain identity → offer → controlling_process → 移交`，握手成功后 listener 把 socket 记入 `peers`/`socks`/`idents`/`principal_sessions` 四张表，然后 `on_packet/4` 收到的已经是**解明文的 CoAP 字节**——去重、Block1 重组、令牌桶、`{active,N}` 收包预算、Observe 的 `pending`/`NSTART=1`/`Max-Age` 全部照旧，DTLS 只是把「socket 从哪来」和「这个 peer 是谁」两件事换掉（`dtls_con_dedup` / `dtls_observe_registers_and_notifies` 是这条判据的护栏）。
+
+**串行握手是身份归属的必要条件。** PSK identity 只能由 `user_lookup_fun` 观察到，该回调**同步**跑在 `ssl:handshake/2` 内、把消息投给持有回调状态的 listener；并发握手时一条 identity 消息无法归属到某条连接（实测会串身份）。因此 acceptor 是**单进程串行**——代价是握手速率约 41 次/秒、同时上线设备落入 DTLS 客户端重传退避（容量报告 §3.5），收益是身份与租户绝不串号。
+
+**`{active,N}` 只能在移交后 arm。** 非 owner 调用 `ssl:setopts({active,N})` 返回 `ok` 但静默把 datagram 投给旧 owner（实测第一个预算的流量跟着 acceptor 走了）。因此握手期 socket 是 `{active,false}`，listener 收到 `{dtls_owned, Sock}` 之后才设 active；移交失败/超时补发 `{dtls_abandoned, Sock}` 释放记录（否则记录的唯一清理触发 `{ssl_closed,_}` 需要 listener 持有 socket，永不到来）。
+
+**未知身份回诱饵密钥，不发 alert。** 实测未知身份 alert 在 20–200 ms 返回、「用户存在+口令错」走 Finished 校验失败 → 客户端 3 s 超时，二者可区分 ⇒ 用户名枚举 oracle。诱饵 = `SHA-256("unifiedmq-coaps-psk-decoy" ‖0‖ 每 listener `crypto:strong_rand_bytes(32)` ‖0‖ Identity)`，`unknown_identity_is_refused` 断言两条错误路径的错误项完全相等（设计 §4.4）。
+
+**没有持久化，也不扩指标键集。** listener 的九张表全在 gen_server 状态里，重启即空——这是正确的：socket 关掉之后，任何「重传窗口内」的承诺都已经过期，**观察关系也不会跨重启恢复**（对端只能在 `Max-Age` 内收不到通知后自己重新 `Observe=0`）。指标只 inc 既有键（`bytes_in` / `frame_decode_errors` / `protocol_errors`），不新增 CoAP 专属计数器（ADR-016 冻结键集，ADR-031 §D6）。
 
 
 ---
