@@ -42,28 +42,43 @@
 run() ->
     run(#{}).
 
+%% Two shapes, because they answer different questions:
+%%
+%%   spread  -- N filters over distinct destinations; one publish hits 3
+%%              subscribers (one exact + two wildcards). Measures "does the
+%%              index cost grow with the number of subscriptions?"
+%%   fanout  -- N subscribers all on the same filter; one publish hits all N
+%%              (plus the wildcards). Measures "what does a single publish pay
+%%              when it must notify many subscribers?"
+%%
+%% The report needs both: `spread' is where the trie's search advantage shows,
+%% `fanout' is where the result-set cost dominates whatever found it.
 run(Opts) ->
     Counts = maps:get(counts, Opts, [1, 1000, 10000]),
+    Shapes = maps:get(shapes, Opts, [spread]),
     DurationMs = maps:get(duration_ms, Opts, 1000),
     WarmupMs = maps:get(warmup_ms, Opts, 200),
     Results =
         [begin
-             Rows = [{N, Impl, measure(Impl, N, DurationMs, WarmupMs)}
+             Rows = [{N, Impl, measure(Shape, Impl, N, DurationMs, WarmupMs)}
                      || Impl <- [old, env, trie]],
-             io:format("~n=== ~p subscriptions ===~n", [N]),
+             io:format("~n=== ~p / ~p subscriptions ===~n", [Shape, N]),
              [io:format("~-5s ~p~n", [Impl, R]) || {_, Impl, R} <- Rows],
-             [{subscriptions, N} | Rows]
+             [{shape, Shape}, {subscriptions, N} | Rows]
          end
-         || N <- Counts],
+         || Shape <- Shapes, N <- Counts],
     io:format("~nRESULT ~p~n", [Results]),
     Results.
 
-%% One `#' and one `+' filter ride along with the exact ones, so both wildcard
-%% branches of the read path are exercised instead of only the literal branch.
-subscriptions(0) ->
-    [];
-subscriptions(N) ->
+%% `spread': N filters over distinct destinations. One `#' and one `+' filter
+%% ride along so both wildcard branches are exercised.
+subscriptions(spread, N) ->
     [{I, filter(I)} || I <- lists:seq(1, N)] ++
+        [{wildcard_hash, <<"bench/#">>}, {wildcard_plus, <<"bench/+/+/+">>}];
+%% `fanout': N subscribers on the *same* filter, the shape of
+%% "devices/+/status" with 10k devices.
+subscriptions(fanout, N) ->
+    [{I, <<"bench/fanout/status">>} || I <- lists:seq(1, N)] ++
         [{wildcard_hash, <<"bench/#">>}, {wildcard_plus, <<"bench/+/+/+">>}].
 
 filter(I) ->
@@ -73,20 +88,30 @@ filter(I) ->
 numeric(Subs) ->
     [S || {R, _} = S <- Subs, is_integer(R)].
 
+%% The publish destination for each shape, derived from the subscription set
+%% rather than written by hand: a destination no filter covers measures "no
+%% subscriber" work and reports nothing useful. Both shapes are asserted below.
+destination(fanout, _Subs) ->
+    <<"bench/fanout/status">>;
+destination(spread, Subs) ->
+    %% SubRef 1007 exists from N = 1007 up; below that use the largest numeric
+    %% SubRef (the wildcard filters carry atom SubRefs and are not destinations).
+    case lists:keyfind(1007, 1, Subs) of
+        {_, D} -> D;
+        false -> element(2, lists:max(numeric(Subs)))
+    end.
+
+%% How many of the registered subs a correct route must return.
+expected_matches(fanout, N) -> N + 1;   % all fanout subs + `bench/#'
+expected_matches(spread, _N) -> 3.      % one exact + both wildcards
+
 %%%_* Measurement ----------------------------------------------------------
 
-measure(Impl, N, DurationMs, WarmupMs) ->
-    Subs = subscriptions(N),
+measure(Shape, Impl, N, DurationMs, WarmupMs) ->
+    Subs = subscriptions(Shape, N),
     Env = setup(Impl, Subs),
     ok = register_all(Env, Subs),
-    %% Every publish targets an exact filter that is part of the set, so the
-    %% work per message is constant while the index is not. SubRef 1007 exists
-    %% from N = 1007 up; below that, the largest numeric SubRef is used (the
-    %% wildcard filters carry atom SubRefs and are not destinations).
-    Dest = case lists:keyfind(1007, 1, Subs) of
-               {_, D} -> D;
-               false -> element(2, lists:max(numeric(Subs)))
-           end,
+    Dest = destination(Shape, Subs),
     Ctx = #route_ctx{tenant_id = <<"default">>, publisher = undefined,
                      reliability = os_buffer},
     {ok, [{_P, Matched}]} = route_one(Impl, Dest, Ctx, Env),
@@ -96,7 +121,7 @@ measure(Impl, N, DurationMs, WarmupMs) ->
     %% be phantom, or a baseline would look fast for the wrong reason. Both are
     %% errors in the harness, and a benchmark that silently measures nothing is
     %% worse than one that crashes.
-    Matched =/= [] orelse erlang:error({no_match, Impl, N, Dest}),
+    Matched =/= [] orelse erlang:error({no_match, Shape, Impl, N, Dest}),
     true = lists:all(fun(R) -> lists:keymember(R, 1, Subs) end, Matched),
     %% Every destination is written under `bench/', so the `bench/#' filter
     %% always matches and `old'/`env'/`trie' must agree on it. If they ever
@@ -106,6 +131,14 @@ measure(Impl, N, DurationMs, WarmupMs) ->
     %% pairs yields an empty list, so this assertion was checking nothing --
     %% which is how a correct `old' row came out failing.
     true = lists:member(wildcard_hash, Matched),
+    %% The three implementations must agree on *how many* subscribers a
+    %% destination has. Otherwise "faster" can just mean "found less": that is
+    %% precisely the failure mode the fan-out shape exists to catch, since there
+    %% a cheaper scan that silently drops half the result set would look great.
+    Expected = expected_matches(Shape, N),
+    length(Matched) =:= Expected
+        orelse erlang:error({wrong_match_count, Shape, Impl, N, Expected,
+                             length(Matched)}),
     _ = warmup(Impl, Dest, Ctx, Env, WarmupMs),
     {Ops, Us} = drive(Impl, Dest, Ctx, Env, DurationMs),
     %% One route, measured in isolation and repeated: the p50 is what a single

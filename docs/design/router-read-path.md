@@ -267,7 +267,9 @@ ETS trie: set, protected, read_concurrency
 
 见 [`docs/benchmarks/2026-11-16-s11x-router-read-path.md`](../benchmarks/2026-11-16-s11x-router-read-path.md)：1 / 1k / 10k 订阅 × 旧实现 / 改动 1 / 改动 1+2，共 9 个点。
 
-关键数字（单进程 `route/3`，p50）：旧实现在 10k 订阅时 **19.7 ms/条**、45 ops/s；改动 1 与改动 1+2 都在 **19 µs/条、约 5 万 ops/s**，且不随订阅数增长。该报告同时写明**没测什么**（高扇出、多进程并发、内存），不要把它读成端到端吞吐。
+关键数字（单进程 `route/3`，p50）：旧实现在 10k 订阅时 **19.7 ms/条**、45 ops/s；改动 1 与改动 1+2 都在 **19 µs/条、约 5 万 ops/s**，且不随订阅数增长。
+
+高扇出另见 [`docs/benchmarks/2026-11-16-s11x-router-fanout.md`](../benchmarks/2026-11-16-s11x-router-fanout.md)：N 个订阅者挂同一 filter 时，1 万扇出下 `env` 与 `trie` 同为约 **90 ops/s、p50 12–13 ms**，索引查找只占约 0.2%，成本在结果集（`keysort` 0.8 ms + 去重 7.3 ms）。**这条数据直接否掉了改动 3（计划缓存）**。两份报告都写明没测什么（多进程并发、内存），不要读成端到端吞吐。
 
 ---
 
