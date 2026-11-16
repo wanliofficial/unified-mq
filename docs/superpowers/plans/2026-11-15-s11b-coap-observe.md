@@ -251,7 +251,7 @@ Task 2 已交付（`62317c6` → `b225100` attach 修复 → `ad27dcc` 定时器
 
 - **每关系独立重传 timer**：`pending` 表项 = `{Bytes, RetransLeft, TimerRef}`（存**已编码字节**，重传原样重发，Message ID 稳定）。`arm_retransmit/4` 在（重）装 timer 前**先 cancel 同 Key 旧 timer**，避免孤儿 timer。`notify_one/5` 装 `{Bytes, observe_max_retrans, Ref}`；`retransmit_observes/1` 每 tick cancel→重发→`Left-1`，到 0 走 `drop_relationship/2`。**没有**「按全局预算重传所有 pending」的逻辑。
 - **会话 detach 粒度（关键）**：`broker_subscription:detach/2` 会拆掉**整个** `<<"coap">>` 会话（所有订阅），而所有观察共用一个匿名 ClientId。故单个关系注销/超时/重传耗尽**只能 `unsubscribe/2` 那一条**，仅当 `observes` 表**清空**时才 `detach/2`。落地为 `maybe_detach/1`（`maps:size(Obs) =:= 0` 时 detach）。`deregister_observe/4`、`sweep_observes/1`、`drop_relationship/2` 都经 `cancel_pending/2` + `maybe_detach/1`。**切勿**在每个关系路径直接 `detach`。
-- **ACK 关联用 token（成立）**：CON 通知经 `coap_observe:notify_message/4` **带上了请求 Token**，客户端回的空 ACK 会带回该 Token，故 `handle_info({udp,...})` 的 `#{type := ack, token := Token}` 命中 `{IP,Port,Token}` 成立。（`coap_codec:ack/1` 本身丢 token 只影响测试助手 `ack_of/1`，线上客户端 ACK 带 token。）
+- **ACK/RST 关联按 Message ID（Task 3 复核推翻上面的「按 token」判断）**：RFC 7252 §4.1 的空 ACK、RFC 7641 §4.5 的空 RST 都是 TKL=0、**不带 token**，只能用回显的 Message ID 关联。故 `pending` 键为 `{IP,Port,MsgId}`，表项存 `{ObsKey, Bytes, RetransLeft, TimerRef}`（`ObsKey = {IP,Port,Token}`）。详见 Task 3 定稿段。
 - **bucket-before-decode 不回归**：新 `{udp,...}` 子句只为查 pending 解码一次；真正 `on_datagram`（含 token bucket）在 miss 时才走。重传自己的通知队列不应被入站 token bucket 限速，正确。
 - **`register_observe/6` 返回 `{St, Rel}`**，`Rel` 已含 `req_type`。Task 3 的 `reply_observe/5` 见 Task 3 小节。
 - **`register_observe/6` 的 `-nowarn_unused_function`**：Task 2 用 `-compile({nowarn_unused_function,[{register_observe,6}]})` 压着（唯一调用点 `respond/5` 在 Task 3 才接）。**Task 3 接上后删掉这行**。
@@ -953,6 +953,26 @@ git commit -q -m "feat(broker_proto_coap): S11-B Observe=0/1 分流 + RST/注销
 
 ---
 
+## ⚠️ Task 3 已交付 + 四轮复审定稿（Task 4 按此写文档）
+
+Task 3 已交付并经**四轮独立复审**返工（`5d38cbf` → `363612b` → `5d25c07` → `68fe40a` → `7ca5ee1`）。中途三轮复审各暴露一组真实缺陷并全部修复；下面覆盖本文档 Task 3 小节里的旧代码/旧断言，是**最终落地形态**：
+
+- **ACK/RST 一律按 Message ID 关联（C1，最关键）**：RFC 7252 §4.1 空 ACK、RFC 7641 §4.5 空 RST 都是 TKL=0、**不带 token**。`pending` 键 = `{IP,Port,MsgId}`，表项 = `{ObsKey, Bytes, RetransLeft, TimerRef}`（`ObsKey = {IP,Port,Token}`）。`{udp,...}` 子句 `#{type:=ack, code:=empty, id:=Id}` / `#{type:=rst, code:=empty, id:=Id}` 匹配；ACK 取消 timer、关系存活；RST 取消 timer 并**按端点作用域**查 `observe_by_notify_id/4` 注销关系。非空 code 的 RST（畸形）落 `on_datagram` 丢弃。
+- **NSTART=1（RFC 7641 §4.5.1）**：每关系最多 1 条未确认 CON 通知。`notify_one/5` 的 con 分支先 `cancel_pending_map(ObsKey, Pend)`（清掉该关系旧通知）再入新表项，故 `pending` 恒 ≤ 关系数，且每关系预算独立。
+- **重传按 timer 精确定位**：timer 消息 = `{observe_ack, IdKey}`；`retransmit_one/3` 按 key **且** timer Ref 双重匹配（陈旧 timer 忽略），只重发/扣减该条，不 fold 全表、不跨关系扣预算。
+- **注销/清扫/放弃按端点作用域**：`cancel_pending_for(ObsKey, St)` → `cancel_pending_map/2` 按完整 `{IP,Port,Token}` 匹配。空 token 是常态，绝不能跨端点误杀。
+- **detach / unsubscribe 双粒度**：`maybe_unsubscribe/2` 仅当无其它关系观察同一 dest 才 `unsubscribe`（两客户端观察同一资源共享一条订阅）；`maybe_detach/1` 仅当 `observes` 清空才 `detach`（`detach/2` 拆整会话）。`deregister_observe/4`、`sweep_observes/1`、`give_up_relationship/2` 均经这两个守卫。
+- **刷新续号（I2）**：同 token re-GET 保留 `seq`（RFC 7641 §4.4），并清继承的未确认通知；`register_observe/6` 只在**新键**时受 `max_observes` 限制，刷新不受容量拒绝。
+- **Observe=1 应答（I4）**：`coap_resource:get/3` 的 Observe=1 按常规 GET 处理（当前表示，**无** Observe 选项；2.05 / 4.04），不再裸 2.01 Created；listener 的 deregister 分支发该表示、不加 Observe。
+- **`register_observe/6` 返回 `Rel1`（含 `req_type`）**；`coap_observe:relationship()` 增可选 `req_type => con|non`、`req_id => non_neg_integer()`（后者用于 RST 按通知 id 关联）。
+- **RST 关联防崩溃 + 端点作用域（第三轮 blocker）**：`observe_by_notify_id/4` 用 `maps:get(req_id, Rel, undefined)`（总函数，未通知过的关系无 req_id 不崩），且按 `{SIP,SPort,_} when SIP=:=IP, SPort=:=Port` 限定发送端点（Message ID 16-bit 可枚举，否则任一客户端可拆别人端点）。
+- **`observe_acl_denied` 降级为 `observe_plain_udp_principal_is_allowed`**：4.03 在 S11-B 不可达（`authorize_principal(undefined,...) -> allow`；`require_auth` 含 coap 时 app 拒绝启动）。该用例钉「ACL 受限部署仍可观察」的真实姿态；4.03 只由容量路径 `observe_bounded_table_refuses` 覆盖。
+- **测试助手**：`ack_of/1` → `coap_codec:ack`、`rst_of/1` → `coap_codec:reset`，产出符合 RFC 的空消息（无 token、按 id）；`observe_two_observers_same_dest_both_notified`（I1）、`observe_stray_rst_does_not_crash`（防崩溃）、`observe_rst_is_endpoint_scoped`（端点作用域，移除守卫即失败，已实测）为回归护栏。
+
+**验证基线（Task 3 定稿）**：CoAP 5 套件 **96/96**（listener 19、resource 14、observe 10、codec 48、app 5）、`broker_subscription_SUITE` 53/53、dialyzer 0、xref 302。
+
+---
+
 ## Task 4: 全量验证 + 文档同步 + 提交
 
 **Files:** 无代码改动（除非 dialyzer/xref 指出问题）
@@ -999,4 +1019,5 @@ Expected：S11-B 相关提交齐全，工作树干净（`docs/compatibility/` �
 
 - **Spec 覆盖**：设计稿 §2 进程模型→Task2/3；§3 会话归属→Task2（observes 表 + max_age sweep）；§4 可靠性分档→Task2（CON 重传）/Task3（NON 至多一次）；§5 数据流→Task2/3 各分支；§6 组件清单→Task1/2/3；§7 测试→Task1/3 逐条；§8 ADR 偏差→Task4 Step5；§9 收口→Task4。
 - **类型一致**：`coap_observe:relationship()` 的字段是 dest/tenant/sub_ref/max_age/seq/last_notified（**注意 `req_type` 不在其中**——它由 listener 在 `register_observe` 里以 `Rel#{req_type => ...}` 附加，是 listener 侧的表项元数据，不进纯模块的类型）；listener 侧 `observes` 表项 = `relationship() + req_type`，`pending` 表项 = `{Bytes, RetransLeft, TimerRef}`；ClientId 恒 `<<"coap">>`；`coap_observe:filter/1` 在 register 与 sweep/deregister 复用。
-- **已知坑**：`sweep_observes/1` 因需 side-effect（unsubscribe）放在 tick 而非纯 `prune/1`（Task2 Step5 已给完整实现），`observe_max_age_expires_relationship` 钉住。`notify pid = listener` 意味着 `attach(<<"coap">>, self(), false)` 的 self 是 listener 进程。`coap_codec:ack/1`、`reset/1` 丢 token，测试必须自带 token（Task3 Step5 的 `ack_of/1`/`rst_of/2`）。
+- **已知坑**：`sweep_observes/1` 因需 side-effect（unsubscribe）放在 tick 而非纯 `prune/1`（Task2 Step5 已给完整实现），`observe_max_age_expires_relationship` 钉住。`notify pid = listener` 意味着 `attach(<<"coap">>, self(), false)` 的 self 是 listener 进程。**空 ACK/RST 不带 token**（`coap_codec:ack/1`/`reset/1` 产出 TKL=0），测试助手 `ack_of/1`/`rst_of/1` 必须产出符合 RFC 的空消息并由 listener 按 **Message ID** 关联（见 Task 3 定稿段）。
+- **类型一致（Task 3 定稿后）**：`coap_observe:relationship()` 的必填字段是 dest/tenant/sub_ref/max_age/seq/last_notified；`req_type => con|non` 与 `req_id => non_neg_integer()` 是**可选**字段（`=>`），由 listener 在 `register_observe`（req_type）和 `notify_one`（req_id）附加——纯模块 `register/5` 不设它们。listener 侧 `observes` 表项 = `relationship() + req_type + req_id`；`pending` 表项 = `{ObsKey, Bytes, RetransLeft, TimerRef}`，键 `{IP,Port,MsgId}`（NSTART=1）；ClientId 恒 `<<"coap">>`；`coap_observe:filter/1` 在 register 与 sweep/deregister 复用。
