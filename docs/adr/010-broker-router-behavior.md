@@ -59,6 +59,19 @@ roadmap §3.2 对 Router 的定义是一行：「destination → `{partition, su
 
 Router 因此**从不**解引用 SubRef，只把它当不透明 key 存取。
 
+**【冻结后补充 S11x，2026-11-16】「读侧」包含取得 `router_env()` 这一步。** 上文把读路径定义为 `route/3` 本身不经 Router 进程。实测发现这个定义不完整：发布路径的实际形式是
+
+```erlang
+{ok, Env} = broker_router:env(),                                  %% 取 env
+{ok, Routed} = broker_router_hash:route(Destination, Ctx, Env),   %% 路由
+```
+
+取 env 这一步在**每条 PUBLISH** 上都会执行（`mqtt_conn_fsm:handle_publish_allowed/7`）。若它是一次 `gen_server:call`，则即使 `route/3` 完全无锁，整条读路径仍然串行化过索引写者——正是上文所禁的那件事，只是换了一步。S11x 改动前它正是 `broker_router_hash_store:table/1` 的一次调用。
+
+据此补充一条**不改变任何 callback 签名**的约束：`router_env()` 的获取必须免调用（S1 实现为 `persistent_term` 读 + 存活检查），并且不得在每次获取时重新读取启动期配置或重建 env（同机实测这两项曾占 1.67–1.77 µs 中的七成）。详见 `docs/design/router-read-path.md` §2.2 的三条硬约束与 `docs/benchmarks/2026-11-16-s11x-router-env-cost.md`。
+
+该批注与 §10.1 的冻结文本不冲突：`route/3` 仍由发布者进程直接调用、`router_env()` 仍是 `term()`、`env/0` 签名不变。它只是把「读侧无进程串行化」的判据从 `route/3` 内部扩展到它的整条调用前导。§10.5 的补充与本条同理，均采用冻结后批注、不动签名。
+
 ### 10.2 职责边界（本 ADR 的核心决策）
 
 **Router = 「路由 + 订阅索引」，不是「订阅状态持有者」。**
