@@ -345,4 +345,4 @@ ETS trie: set, protected, read_concurrency
 | 1. env 缓存 + gen | ✅ 已实现（分支 `s11x-router-env-cache`） | `broker_router_hash_store.erl`（`env/1`、`gen/1`、`bump/1`）、`broker_router_hash.erl`（`current_env/0`、`gen/0`、`init/1`）。`gen/0` 只放在后端模块：行为门面 `broker_router.erl` 未改，ADR-010 冻结的 5 个回调与 `env/0` 签名不动。**补充（`7f87e28`）**：`env/1` 起初只发布 `#{store, tab, gen}`，`current_env/0` 仍每次 `application:get_env(partitions)` 并重建 map。现由 store 在 `init/1` 发布完整 env（含 `partitions`/`hash`），backend 由 `broker_router_sup:init/1` 发布进 `persistent_term`，取 env 从 1.67–1.77 µs 降到 0.37–0.39 µs（见 §2.2 约束 3） |
 | 2. trie 索引 | ✅ 已实现（分支 `s11x-router-trie-index`，叠在改动 1 之上） | `broker_router_hash_store.erl`（节点行、`link/4`、`prune/3`）、`broker_router_hash.erl`（`route/3` 改为按层走、删除 `match/2` 与 `tenant_visible/3`）；测试见 §7.2（读侧 churn 可见性 + 写侧并发不丢更新） |
 | 3. 计划缓存 | ❌ 不做（OQ-5，模型扫描后否决；`gen` 全局失效使 fleet 形状零命中） | 本文 §4 |
-| ADR-010 §10.1 增补 | ✅ 已采纳（2026-11-16） | 按 §10.5 体例在 ADR-010 §10.1 追加一段**不改签名**的冻结后批注（S11x），把「读侧无进程串行化」的判据从 `route/3` 内部扩到其取 env 的前导。拟稿见 §8.1 |
+| ADR-010 §10.1 增补 | ✅ 已采纳（2026-11-16） | 按 §10.5 体例在 ADR-010 §10.1 追加一段**不改签名**的冻结后批注（S11x），把「读侧无进程串行化」的判据从 `route/3` 内部扩到其取 env 的前导。文本见 §8.1 |
