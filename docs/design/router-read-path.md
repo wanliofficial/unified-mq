@@ -3,7 +3,7 @@
 - **文档版本**：v0.2（2026-11-16）
 - **状态**：**改动 1 与改动 2 已实现（见 §9 交付表）**。改动 3 经命中率模型扫描后**否决**（§8 OQ-5），不实现。
 - **关联**：ADR-010 §10.1（读路径不得进程串行化）/§10.3（hash 后端）；ADR-008 §8.4（append 路径不得付共识成本）；ADR-016（指标键集）；`docs/architecture.md` §2.1（`broker_router` 行）；`docs/benchmarks/2026-11-08-s2-baseline.md` §154
-- **证据口径**：所有代码位置为 2026-11-16 工作区实际行号；所有「未实测」明确标注；性能结论见 §7.3 的五份报告（其中计划缓存那份是模型，已注明）。
+- **证据口径**：所有代码位置为 2026-11-16 工作区实际行号；所有「未实测」明确标注；性能结论见 §7.3 的六份报告（其中计划缓存那份是模型，已注明）。
 
 ---
 
@@ -115,10 +115,13 @@ env(Name) ->
 
 `broker_router_hash:current_env/0` 变成「读 persistent_term + 读 app env」，`partitions` 与 `hash` 的校验逻辑一字不改。
 
-### 2.2 两条硬约束（写给后来改这段代码的人）
+### 2.2 三条硬约束（写给后来改这段代码的人）
 
 1. **`persistent_term:put` 只允许在 `init/1` 出现**。它的写入会触发全 VM 的 literal 区扫描，写到热路径上等于每条发布一次全局抖动。失效一律走 `atomics`。
 2. **不允许在读者进程里 `persistent_term:erase`**。erase 同样是全局操作；读者只负责报告错误，清理留给写者的 `terminate/2`，并用 `is_process_alive/1` 兜住「`terminate` 没跑到」的情况（supervisor 发 `exit(Pid, shutdown)` 时，非 trap_exit 的 gen_server 不走 `terminate/2`）。
+3. **`current_env/0` 只允许做「一次 `persistent_term` 读 + 一次存活检查」。** 它跑在每条 PUBLISH 上（`mqtt_conn_fsm:handle_publish_allowed/7` 的第一行），所以任何**每次调用**才去查启动期配置的动作都是回归。这条是被实测逼出来的：改动 1 之后 `current_env/0` 仍每次都 `application:get_env(broker_router, partitions)` 再重建一次 env map，加上 `broker_router:backend/0` 的另一次 `application:get_env`，把「一次免调用读」变成了 **1.67–1.77 µs**，其中七成是两个 `ac_tab` 查找。现在 `partitions`/`hash` 由 store 在 `init/1` 一次性发布进 env，backend 由 `broker_router_sup:init/1` 发进 `persistent_term`，同机 A/B 降到 **0.37–0.39 µs**（4.4x）。见 [`docs/benchmarks/2026-11-16-s11x-router-env-cost.md`](../benchmarks/2026-11-16-s11x-router-env-cost.md)。
+
+> 约束 3 的推论：`partitions` 现在是**启动期冻结值**。S4 若要在运行期改分区数，必须重新 `persistent_term:put` 一份新 env（一次全局扫描，可接受因为它不是热路径），而不是指望读者去 app env 里看到新值——**改动前那个「每次重新读 app env」的写法看起来更灵活，实际是在热路径上付了 1.2 µs 去买一个 S4 还没实现的能力**。
 
 ### 2.3 为什么 key 要带 `Name`
 
@@ -277,7 +280,7 @@ ETS trie: set, protected, read_concurrency
 
 ### 7.3 压测口径（已落盘）
 
-四份报告，均在 `docs/benchmarks/`。**注意：前两份出过一版结论错误的版本，已更正并替换**——初版让 `env` 与 `trie` 调用同一份代码，因此得出「改动 1 独立就够」的错误结论。更正后三个实现各差一个变量（平表+调用 / 平表无调用 / trie 无调用）。
+六份报告，均在 `docs/benchmarks/`。**注意：前两份出过一版结论错误的版本，已更正并替换**——初版让 `env` 与 `trie` 调用同一份代码，因此得出「改动 1 独立就够」的错误结论。更正后三个实现各差一个变量（平表+调用 / 平表无调用 / trie 无调用）。
 
 1. **读路径**（[`2026-11-16-s11x-router-read-path.md`](../benchmarks/2026-11-16-s11x-router-read-path.md)）：单进程 `route/3`，1 / 1k / 10k 订阅 × 三种实现。p50：
 
@@ -287,7 +290,7 @@ ETS trie: set, protected, read_concurrency
    | 1,000 | 2,097 µs | 1,984 µs | **19 µs** |
    | 10,000 | 23,014 µs | 22,510 µs | **19 µs** |
 
-   **改动 1 只在索引极小时有意义**（省一次约 8 µs 的调用）；1k 订阅以上几乎无效（仅快 5%），因为全表拷贝盖过了它。**大表收益全部来自改动 2**（1k: 118x，10k: 1,236x）。trie 在 1 订阅时略慢于平表（19 vs 13 µs），是「按层走 map」的固定成本。
+   **改动 1 只在索引极小时有意义**（省一次约 8 µs 的调用）；1k 订阅以上几乎无效（仅快 5%），因为全表拷贝盖过了它。注意这 9 个点的 env 是 setup 阶段构造好的，**不含** `broker_router:env()` 的成本——后者见第 6 条。**大表收益全部来自改动 2**（1k: 118x，10k: 1,236x）。trie 在 1 订阅时略慢于平表（19 vs 13 µs），是「按层走 map」的固定成本。
 
 2. **高扇出**（[`2026-11-16-s11x-router-fanout.md`](../benchmarks/2026-11-16-s11x-router-fanout.md)）：N 个订阅者挂同一 filter。1 万扇出下 old/env 均约 6 ops/s（p50 158–165 ms，被 O(N²) 去重拖死），trie **87 ops/s、p50 11.7 ms**，快 15x。差距主因是 map 去重取代 `lists:member`。**计划缓存（改动 3）在此形状下确有可缓存的工作量**，但因失效粒度为全局 `gen`，是否值得取决于「订阅变更频率 / 同 topic 重复发布频率」。该比值已用模型扫描（见下条），结论是**不做**。
 
@@ -297,7 +300,9 @@ ETS trie: set, protected, read_concurrency
 
 5. **计划缓存命中率模型**（[`2026-11-16-s11x-router-plan-cache.md`](../benchmarks/2026-11-16-s11x-router-plan-cache.md)）：**模型而非实测**，只有 miss 代价（11,734 µs）取自扇出报告。全局 `gen` 使缓存窗口等于两次订阅变更之间的间隔：fleet 形状任何 churn 下都零命中；hot 从 99.8% 随 churn 降到 80%（0.01）；bursty 上限即热头占比 50%。**结论：不做（OQ-5）**。
 
-五份报告都写明没测什么；机器测量期间有外部负载，**绝对数字偏低，引用请复跑**。
+6. **取 env 的成本**（[`2026-11-16-s11x-router-env-cost.md`](../benchmarks/2026-11-16-s11x-router-env-cost.md)）：`broker_router:env/0` 在发布路径上每次调用。改动 1 之后它仍需 1.67–1.77 µs（两次 `application:get_env/3` 占七成）；把 `partitions` 收进 store 发布的 env、把 backend 收进 supervisor 的缓存后降到 **0.37–0.39 µs**（同机 A/B，4.4x）。这是 §2.2 约束 3 的来源。
+
+六份报告都写明没测什么；机器测量期间有外部负载，**绝对数字偏低，引用请复跑**。
 
 ---
 

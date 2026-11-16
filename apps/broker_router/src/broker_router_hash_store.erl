@@ -43,7 +43,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/1, register/4, unregister/2, table/1, env/1, gen/1]).
+-export([start_link/1, start_link/2, register/4, unregister/2, table/1, env/1, gen/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -55,6 +55,14 @@
 
 start_link(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, [Name], []).
+
+%% Boot path for `broker_router_hash:init/1', which has an explicit partition
+%% count and must not be told one by app env. `broker_router_sup' keeps using
+%% `start_link/1' and lets the store read the app env, because at boot the sup is
+%% the only place that knows it and it must fail here -- not on the first publish
+%% -- if the count is unusable.
+start_link(Name, Config) ->
+    gen_server:start_link({local, Name}, ?MODULE, [Name, Config], []).
 
 %% S6: the tenant is part of the index key, so `route/3' can filter without a
 %% second lookup. `<<"*">>' means "legacy subscription, visible to every tenant"
@@ -112,11 +120,31 @@ gen(Name) ->
 %%%_* gen_server ---------------------------------------------------------
 
 init([Name]) ->
-    Trie = ets:new(trie, [set, protected, {read_concurrency, true}]),
-    Subs = ets:new(subs, [set, protected, {read_concurrency, true}]),
-    Gen = atomics:new(1, [{signed, false}]),
-    persistent_term:put(key(Name), #{store => self(), tab => Trie, gen => Gen}),
-    {ok, #st{name = Name, trie = Trie, subs = Subs, gen = Gen}}.
+    init([Name, #{}]);
+init([Name, Config]) ->
+    %% `partitions' and `hash' are boot config: read once here, published with the
+    %% rest of the env. Callers used to re-read the partition count from app env on
+    %% every publish (`current_env/0'), which cost a full `application:get_env/3'
+    %% -- an `ac_tab' lookup, measured at ~1.1 us -- plus a map rebuild, for a
+    %% value that cannot change without a partition migration (S4).
+    Partitions = maps:get(partitions, Config,
+                          application:get_env(broker_router, partitions, undefined)),
+    Hash = maps:get(hash, Config, phash2),
+    case is_integer(Partitions) andalso Partitions > 0 of
+        false ->
+            %% Fail at start, which the supervisor turns into a failed boot. Before
+            %% this check moved here, a bad count surfaced as a crash in a publisher
+            %% on the first message, or as `{error, {invalid_partitions, _}}' from a
+            %% read path nobody checks.
+            {stop, {invalid_partitions, Partitions}};
+        true ->
+            Trie = ets:new(trie, [set, protected, {read_concurrency, true}]),
+            Subs = ets:new(subs, [set, protected, {read_concurrency, true}]),
+            Gen = atomics:new(1, [{signed, false}]),
+            persistent_term:put(key(Name), #{store => self(), tab => Trie, gen => Gen,
+                                             partitions => Partitions, hash => Hash}),
+            {ok, #st{name = Name, trie = Trie, subs = Subs, gen = Gen}}
+    end.
 
 %% A write is: link the leaf into the tree (one row per ancestor), then append
 %% to the leaf's own list. Seq is monotonic, so a leaf's list is already in

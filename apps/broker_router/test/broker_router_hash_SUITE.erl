@@ -52,10 +52,18 @@ end_per_testcase(_Case, _Config) ->
 init_yields_env_and_rejects_bad_config(Config) ->
     Env = env(Config),
     true = is_tuple(Env) orelse is_map(Env),
+    %% A valid init must publish the *complete* env. The store used to publish only
+    %% {store, tab, gen} and let each caller merge in the config, which cost an
+    %% application:get_env per publish and could hand out two different shapes.
+    #{store := _, tab := _, partitions := 4, hash := phash2} = Env,
     %% 0 partitions would make the modulo crash on the first publish, and a
-    %% non-integer would be a config typo caught the same way.
+    %% non-integer would be a config typo. Both are now refused by the store's
+    %% init/1, so the whole start fails instead of surfacing in a publisher.
     {error, _} = ?HASH:init(#{partitions => 0}),
     {error, _} = ?HASH:init(#{partitions => <<"four">>}),
+    %% A refused start must not have published an env or replaced the live store:
+    %% the suite's store is the only one, and its env is still the one route/3 uses.
+    {ok, Env} = ?HASH:current_env(),
     %% A rejected init must not have touched the store the suite is using.
     {ok, [{_, []}]} = ?HASH:route(<<"still/alive">>, ctx(), Env),
     ok.

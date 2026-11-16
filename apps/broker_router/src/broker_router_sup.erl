@@ -21,6 +21,11 @@ start_link() ->
 
 init([]) ->
     Backend = application:get_env(broker_router, backend, broker_router_hash),
+    %% Published once per app start so `broker_router:env/0' -- on the publish path
+    %% -- does not read app env per call, and so both sides read one value: the sup
+    %% picks the child from `Backend', and the facade resolves the backend from this
+    %% same cache rather than re-reading a config that could have moved since.
+    persistent_term:put({?MODULE, backend}, Backend),
     {ok, {#{strategy => one_for_all, intensity => 1, period => 5},
           children(Backend)}}.
 

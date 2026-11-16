@@ -37,14 +37,16 @@ init(Config) ->
     case parse_config(Config) of
         {ok, N, Hash} ->
             Name = maps:get(name, Config, broker_router_hash_store),
-            case broker_router_hash_store:start_link(Name) of
+            case broker_router_hash_store:start_link(Name, #{partitions => N, hash => Hash}) of
                 {ok, Pid} ->
-                    %% Same shape as current_env/0, gen included: a caller that
-                    %% got its env from init/1 (tests) and one that got it from
-                    %% current_env/0 (publishers) must not see two different
-                    %% maps -- the cache rules in design §2.4 depend on it.
+                    %% The store publishes the *complete* env, partitions and hash
+                    %% included, so this return and `current_env/0' hand out one
+                    %% shape from one place. They used to differ: the store's map
+                    %% lacked the two config fields and each caller merged them in,
+                    %% which the design §2.4 cache rules would have read as two
+                    %% different maps.
                     {ok, Published} = broker_router_hash_store:env(Name),
-                    {ok, Published#{store => Pid, partitions => N, hash => Hash}};
+                    {ok, Published#{store => Pid}};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -156,30 +158,22 @@ unregister(#{store := Store}, SubRef) ->
 %% in the node queued on the index writer to re-learn a table id that never
 %% changes. ADR-010 §10.1 only bites the *inside* of `route/3', but the metric
 %% that matters is "publish to `[{Partition, Refs}]'", and that path was
-%% serialized. The store now publishes the env once; this reads it, plus the
-%% partition count from app env (an ETS read, not a call).
+%% serialized.
 %%
-%% Error precedence is unchanged: a missing store outranks a bad partition
-%% count, because the former is an assembly bug and the latter a typo.
+%% It was not free after change 1 either: the store published only
+%% `#{store, tab, gen}', so this read the partition count from app env and merged
+%% it into a fresh map on *every* publish. `application:get_env/3' is an `ac_tab'
+%% lookup, measured at ~1.1 us (tools/bench/env_cost.erl) -- more than the
+%% persistent_term read it wrapped. The store now publishes the complete env at
+%% init, so this is a `persistent_term' read plus an aliveness check, and the
+%% partition count is validated at boot instead of on the first publish.
+%%
+%% Error precedence is unchanged: a missing store is `router_store_not_started',
+%% an assembly bug, and it outranks nothing else because the count can no longer
+%% be wrong by the time this runs.
 -spec current_env() -> {ok, env()} | {error, term()}.
 current_env() ->
-    case broker_router_hash_store:env(store_name()) of
-        {ok, Env} ->
-            Partitions = application:get_env(broker_router, partitions, undefined),
-            case partitions_ok(Partitions) of
-                %% Same guard as init/1: an out-of-range count would make modulo
-                %% arithmetic on the first publish crash, and here it is caught at
-                %% boot instead. The hash stays phash2 -- S1 offers no other, and
-                %% the app env has no `hash' key (init/1 took it from a Config map
-                %% nobody builds at boot; see design §6 'two partition keys').
-                true ->
-                    {ok, Env#{partitions => Partitions, hash => phash2}};
-                false ->
-                    {error, {invalid_partitions, Partitions}}
-            end;
-        {error, _} = Error ->
-            Error
-    end.
+    broker_router_hash_store:env(store_name()).
 
 %% @doc Monotonic write counter of the index behind the configured store.
 %%
@@ -190,9 +184,6 @@ current_env() ->
 -spec gen() -> non_neg_integer() | undefined.
 gen() ->
     broker_router_hash_store:gen(store_name()).
-
-partitions_ok(N) ->
-    is_integer(N) andalso N > 0.
 
 %% The registered name `broker_router_sup' gives the child, and the name init/1
 %% defaults to. One source so the supervisor's child and current_env/0 cannot
