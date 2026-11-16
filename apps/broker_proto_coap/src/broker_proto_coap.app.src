@@ -5,8 +5,10 @@
     {mod, {broker_proto_coap_app, []}},
     %% ADR-031 §D6: same app family as `broker_proto_mqtt_sn' -- the message
     %% kernel facades plus `broker_security'. Deliberately NOT dependent on
-    %% `ranch' (CoAP here is UDP, like MQTT-SN) nor on the signalling apps.
-    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics,
+    %% `ranch' (CoAP here is UDP or DTLS over UDP, like MQTT-SN) nor on the
+    %% signalling apps. `ssl' is listed because S11-C's DTLS listeners call
+    %% `ssl:listen/2' directly; it is an OTP app, not a new dependency.
+    {applications, [kernel, stdlib, sasl, ssl, broker_core, broker_metrics,
                     broker_router, broker_queue, broker_subscription,
                     broker_event, broker_security, broker_retain]},
     {env, [{%% ADR-031 §D5/§D6: the ship default. No socket is opened, and no
@@ -42,5 +44,16 @@
            {max_observes, 4096},
            {observe_ack_timeout_ms, 2000},
            {observe_max_retrans, 3},
-           {observe_max_age_s, 30}]}
+           {observe_max_age_s, 30},
+           %% DTLS (S11-C). A listener opts in per spec with
+           %% `#{port => 5684, transport => dtls}'; plain UDP stays the default.
+           %% The acceptor handshakes one peer at a time (the PSK identity can
+           %% only be captured through the lookup callback, which needs a single
+           %% serialized receiver), so both phases are time-boxed.
+           {dtls_transport_accept_timeout_ms, 1000},
+           {dtls_handshake_timeout_ms, 2000},
+           %% Bounded session table: established DTLS sockets (one per peer).
+           {max_dtls_sessions, 1024},
+           %% One device may hold a handful of connections, not the table.
+           {dtls_max_sessions_per_principal, 16}]}
 ]}.

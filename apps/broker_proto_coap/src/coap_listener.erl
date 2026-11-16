@@ -16,8 +16,9 @@
 %%     datagram arrives as a sequence, and the assembled buffer is bounded.
 %%
 %% The listener owns the socket and is the only writer to it, so there is no
-%% hand-off and no second process to race the dedup table. Replies go out with
-%% `gen_udp:send/4', which any process may call on a UDP socket.
+%% hand-off and no second process to race the dedup table. Replies go out through
+%% `send_to/4' -- `gen_udp:send/4' for plain UDP (any process may call it), or
+%% `ssl:send/2' on the peer's established socket for DTLS.
 %%
 %% Reliability (ADR-031 §D3) is per-datagram and is decided here, before the
 %% resource layer runs: a CON request is answered with a piggybacked ACK, a NON
@@ -28,6 +29,22 @@
 %% Every table here is capped and swept on the one-second tick, so a flood of
 %% new source addresses or a client that abandons a Block1 stream cannot grow
 %% memory without bound.
+%%
+%% ## Two transports, one state machine (S11-C)
+%%
+%% A listener spec may say `#{transport => dtls}', which makes this process own
+%% an `ssl' listen socket plus one established DTLS socket per peer. The
+%% datagram path is unchanged: `on_packet/4' is the single entry for both
+%% transports, and `send_to/4' is the single exit, so the codec, the resource
+%% layer and Observe never learn which transport carried a message. The five
+%% bounded tables keep the same `{IP, Port}' keys, because `ssl:peername/1'
+%% reports the same tuple `gen_udp' does.
+%%
+%% DTLS is PSK-only and needs no certificate (S11-C): the PSK identity IS a
+%% username in `broker_security''s `users' table, so an established session has
+%% a real `principal' and a real tenant, and the ACL can finally deny a request.
+%% Handshaking is delegated to `coap_dtls_acceptor' (one peer at a time) because
+%% the identity is only observable inside the PSK lookup callback.
 -module(coap_listener).
 
 -behaviour(gen_server).
@@ -47,9 +64,13 @@
 -define(ACTIVE_N, 100).
 
 -record(st, {
-    socket :: gen_udp:socket(),
+    %% The plain-UDP socket, or `undefined' when this listener speaks DTLS (the
+    %% listen socket then lives in `dtls_listen'). Keeping them separate avoids
+    %% lying about the type of a field that is only ever one of the two.
+    socket :: gen_udp:socket() | undefined,
     port :: inet:port_number(),
     cfg :: map(),
+    transport = udp :: udp | dtls,
     %% {IP, Port, Id} -> {ReplyBytes, AtMs} for a CON we already answered.
     dedup = #{} :: map(),
     %% {IP, Port} -> token-bucket state.
@@ -66,7 +87,23 @@
     %% conformant empty ACK/RST carries no token -- RFC 7252 §4.1 / RFC 7641
     %% §4.5). Bytes are the encoded datagram, so a retransmit resends the same
     %% Message ID.
-    pending = #{} :: map()
+    pending = #{} :: map(),
+    %% --- DTLS only (S11-C) ---
+    %% The ssl:listen socket peers are accepted on.
+    dtls_listen :: term() | undefined,
+    %% The process that handshakes peers and transfers them here.
+    dtls_acceptor :: pid() | undefined,
+    %% Established DTLS socket -> its peer endpoint (inbound demux).
+    peers = #{} :: map(),
+    %% Peer endpoint -> its established DTLS socket (outbound demux). The two
+    %% maps are inverses; both are needed because `{ssl,Sock,Bin}' arrives keyed
+    %% by socket while every table and every send is keyed by endpoint.
+    socks = #{} :: map(),
+    %% Peer endpoint -> #{principal, tenant}: the identity the handshake proved,
+    %% threaded into the resource layer's Ctx so ACL and tenant isolation apply.
+    idents = #{} :: map(),
+    %% Principal -> number of live sessions, for `dtls_max_sessions_per_principal'.
+    principal_sessions = #{} :: map()
 }).
 
 start_link(Spec) ->
@@ -83,6 +120,13 @@ init(Spec) when is_map(Spec) ->
     %% App-wide settings come from the application environment; the listener
     %% spec may override any of them (a second listener with its own limits).
     Cfg = config(Spec),
+    case maps:get(transport, Cfg, udp) of
+        udp -> init_udp(Cfg);
+        dtls -> init_dtls(Cfg);
+        Other -> {stop, {unknown_transport, Other}}
+    end.
+
+init_udp(Cfg) ->
     Port = maps:get(port, Cfg),
     Opts = [binary, {active, ?ACTIVE_N}, {reuseaddr, true},
             {recbuf, maps:get(recbuf_bytes, Cfg, 65536)}],
@@ -96,6 +140,109 @@ init(Spec) when is_map(Spec) ->
             %% mirroring `broker_proto_mqtt_sn').
             {stop, {bind_failed, Port, Reason}}
     end.
+
+%% A DTLS listener refuses to start without credentials: an empty `users' table
+%% means no peer can ever complete a handshake, which is a configuration error,
+%% not a safe default (design §4.3).
+init_dtls(Cfg) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    case has_users() of
+        false ->
+            {stop, {dtls_no_credentials}};
+        true ->
+            start_dtls(Cfg)
+    end.
+
+%% Read through `redacted_config/0' rather than the listener poking at
+%% `broker_security''s internals: it is the public view of the identity table and
+%% it keeps usernames (only the passwords are stripped).
+has_users() ->
+    Users = maps:get(users, broker_security:redacted_config(), []),
+    Users =/= [].
+
+start_dtls(Cfg) ->
+    Port = maps:get(port, Cfg),
+    Suites = cert_free_psk_suites(),
+    case Suites of
+        [] ->
+            {stop, {dtls_no_suites}};
+        _ ->
+            %% Order matters: the listen options need the acceptor's pid in the
+            %% PSK lookup state, so the acceptor must exist first; it blocks
+            %% waiting for the socket this process is about to create.
+            Self = self(),
+            {ok, Acceptor} = coap_dtls_acceptor:start_link(Self, Cfg),
+            %% Per-listener randomness for the decoy key (see `psk_lookup/2'):
+            %% without it a decoy could be guessed offline from the public label.
+            DecoySecret = crypto:strong_rand_bytes(32),
+            ListenOpts = [{protocol, dtls},
+                          {ciphers, Suites},
+                          {user_lookup_fun,
+                           {psk_lookup(Acceptor, DecoySecret), undefined}},
+                          {reuseaddr, true},
+                          %% `binary' matters: without it every `{ssl,Sock,Data}'
+                          %% delivers an iolist and the codec -- which measures
+                          %% and matches binaries -- would crash on the first
+                          %% request. The UDP listener gets the same guarantee
+                          %% from `gen_udp''s `binary' option.
+                          {mode, binary},
+                          {active, false}],
+            case ssl:listen(Port, ListenOpts) of
+                {ok, Listen} ->
+                    %% `ssl:sockname/1' reports the whole address, unlike
+                    %% `inet:port/1' for a UDP socket -- and with `port => 0' the
+                    %% kernel-chosen port is a different number than requested,
+                    %% so it must be read back rather than assumed.
+                    {ok, {_Addr, ActualPort}} = ssl:sockname(Listen),
+                    Acceptor ! {listen_socket, Listen},
+                    {ok, #st{socket = undefined, port = ActualPort, cfg = Cfg,
+                             transport = dtls, dtls_listen = Listen,
+                             dtls_acceptor = Acceptor},
+                     {continue, refill}};
+                {error, Reason} ->
+                    {stop, {bind_failed, Port, Reason}}
+            end
+    end.
+
+%% The PSK callback. The identity is a username in `broker_security''s table;
+%% resolving it IS the admission decision, and the key is derived from the stored
+%% password so nothing secret is configured twice.
+%%
+%% An unknown identity gets a DECOY key, not an alert, and that is a security
+%% requirement rather than a quirk: an alert fails the handshake before any key
+%% exchange is verified, so the client sees a fast, distinct error, while a known
+%% identity with a wrong password fails later and looks like a timeout. Measured
+%% on OTP 28.3.1: alert in ~20-200 ms versus a 3 s timeout -- enough to enumerate
+%% every username in the table. With a decoy both cases die at the Finished
+%% check and are indistinguishable from outside. The decoy is salted with a
+%% per-listener random secret so it can never coincide with a derived key and
+%% cannot be confirmed offline.
+%%
+%% The callback runs inside `ssl:handshake/2' in the acceptor, so it also posts
+%% the identity back to that process -- the only place `psk_identity' is
+%% observable on the server side.
+psk_lookup(Acceptor, DecoySecret) ->
+    fun(psk, Identity, _State) ->
+            Acceptor ! {psk_identity, Identity},
+            case broker_security:psk_for_identity(Identity) of
+                {ok, Psk} -> {ok, Psk};
+                {error, _} -> {ok, decoy_psk(Identity, DecoySecret)}
+            end
+    end.
+
+decoy_psk(Identity, Secret) ->
+    crypto:hash(sha256, [<<"unifiedmq-coaps-psk-decoy">>, 0, Secret, 0, Identity]).
+
+%% The cert-free PSK suites. OTP's `all' category only surfaces `rsa_psk', which
+%% would drag in certificate handling; the suites that need no server
+%% certificate at all live in the `anonymous' category, and AEAD ciphers are the
+%% only ones worth negotiating here.
+cert_free_psk_suites() ->
+    [S || S <- ssl:cipher_suites(anonymous, 'dtlsv1.2'),
+          lists:member(maps:get(key_exchange, S, none), [psk, dhe_psk, ecdhe_psk]),
+          lists:member(maps:get(cipher, S, none),
+                       [aes_128_gcm, aes_256_gcm, aes_128_ccm, aes_256_ccm,
+                        aes_128_ccm_8, aes_256_ccm_8])].
 
 handle_continue(refill, St) ->
     _ = erlang:start_timer(1000, self(), refill),
@@ -115,7 +262,13 @@ config(Spec) ->
                  max_observes => env(max_observes, 4096),
                  observe_ack_timeout_ms => env(observe_ack_timeout_ms, 2000),
                  observe_max_retrans => env(observe_max_retrans, 3),
-                 observe_max_age_s => env(observe_max_age_s, 30)},
+                 observe_max_age_s => env(observe_max_age_s, 30),
+                 dtls_transport_accept_timeout_ms =>
+                     env(dtls_transport_accept_timeout_ms, 1000),
+                 dtls_handshake_timeout_ms => env(dtls_handshake_timeout_ms, 2000),
+                 max_dtls_sessions => env(max_dtls_sessions, 1024),
+                 dtls_max_sessions_per_principal =>
+                     env(dtls_max_sessions_per_principal, 16)},
     maps:merge(Defaults, Spec).
 
 env(Key, Default) ->
@@ -144,57 +297,66 @@ handle_info({broker_deliver, <<"coap">>, _MaxQoS, _Matched, {_P, _O, Msg}},
 %% keyed by `{IP,Port,Id}'. An ACK cancels the retransmit timer and keeps the
 %% relationship; an RST ends it. Anything else (including a non-empty-code RST)
 %% falls through to `on_datagram/4'.
-handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
-    Decoded =
-        try coap_codec:decode(Bin) of
-            {ok, #{type := ack, code := empty, id := A}} -> {ack, A};
-            {ok, #{type := rst, code := empty, id := R}} -> {rst, R};
-            {ok, _Msg} -> other;
-            {error, _} -> other
-        catch
-            _:_ -> other
-        end,
-    case Decoded of
-        {ack, Aid} ->
-            case maps:find({IP, Port, Aid}, Pend) of
-                {ok, {_Token, _Bytes, _Left, Ref}} ->
-                    _ = erlang:cancel_timer(Ref),
-                    {noreply,
-                     St0#st{pending = maps:remove({IP, Port, Aid}, Pend)}};
-                error ->
-                    {noreply, on_datagram(IP, Port, Bin, St0)}
-            end;
-        {rst, Rid} ->
-            %% A CON notification's retransmit is keyed by its Message ID in
-            %% `pending'; if its timer is still armed, cancel it and drop the
-            %% entry. If not (already ACKed, superseded by NSTART=1, or not yet
-            %% recorded because the notification is dispatched asynchronously), no
-            %% timer to cancel.
-            St1 =
-                case maps:take({IP, Port, Rid}, Pend) of
-                    {{_Token, _Bytes, _Left, Ref}, Rest} ->
-                        _ = erlang:cancel_timer(Ref),
-                        St0#st{pending = Rest};
-                    error ->
-                        St0
-                end,
-            %% End the relationship whose CURRENT notification carries this ID. A
-            %% conformant empty RST has no token, so the relationship is found by
-            %% scanning `observes' for a matching notification id (RFC 7641
-            %% §4.5) -- this works whether or not the notification is still in
-            %% `pending', so a client may RST immediately.
-            case observe_by_notify_id(IP, Port, Rid, St1#st.observes) of
-                undefined ->
-                    %% No such notification on this endpoint: a stray/late RST. Not
-                    %% a request, no response owed (RFC 7252 §4.3).
-                    {noreply, St1};
-                {_, _, _} = Key ->
-                    {noreply, deregister_observe(element(1, Key), element(2, Key),
-                                                 element(3, Key), St1)}
-            end;
-        other ->
-            {noreply, on_datagram(IP, Port, Bin, St0)}
+handle_info({udp, _Socket, IP, Port, Bin}, St) ->
+    {noreply, on_packet(IP, Port, Bin, St)};
+
+%% --- DTLS (S11-C) ---------------------------------------------------------
+%%
+%% A peer finished its handshake in the acceptor and asked whether it fits. The
+%% caps and the tables live here, so this is the single place that decides.
+handle_info({dtls_handshake_ok, From, Socket, Peer, Identity}, St) ->
+    case admit_session(Identity, Peer, Socket, St) of
+        {ok, St1} ->
+            From ! {dtls_admit, Socket, ok},
+            {noreply, St1};
+        {refuse, Why} ->
+            logger:notice("coap dtls session refused (~p) peer=~p identity=~p",
+                          [Why, Peer, Identity]),
+            From ! {dtls_admit, Socket, refuse},
+            {noreply, St}
     end;
+
+%% The acceptor transferred ownership: the socket is ours now, so arming the
+%% active budget here is both legal and correct. Doing it before the transfer
+%% returns `ok' and yet delivers datagrams to the old owner (measured: the first
+%% budget's worth of traffic vanished with the acceptor).
+handle_info({dtls_owned, Socket}, #st{peers = Peers} = St) ->
+    case maps:is_key(Socket, Peers) of
+        true -> _ = ssl:setopts(Socket, [{active, ?ACTIVE_N}]);
+        false -> ok
+    end,
+    {noreply, St};
+
+%% Decrypted datagram from an established peer. Mapped back to the endpoint so
+%% the rest of the pipeline is transport-blind.
+handle_info({ssl, Socket, Bin}, #st{peers = Peers} = St) ->
+    case maps:find(Socket, Peers) of
+        {ok, {IP, Port}} ->
+            {noreply, on_packet(IP, Port, Bin, St)};
+        error ->
+            %% Closed in between: the peer is gone, nothing to answer.
+            {noreply, St}
+    end;
+
+handle_info({ssl_closed, Socket}, St) ->
+    {noreply, drop_session(Socket, St)};
+
+handle_info({ssl_error, Socket, Reason}, St) ->
+    logger:debug("coap dtls socket error: ~p", [Reason]),
+    {noreply, drop_session(Socket, St)};
+
+%% The active budget ran out: re-arm it, or the listener silently stops reading.
+handle_info({ssl_passive, Socket}, #st{peers = Peers} = St) ->
+    case maps:is_key(Socket, Peers) of
+        true -> _ = ssl:setopts(Socket, [{active, ?ACTIVE_N}]);
+        false -> ok
+    end,
+    {noreply, St};
+
+%% The acceptor is the only process that can admit new peers; if it dies the
+%% listener can never accept again, which is a restart, not a degraded state.
+handle_info({'EXIT', Acceptor, Reason}, #st{dtls_acceptor = Acceptor} = St) ->
+    {stop, {dtls_acceptor_died, Reason}, St};
 
 %% A CON notification went un-acked: retransmit exactly that one (the timer
 %% message carries its `pending' key) or give up after `observe_max_retrans'
@@ -222,11 +384,73 @@ handle_info({udp_error, Socket, Reason}, #st{socket = Socket} = St) ->
 handle_info(_Info, St) ->
     {noreply, St}.
 
+terminate(_Reason, #st{transport = dtls} = St) ->
+    %% Close the listen socket first so the acceptor stops accepting, then every
+    %% established peer. Left to the runtime, a restarted listener could find the
+    %% port still held.
+    _ = (catch ssl:close(St#st.dtls_listen)),
+    [ _ = (catch ssl:close(S)) || S <- maps:keys(St#st.peers) ],
+    ok;
 terminate(_Reason, _St) ->
     ok.
 
 code_change(_Old, St, _Extra) ->
     {ok, St}.
+
+%% One datagram, from either transport. The ACK/RST correlation runs first
+%% because a conformant empty ACK/RST carries no token -- it is matched to a
+%% pending CON notification by the echoed Message ID (RFC 7252 §4.1 / RFC 7641
+%% §4.5). Anything else is a request and takes the normal path.
+on_packet(IP, Port, Bin, #st{pending = Pend} = St0) ->
+    Decoded =
+        try coap_codec:decode(Bin) of
+            {ok, #{type := ack, code := empty, id := A}} -> {ack, A};
+            {ok, #{type := rst, code := empty, id := R}} -> {rst, R};
+            {ok, _Msg} -> other;
+            {error, _} -> other
+        catch
+            _:_ -> other
+        end,
+    case Decoded of
+        {ack, Aid} ->
+            case maps:find({IP, Port, Aid}, Pend) of
+                {ok, {_Token, _Bytes, _Left, Ref}} ->
+                    _ = erlang:cancel_timer(Ref),
+                    St0#st{pending = maps:remove({IP, Port, Aid}, Pend)};
+                error ->
+                    on_datagram(IP, Port, Bin, St0)
+            end;
+        {rst, Rid} ->
+            %% A CON notification's retransmit is keyed by its Message ID in
+            %% `pending'; if its timer is still armed, cancel it and drop the
+            %% entry. If not (already ACKed, superseded by NSTART=1, or not yet
+            %% recorded because the notification is dispatched asynchronously), no
+            %% timer to cancel.
+            St1 =
+                case maps:take({IP, Port, Rid}, Pend) of
+                    {{_Token, _Bytes, _Left, Ref}, Rest} ->
+                        _ = erlang:cancel_timer(Ref),
+                        St0#st{pending = Rest};
+                    error ->
+                        St0
+                end,
+            %% End the relationship whose CURRENT notification carries this ID. A
+            %% conformant empty RST has no token, so the relationship is found by
+            %% scanning `observes' for a matching notification id (RFC 7641
+            %% §4.5) -- this works whether or not the notification is still in
+            %% `pending', so a client may RST immediately.
+            case observe_by_notify_id(IP, Port, Rid, St1#st.observes) of
+                undefined ->
+                    %% No such notification on this endpoint: a stray/late RST. Not
+                    %% a request, no response owed (RFC 7252 §4.3).
+                    St1;
+                {_, _, _} = Key ->
+                    deregister_observe(element(1, Key), element(2, Key),
+                                       element(3, Key), St1)
+            end;
+        other ->
+            on_datagram(IP, Port, Bin, St0)
+    end.
 
 %%%_* Datagram path --------------------------------------------------------
 
@@ -304,17 +528,17 @@ handle_message(IP, Port, Msg, Cfg, #st{dedup = Dedup} = St) ->
             %% re-executing (RFC 7252 §4.8.2).
             case maps:find({IP, Port, coap_codec:id(Msg)}, Dedup) of
                 {ok, {Cached, _At}} ->
-                    send(IP, Port, Cached, St),
+                    send_to(IP, Port, Cached, St),
                     St;
                 error ->
                     {Reply, St1} = respond(IP, Port, Msg, Cfg, St),
-                    send(IP, Port, Reply, St1),
+                    send_to(IP, Port, Reply, St1),
                     remember(IP, Port, coap_codec:id(Msg), Reply, Cfg, St1)
             end;
         _Non ->
             %% A NON request still gets the resource's answer, as a separate NON.
             {Reply, St1} = respond(IP, Port, Msg, Cfg, St),
-            send(IP, Port, Reply, St1),
+            send_to(IP, Port, Reply, St1),
             St1
     end.
 
@@ -342,9 +566,9 @@ respond(IP, Port, Msg, Cfg, St) ->
 reply_observe(IP, Port, Req, Cfg, St) ->
     case observe_action(Req) of
         none ->
-            {resource_reply(Req, Cfg, {IP, Port}), St};
+            {resource_reply(Req, Cfg, {IP, Port}, St), St};
         register ->
-            {Code, Options, Payload} = run_resource(Req, Cfg, {IP, Port}),
+            {Code, Options, Payload} = run_resource(Req, Cfg, {IP, Port}, St),
             case Code of
                 {response, 2, 5} ->
                     case register_observe(IP, Port, coap_codec:token(Req), Req,
@@ -367,7 +591,7 @@ reply_observe(IP, Port, Req, Cfg, St) ->
             end;
         deregister ->
             St2 = deregister_observe(IP, Port, coap_codec:token(Req), St),
-            {resource_reply(Req, Cfg, {IP, Port}), St2}
+            {resource_reply(Req, Cfg, {IP, Port}, St2), St2}
     end.
 
 %% Observe only applies to GET (RFC 7641 §3.1): 0 registers, 1 deregisters.
@@ -378,12 +602,23 @@ observe_action(Req) ->
         _ -> none
     end.
 
-send(IP, Port, Bin, #st{socket = Socket}) ->
+%% The single write path for both transports. A DTLS peer that vanished between
+%% the decision to send and the send itself is not an error: UDP has always been
+%% "send is not delivery", and a closed socket must not turn that into a crash.
+send_to(IP, Port, Bin, #st{transport = udp, socket = Socket}) ->
     _ = gen_udp:send(Socket, IP, Port, Bin),
-    ok.
+    ok;
+send_to(IP, Port, Bin, #st{socks = Socks}) ->
+    case maps:find({IP, Port}, Socks) of
+        {ok, Socket} ->
+            _ = ssl:send(Socket, Bin),
+            ok;
+        error ->
+            ok
+    end.
 
-resource_reply(Req, Cfg, Endpoint) ->
-    {ReplyCode, Options, Payload} = run_resource(Req, Cfg, Endpoint),
+resource_reply(Req, Cfg, Endpoint, St) ->
+    {ReplyCode, Options, Payload} = run_resource(Req, Cfg, Endpoint, St),
     encode_reply(Req, reply_type(Req), ReplyCode, Options, Payload).
 
 %% RFC 7252 §5.2.1: a reply to a CON rides in the ACK; a reply to a NON is a
@@ -466,16 +701,122 @@ refusal_base(Msg, Code) ->
 
 %%%_* Resource call ---------------------------------------------------------
 
-run_resource(Req, Cfg, Endpoint) ->
+%% The context the resource layer sees. On plain UDP there is no credential, so
+%% `principal' stays `undefined' and `broker_security' treats the request as the
+%% default tenant -- an honest statement of what the wire carries. On DTLS the
+%% handshake proved an identity, so a real `principal' and its tenant go in, and
+%% the ACL and tenant isolation finally apply (S11-C).
+run_resource(Req, Cfg, Endpoint, St) ->
+    {Tenant, Principal} = endpoint_identity(Endpoint, St),
     Ctx = #{endpoint => Endpoint,
-            tenant => broker_security:default_tenant(),
-            principal => undefined},
+            tenant => Tenant,
+            principal => Principal},
     case catch coap_resource:handle(Req, Cfg, Ctx) of
         {reply, Code, Options, Payload} ->
             {Code, Options, Payload};
         _ ->
             {{response, 5, 0}, [], <<>>}
     end.
+
+endpoint_identity(Endpoint, #st{idents = Idents}) ->
+    case maps:find(Endpoint, Idents) of
+        {ok, #{principal := P, tenant := T}} ->
+            {T, P};
+        error ->
+            {broker_security:default_tenant(), undefined}
+    end.
+
+%%%_* DTLS sessions (S11-C) -------------------------------------------------
+
+%% Decide whether an established peer fits, and if so record it. The caps are
+%% checked here (not in the acceptor) because the tables live here: a second copy
+%% of the counters would be a second truth.
+admit_session(Identity, Peer, Socket, #st{peers = Peers, cfg = Cfg} = St) ->
+    Max = maps:get(max_dtls_sessions, Cfg, 1024),
+    case maps:size(Peers) >= Max of
+        true ->
+            {refuse, session_cap};
+        false ->
+            %% An identity that did not arrive is a handshake that must not be
+            %% admitted: the whole point of DTLS here is that `principal' is
+            %% proven. (It cannot happen on the PSK path -- the lookup either
+            %% supplies the key or fails the handshake -- but the guard keeps
+            %% the invariant local.)
+            case Identity of
+                undefined ->
+                    {refuse, no_identity};
+                _ ->
+                    Principal = Identity,
+                    PerCap = maps:get(dtls_max_sessions_per_principal, Cfg, 16),
+                    case maps:get(Principal, St#st.principal_sessions, 0) >= PerCap of
+                        true ->
+                            {refuse, principal_cap};
+                        false ->
+                            {ok, record_session(Peer, Socket, Principal, St)}
+                    end
+            end
+    end.
+
+record_session({IP, Port} = Peer, Socket, Principal,
+               #st{peers = Peers, socks = Socks, idents = Idents,
+                   principal_sessions = Counts} = St) ->
+    St#st{peers = maps:put(Socket, Peer, Peers),
+          socks = maps:put({IP, Port}, Socket, Socks),
+          idents = maps:put({IP, Port}, #{principal => Principal,
+                                          tenant => broker_security:tenant_id(Principal)},
+                            Idents),
+          principal_sessions = maps:update_with(Principal, fun(N) -> N + 1 end, 1,
+                                                Counts)}.
+
+%% A DTLS peer disappeared. Unlike plain UDP -- where an endpoint just goes
+%% silent and its entries age out -- here the close is a positive fact, so every
+%% table gets cleaned at once. Skipping this would let dead endpoints hold
+%% buckets, dedup slots and observations until the timers eventually caught up.
+drop_session(Socket, #st{peers = Peers} = St) ->
+    case maps:take(Socket, Peers) of
+        error ->
+            St;
+        {Peer, Peers1} ->
+            St1 = St#st{peers = Peers1},
+            forget_endpoint(Peer, remove_session(Peer, St1))
+    end.
+
+remove_session(Peer, #st{socks = Socks, idents = Idents,
+                         principal_sessions = Counts} = St) ->
+    St1 = St#st{socks = maps:remove(Peer, Socks),
+                idents = maps:remove(Peer, Idents)},
+    case maps:find(Peer, Idents) of
+        {ok, #{principal := Principal}} ->
+            St1#st{principal_sessions = decrement(Principal, Counts)};
+        error ->
+            St1
+    end.
+
+decrement(Key, Map) ->
+    case maps:get(Key, Map, 0) of
+        N when N =< 1 -> maps:remove(Key, Map);
+        N -> maps:put(Key, N - 1, Map)
+    end.
+
+%% Every per-endpoint entry this listener holds, dropped. Observe relationships
+%% go through the normal teardown so the kernel subscription and the retransmit
+%% timers stay consistent with the relationship table.
+forget_endpoint({IP, Port}, St0) ->
+    Keys = [K || {{KIP, KPort, _} = K, _Rel} <- maps:to_list(St0#st.observes),
+                 KIP =:= IP, KPort =:= Port],
+    St1 = lists:foldl(fun({_, _, Token}, Acc) ->
+                              deregister_observe(IP, Port, Token, Acc)
+                      end, St0, Keys),
+    Pend = maps:filter(fun({PIP, PPort, _}, _) -> not (PIP =:= IP andalso PPort =:= Port) end,
+                       St1#st.pending),
+    Dedup = maps:filter(fun({DIP, DPort, _}, _) ->
+                                not (DIP =:= IP andalso DPort =:= Port)
+                        end, St1#st.dedup),
+    Block1 = maps:filter(fun({BIP, BPort, _, _}, _) ->
+                                 not (BIP =:= IP andalso BPort =:= Port)
+                         end, St1#st.block1),
+    St1#st{pending = Pend, dedup = Dedup, block1 = Block1,
+           endpoints = maps:remove({IP, Port}, St1#st.endpoints)}.
 
 %%%_* Observe (RFC 7641) ----------------------------------------------------
 
@@ -491,7 +832,10 @@ run_resource(Req, Cfg, Endpoint) ->
 %% inherited un-acked CON notification for the old relationship is dropped.
 register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
     Dest = coap_codec:destination(Req),
-    Tenant = broker_security:default_tenant(),
+    %% The subscription lives in the kernel under the peer's real tenant, so a
+    %% DTLS device observes inside its own tenant and the kernel's dispatch
+    %% respects that boundary. Plain UDP has no principal and keeps the default.
+    Tenant = element(1, endpoint_identity({IP, Port}, St)),
     MaxAge = coap_codec:option(max_age, Req, 30),
     Key = {IP, Port, Token},
     %% Only a *new* relationship consumes a table slot; a refresh of an existing
@@ -605,7 +949,7 @@ notify_one({IP, Port, Token} = ObsKey, Rel, Msg, Cfg,
     Note = coap_observe:notify_message(Type, Seq, Token, Msg),
     Id = next_id(),
     Bytes = coap_codec:encode(Note#{id => Id}),
-    _ = gen_udp:send(St#st.socket, IP, Port, Bytes),
+    _ = send_to(IP, Port, Bytes, St),
     case Type of
         con ->
             Timeout = maps:get(observe_ack_timeout_ms, Cfg, 2000),
@@ -674,7 +1018,7 @@ retransmit_one(IdKey, Ref, #st{pending = Pend} = St) ->
         {ok, {ObsKey, Bytes, Left, Ref}} ->
             IP = element(1, IdKey),
             Port = element(2, IdKey),
-            _ = gen_udp:send(St#st.socket, IP, Port, Bytes),
+            _ = send_to(IP, Port, Bytes, St),
             Pend1 = maps:remove(IdKey, Pend),
             case Left - 1 of
                 0 ->

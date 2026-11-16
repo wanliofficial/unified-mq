@@ -20,8 +20,10 @@
 | PSK 身份抵达服务端 | ✅ 客户端的 identity **逐字**到达服务端 lookup（`<<"device-01">>`）——这正是映射到 `broker_security` principal 的钩子 |
 | 无证书可行 | ✅ 用 **cert-free PSK 套件**（`psk`/`dhe_psk`/`ecdhe_psk` 的 AEAD），服务端**不配 certfile/keyfile** 也能完成握手 → ADR-031 D5「默认不自签」可满足 |
 | 单进程多 DTLS socket | ✅ 一个进程可同时持有多个 active DTLS socket，收 `{ssl, Sock, Data}`，按 `Sock -> {Peer, Identity}` 映射 demux |
-| 未知身份拒绝 | ✅ lookup 返回 alert → 客户端在 **~224 ms** 内收到 `{tls_alert, {handshake_failure, _}}`（干净拒绝，不是挂死） |
+| 未知身份拒绝 | ⚠️ **不要用 `#alert{}`**（实现期实测修正）。返回 alert → 客户端 ~20–200 ms 拿到 `{tls_alert,{handshake_failure,_}}`；而「用户存在但口令错」走的是**后期 Finished 校验失败** → 客户端表现为 **3 s 超时**。两者时延/错误形态截然不同 ⇒ **用户名枚举 oracle**。正确做法：未知身份返回**诱饵密钥**（`SHA-256("...-decoy" ‖ 0 ‖ 每 listener 随机 secret ‖ 0 ‖ Identity)`），让两种情况都死在同一个 Finished 检查上，对外不可区分。 |
 | 身份竞态 | ⚠️ 身份只能在 lookup fun 里捕获；`ssl:connection_information` **不暴露** `psk_identity`。**并发握手时**必须在成功与失败**两条路径都 drain**，否则被拒连接的 identity 会串给下一连接 |
+| 二进制模式 | ⚠️ `ssl:listen` / `ssl:connect` **必须显式 `{mode, binary}`**，否则 `{ssl,Sock,Data}` 与 `ssl:recv` 给的是 **iolist/整数列表**，`coap_codec` 的 `byte_size/1` 直接 `badarg` 崩溃 |
+| `port/1` 语义 | ⚠️ `ssl:sockname/1` 返回 `{ok, {Addr, Port}}`，而 `gen_udp` 路径用 `inet:port/1` 返回裸 port。DTLS 分支必须解开元组，否则 `port/1` 把端口暴露成元组 |
 | `{active, N}` 预算 | ✅ `{ssl_passive, Sock}` **会**发出（spike12：收 5 条后到达）→ UDP 的重挂模式原样可用 |
 | socket 所有权 | ⚠️ **`ssl:setopts({active,_})` 由非 owner 调用返回 `ok` 却把数据投给当时的 owner**（spike11）。握手期必须 `{active,false}`，**只有移交后的 listener** 才设 active |
 

@@ -79,9 +79,27 @@ spike8 实测：一个普通进程可同时持有 2+ 个 active `sslsocket`，�
 
 - `Fun(psk, Identity, State)` 拿到的 `Identity`（binary，如 `<<"device-01">>`）→ `broker_security:psk_for_identity/1`。
   - `{ok, Psk}` → 握手继续；acceptor 把 `Principal = Identity` 交给 listener。
-  - `{error, _}` → 返回 `#alert{?FATAL, ?UNKNOWN_PSK_IDENTITY}` → 客户端在 ~224 ms 内收到 `{tls_alert, {handshake_failure, _}}`（spike10 实测，干净拒绝，非挂死）。
+  - `{error, _}` → **返回诱饵密钥**（不是 alert）。原因见 §4.4：返回 alert 会让「未知用户」与「口令错」在客户端表现为截然不同的时延，构成用户名枚举 oracle。
 - **principal = Identity 本身**（与 S6/S1 的 `principal` 定义一致：principal 是认证身份）。
 - **tenant = `broker_security:tenant_id(Identity)`**（身份记录里带的租户，客户端不能自选）。
+
+### 4.4 拒绝形态：诱饵密钥，不是 alert（实现期修正）
+
+spike 报告原先记为「未知身份返回 `#alert{}`，客户端 ~224 ms 干净拒绝」，实现后发现这本身就是漏洞：
+
+| 情形 | 服务端行为 | 客户端观感 |
+|---|---|---|
+| 用户名不存在 | lookup 立即 alert | `{error,{tls_alert,{handshake_failure,_}}}`，22–210 ms |
+| 用户名存在、口令错 | lookup 给真密钥，握手走到 Finished 才发现不符 | `timeout`，~3000 ms |
+
+两种结果的**形态与时延都不同**，攻击者可据此枚举 `users` 表里的用户名（且不需要猜中任何口令）。
+
+**定稿**：`{error, _}` 时返回 `SHA-256("unifiedmq-coaps-psk-decoy" ‖ 0 ‖ 每 listener 随机 secret ‖ 0 ‖ Identity)`。这样未知身份也「握手成功了一半」，两种情况都死在同一个 Finished 校验上，客户端一律得到 `timeout`。诱饵掺入每 listener 的 `crypto:strong_rand_bytes(32)`，因此：
+- 不可能与任何真实派生密钥相等（标签不同 + 随机 secret）；
+- 无法离线预计算（secret 不在配置里，只在进程内存）；
+- 重启后诱饵变化，对攻击者只是一次无信息的失败。
+
+实测（OTP 28.3.1，同一 listener）：未知用户 3073/3002/3002 ms，已知用户错口令 3002/3003/3003 ms，两者不可区分；正确口令 19/19/21 ms 成功。
 
 ### 4.2 密钥派生（`broker_security:psk_for_identity/1`，新增导出）
 
@@ -132,7 +150,7 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 | 层 | 机制 | 新/旧 |
 |---|---|---|
 | 握手 | acceptor 串行 + `dtls_transport_accept_timeout_ms`（1000）+ `dtls_handshake_timeout_ms`（2000） | **新** |
-| 握手 | 未知身份 → alert 拒绝（不建 socket、不进表） | **新**（复用 identity 表） |
+| 握手 | 未知身份 → 诱饵密钥（与口令错不可区分） | **新**（复用 identity 表；不是 alert，理由见设计 §4.4） |
 | 会话 | `max_dtls_sessions`（1024）：`peers`/`socks`/`idents` 表上限；满则 acceptor 关掉新 socket（不挤掉已有会话） | **新** |
 | 会话 | `dtls_max_sessions_per_principal`（16）：同一 principal 的并发会话数上限，超则拒 | **新** |
 | 连接关闭 | `{ssl_closed, Sock}` → 清 `peers`/`socks`/`idents`、`principal_sessions` 计数、该端点的 `dedup`/`block1`/`endpoints` 条目、注销该端点的全部 Observe 关系并取消 `pending` timer（DTLS 关闭 = 端点消失，比 UDP 的「静默消失」更确定，所以必须真清理——否则表会被死端点占满） | **新** |
@@ -207,4 +225,5 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 | `ssl` 未启动导致 `ssl:listen` `noproc` | `app.src` `applications` 追加 `ssl`（OTP 内置，非新增运行时依赖）；DTLS 分支首行再 `ensure_all_started(ssl)` 兜底 |
 | 关闭清理漏项导致表泄漏 | §6 的 close 清理逐表列出；`dtls_close_cleans_up` 用例断言四张表归零 |
 | 身份竞态回归 | acceptor 串行 + 双路径 drain 写进模块 doc 与用例（并发好/坏客户端各一，断言身份不串） |
+| 用户名枚举（时延/错误形态区分未知用户与错口令） | **已实测发现并修正**：未知身份不返回 alert，改返诱饵密钥（设计 §4.4），`unknown_identity_is_refused` 断言两者错误项完全相等 |
 | 客户端 PSK 身份类型（list vs binary） | 产品代码只处理**服务端**方向（identity 是 binary）；suite 的客户端 helper 用 `binary_to_list/1`，spike8 踩过这个坑 |
