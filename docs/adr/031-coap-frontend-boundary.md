@@ -127,3 +127,51 @@ ADR-030 §D1 把 CoAP 定为 S11 唯一进入实现评审的协议。`s11-coap.m
    - 留痕：`docs/protocol-compatibility.md` §4.24.4、[`docs/roadmap.md`](../roadmap.md) §13.1 S11-C 行。
 
 - **对照结论**：D1（自写编解码）、D2（Observe 归订阅层，本期未实现通知）、D3（CON/ACK 是 datagram 级、NON 不产生 piggybacked ACK）、D4（资源路径直映射 destination，不新开 `$coap/`）、D6（零 socket 出厂、依赖同族、metrics 不扩容）在首个交付里成立；D5 与 D7 的 Observe/互操作两半分别留 S11-C 与 S11-B/第三方证据。**冻结文本未改**，本节只追加落地事实。
+
+### S11-B 首个代码交付（2026-11-15）
+
+> Observe（RFC 7641）落地：`coap_observe`（纯函数：关系表 / 序列 / `Max-Age` 窗口 / 通知报文形状）+ `coap_listener` 的 notify 侧（注册 / 通知 / 重传 / 注销 / 清扫）。CT **96 例**（CoAP 五套）、全量 `rebar3 ct` **1347/1347、84 套件**零回归、`broker_subscription_SUITE` 53/53、dialyzer 0 warning、xref **302**（零新增）、`rebar3 release` 装配成功。**D1~D4/D6 逐条仍成立**；以下是 D2/D3 条文没写死、实现时必须选择的地方。
+
+1. **D2 的「adapter 只持会话↔SubRef 映射」具体化为「listener 自己就是 notify pid」**
+   - 计划（D2）：Observe 归 `broker_subscription` + cursor，adapter 只持映射；没有指定谁当 consumer 进程。
+   - 实际：**不新开进程、不建 `simple_one_for_one`**——`coap_listener`（S11-A 的唯一 UDP socket owner）直接 `attach/3` 为 consumer（`persist=false`），`handle_info({broker_deliver,…})` 里对 destination 匹配的每条关系各发一条通知。CON 重传的 timer 状态用 `pending` map 存在 listener state 里。
+   - 为什么：通知发送只是一次 `gen_udp:send`，为它单开监督树是纯开销；`{active,100}` 的**收包**预算也不受影响（通知是发送不是接收）。代价是 UDP 编码在 listener 串行——通知速率受对端窗口与 `max_requests_per_second` 约束，受限设备场景不构成瓶颈。与 S11-A「单 socket owner 持有全部有界状态」的姿态一致。
+   - 留痕：`coap_listener.erl` 的 `register_observe/6`、`dispatch_notifications/2`、`notify_one/5`；`docs/architecture.md` §3.18；`docs/design/s11b-coap-observe.md` §2。
+
+2. **ClientId 固定 `<<"coap">>`：所有观察共用一个匿名内核会话，filter 才是区分粒度**
+   - 计划（D2/D4）：只说「归 `broker_subscription`」「资源路径即 destination」（OQ-5），没指定 ClientId。
+   - 实际：`?COAP_CLIENT = <<"coap">>`；`subscribe(<<"coap">>, Destination, 0, Tenant)`，`coap_observe:filter/1` 就是恒等（destination 本身）。
+   - 为什么：UDP 无连接、无会话，为每个端点铸一个 ClientId 会凭空造出「伪会话」并让 `detach`/超时语义与真实身份脱钩；一个匿名 ClientId + 每关系一个 filter 已经够表达「谁在看哪个目的地」。代价——`detach/2` 会拆掉该 ClientId 的**全部**订阅，因此必须 `maybe_detach/1` 只在关系表空时调用；同理 `unsubscribe` 必须 `maybe_unsubscribe/2` 只在无人再观察同一 destination 时调用。这两级粒度是首版缺陷（见本条 3/4 与 §4.24.7）。
+   - 留痕：`coap_listener.erl` 的 `?COAP_CLIENT`、`maybe_unsubscribe/2`、`maybe_detach/1`；`docs/protocol-compatibility.md` §4.24.6。
+
+3. **D3 的「可确认通知靠通知自己的重传」具体化为 `pending` 键 `{IP,Port,MessageId}`（不是 token），且 CON 通知**总是**进入 `pending`**
+   - 计划（D3）：CON 通知靠重传、空 ACK 确认；没有指定关联键。
+   - 实际：`pending[{IP,Port,MsgId}] = {关系键, 已发字节, 剩余次数, timer}`。符合 RFC 的空 ACK（§4.1）与空 RST（§4.5）都是 **TKL=0、不带 token**，只有回显的 Message ID 能把它们配到某条通知上；值里再存关系键，RST 才能注销对应关系。**CON 通知一律进 `pending`**（不是「仅在超时后才记」），否则通知发出到 ACK 到达之间的空 ACK 无处可配。
+   - 为什么：首版按 token 关联，真实客户端的空 ACK **永不命中**，每条观察在 `1 + MAX_RETX` 帧后被自己拆掉——D3 的可靠性目标整体失效（§4.24.7 第 1 条）。NON 通知**不进** `pending`：至多一次，不重传、不超时。
+   - 留痕：`coap_listener.erl` 的 `notify_one/5`、`retransmit_one/3`、udp 子句的空 ack/rst 分支；`docs/protocol-compatibility.md` §4.24.6。
+
+4. **NSTART=1（§4.5.1）是 `pending` 有界的唯一手段**
+   - 计划（D3）：未提并发通知的窗口。
+   - 实际：同一关系的新 CON 通知**先取消**仍未确认的旧通知（`cancel_pending_map/2` 按完整 `{IP,Port,token}` 作用域），再登记新的。`pending` 因此恒 ≤ 关系数，且每条关系只有一份重传预算。
+   - 为什么：不做的话每次 publish 都给慢客户端新增一条未确认项，表涨到与 publish 速率成正比（这正是首版第二个缺陷）；同时「一个 timer 触发 fold 全表重发并扣减所有关系预算」也是错的——timer 消息带 `{observe_ack, IdKey}`，`retransmit_one/3` 按 **key + timer ref 双重匹配**精确定位，陈旧 timer 直接忽略。
+   - 留痕：`coap_listener.erl` 的 `notify_one/5` con 分支、`arm_retransmit/2`、`retransmit_one/3`；§4.24.6 的 NSTART 行。
+
+5. **RST 关联必须限定在发送者端点 `{IP,Port,_}`**
+   - 计划（D3/§4.5）：只说「RST 取消关系」。
+   - 实际：`observe_by_notify_id/4` 在 `observes` 里按 `req_id` 匹配**且** `when SIP =:= IP, SPort =:= Port`。另外该函数用 `maps:get(req_id, Rel, undefined)` 而非硬匹配——刚注册、尚未收到第一条通知的关系（GET-Observe 到下次 publish 之间的**稳态**）没有 `req_id` 键。
+   - 为什么：Message ID 是 **16-bit**，可枚举也可观测；不限定端点就等于允许任一客户端猜到/看到一个 ID 就拆掉别人的观察（跨客户端 DoS）。而硬匹配会让一个**未认证**来源的空 RST 在稳态下打死 listener（`function_clause` → one_for_all 1/5s 重启）。`relationship()` 类型补 `req_id => non_neg_integer()` 让 dialyzer 能捕获此类回归；`observe_rst_is_endpoint_scoped` 是这两个守卫的回归护栏（移除 `when` 即失败）。
+   - 留痕：`coap_listener.erl` 的 `observe_by_notify_id/4`、`deregister_observe/4`；`coap_observe.erl` 的 `relationship/0`；§4.24.7 第 4/5 条。
+
+6. **`Max-Age` 兜底窗口：每关系取客户端 `Max-Age`，钳到 `[1 s, observe_max_age_s]`**
+   - 计划（§3.2/§3.3）：`Max-Age` 作为非确认兜底超时，默认 30 s。
+   - 实际：`coap_observe:sweep_window_ms(ClientAgeS, CapS) = min(max(ClientAgeS,1), max(CapS,1)) * 1000`；`observe_max_age_s`（默认 30）是**上界**，1 s 是**下界**；在 1 s refill tick 上由 `sweep_observes/1` 清扫（有副作用——要 `unsubscribe`，所以不能放进纯的 `prune/1`）。
+   - 为什么：没有下界，客户端一个 `Max-Age: 0` 就能在下一 tick 杀掉自己的观察；没有上界，一个 `Max-Age: 604800` 就能白占一个表槽一周。**时间戳由 listener 传入**（`register/5` 的 `NowMs` / `next_seq/2`），因为本 VM 上 `erlang:monotonic_time(millisecond)` 是负数，用 0 当哨兵会让「从未通知过」的关系永不过期。
+   - 留痕：`coap_observe.erl` 的 `sweep_window_ms/2`、`expired/3`；`coap_listener.erl` 的 `sweep_observes/1`；`coap_observe_SUITE` 的 `sweep_window_is_clamped` / `expired_needs_the_window_to_elapse`；§4.24.4、`docs/security.md` §12.5 第 6 条。
+
+7. **`observe_acl_denied` 降级为 `observe_plain_udp_principal_is_allowed`——4.03 只剩容量路径**
+   - 计划（§4.24.2 的 ACL 行 + 设计稿 §7 的用例名）：ACL 拒绝时回 `4.03`。
+   - 实际：plain UDP 下 `principal = undefined`，`broker_security:authorize/2` 在 `acl => allow` 时直接放行，**构造不出** ACL 导致的 4.03；用例改名为 `observe_plain_udp_principal_is_allowed`，如实钉住「ACL 受限部署下仍然可观察」。S11-B 唯一的拒绝路径是**容量**（`max_observes` 满 → `4.03`，`observe_bounded_table_refuses`）。把 `coap`/`coaps` 列进 `require_auth` 会让 app **拒绝启动**（`coap_app_SUITE` 钉住），所以连「启动即收紧」的路都不通。
+   - 为什么：这不是实现偏差，是**分期**——ACL 需要一个可识别的主体，而主体要等 S11-C 的 DTLS 客户端身份（D5）。把用例名和文档口径改成现状，好过留一条永远绿的假用例。
+   - 留痕：`coap_listener_SUITE` 的 `observe_plain_udp_principal_is_allowed`、`observe_bounded_table_refuses`；`coap_app_SUITE` 的 `require_auth_for_coap_is_refused` / `require_auth_for_coaps_is_refused`；§4.24.4、§4.24.7、`docs/security.md` §12.5 第 5 条。
+
+- **对照结论**：D2（Observe 归订阅层、adapter 不写第二套内核）、D3（CON 通知是 datagram 级重传、NON 至多一次、**都不提供恰好一次**）、D4（filter 即 destination）在 S11-B 成立；D6（metrics 不扩容、有界簿记）从三张表扩到五张表但姿态不变。**D5（DTLS）与跨节点/崩溃恢复仍不在本期**，D7 的 Block2 也未做。**冻结文本未改**，本节只追加落地事实。

@@ -359,10 +359,25 @@ S10-C 交付 STUN Binding + TURN over UDP。下表逐条留痕本阶段**真实�
 S11-A 交付了 CoAP（RFC 7252）的请求/响应面：自写编解码、资源映射、UDP listener。下表逐条留痕本阶段**真实没有**的东西（不作为 Gate 依据；`docs/protocol-compatibility.md` §4.24 是同一份事实的协议口径，ADR-031 是本期的冻结合同）。
 
 1. **无 DTLS**：只有明文 UDP（默认 5683）。`principal` 恒 `undefined`，`broker_security:authorize/2` 只在 `acl => allow` 下放行；没有 PSK / 证书 / 自签路径（ADR-031 §D5 明确「默认不自签」，接线在 S11-C）。后果：CoAP 端口与 1883 一样是明文端口，跨不可信网段部署需自行封装。
-2. **无 Observe（RFC 7641）**：`observe` option 能解析，但没有注册、通知、取消。ADR-031 §D2 已冻结做法（归 `broker_subscription` + cursor，禁止 `pg2` 扇出、禁止把 `{Port, IP}` 当会话键），实现留 S11-B。后果：CoAP 客户端拿不到推送，只能轮询 GET。
+2. **无 Observe（RFC 7641）**：`observe` option 能解析，但没有注册、通知、取消。ADR-031 §D2 已冻结做法（归 `broker_subscription` + cursor，禁止 `pg2` 扇出、禁止把 `{Port, IP}` 当会话键），实现留 S11-B。后果：CoAP 客户端拿不到推送，只能轮询 GET。**S11-B 已交付（2026-11-15）**：注册/通知/取消已落地，本条对 S11-A 时点仍然成立；S11-B 未覆盖的部分见 §12.5。
 3. **只有 Block1（请求方向）**：服务端**不做 Block2 分块响应**。大响应受 `max_message_bytes`（UDP 本身 65535）限制，没有分块编码路径。
 4. **Block-wise 是草案**：对齐 `draft-ietf-core-block-18`，**不是 RFC 7959**（ADR-031 §D7）。与 libcoap 现行实现是否互通**未验证**——这正是 Gate S11 尚未勾选的「真实第三方客户端证据」。
 5. **无 multicast、无 CoAP over TCP/WebSocket（RFC 8323）、无 OSCORE、无 `If-Match`/`ETag` 条件请求**：均在 ADR-031 的非目标或后续阶段里。
 6. **限流不识别身份，且源地址可伪造**：令牌桶按 `{IP, Port}` 计（`max_requests_per_second` 默认 100），`max_endpoints`（默认 4096）满时**拒绝新来源**而不是驱逐已有桶——这是抗伪造源地址洪泛的取舍，代价是 NAT 后的多个客户端共享一个桶。
 7. **不写 CoAP 专属指标、无协议层日志**：沿用 ADR-016 冻结键集，只 inc 既有 `bytes_in` / `frame_decode_errors` / `protocol_errors`；没有「哪个目的地被写了几次」这类观测面，需要时只能看内核层的 retain/queue 统计。
-8. **单节点**：listener 的三张表（dedup / 令牌桶 / Block1）全在进程内存、不持久化，也不跨节点；retained 与日志语义完全由既有层决定。
+8. **单节点**：listener 的三张表（dedup / 令牌桶 / Block1）全在进程内存、不持久化，也不跨节点；retained 与日志语义完全由既有层决定。（S11-B 又加了 `observes` / `pending` 两张，同姿态，见 §12.5 第 1 条。）
+
+### 12.5 S11-B CoAP Observe 面明确未实现项（2026-11-15 立）
+
+S11-B 交付了 Observe（RFC 7641）：`Observe=0` 注册、内核 dispatch → 通知、`Observe=1`/RST 注销，全部映射到 `broker_subscription` + ADR-013 cursor。下表逐条留痕本阶段**真实没有**的东西（不作为 Gate 依据；`docs/protocol-compatibility.md` §4.24.4/§4.24.6 是同一份事实的协议口径，ADR-031「落地偏差记录」是本期的冻结落点）。
+
+1. **观察关系不跨节点、也不跨崩溃恢复**：`observes`（关系表）与 `pending`（未确认 CON 通知）都在 `coap_listener` 的 `gen_server` 状态里，listener 重启（或 one_for_all 1/5s 重启整棵子树）即空。对端**收不到任何错误**——只会在 `Max-Age` 窗口内静默无通知，需要自己重新 `Observe=0`。多节点部署下客户端被负载均衡到另一节点时同理：另一节点没有这条关系。**没有** ra/Mnesia 参与、没有会话迁移、没有重放。后果：这不是「可靠订阅」，是可丢的实时推送。
+2. **通知不是 QoS 1（也不该被当 QoS 1 用）**：CON 通知只有 **datagram 级**重传——`observe_ack_timeout_ms`（默认 2000 ms）× `observe_max_retrans`（默认 3）为上限，耗尽即放弃关系；**不落盘、不在内核重投、不跨重启、不提供「恰好一次」**。NON 通知**至多一次**，丢了就是丢了。两者都**不保证**送达（ADR-031 §D3 冻结口径）。需要业务级可靠投递请走 MQTT QoS 1/2 或内核 cursor 重放，不能靠 Observe。
+3. **服务端不做 Block2 分块**：大响应受 `max_message_bytes`（UDP 上限 65535）限制，**通知同样不分块**——单条通知超过上限就没有兜底路径，只能等 `Max-Age` 过期让客户端重新 GET（而重新 GET 一样受同一上限约束）。Block-wise 仍按 `draft-ietf-core-block-18`，不是 RFC 7959（ADR-031 §D7）。
+4. **无 OSCORE、无 DTLS**：报文与通知都是明文 UDP；`Observe` 的载荷与序列号在链路上可读、可改。D5 的 DTLS 接线留 S11-C。**没有**重放保护、**没有**消息完整性。
+5. **plain UDP 下 `principal = undefined`，ACL 无法拒绝一条 datagram**：`broker_security:authorize/2` 对匿名主体在 `acl => allow` 时直接放行；把 `coap`/`coaps` 列进 `require_auth` 会让 app **拒绝启动**（`coap_app_SUITE` 的 `require_auth_for_coap_is_refused` / `require_auth_for_coaps_is_refused` 钉住）。因此 **S11-B 唯一的 4.03 拒绝路径是容量**（`max_observes` 满），`observe_acl_denied` 这条用例因此在落地时**降级**为 `observe_plain_udp_principal_is_allowed`（如实钉住「ACL 受限部署下仍然可观察」）。基于 ACL 的 4.03 要等 S11-C 的 DTLS 客户端身份。
+6. **`observe_max_age_s` 是兜底窗口，不是新鲜度保证**：每关系取客户端 `Max-Age`（缺省 30 s）并钳到 `[1 s, observe_max_age_s]`；钳制的直接后果是——客户端请求 `Max-Age: 0` 拿不到「立刻失效」，请求 `Max-Age: 604800` 也拿不到一周的保活（上限 30 s）。静默超过窗口的关系在下一次 1 s tick 被清扫，**清扫是单向的、没有通知对端**。客户端靠 `Observe` 序列号无法区分「关系被清扫」与「资源没变」，只能靠超时自己重注册。
+7. **NSTART=1 意味着慢客户端会丢中间通知**：同一关系的新 CON 通知**替换**仍未确认的旧通知（RFC 7641 §4.5.1），这是 `pending` 有界的代价。客户端如果持续来不及 ACK，看到的是「最新一条」，不是「全部一条不丢」——这与 NON 的至多一次在语义上一致，不是缺陷，但**不能**把 Observe 当消息队列用。
+8. **共享匿名会话带来的观测面缺口**：所有观察共用一个 `<<"coap">>` ClientId，因此 `broker_subscription:subscriptions/1` 里看不到「是哪个 UDP 端点在看哪个目的地」；`max_observes` 是**全局**上限，不是每用户/每 IP。没有 CoAP 专属指标（ADR-016 冻结键集），没有观察关系的生命周期日志——运维只能靠 `coap_listener` 的进程状态与内核层 retain/queue 统计间接判断。
+9. **`max_observes` 满时只拒绝新的 `Observe=0`**：刷新一条已有观察（同 token re-GET）**不**占新槽、**不**会被拒；也就是说一个已经建立的关系无法被容量压力驱逐，只有 `Max-Age`/重传耗尽/主动注销能让它退出。占满表的攻击者优先于后来者——这是有界表「拒绝新来源而不是驱逐已有」的一贯取舍（与 §12.4 第 6 条同姿态）。
+

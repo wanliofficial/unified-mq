@@ -561,22 +561,31 @@ turn_allocation（每 allocation 一个 temporary gen_server，持有自己的 r
 
 **没有持久化状态，也不写指标。** allocation、permission、channel 全在进程内存；`broker_metrics` 出现在 `.app.src` 的 `applications` 里但代码零调用（ADR-016 冻结键集，ADR-029 §D1 明确不借语义不符的键）。
 
-### 3.18 CoAP 前端的单 socket / 无会话模型（S11-A）
+### 3.18 CoAP 前端的单 socket / 无会话模型（S11-A）+ Observe 状态（S11-B）
 
 ```
 broker_proto_coap_sup (one_for_all, 1/5s)
 └── coap_listener × N              % 每个 listener spec 一个；打开 UDP socket，{active, 100}
+                                   % S11-B 起同一个进程兼任 Observe 的 notify pid
 ```
 
 **CoAP 比 MQTT-SN 还少一层：没有会话进程。** MQTT-SN 至少要为每个已 CONNECT 的端点维持 topic id 表与 in-flight 窗口，所以它有 `mqtt_sn_conn`；CoAP 的每条 datagram 自带 Message ID、token 和全部 option，一次请求-响应在 `coap_listener` 进程里就结束了，不需要为任何对端建进程。listener 因此是**唯一的 socket owner，也是唯一的状态持有者**。
 
-**三张表，全部有界，全部在 1 s tick 上清扫。** CoAP 的「连接」只是 UDP 四元组，任何跨 datagram 的状态都可能被伪造源地址撑爆，所以每一张表都有硬上限：
+**listener 自己就是 notify pid（S11-B，ADR-031 §D2）。** `Observe=0` 的 GET 会 `broker_subscription:subscribe(<<"coap">>, Destination, 0, Tenant)` 后再 `attach(listener, persist=false)`；内核 dispatch 命中时投递 `{broker_deliver, <<"coap">>, _, _, {P,O,Msg}}`，listener 在 `handle_info` 里对 destination 匹配的每条关系各发一条通知。**不为每条观察单开进程**：通知发送只是一次 `gen_udp:send`，CON 重传的 timer 状态用 map 存在 listener state 里就够；`{active,100}` 的收包预算也不受影响（通知是发送不是接收）。代价是所有通知的 UDP 编码在 listener 串行——通知速率受对端窗口与 `max_requests_per_second` 约束，在受限设备场景不构成瓶颈。
+
+**五张表，全部有界，全部在 1 s tick 上清扫。** CoAP 的「连接」只是 UDP 四元组，任何跨 datagram 的状态都可能被伪造源地址撑爆，所以每一张表都有硬上限：
 
 | 表 | 键 | 值 | 上限 / 过期 |
 |---|---|---|---|
 | CON 去重 | `{IP, Port, Message ID}` | 已发出的回复**字节** | `max_dedup_entries`（默认 4096，超限丢 1/3）+ `dedup_window_ms`（默认 247 s = EXCHANGE_LIFETIME） |
 | 端点令牌桶 | `{IP, Port}` | 剩余令牌 + 上次回填时刻 | `max_endpoints`（默认 4096）；表满时**拒绝新来源**而不是驱逐已有桶；令牌满且闲置超过窗口即丢弃 |
 | Block1 重组 | `{IP, Port, token, destination}` | 已拼装字节 + 累计长度 + 时刻 | 累计长度 `max_block1_bytes`（默认 256 KiB）；闲置超过窗口即丢弃 |
+| Observe 关系（S11-B） | `{IP, Port, token}` | `#{dest, tenant, sub_ref, max_age, seq, last_notified, req_type, req_id}` | `max_observes`（默认 4096）；满时**拒绝新的 `Observe=0`** 回 `4.03`（刷新已有关系不占新槽）；静默超过该关系的 `Max-Age` 窗口即清扫 |
+| 未确认 CON 通知（S11-B） | `{IP, Port, Message ID}` | `{关系键, 已发字节, 剩余重传次数, timer}` | **≤ 关系数**（NSTART=1：同关系新通知替换旧的）；`observe_max_retrans`（默认 3）次未确认即放弃该关系 |
+
+**`observes` 的键是「一次观察关系」，不是「会话」。** UDP 没有连接可挂，`{IP,Port,token}` 只是 RFC 7641 观察关系的标识：对端不发 `Observe=1`/RST 就一直在，直到 `Max-Age` 兜底窗口或 CON 重传预算耗尽。`pending` 的键**必须是 Message ID 而不是 token**：符合 RFC 的空 ACK（§4.1）与空 RST（§4.5）都是 TKL=0、**不带 token**，只有回显的 Message ID 能把它们配到某条通知上；值里再存关系键，才能在 RST 时注销对应关系。同理，RST 的查找**限定在发送者端点** `{IP,Port,_}` 内——16-bit Message ID 空间可枚举，不限定就允许任一客户端拆掉别人的观察。
+
+**关系表与订阅表是两套粒度，回收也必须分两级。** 所有观察共用一个 `<<"coap">>` 匿名内核会话、filter 就是 destination，因此：`maybe_unsubscribe/2` 只在**没有其它活关系**观察同一 destination 时才退订该 filter（否则两个客户端观察同一资源时，先注销的那个会饿死后到者）；`maybe_detach/1` 只在关系表**空**时才 detach 共享会话（`detach` 会拆掉该 ClientId 的**全部**订阅）。这两级都写进了 §4.24.6 与 ADR-031「落地偏差记录」。
 
 **去重键是 Message ID，Block1 键是 token——这不是不一致。** 去重的对象是「同一个 CON 报文被重传」，RFC 7252 §4.8.2 的重复判定就是 Message ID + 端点；Block1 的对象是「一次请求的分块序列」，RFC 7959 草案 §2.1 用 **token** 标识这次请求，而每个分块都有自己的 Message ID。用 Message ID 做分块键会让每个分块都开一条新流，重组永远只剩最后一块（`coap_listener_SUITE` 的 `block1_reassembles_a_multidatagram_body` 特意让两个分块用不同 Message ID、同一 token 来钉死这一点）。
 
@@ -584,7 +593,7 @@ broker_proto_coap_sup (one_for_all, 1/5s)
 
 **限流在解码前。** 令牌桶的扣减发生在 `coap_codec:decode/1` 之前：UDP 没有握手，源地址不可验证，如果先解码再限流，洪泛已经买到了 CPU。同理 `max_message_bytes` 的检查也在解码前——一个超长 datagram 连读都不该读。
 
-**没有持久化，也不扩指标键集。** listener 的三张表全在 gen_server 状态里，重启即空——这是正确的：socket 关掉之后，任何「重传窗口内」的承诺都已经过期。指标只 inc 既有键（`bytes_in` / `frame_decode_errors` / `protocol_errors`），不新增 CoAP 专属计数器（ADR-016 冻结键集，ADR-031 §D6）。
+**没有持久化，也不扩指标键集。** listener 的五张表全在 gen_server 状态里，重启即空——这是正确的：socket 关掉之后，任何「重传窗口内」的承诺都已经过期，**观察关系也不会跨重启恢复**（对端只能在 `Max-Age` 内收不到通知后自己重新 `Observe=0`）。指标只 inc 既有键（`bytes_in` / `frame_decode_errors` / `protocol_errors`），不新增 CoAP 专属计数器（ADR-016 冻结键集，ADR-031 §D6）。
 
 
 ---

@@ -480,25 +480,25 @@ S7 有两项交付：
 | 子阶段 | 状态 | 产出 | 证据 |
 |---|---|---|---|
 | S11-0 候选池筛选 | ✅ **已交付（2026-11-15，ADR-030）** | 14 仓「立项 / 归并 / 参考 / 不做」结论 + ADR-030；发现面 / DHT / SIP 三组统一裁决；5 份索引级稿的深挖去向 | **ADR-030 + 14 份立项稿 + 评审签认**（S11-0 纯文档，无代码）；**仅 CoAP 进入实现评审**，SIP 并入 ADR-028，发现面保留为延迟候选 |
-| S11-A CoAP 前端与编解码 | 🟡 **首个代码交付（2026-11-15）**：新 app `broker_proto_coap`（编解码 / 资源映射 / UDP listener）已落地，DTLS 与真实第三方客户端证据未做 | 仅当 S11-0 通过：UDP/DTLS 前端 + 报文编解码 + 资源路由 + `.well-known/core` | **CT 73 例**（`coap_codec_SUITE` 48 / `coap_resource_SUITE` 13 / `coap_listener_SUITE` 7，真实 UDP 且 `port => 0`）；全量 `rebar3 ct` **1324/1324、83 套件**（基线 1251/1251、79 套件 → 零回归）；dialyzer 0 warning；xref 302 条全为 unused-export；`broker_proto_coap` 已进 release 列表，出厂 `enabled => false` 零 socket。**ADR-031 D1~D7 逐条对照见 [`docs/protocol-compatibility.md`](protocol-compatibility.md) §4.24**；OQ-3 spike 见 [`docs/benchmarks/2026-11-15-s11a-gen-coap-spike.md`](benchmarks/2026-11-15-s11a-gen-coap-spike.md)。**未做**：DTLS（D5，S11-C）、Observe 通知（S11-B）、libcoap 真实客户端证据（Gate 未勾选） |
-| S11-B CoAP Observe 与内核映射 | 🟡 设计已冻结（本文 + ADR-031 §D2），实现未开工 | Observe 订阅 / 通知 / 取消 + `broker_message` 映射 + 可靠性分档 | Observe 全流程 + 崩溃恢复用例；映射 ADR |
+| S11-A CoAP 前端与编解码 | 🟡 **首个代码交付（2026-11-15）**：新 app `broker_proto_coap`（编解码 / 资源映射 / UDP listener）已落地，DTLS 与真实第三方客户端证据未做 | 仅当 S11-0 通过：UDP/DTLS 前端 + 报文编解码 + 资源路由 + `.well-known/core` | **CT 73 例**（`coap_codec_SUITE` 48 / `coap_resource_SUITE` 13 / `coap_listener_SUITE` 7，真实 UDP 且 `port => 0`）；全量 `rebar3 ct` **1324/1324、83 套件**（基线 1251/1251、79 套件 → 零回归）；dialyzer 0 warning；xref 302 条全为 unused-export；`broker_proto_coap` 已进 release 列表，出厂 `enabled => false` 零 socket。**ADR-031 D1~D7 逐条对照见 [`docs/protocol-compatibility.md`](protocol-compatibility.md) §4.24**；OQ-3 spike 见 [`docs/benchmarks/2026-11-15-s11a-gen-coap-spike.md`](benchmarks/2026-11-15-s11a-gen-coap-spike.md)。**未做**：DTLS（D5，S11-C）、Observe 通知（S11-B 交付，见下一行）、libcoap 真实客户端证据（Gate 未勾选） |
+| S11-B CoAP Observe 与内核映射 | 🟡 **已交付（2026-11-15）**：Observe（RFC 7641）注册 / 通知 / 取消落地，映射到 `broker_subscription` + ADR-013 cursor（listener 兼 notify pid、无第二套消息内核、无 `pg2` 扇出） | Observe 订阅 / 通知 / 取消 + `broker_message` 映射 + 可靠性分档 | **CT 96 例**（`coap_codec_SUITE` 48 / `coap_resource_SUITE` 14 / `coap_observe_SUITE` 10 新增 / `coap_listener_SUITE` 19 / `coap_app_SUITE` 5）；全量 `rebar3 ct` **1347/1347、84 套件**（S11-A 基线 1324/1324、83 套件 → 零回归；`broker_subscription_SUITE` 53/53）；dialyzer 0 warning；xref **302** 条全为 unused-export（本阶段零新增）；`rebar3 release` 装配成功。CON 通知 = datagram 级重传（`ACK_TIMEOUT`×`MAX_RETX`，**非 QoS 1、不落盘**），NON = 至多一次；空 ACK/RST 按 **Message ID** 关联、RST 端点作用域、NSTART=1、`Max-Age` 兜底、`max_observes` 有界。**ADR-031 落地偏差 + 能力矩阵见 [`docs/protocol-compatibility.md`](protocol-compatibility.md) §4.24.6/§4.24.7**。**未做**：跨节点 / 崩溃恢复（关系表在进程内存，重启即空）、Block2、OSCORE、libcoap 真实客户端证据（Gate 未勾选）；基于 ACL 的 4.03 待 S11-C DTLS |
 | S11-C CoAP 安全与一致性收口 | ⬜ 未开工 | 身份表 / ACL / 限流 / 能力矩阵 / 压测 / 文档同步 / ADR 定稿 | 全量 CT + dialyzer/xref + 容量报告 + 安全专项用例 |
 
 > 子阶段命名与粒度是**建议**；实际以 S11-0 评审后冻结的 ADR 为准。归并到 S9 / S10 的候选不产生 S11 子阶段：`processone/stun` 归并 S10 ICE 组件，`apns4erl` 出站推送归并 S9 webhook，`lorawan-server` 收窄为桥接。
 
 ### 13.2 Gate S11（与总览文档 §4.3 同一份清单）
 
-- [ ] 14 个候选全部有「立项 / 归并 / 参考 / 不做」四选一的明确结论，并由 ADR 冻结
+- [ ] 14 个候选全部有「立项 / 归并 / 参考 / 不做」四选一的明确结论，并由 ADR 冻结（**S11-0 已交付 ADR-030；该勾选按 S11 整体收口口径留待 S11-C 复核**）
 - [ ] 「发现面一组」「DHT 一组」「SIP 一组」完成统一裁决；总览 §3.2「明确不做清单」逐行留痕
 - [ ] 5 份索引级稿的「待深挖」项有明确去向（升级 / 移除 / 保留）
-- [ ] 经 Gate 通过的候选有真实第三方客户端证据落盘 `test/protocol-compatibility/` + 能力矩阵与限制清单
-- [ ] 无第二套消息内核、无替代 S4 Membership、无外部守护进程依赖（除非 ADR 显式推翻）
-- [ ] 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功
+- [ ] 经 Gate 通过的候选有真实第三方客户端证据落盘 `test/protocol-compatibility/` + 能力矩阵与限制清单（**能力矩阵 + 限制清单已随 S11-A/B 交付〔§4.24.4/§4.24.6〕；CoAP 的 `test/protocol-compatibility/` 目录与 libcoap 证据仍未落盘**）
+- [x] 无第二套消息内核、无替代 S4 Membership、无外部守护进程依赖（除非 ADR 显式推翻）（**S11-B 已钉住**：Observe 归 `broker_subscription` + cursor，adapter 只持关系↔SubRef 映射，无 `pg2` 扇出）
+- [x] 既有 `rebar3 ct` 零回归（基线 823/823、52 套件）；dialyzer / xref 干净；`rebar3 release` 装配成功（**S11-B 复跑**：1347/1347、84 套件零 FAILED；dialyzer 0 warning；xref 302 条全为 unused-export；release 装配成功）
 - [ ] 压测 / 容量报告落盘，数字全部来自实测
-- [ ] S11 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
-- [ ] 非目标与裁剪项在能力矩阵中逐行留痕
+- [ ] S11 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步（**文档已随 S11-A/B 逐阶段同步；ADR-031 仍为「冻结 + 落地偏差记录」状态，定稿留 S11-C**）
+- [ ] 非目标与裁剪项在能力矩阵中逐行留痕（**§4.24.4 已逐条列 CoAP 的非目标与裁剪项；总表级勾选仍待 S11-C 收口**）
 
-**状态口径**：**S11-0 已交付（2026-11-15，ADR-030 冻结候选池筛选结论，纯文档无代码）；S11-A 首个代码交付已落地（2026-11-15，新 app `broker_proto_coap`：编解码 + 资源映射 + UDP listener，CT 68 例、全量 1319/1319 零回归；DTLS 与真实第三方客户端证据未做）；S11-B/C「⬜ 未开工」，Gate S11 除 S11-0 外全未勾选**。ADR-030 裁决：**仅 CoAP 进入实现评审**（S11-A/B/C），SIP 一组并入 ADR-028 信令面评估，发现面保留为延迟候选，lorawan-server / processone/stun / apns4erl 归并既有阶段，mtproto_proxy / dhtcrawler / yxa 明确不做。README / `progress.md` / `architecture.md` 的「S0–S10 已实现」状态行与 `docs/security.md` §12 清单**已随本次首个代码交付同步**（29 个应用、1324/1324、83 套件），但 **S11 整体仍未收口**：DTLS、Observe、真实第三方客户端证据、容量报告与 ADR-031 定稿都还在 S11-B/C。
+**状态口径**：**S11-0 已交付（2026-11-15，ADR-030 冻结候选池筛选结论，纯文档无代码）；S11-A 首个代码交付已落地（2026-11-15，新 app `broker_proto_coap`：编解码 + 资源映射 + UDP listener）；S11-B 已交付（2026-11-15，Observe/RFC 7641：注册/通知/取消 + CON datagram 级重传 + NON 至多一次 + `Max-Age`；CT 96 例、全量 1347/1347 零回归）；S11-C「⬜ 未开工」**。ADR-030 裁决：**仅 CoAP 进入实现评审**（S11-A/B/C），SIP 一组并入 ADR-028 信令面评估，发现面保留为延迟候选，lorawan-server / processone/stun / apns4erl 归并既有阶段，mtproto_proxy / dhtcrawler / yxa 明确不做。README / `progress.md` / `architecture.md` 的「S0–S10 已实现」状态行与 `docs/security.md` §12 清单**已随 S11-A/S11-B 同步**（29 个应用、1347/1347、84 套件），但 **S11 整体仍未收口**：DTLS（S11-C）、跨节点观察恢复、libcoap 真实客户端证据、容量报告与 ADR-031 定稿都还没做。
 
 ---
 
