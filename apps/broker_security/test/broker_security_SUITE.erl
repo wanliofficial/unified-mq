@@ -6,6 +6,8 @@
 
 -compile([export_all, nowarn_export_all]).
 
+-include_lib("stdlib/include/assert.hrl").
+
 all() ->
     [known_user_authenticates,
      unknown_user_is_rejected,
@@ -13,7 +15,14 @@ all() ->
      rejection_reason_does_not_distinguish_user_from_password,
      non_binary_credentials_are_rejected,
      tenant_id_comes_from_the_table,
-     authorize_stub_always_allows].
+     authorize_stub_always_allows,
+     psk_for_known_identity,
+     psk_is_deterministic,
+     psk_changes_with_realm,
+     psk_is_not_the_password,
+     psk_unknown_identity_is_an_error,
+     psk_missing_password_is_same_error,
+     psk_is_not_in_redacted_config].
 
 init_per_suite(Config) ->
     Saved = application:get_env(broker_security, users, undefined),
@@ -75,3 +84,79 @@ authorize_stub_always_allows(_Config) ->
     allow = broker_security:authorize(<<"guest">>, #{action => publish, topic => <<"a/b">>}),
     allow = broker_security:authorize(<<"whatever">>, anything),
     ok.
+
+%%%_* S11-C: CoAP-over-DTLS PSK derivation ----------------------------------
+
+%% The PSK identity IS a username in the SAME `users' table every other
+%% protocol authenticates against -- no second credential store. These cases pin
+%% the derivation's four load-bearing properties: it is deterministic, it is
+%% realm-bound, it is not the password (nor a bare hash of it), and an unknown
+%% identity fails indistinguishably from one with no password.
+
+psk_for_known_identity(_Config) ->
+    {ok, Psk} = broker_security:psk_for_identity(<<"alice">>),
+    ?assertEqual(32, byte_size(Psk)),
+    ok.
+
+psk_is_deterministic(_Config) ->
+    {ok, A} = broker_security:psk_for_identity(<<"alice">>),
+    {ok, B} = broker_security:psk_for_identity(<<"alice">>),
+    ?assertEqual(A, B),
+    %% And a different identity yields a different key even under a shared realm.
+    {ok, C} = broker_security:psk_for_identity(<<"guest">>),
+    ?assertNotEqual(A, C),
+    ok.
+
+psk_changes_with_realm(_Config) ->
+    Saved = application:get_env(broker_security, coaps, undefined),
+    try
+        {ok, Before} = broker_security:psk_for_identity(<<"alice">>),
+        ok = application:set_env(broker_security, coaps, #{realm => <<"other-realm">>}),
+        {ok, After} = broker_security:psk_for_identity(<<"alice">>),
+        ?assertNotEqual(Before, After)
+    after
+        restore_env(broker_security, coaps, Saved)
+    end.
+
+psk_is_not_the_password(_Config) ->
+    {ok, Psk} = broker_security:psk_for_identity(<<"alice">>),
+    Password = <<"s3cret">>,
+    %% Not the password, and not a bare hash of it: the domain-separation label
+    %% and the identity/realm separators are what keep this derivation from
+    %% colliding with any hash a client might guess.
+    ?assertNotEqual(Password, Psk),
+    ?assertNotEqual(crypto:hash(sha256, Password), Psk),
+    ?assertNotEqual(crypto:hash(sha256, [<<"alice">>, 0, Password]), Psk),
+    ok.
+
+psk_unknown_identity_is_an_error(_Config) ->
+    ?assertEqual({error, bad_username_or_password},
+                 broker_security:psk_for_identity(<<"nobody">>)),
+    ok.
+
+psk_missing_password_is_same_error(_Config) ->
+    %% A user record with no password must fail exactly like an unknown user:
+    %% differentiating them would be an enumeration oracle on the handshake.
+    Saved = application:get_env(broker_security, users, undefined),
+    try
+        ok = application:set_env(broker_security, users,
+                                 [{<<"nopass">>, #{tenant_id => <<"t0">>}}]),
+        {error, R1} = broker_security:psk_for_identity(<<"nopass">>),
+        {error, R2} = broker_security:psk_for_identity(<<"nobody">>),
+        ?assertEqual(R1, R2),
+        ?assertEqual(bad_username_or_password, R1)
+    after
+        restore_env(broker_security, users, Saved)
+    end.
+
+psk_is_not_in_redacted_config(_Config) ->
+    {ok, Psk} = broker_security:psk_for_identity(<<"alice">>),
+    %% The admin/log view must never carry the derived key; a hex or term form
+    %% of it appearing there would be a credential leak.
+    Rendered = iolist_to_binary(io_lib:format("~p", [broker_security:redacted_config()])),
+    ?assertEqual(nomatch, binary:match(Rendered, Psk)).
+
+restore_env(App, Key, undefined) ->
+    application:unset_env(App, Key);
+restore_env(App, Key, Value) ->
+    application:set_env(App, Key, Value).

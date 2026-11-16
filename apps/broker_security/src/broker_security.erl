@@ -25,7 +25,7 @@
 -export([authenticate/2, authorize/2, tenant_id/1,
          authorized/2, acl_rules/0, redacted_config/0,
          authenticate_conn/1, auth_required/1, default_tenant/0,
-         long_term_key/2]).
+         long_term_key/2, psk_for_identity/1]).
 
 -export_type([principal/0, request/0, credential/0, conn_identity/0]).
 
@@ -149,6 +149,44 @@ long_term_key(Username, Realm) when is_binary(Username), is_binary(Realm) ->
 long_term_key(_Username, _Realm) ->
     {error, bad_username_or_password}.
 
+%% @doc The PSK for a CoAP-over-DTLS peer (S11-C), derived from the SAME
+%% `users' table every other protocol authenticates against.
+%%
+%% The DTLS PSK identity IS the username: a device presents its own name during
+%% the handshake and the broker derives the key from the password it already
+%% stores. No second credential store, no certificate, no key material on the
+%% wire -- same precedent as `long_term_key/2' (TURN): the server derives, the
+%% client derives, the password never crosses.
+%%
+%% Domain separation is what makes this safe to co-exist with the TURN key: a
+%% distinct label plus three NUL separators makes `(Identity, Realm, Password)'
+%% unambiguous, and SHA-256 over a different label cannot collide with TURN's
+%% `MD5(user ":" realm ":" pass)'.
+%%
+%% A missing user and a user without a password fail identically, so the handshake
+%% never reveals which names exist.
+-spec psk_for_identity(binary()) -> {ok, <<_:256>>} | {error, term()}.
+psk_for_identity(Identity) when is_binary(Identity) ->
+    case user_record(Identity) of
+        #{password := Password} when is_binary(Password) ->
+            {ok, crypto:hash(sha256, [<<"unifiedmq-coaps-psk">>, 0,
+                                      Identity, 0, coaps_realm(), 0, Password])};
+        _ ->
+            {error, bad_username_or_password}
+    end;
+psk_for_identity(_Other) ->
+    {error, bad_username_or_password}.
+
+%% The realm the derivation is bound to. Separate from `broker_security.tls'
+%% on purpose: that block describes certificate-based TCP TLS, and DTLS/PSK has
+%% no certificate at all. A deployment that changes the realm invalidates every
+%% derived PSK, which is the point -- realm is part of the key.
+coaps_realm() ->
+    case application:get_env(broker_security, coaps, #{}) of
+        #{realm := R} when is_binary(R), byte_size(R) > 0 -> R;
+        _ -> <<"unifiedmq">>
+    end.
+
 %% @doc Whether a protocol must present a credential at all.
 %%
 %% A protocol that is not required accepts anonymous connections and runs them
@@ -181,9 +219,14 @@ default_tenant() ->
 identity(Name) ->
     #{principal => Name, tenant_id => tenant_id(Name)}.
 
-%% The protocols whose handshakes can carry a credential at all.
+%% The protocols whose handshakes can carry a credential at all. `coaps' is
+%% CoAP over DTLS (S11-C): the PSK identity IS the username, so the shared
+%% table is the actual gate. Plain `coap' is absent on purpose -- a UDP datagram
+%% has no credential field, and claiming otherwise would let `require_auth'
+%% silently do nothing.
 credential_capable() ->
-    [<<"mqtt">>, <<"ws">>, <<"nats">>, <<"amqp">>, <<"kafka">>, <<"pulsar">>].
+    [<<"mqtt">>, <<"ws">>, <<"nats">>, <<"amqp">>, <<"kafka">>, <<"pulsar">>,
+     <<"coaps">>].
 
 required_protocols() ->
     case application:get_env(broker_security, require_auth, []) of
