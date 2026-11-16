@@ -327,6 +327,13 @@ handle_info({dtls_owned, Socket}, #st{peers = Peers} = St) ->
     end,
     {noreply, St};
 
+%% The acceptor admitted this session, then failed to hand the socket over (or
+%% the transfer timed out). The record was written when we answered `ok', so it
+%% must be released here -- the socket was never ours, so no `{ssl_closed,_}'
+%% will ever arrive to trigger `drop_session/2' (spec review B1).
+handle_info({dtls_abandoned, Socket}, St) ->
+    {noreply, drop_session(Socket, St)};
+
 %% Decrypted datagram from an established peer. Mapped back to the endpoint so
 %% the rest of the pipeline is transport-blind.
 handle_info({ssl, Socket, Bin}, #st{peers = Peers} = St) ->

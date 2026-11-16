@@ -108,12 +108,21 @@ offer(ListenerPid, Socket, Peer, Identity) ->
                 {error, Reason} ->
                     logger:warning("coap dtls controlling_process failed: ~p",
                                    [Reason]),
+                    %% The listener already recorded this session when it
+                    %% answered `ok' -- it counted the slot before the transfer,
+                    %% because the caps live there. Without this notice the
+                    %% record would outlive the socket for ever (only
+                    %% `{ssl_closed,_}' would clean it, and that socket was
+                    %% never handed over). So release it explicitly.
+                    ListenerPid ! {dtls_abandoned, Socket},
                     _ = ssl:close(Socket)
             end;
         {dtls_admit, Socket, refuse} ->
             _ = ssl:close(Socket)
     after 5000 ->
-            %% The listener is gone or wedged; do not leak the socket.
+            %% The listener is gone or wedged; do not leak the socket. It may
+            %% also have recorded the session, so release that too.
+            ListenerPid ! {dtls_abandoned, Socket},
             _ = ssl:close(Socket)
     end.
 

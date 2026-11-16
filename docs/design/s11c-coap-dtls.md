@@ -116,7 +116,7 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 ### 4.3 `credential_capable/0` 与启动 guard
 
 - `broker_security:credential_capable/0` **追加 `<<"coaps">>`**（DTLS 握手能携带凭据）。**不加 `coap`**：明文 UDP 仍无凭据字段。
-- `broker_proto_coap_app:auth_unsupported/0` 改为**分协议判定**：
+- `broker_proto_coap_app:guard/0` 改为**分协议判定**：
   - `require_auth` 含 `<<"coap">>` → **拒绝启动**（明文前端无法索要凭据；提示改用 `coaps`）；
   - `require_auth` 含 `<<"coaps">>` → **允许**，但**要求所有启用的 listener spec 都是 `transport => dtls`**；只要有一个是明文 UDP 就拒绝启动（否则「要求认证」的部署被悄悄降级成匿名前端——这正是 §D5 要防的静默降级）。
   - 其他协议在列 → 不干扰（既有「外科式」负控保持）。
@@ -165,9 +165,9 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 |---|---|
 | `apps/broker_security/src/broker_security.erl` | 新增导出 `psk_for_identity/1`（§4.2）；`credential_capable/0` 追加 `<<"coaps">>` |
 | `apps/broker_proto_coap/src/coap_listener.erl` | `transport` 决议 + DTLS 分支（`init` 建 `ssl:listen` 并 `spawn_link` acceptor）；`{ssl,...}` 系列 `handle_info`；`send_to/4` 统一出向；`Ctx` 带 principal/tenant；`dtls` 表与上限；close 清理 |
-| `apps/broker_proto_coap/src/coap_dtls_acceptor.erl` | **新模块**：串行 `transport_accept → handshake → drain identity → controlling_process → 移交`；未知身份 alert 拒绝；上限检查（会话数/每身份） |
+| `apps/broker_proto_coap/src/coap_dtls_acceptor.erl` | **新模块**：串行 `transport_accept → handshake → drain identity → offer → controlling_process → 移交`；未知身份由 listener 回**诱饵密钥**（§4.4，不发 alert）；**不做容量判定**——两个上限都在 listener 的 `admit_session/4`；移交失败/超时补发 `{dtls_abandoned, Sock}`（§11 复审 B1） |
 | `apps/broker_proto_coap/src/coap_resource.erl` | 无逻辑改动（`authorized/3` 已读 `Ctx.principal`）；仅在 `Ctx` 说明处补 DTLS 来源 |
-| `apps/broker_proto_coap/src/broker_proto_coap_app.erl` | `auth_unsupported/0` 改分协议判定（§4.3） |
+| `apps/broker_proto_coap/src/broker_proto_coap_app.erl` | `guard/0` 改分协议判定（§4.3），`{require_auth_unsupported, coap}` 与 `{require_auth_needs_dtls, coaps}` 两个拒绝项 |
 | `apps/broker_proto_coap/src/broker_proto_coap.app.src` | `applications` 追加 `ssl`；env 追加 `coaps` 相关键（见下） |
 | `apps/broker_proto_coap/test/coap_dtls_SUITE.erl` | **新套件**：真实 DTLS PSK 客户端（§8） |
 | `apps/broker_proto_coap/test/coap_app_SUITE.erl` | `require_auth` 两用例改口径（`coap` 拒 / `coaps` 允许）+ 2 例（dtls 无凭据拒启、coaps 要求但存在明文 listener 拒启） |
@@ -182,20 +182,22 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 
 1. `dtls_psk_handshake_and_get`：合法身份握手 → `GET` retained → 2.05（证「无证书 PSK 可用」在产品路径上也成立）。
 2. `dtls_psk_write_and_read`：`PUT` → 2.04，再 `GET` → 2.05 同 payload（写读闭环）。
-3. `unknown_identity_is_refused`：未知身份 → 客户端 `{tls_alert, _}`，listener 表零增长。
+3. `unknown_identity_is_refused`：未知身份与「已知身份+错口令」**返回完全相同的错误项**（都是 `timeout`，见 §4.4），listener 表零增长。
 4. `acl_denies_on_dtls`：ACL 对 `device-01` 拒某 destination → **4.03**（S11-B 欠的这条，本阶段真正可达）。
 5. `acl_allows_on_dtls`：allow 规则 → 2.05（负控的正向对位，防「一律拒绝」当通过）。
-6. `tenant_isolation_on_dtls`：principal 属 t1，写 t2 destination → 拒（`authorize_principal` 的租户检查在 DTLS 路径上真跑）。
+6. `tenant_isolation_on_dtls`：每条写入盖上**其 principal 自己的 tenant**（`t1`/`t2` 各自），从 retain 存储读回断言。注意 CoAP 的 destination 是资源路径、不是租户限定 topic，所以这里没有「设备指名他租户」这个攻击面；租户边界 = 设备不能自选 tenant + ACL（上两例）。
 7. `dtls_con_dedup`：DTLS 上重发同一 CON（同 `{IP,Port,Id}`）→ 回原 ACK、不二次执行（证五张表的键在 DTLS 下仍正确）。
-8. `dtls_observe_registers_and_notifies`：DTLS 上 `Observe=0` → 发布 → 收到通知（B 期能力跨传输成立）。
-9. `dtls_session_cap`：`max_dtls_sessions = 1`，第二个客户端握手被拒、第一个不受影响。
-10. `dtls_close_cleans_up`：客户端 `ssl:close` → listener 的 `peers`/`socks`/`idents`/`observes` 归零（用心跳式断言：再 `sys:get_state` 或经 `port/1` 后重连证明无泄漏）。
+8. `identity_does_not_leak_between_handshakes`：连续拒绝后 acceptor 邮箱的身份消息**不累积**（≤1，良性残余），且好坏交错的会话各自写进自己的 tenant。这条覆盖 §3.2 第 2 条（双路径 drain）与串行化的语义。
+9. `dtls_observe_registers_and_notifies`：DTLS 上 `Observe=0` → 发布 → 收到通知（B 期能力跨传输成立）。
+10. `dtls_session_cap`：`max_dtls_sessions = 1`，第二个客户端握手被拒、第一个不受影响。
 11. `dtls_per_principal_cap`：同身份第二条会话超限被拒（不同身份不受影响）。
-12. `plain_udp_unaffected`：`transport => udp` 的 listener 在 `users` 表非空时行为不变（`principal = undefined`，ACL 放行）——明文的如实降级不被 DTLS 改动波及。
+12. `dtls_abandoned_releases_slot`：listener 已记录但 `controlling_process` 失败的会话在收到 `{dtls_abandoned, Sock}` 后释放槽位与四张表（规格复审 B1）。
+13. `dtls_close_cleans_up`：客户端 `ssl:close` → listener 的 `peers`/`socks`/`idents`/`principal_sessions`/`observes`/`pending` 归零，且同身份可重连（证明计数器真释放）。
+14. `plain_udp_unaffected`：`transport => udp` 的 listener 在 `users` 表非空时行为不变（`principal = undefined`，ACL 放行）——明文的如实降级不被 DTLS 改动波及。
 
-**`coap_app_SUITE` 改/增**：`require_auth_for_coap_is_refused`（保持拒绝，理由文案更新）、`require_auth_for_coaps_is_allowed`（改成允许）、`coaps_requires_dtls_listeners`（coaps 在列但有明文 listener → 拒）、`dtls_without_users_is_refused`。
+**`coap_app_SUITE` 改/增**：`require_auth_for_coap_is_refused`（保持拒绝，理由文案更新）、`require_auth_for_coaps_is_allowed_when_dtls`（改成允许）、`coaps_requires_dtls_listeners`（coaps 在列但有明文 listener → 拒）、`dtls_without_users_is_refused`（DTLS listener + 空 `users` → 拒）。
 
-**基线目标**：CoAP 五套件 96 例零改动全过 + 新 DTLS 套件（12 例）+ app 套件净增 2 例；全量 CT 从 1347 起、零回归；dialyzer 0；xref 只多 `psk_for_identity/1` 的导出（若被调用则不算 unused）。
+**基线目标**：CoAP 五套件 96 例零改动全过 + 新 DTLS 套件（14 例）+ app 套件 5→7 例；全量 CT 从 1347 起、零回归；dialyzer 0；xref 只多 `psk_for_identity/1` 的导出（若被调用则不算 unused）。
 
 ## 9. 容量报告（纳入本阶段）
 
@@ -223,7 +225,9 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 | `setopts` 在非 owner 上静默错投 | **已 spike 证**并写进设计 §3.2 第 5 条：握手期 `{active,false}`，只有移交后的 listener 设 active |
 | 串行握手成为 DoS 面 | 双重限时（1000 + 2000 ms）+ 会话上限；容量报告给实测握手速率，能力矩阵如实声明 |
 | `ssl` 未启动导致 `ssl:listen` `noproc` | `app.src` `applications` 追加 `ssl`（OTP 内置，非新增运行时依赖）；DTLS 分支首行再 `ensure_all_started(ssl)` 兜底 |
-| 关闭清理漏项导致表泄漏 | §6 的 close 清理逐表列出；`dtls_close_cleans_up` 用例断言四张表归零 |
-| 身份竞态回归 | acceptor 串行 + 双路径 drain 写进模块 doc 与用例（并发好/坏客户端各一，断言身份不串） |
+| 关闭清理漏项导致表泄漏 | §6 的 close 清理逐表列出；`dtls_close_cleans_up` 用例断言 `peers`/`socks`/`idents`/`principal_sessions`/`observes`/`pending` 六张表归零，并用「同身份可重连」证明计数器真释放 |
+| 移交失败后会话记录永久残留 | acceptor 在 `controlling_process/2` 失败与 offer 超时两条路径都发 `{dtls_abandoned, Sock}`，listener 复用 `drop_session/2` 释放；`dtls_abandoned_releases_slot` 为回归用例（移除该分支则红） |
+| 身份竞态回归 | acceptor 串行 + 双路径 drain 写进模块 doc；`identity_does_not_leak_between_handshakes` 断言连续拒绝后邮箱不累积（≤1，良性残余为失败握手的 lookup 晚于 drain）且好坏交错会话各写自己 tenant（移除 drain 则红） |
+| 同时连接风暴（fleet 冷启动） | **实测**：串行 acceptor 下 N 个 peer 同时握手，后续 peer 落入 DTLS 客户端重传退避（1/3/7 s），N=8 时 5 s 客户端超时内仅 ~3–4 个成功。这是**连接**延迟不是请求吞吐（预热后请求吞吐零错误），属 §3.2 串行化的已知代价；容量报告单列 `connect_storm`，并给出顺序握手 ~26 ms/次的上界 |
 | 用户名枚举（时延/错误形态区分未知用户与错口令） | **已实测发现并修正**：未知身份不返回 alert，改返诱饵密钥（设计 §4.4），`unknown_identity_is_refused` 断言两者错误项完全相等 |
 | 客户端 PSK 身份类型（list vs binary） | 产品代码只处理**服务端**方向（identity 是 binary）；suite 的客户端 helper 用 `binary_to_list/1`，spike8 踩过这个坑 |
