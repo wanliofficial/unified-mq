@@ -175,3 +175,39 @@ ADR-030 §D1 把 CoAP 定为 S11 唯一进入实现评审的协议。`s11-coap.m
    - 留痕：`coap_listener_SUITE` 的 `observe_plain_udp_principal_is_allowed`、`observe_bounded_table_refuses`；`coap_app_SUITE` 的 `require_auth_for_coap_is_refused` / `require_auth_for_coaps_is_refused`；§4.24.4、§4.24.7、`docs/security.md` §12.5 第 5 条。
 
 - **对照结论**：D2（Observe 归订阅层、adapter 不写第二套内核）、D3（CON 通知是 datagram 级重传、NON 至多一次、**都不提供恰好一次**）、D4（filter 即 destination）在 S11-B 成立；D6（metrics 不扩容、有界簿记）从三张表扩到五张表但姿态不变。**D5（DTLS）与跨节点/崩溃恢复仍不在本期**，D7 的 Block2 也未做。**冻结文本未改**，本节只追加落地事实。
+
+### S11-C 首个安全交付（2026-11-16）
+
+> DTLS 1.2（PSK）落地：`coap_listener` 新增 `transport => dtls` 分支 + 新模块 `coap_dtls_acceptor`，身份 → `principal`/`tenant`、ACL 生效、会话/每主体双上限、六表关闭清理。CT 112 例（CoAP 六套，新增 `coap_dtls_SUITE` 14 例）、全量 `rebar3 ct` 1378/1378、dialyzer 0、容量报告落盘。**D1~D7 仍然成立**；以下是 D 条文没写死、实现时必须选择的地方，以及本期**没有**落地的 D 条目。
+
+1. **D5 的「DTLS」具体化为 PSK-only、cert-free，且 realm 放在 `broker_security.coaps` 而不是 `broker_security_tls`**
+   - 计划（D5）：只说「接 `broker_security`、默认不自签」，隐含「DTLS 可能带证书」。
+   - 实际：`ssl:listen` **不加载任何证书**，只启用 PSK 套件 + `verify => verify_none`；PSK 由 `broker_security:psk_for_identity/1`（新增导出）从 `users` 表派生。realm 单独放 `broker_security.coaps = #{realm => binary()}`，缺省 `<<"unifiedmq">>`。
+   - 为什么：S11-C 的范围明确是「DTLS 凭据仅 PSK」（证书/mTLS 是已决非目标）。把 realm 塞进 `broker_security_tls` 会污染那个**证书导向的封闭 map**、并向 dialyzer 撒谎（类型是封闭的），所以单开 `coaps` 语义自洽。口令不过线（服务端派生）与 TURN `long_term_key/2` 同一先例。
+   - 留痕：`broker_security.erl` 的 `psk_for_identity/1`、`coaps_realm/0`；`coap_listener.erl` 的 DTLS 分支；`docs/protocol-compatibility.md` §4.24.8、`docs/security.md` §12.6。
+
+2. **D5 的「接 `broker_security`」具体化为「串行握手 + 身份在 `user_lookup_fun` 里归属」**
+   - 计划（D5）：只说「接 `broker_security`」，没有说握手能不能并发。
+   - 实际：一个 `coap_dtls_acceptor` **串行**跑 `transport_accept → handshake → drain identity → offer → controlling_process`。PSK identity 只能由 `user_lookup_fun` 观察到，该回调**同步**跑在 `ssl:handshake/2` 内、把消息投给持有回调状态的进程；并发握手时无法判断一条 identity 消息属于哪条连接。
+   - 为什么：实测并发握手会让被拒绝的身份**串进下一条连接**——这是一个身份/租户串号的正确性缺陷，不是性能问题。因此串行化是**身份归属的决定性约束**，代价是握手速率约 41 次/秒、同时上线设备落入 DTLS 客户端重传退避（容量报告 §3.5）。OTP 目前不提供「回调能拿到连接标识」的接口，所以没有并发的正解。
+   - 留痕：`coap_dtls_acceptor.erl` 的模块 doc 与 `accept_loop/4`；`docs/benchmarks/2026-11-16-s11c-dtls-capacity.md` §3.1/§3.5。
+
+3. **`coaps` 进入 `broker_security:credential_capable/0`，`require_auth` 从「一刀切拒启」改为分协议门控**
+   - 计划（D5 + S11-B 遗留）：`require_auth` 含 `coap`/`coaps` 时 app 拒绝启动（S11-B 的 `auth_unsupported/0`）；D5 没有说 `coaps` 是否算「能带凭据」。
+   - 实际：`credential_capable/0` 追加 `<<"coaps">>`（与 `mqtt`/`mqtts`/`wss`/`turn` 同姿态）；`broker_proto_coap_app:guard/0` 分协议判定——`coap` 仍 `{error, {require_auth_unsupported, coap}}`（明文无法承载凭据），`coaps` 则要求**所有** listener 都是 DTLS，否则 `{error, {require_auth_needs_dtls, coaps}}`。
+   - 为什么：S11-B 的一刀切在 DTLS 落地后是错的——`coaps` 恰恰**能**承载凭据。门控必须区分「明文不可能有凭据」与「要求凭据但配了明文 listener」两件不同的事，否则用户得到一个无法诊断的拒启。
+   - 留痕：`broker_security.erl` 的 `credential_capable/0`；`broker_proto_coap_app.erl` 的 `guard/0`；`coap_app_SUITE` 的 `require_auth_for_coaps_is_allowed_when_dtls` / `coaps_requires_dtls_listeners` / `dtls_without_users_is_refused`。
+
+4. **未知身份回诱饵密钥，不发 TLS alert（对 D5「默认不自签」的安全姿态补充）**
+   - 计划（D5）：只讲「不加载证书」，没讲失败形态。
+   - 实际：未知身份 → 返回 `SHA-256("unifiedmq-coaps-psk-decoy" ‖0‖ 每 listener `crypto:strong_rand_bytes(32)` ‖0‖ Identity)`，让握手走到 Finished 校验失败；**不**发 alert。
+   - 为什么：实测未知身份 alert 在 20–200 ms 返回，「用户存在+口令错」走 Finished 校验失败 → 客户端 3 s 超时，两者**可区分** ⇒ 用户名枚举 oracle。诱饵密钥把两条路径的错误形态拉平（`unknown_identity_is_refused` 断言错误项完全相等）。这是一条**安全修复**，不是新增范围。
+   - 留痕：`coap_listener.erl` 的 `decoy_psk/2`；`coap_dtls_SUITE` 的 `unknown_identity_is_refused`；`docs/design/s11c-coap-dtls.md` §4.4。
+
+5. **`max_dtls_sessions` / `dtls_max_sessions_per_principal` 在 listener 侧判定，acceptor 不做容量判定**
+   - 计划（D6）：要求「有界簿记」，没有说上限归谁。
+   - 实际：两个上限都在 listener 的 `admit_session/4` 判定（它持有五张表的真相）；acceptor 只负责握手与移交。移交失败/超时补发 `{dtls_abandoned, Sock}`，listener 用 `drop_session/2` 释放——否则记录的唯一清理触发 `{ssl_closed,_}`（需要 listener 持有 socket）永不到来。
+   - 为什么：容量是「表」的属性，acceptor 看不到表；把判定放在 acceptor 会需要跨进程同步，而 `{dtls_abandoned}` 这条补丁正是「只记不释放」的必然结果（规格复审 B1）。表从 S11-B 的五张扩到六张（+`principal_sessions`），姿态不变。
+   - 留痕：`coap_listener.erl` 的 `admit_session/4`、`drop_session/2`、`dtls_abandoned` 分支；`coap_dtls_SUITE` 的 `dtls_session_cap` / `dtls_per_principal_cap` / `dtls_abandoned_releases_slot` / `dtls_close_cleans_up`。
+
+- **对照结论**：D2（Observe 归订阅层）、D3（CON 通知是 datagram 级重传、不是 QoS 1）、D4（filter 即 destination）、D6（metrics 不扩容、有界簿记）在 S11-C 继续成立；D5（DTLS）**按 PSK-only 交付**，证书/mTLS 是已决非目标；D7（Block1 草案、无 Block2）不变。**D5 的「DTLS」不再是「未做」**，但 libcoap 真实客户端证据按 S11-C 的明确决定单列推迟。**冻结文本未改**，本节只追加落地事实。
