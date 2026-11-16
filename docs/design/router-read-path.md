@@ -195,7 +195,11 @@ ETS trie: set, protected, read_concurrency
 
 `broker_router_hash_SUITE:trie_matches_the_reference_matcher/1` 把改动前的 `match/2` 原样留在测试里当 oracle：随机生成 400 个合法 filter（含 `+`、`#`、重复 filter、三个租户根）与 400 个 topic，逐个断言 trie 的结果列表与 oracle 完全一致（含顺序）。种子固定，失败可复现。
 
-另外两例：`unregister_prunes_the_trie/1` 逐行断言剪枝后的行数（4 → 5 → 4 → 0）；`tenant_roots_are_independent_and_legacy_is_visible/1` 断言同一 filter 在两个租户下互不可见、legacy `*` 对所有人可见。
+另外两例：`unregister_prunes_the_trie/1` 逐行断言剪枝后的行数（4 → 5 → 4 → 0，并含「祖先节点保留」一段）；`tenant_roots_are_independent_and_legacy_is_visible/1` 断言同一 filter 在两个租户下互不可见、legacy `*` 对所有人可见。
+
+### 3.8 自查发现的一个真实缺陷
+
+首版实现里，`unregister` 只要末节点 `SubsAtNode` 空了就删整行。同时注册 `a/b` 与 `a/b/c` 时，删掉 `a/b` 会让 `[a]` 到 `[a,b,c]` 之间唯一的链接消失 —— `a/b/c` 的订阅还在 `subs` 表里，却再也走不到。修复后只在「无子且无订阅」时删行，`unregister_prunes_the_trie/1` 补了这一段（删 `a/b` 后行数不变，`a/b/c` 仍能路由到）。
 
 
 ---
