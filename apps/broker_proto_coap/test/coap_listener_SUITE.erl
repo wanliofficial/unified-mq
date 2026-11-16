@@ -46,6 +46,7 @@ all() ->
      observe_rst_deregisters,
      observe_bounded_table_refuses,
      observe_stray_rst_does_not_crash,
+     observe_rst_is_endpoint_scoped,
      observe_plain_udp_principal_is_allowed,
      observe_max_age_expires_relationship,
      observe_two_observers_same_dest_both_notified].
@@ -517,7 +518,9 @@ observe_deregister_with_observe_1(Config) ->
     refute(S, con, {response, 2, 5}, 400),
     close(S).
 
-%% An RST carrying the observation's token ends it (RFC 7641 §3.6).
+%% An empty RST (RFC 7641 §4.5) echoing a notification's Message ID ends the
+%% relationship -- the RST carries no token, so it is correlated by Message ID,
+%% not token.
 observe_rst_deregisters(Config) ->
     Port = ?config(port, Config),
     S = open(),
@@ -559,6 +562,41 @@ observe_stray_rst_does_not_crash(Config) ->
     Note = expect(S, non, {response, 2, 5}),
     ?assertEqual(<<"stok">>, coap_codec:token(Note)),
     close(S).
+
+%% A RST is only honoured for the endpoint that sent it: a RST from client A
+%% echoing a Message ID that belongs to client B's notification must NOT end B's
+%% relationship (RFC 7641 §4.5 correlates an empty RST by Message ID, but only on
+%% the sender's endpoint -- the pending/observes scan is scoped to {IP,Port,_}).
+%% Regression for a cross-endpoint kill: Message IDs are a 16-bit space, so any
+%% client could otherwise guess one and tear down another's observation.
+observe_rst_is_endpoint_scoped(Config) ->
+    Port = ?config(port, Config),
+    A = open(),
+    B = open(),
+    send(A, Port, request(non, put, 1, [{uri_path, <<"epA">>}], <<"a">>)),
+    _ = expect(A, non, {response, 2, 4}),
+    send(B, Port, request(non, put, 2, [{uri_path, <<"epB">>}], <<"b">>)),
+    _ = expect(B, non, {response, 2, 4}),
+    send(A, Port, (request(non, get, 3, [{uri_path, <<"epA">>}, {observe, 0}]))
+                  #{token => <<"tA">>}),
+    _ = expect(A, non, {response, 2, 5}),
+    send(B, Port, (request(non, get, 4, [{uri_path, <<"epB">>}, {observe, 0}]))
+                  #{token => <<"tB">>}),
+    _ = expect(B, non, {response, 2, 5}),
+    %% Drive B's relationship to a notification so it has a req_id to target.
+    send(A, Port, request(non, put, 5, [{uri_path, <<"epB">>}], <<"b1">>)),
+    _ = expect(A, non, {response, 2, 4}),
+    BNote = expect(B, non, {response, 2, 5}),
+    ?assertEqual(<<"tB">>, coap_codec:token(BNote)),
+    %% A sends a RST echoing B's notification id -- from A's endpoint. B must
+    %% survive; if the scan were not endpoint-scoped this would kill B.
+    send(A, Port, rst_of(coap_codec:id(BNote))),
+    send(A, Port, request(non, put, 6, [{uri_path, <<"epB">>}], <<"b2">>)),
+    _ = expect(A, non, {response, 2, 4}),
+    BNote2 = expect(B, non, {response, 2, 5}),
+    ?assertEqual(<<"tB">>, coap_codec:token(BNote2)),
+    close(A),
+    close(B).
 
 %% A full relationship table refuses the observation with 4.03.
 observe_bounded_table_refuses(Config) ->

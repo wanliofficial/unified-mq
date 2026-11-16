@@ -534,11 +534,6 @@ register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
             end
     end.
 
-%% Find the observe relationship (identified by its `{IP,Port,Token}' key) whose
-%% MOST RECENT notification carries Message ID `Id'. A conformant empty RST has no
-%% token, so this scan of `observes' is how a client's RST is matched to a
-%% relationship (RFC 7641 §4.5). Returns the relationship key, or `undefined' when
-%% no live relationship has such a notification (a stray/late RST).
 %% Find the observe relationship, ON THE SENDER'S ENDPOINT, whose MOST RECENT
 %% notification carries Message ID `Id'. A conformant empty RST has no token, so
 %% this scan of `observes' is how a client's RST is matched to a relationship
