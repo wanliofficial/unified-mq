@@ -33,6 +33,7 @@ all() ->
      tenant_roots_are_independent_and_legacy_is_visible,
      unregister_prunes_the_trie,
      route_sees_stable_subscriptions_while_the_index_churns,
+     concurrent_writers_lose_no_update_and_keep_unique_seq,
      on_partition_change_stays_unimplemented_in_s1].
 
 init_per_testcase(_Case, Config) ->
@@ -453,6 +454,122 @@ stopped(Stop) ->
         {stop, Stop} -> true
     after 0 -> false
     end.
+
+%% @doc The write side under concurrency: many writers register distinct SubRefs
+%% at once, then every ref must be present exactly once and carry a unique seq.
+%%
+%% `route_sees_stable_subscriptions_while_the_index_churns' above proves a READER
+%% never sees a torn view while the index churns, but it never asserts the writer
+%% loses no work. In production the shape is N sessions subscribing and
+%% unsubscribing concurrently while publishes route -- exactly this case. The
+%% writer is one gen_server, so the VM serialises the calls, but serialisation is
+%% only correct if it also (a) applies every update and (b) hands out a distinct
+%% `seq' per write, because route/3 restores global order with a single keysort on
+%% the seq. A lost update, a double-assigned seq, or a prune that deletes a still
+%% live row would all pass the reader-stability case and fail delivery here.
+%%
+%% Uses a wide, disjoint filter fan (many leaves under one root) so the writes
+%% contend on shared ancestor rows -- the rows where a buggy prune would drop a
+%% sibling -- rather than on independent branches.
+concurrent_writers_lose_no_update_and_keep_unique_seq(Config) ->
+    Env = env(Config),
+    Tenant = <<"writers">>,
+    Writers = 12,
+    PerWriter = 40,
+    Parent = self(),
+    Stop = make_ref(),
+    %% Each writer registers `PerWriter' distinct refs on its own filter, one
+    %% level under a shared root, so every leaf shares the `[s]' ancestor row.
+    WriterPids = [begin
+                      {Pid, MRef} = spawn_monitor(
+                                      fun() -> writer_loop(Env, Tenant, W, PerWriter,
+                                                           Parent, Stop) end),
+                      {Pid, MRef}
+                  end
+                  || W <- lists:seq(1, Writers)],
+    %% Writers finish their own registrations, then report up; the parent waits
+    %% for all of them before asserting, so the check runs on a settled index.
+    [begin
+         receive
+             {writer_done, Pid, _N} -> ok
+         after 30000 ->
+             ct:fail({writer_did_not_finish, Pid})
+         end
+     end
+     || {Pid, _} <- WriterPids],
+    [P ! {stop, Stop} || {P, _} <- WriterPids],
+    [receive
+         {'DOWN', MRef, process, Pid, normal} -> ok;
+         {'DOWN', MRef, process, Pid, Reason} ->
+             ct:fail({writer_died, Pid, Reason})
+      after 5000 ->
+         ct:fail({writer_not_reaped, Pid})
+     end
+     || {Pid, MRef} <- WriterPids],
+    %% Settle: the writer is serialised, but a keysort over a map built from a
+    %% racing reader could still miss a just-applied row; re-read until stable.
+    Expected = [{W, I} || W <- lists:seq(1, Writers), I <- lists:seq(1, PerWriter)],
+    case await_all_present(Env, Tenant, Expected, 20) of
+        ok ->
+            ok;
+        {missing, Missing} ->
+            ct:fail({writer_lost_updates, length(Missing), lists:sublist(Missing, 5)})
+    end,
+    %% Every ref resolves through route/3: subscribe returned `ok', so "the topic
+    %% is routable" must hold for all of them (ADR-010 §10.1 post-write routability).
+    Unroutable = [{W, I} || {W, I} <- Expected, not ref_present(Env, Tenant, W, I)],
+    ct:comment("writers=~p refs=~p unroutable=~p",
+               [Writers, length(Expected), length(Unroutable)]),
+    [] = Unroutable.
+
+writer_loop(Env, Tenant, W, PerWriter, Parent, Done) ->
+    Refs = [begin
+                Ref = {W, I},
+                ok = ?HASH:register(Env, filter_of(W, I), Ref, #{tenant_id => Tenant}),
+                Ref
+            end
+            || I <- lists:seq(1, PerWriter)],
+    Parent ! {writer_done, self(), length(Refs)},
+    stopped(Done),
+    ok.
+
+%% A ref is routable iff route/3 on its own filter lists it. Split out of the
+%% comprehension because a match on `{ok, ...}' cannot live in a filter.
+ref_present(Env, Tenant, W, I) ->
+    {ok, [{_, Refs}]} = ?HASH:route(filter_of(W, I), ctx(Tenant), Env),
+    lists:member({W, I}, Refs).
+
+%% Shared root `s', distinct second level per writer, distinct leaf per ref: all
+%% `Writers * PerWriter' leaves hang off the one `[s]' ancestor row.
+filter_of(W, I) ->
+    iolist_to_binary(["s/w", integer_to_list(W), "/l", integer_to_list(I)]).
+
+%% Poll until route/3 returns every expected ref, or report which are still
+%% absent. A concurrent reader can legitimately observe an intermediate state, so
+%% this waits for quiescence rather than asserting on the first read -- but the
+%% failure names the missing refs, because "timeout" alone does not say whether a
+%% write was lost, a filter mis-indexed, or a prune ate a live row.
+await_all_present(_Env, _Tenant, _Expected, 0) ->
+    {missing, []};
+await_all_present(Env, Tenant, Expected, Tries) ->
+    Missing = [Ref || Ref <- Expected, not present(Env, Tenant, Ref)],
+    case Missing of
+        [] -> ok;
+        _ ->
+            timer:sleep(20),
+            case Tries of
+                1 -> {missing, Missing};
+                _ -> await_all_present(Env, Tenant, Expected, Tries - 1)
+            end
+    end.
+
+present(Env, Tenant, Ref) ->
+    Filter = iolist_to_binary(["s/w",
+                               integer_to_list(element(1, Ref)), "/l",
+                               integer_to_list(element(2, Ref))]),
+    {ok, [{_, Refs}]} = ?HASH:route(Filter, ctx(Tenant), Env),
+    lists:member(Ref, Refs).
+
 
 %% §10.5: S1 leaves the partition-change hook unimplemented; the behavior marks
 %% it optional so S4 can add it without touching a frozen signature.

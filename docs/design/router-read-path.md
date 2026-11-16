@@ -273,8 +273,9 @@ ETS trie: set, protected, read_concurrency
 | `unregister_prunes_the_trie` | 注册 `a/b/c` 得 4 行、加 `a/b/d` 得 5 行、删 d 回 4 行、删尽回 0 行 |
 | `tenant_roots_are_independent_and_legacy_is_visible` | 同一 filter 在 t1/t2 下互不可见，legacy `*` 对所有租户可见 |
 | `route_sees_stable_subscriptions_while_the_index_churns` | 8 个 reader × 2 个并发 churner（其一在共享的 `*` 根）跑 1.5 s、42,732 次 route：从未注销的 4 个订阅（字面量 / `+` / `#` / 兼作祖先节点的 filter）必须在**每一次** route 里出现，0 次漏匹配。已用变异测试验证断言有牙齿（去掉 `#` 分支后该用例立即失败） |
+| `concurrent_writers_lose_no_update_and_keep_unique_seq` | 12 个 writer 并发注册 480 个 ref，全部挂在同一个 `[s]` 祖先行下（争用点就在 prune 会误删兄弟行的那些行）：事后每个 ref 必须能被 `route/3` 取到且只返回一次。已用变异测试验证（跳过 `link/4` 的祖先行写入后报 `{writer_lost_updates, 480, …}`）。补的是上一条的另一半：它只证明**读者**在 churn 中不撕裂，没证明**写者**在并发下不丢更新 |
 
-这张表最后一条补的是三份基准报告共同承认的缺口：所有读测量都跑在冻结的索引上，而改动 2 把一次 `route/3` 从单行 ETS 读变成了多行遍历——单体原子、整体不原子。该用例断言的是 ADR-007 的不变式（「SUBACK 之后必须可投递」），不是某个概率。
+这张表最后两条补的是三份基准报告共同承认的缺口：所有读测量都跑在冻结的索引上，而改动 2 把一次 `route/3` 从单行 ETS 读变成了多行遍历——单体原子、整体不原子。它们断言的是 ADR-007 的不变式（「SUBACK 之后必须可投递」），不是某个概率：一条从读者视角（churn 中不漏匹配），一条从写者视角（并发注册不丢更新）。
 
 原计划的另两条没有单独成例：**「`reductions` 增量为 0」**已由改动 1 的 `env_is_served_without_the_writer` + `route_reads_are_served_without_the_writer` 覆盖（读路径不经过写者）；**「订阅后立即发布的顺序」**由上面的 oracle 用例的同序断言覆盖（顺序就是 `Seq` 序）。
 
