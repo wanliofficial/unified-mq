@@ -263,7 +263,7 @@ ETS trie: set, protected, read_concurrency
 | `gen_advances_on_successful_writes_only` | 成功 register/unregister 使 `gen/0` 严格递增；重复 register（`already_registered`）不递增 | §2.4 规则前提 |
 | `env_rejects_a_dead_store` | store 停掉后 `broker_router:env()` 返回 `{error, router_store_not_started}`，而不是返回一个指向死表的 env | §2.2 第 2 条 |
 
-**已跑证据**（2026-11-16，OTP 28.3.1）：`broker_router_hash_SUITE` + `broker_router_sup_SUITE` 共 **20/20 通过**（含新增 3 例）；下游 `broker_subscription_SUITE` + `broker_queue_SUITE` + `mqtt_conn_SUITE` 共 **139/139 通过**。改动 2 分支上：router 两套件 + `broker_queue_SUITE` + `mqtt_conn_SUITE` 共 **109/109**，`broker_subscription_SUITE` **53/53**。未做任何压测，§7.3 的三档数字仍缺。
+**已跑证据**（2026-11-16，OTP 28.3.1，`s11x-router-trie-index`）：`broker_router_hash_SUITE` **22/22** + `broker_router_sup_SUITE` **4/4** + `broker_subscription_SUITE` **52/52** + `broker_event_SUITE` **35/35** = **113/113 通过**。压测见 §7.3 的六份报告（数字来自有外部负载的机器，**绝对偏低，引用请复跑**）；端到端 `s2_bench.py` 因机器负载未能跑，见 §8。
 
 ### 7.2 改动 2 的 CT 用例（已实现）
 
@@ -323,7 +323,7 @@ ETS trie: set, protected, read_concurrency
 
 | 改动 | 状态 | 落点 |
 |---|---|---|
-| 1. env 缓存 + gen | ✅ 已实现（分支 `s11x-router-env-cache`） | `broker_router_hash_store.erl`（`env/1`、`gen/1`、`bump/1`）、`broker_router_hash.erl`（`current_env/0`、`gen/0`、`init/1`）。`gen/0` 只放在后端模块：行为门面 `broker_router.erl` 未改，ADR-010 冻结的 5 个回调与 `env/0` 签名不动 |
-| 2. trie 索引 | ✅ 已实现（分支 `s11x-router-trie-index`，叠在改动 1 之上） | `broker_router_hash_store.erl`（节点行、`link/4`、`prune/3`）、`broker_router_hash.erl`（`route/3` 改为按层走、删除 `match/2` 与 `tenant_visible/3`）；测试见 §7.2 |
+| 1. env 缓存 + gen | ✅ 已实现（分支 `s11x-router-env-cache`） | `broker_router_hash_store.erl`（`env/1`、`gen/1`、`bump/1`）、`broker_router_hash.erl`（`current_env/0`、`gen/0`、`init/1`）。`gen/0` 只放在后端模块：行为门面 `broker_router.erl` 未改，ADR-010 冻结的 5 个回调与 `env/0` 签名不动。**补充（`7f87e28`）**：`env/1` 起初只发布 `#{store, tab, gen}`，`current_env/0` 仍每次 `application:get_env(partitions)` 并重建 map。现由 store 在 `init/1` 发布完整 env（含 `partitions`/`hash`），backend 由 `broker_router_sup:init/1` 发布进 `persistent_term`，取 env 从 1.67–1.77 µs 降到 0.37–0.39 µs（见 §2.2 约束 3） |
+| 2. trie 索引 | ✅ 已实现（分支 `s11x-router-trie-index`，叠在改动 1 之上） | `broker_router_hash_store.erl`（节点行、`link/4`、`prune/3`）、`broker_router_hash.erl`（`route/3` 改为按层走、删除 `match/2` 与 `tenant_visible/3`）；测试见 §7.2（读侧 churn 可见性 + 写侧并发不丢更新） |
 | 3. 计划缓存 | ❌ 不做（OQ-5，模型扫描后否决；`gen` 全局失效使 fleet 形状零命中） | 本文 §4 |
 | ADR-010 §10.1 增补 | ⬜ 未改 | OQ-1 |
