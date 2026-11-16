@@ -164,6 +164,7 @@ handle_call({register, Tenant, Filter, SubRef}, _From,
             %% Bumped after the index is written and before the caller is told
             %% `ok', so "subscribe returned" implies "gen already moved".
             _ = bump(State),
+            report_rows(Trie),
             {reply, ok, State#st{seq = Seq + 1}}
     end;
 
@@ -185,6 +186,7 @@ handle_call({unregister, SubRef}, _From, #st{trie = Trie, subs = Subs} = State) 
             end,
             true = ets:delete(Subs, SubRef),
             _ = bump(State),
+            report_rows(Trie),
             {reply, ok, State};
         [] ->
             {reply, {error, {not_found, SubRef}}, State}
@@ -209,6 +211,17 @@ key(Name) ->
 
 bump(#st{gen = Gen}) ->
     atomics:add(Gen, 1, 1).
+
+%% Publish the trie row count as the ADR-016 OQ-2 gauge. Rows, not subscriptions:
+%% a row is a path and many subscribers share one, so row count -- the thing memory
+%% actually tracks -- can be ~19x below the subscription count. Set absolutely
+%% (not gauge_add) because re-inserting an existing key does not add a row, so no
+%% delta can be maintained. `broker_router' depends on `broker_metrics', so this
+%% runs with the server up; the catch keeps a unit test that never starts the app
+%% from turning a missing server into a crashed writer.
+report_rows(Trie) ->
+    _ = (catch broker_metrics:gauge(router_index_rows, ets:info(Trie, size))),
+    ok.
 
 %% The store owns its own split so a write never needs the filter binary again
 %% after the caller validated it: the path *is* the filter.

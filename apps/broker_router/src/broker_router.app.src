@@ -3,6 +3,6 @@
     {vsn, "0.1.0"},
     {registered, [broker_router_sup, broker_router_hash_store]},
     {mod, {broker_router_app, []}},
-    {applications, [kernel, stdlib, sasl, broker_core]},
+    {applications, [kernel, stdlib, sasl, broker_core, broker_metrics]},
     {env, []}
 ]}.

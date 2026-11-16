@@ -312,7 +312,7 @@ ETS trie: set, protected, read_concurrency
 | 编号 | 问题 | 需要谁决定 |
 |---|---|---|
 | OQ-1 | ADR-010 §10.1 的「读侧」定义是否按本文口径收窄/澄清？ | **已拟稿（2026-11-16），待采纳**：建议按 §10.5「冻结后补充」的既有体例，在 §10.1 末尾追加一段**不改任何签名**的冻结后批注（见下）。不直接改 ADR 的原因：OQ-1 的决策方是 ADR 修订 |
-| OQ-2 | trie 化的写入放大（每层一行）在 10 万 filter 下的内存上限是否需要配置项 | **已答（2026-11-16）**：不需要配置项（最坏 129 MB / 10 万 filter），但需导出**行数**而非订阅数作监控指标——二者可差 19 倍。见 [`docs/benchmarks/2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md) |
+| OQ-2 | trie 化的写入放大（每层一行）在 10 万 filter 下的内存上限是否需要配置项 | **已答并落地（2026-11-16）**：不需要配置项（最坏 129 MB / 10 万 filter），但需导出**行数**而非订阅数作监控指标——二者可差 19 倍。`router_index_rows` gauge 已实现（`broker_router_hash_store` 每次 register/unregister 刷新 = `ets:info(Tab, size)`），按 ADR-016 §16.2 的既定程序登记了这一个原子键。见 [`docs/benchmarks/2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md) §0 与 ADR-016 §16.2 的 S11x 实施注记 |
 | OQ-3 | `services_search` 等价物是否随 S12-A 的管理 API 一起做 | S12-0 |
 | OQ-4 | 跨节点订阅索引（若 S12-B 引入跨节点投递）与本地 trie 的关系 | S12-0 |
 | OQ-5 | 计划缓存（改动 3）是否值得做 | **已答（2026-11-16）：不做**。`gen` 是全局计数器、任何订阅写都使缓存整体失效，因此缓存窗口 = 两次订阅变更之间。模型扫描显示：fleet 形状（5 万 topic、一设备一 topic）在任何 churn 下都零命中；hot 形状 99.8% → churn 0.01 时降到 80%；bursty 上限即热头占比（50%）。只有「少热 topic + 低 churn」同时成立才划算，而那种负载的 route 本来只要几十微秒。若未来要重开，前提是 per-prefix / per-partition 失效——那是重新设计。见 [`docs/benchmarks/2026-11-16-s11x-router-plan-cache.md`](../benchmarks/2026-11-16-s11x-router-plan-cache.md) |

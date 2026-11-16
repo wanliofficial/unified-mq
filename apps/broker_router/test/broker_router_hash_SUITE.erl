@@ -34,6 +34,7 @@ all() ->
      unregister_prunes_the_trie,
      route_sees_stable_subscriptions_while_the_index_churns,
      concurrent_writers_lose_no_update_and_keep_unique_seq,
+     router_index_rows_gauge_tracks_trie_rows_not_subscriptions,
      on_partition_change_stays_unimplemented_in_s1].
 
 init_per_testcase(_Case, Config) ->
@@ -46,6 +47,26 @@ init_per_testcase(_Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     catch gen_server:stop(?STORE, normal, 1000),
+    ok.
+
+init_per_suite(Config) ->
+    %% The OQ-2 gauge (router_index_rows) is written by the index store, which
+    %% calls broker_metrics on every register/unregister. Start the app once for
+    %% the suite with the report loop off (report_interval_ms=0, same as the
+    %% metrics suite) so no report process lingers between cases.
+    _ = application:stop(broker_metrics),
+    _ = application:load(broker_metrics),
+    Saved = application:get_env(broker_metrics, report_interval_ms, undefined),
+    ok = application:set_env(broker_metrics, report_interval_ms, 0),
+    {ok, _} = application:ensure_all_started(broker_metrics),
+    [{saved_interval, Saved} | Config].
+
+end_per_suite(Config) ->
+    case proplists:get_value(saved_interval, Config) of
+        undefined -> ok;
+        Saved -> ok = application:set_env(broker_metrics, report_interval_ms, Saved)
+    end,
+    application:stop(broker_metrics),
     ok.
 
 %%%_* Tests --------------------------------------------------------------
@@ -570,6 +591,45 @@ present(Env, Tenant, Ref) ->
     {ok, [{_, Refs}]} = ?HASH:route(Filter, ctx(Tenant), Env),
     lists:member(Ref, Refs).
 
+
+%% §10.1【F3】 + OQ-2 metric: the ADR-016 `router_index_rows' gauge must equal
+%% the trie row count, and must count ROWS not subscriptions. Three subscribers
+%% on one single-level filter share one row, so the gauge reads 1 where the
+%% subscription count is 3 -- the ~19x divergence the index-memory report warns
+%% about, in miniature. Asserted with teeth: a gauge that tracked subscriptions
+%% would read 3 here and fail.
+router_index_rows_gauge_tracks_trie_rows_not_subscriptions(Config) ->
+    Env = env(Config),
+    Tab = maps:get(tab, Env),
+    Tenant = <<"metrics">>,
+    ok = broker_metrics:reset(),
+    Size = fun() -> ets:info(Tab, size) end,
+    Gauge = fun() -> maps:get(router_index_rows, broker_metrics:snapshot()) end,
+    %% Three SubRefs on one single-level filter: a per-tenant root row plus one
+    %% leaf row, shared by all three -- five subscribers can live on those two rows.
+    [ok = ?HASH:register(Env, <<"leaf">>, {s, I}, #{tenant_id => Tenant})
+     || I <- lists:seq(1, 3)],
+    2 = Size(),
+    2 = Gauge(),
+    %% Two more subscribers on the SAME filter: the subscription count grows to
+    %% 5 while the row count must not. This is the rows-not-subscriptions
+    %% contract; a gauge that counted subscriptions would read 5 and fail.
+    [ok = ?HASH:register(Env, <<"leaf">>, {s, I}, #{tenant_id => Tenant})
+     || I <- lists:seq(4, 5)],
+    2 = Size(),
+    2 = Gauge(),
+    %% Distinct single-level filters add one leaf row each under the shared root.
+    [ok = ?HASH:register(Env, iolist_to_binary(["solo", integer_to_list(I)]),
+                         {solo, I}, #{tenant_id => Tenant})
+     || I <- lists:seq(1, 3)],
+    5 = Size(),
+    5 = Gauge(),
+    %% Pruning everything back to empty drives the gauge to zero rows.
+    [ok = ?HASH:unregister(Env, {s, I}) || I <- lists:seq(1, 5)],
+    [ok = ?HASH:unregister(Env, {solo, I}) || I <- lists:seq(1, 3)],
+    0 = Size(),
+    0 = Gauge(),
+    ok.
 
 %% §10.5: S1 leaves the partition-change hook unimplemented; the behavior marks
 %% it optional so S4 can add it without touching a frozen signature.
