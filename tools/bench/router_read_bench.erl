@@ -26,7 +26,7 @@
 %% is a correctness test; `broker_router_hash_SUITE' owns that.
 -module(router_read_bench).
 
--export([run/0, run/1]).
+-export([run/0, run/1, concurrent/1]).
 
 -include_lib("broker_core/include/broker_message.hrl").
 -include_lib("broker_router/include/broker_router.hrl").
@@ -202,67 +202,136 @@ single_latency(Impl, Dest, Ctx, Env) ->
 
 route_one(old, Dest, Ctx, Env) -> old_route(Dest, Ctx, Env);
 route_one(env, Dest, Ctx, Env) -> env_route(Dest, Ctx, Env);
-route_one(trie, Dest, Ctx, Env) -> ?HASH:route(Dest, Ctx, Env).
+route_one(trie, Dest, Ctx, Env) -> trie_route(Dest, Ctx, Env).
+
+%% Aggregate throughput with P concurrent reader processes. This is the axis
+%% ADR-010 §10.1 actually claims something about: reads must not go through the
+%% writer. In the old path `table/1' is a gen_server:call, so every reader
+%% serialises on the store process and adding processes cannot help. In env/trie
+%% the env comes from persistent_term and the index is a direct ETS read
+%% (`read_concurrency' is on), so throughput should grow with P.
+%%
+%% Absolute numbers here are load-sensitive -- use the *shape* (does adding a
+%% reader add throughput?) rather than the values on a busy machine.
+concurrent(Opts) ->
+    Shape = maps:get(shape, Opts, spread),
+    N = maps:get(counts, Opts, 10000),
+    Ps = maps:get(processes, Opts, [1, 2, 4, 8]),
+    DurationMs = maps:get(duration_ms, Opts, 1000),
+    WarmupMs = maps:get(warmup_ms, Opts, 200),
+    io:format("~n%% ~p / ~p subscriptions, ~p ms per cell~n",
+              [Shape, N, DurationMs]),
+    io:format("~-6s ~-4s ~-12s ~-18s~n", ["impl", "P", "ops/s", "scaling"]),
+    Rows =
+        [begin
+             {PerImpl, _} =
+                 lists:mapfoldl(
+                   fun(P, Base) ->
+                           Ops = run_concurrent(Shape, N, Impl, P, DurationMs, WarmupMs),
+                           OpsPerS = (Ops * 1000) div max(1, DurationMs),
+                           Base1 = case Base of 0 -> OpsPerS; _ -> Base end,
+                           io:format("~-6s ~-4w ~-12w ~s~n",
+                                     [Impl, P, OpsPerS, scaling(Base1, P, OpsPerS)]),
+                           {{P, OpsPerS}, Base1}
+                   end, 0, Ps),
+             {Impl, PerImpl}
+         end
+         || Impl <- [old, env, trie]],
+    io:format("~nRESULT ~p~n", [Rows]),
+    Rows.
+
+scaling(_Base, 1, _OpsPerS) ->
+    "(baseline)";
+scaling(Base, P, OpsPerS) ->
+    io_lib:format("~.2fx (ideal ~px)", [OpsPerS / max(1, Base), P]).
+
+%% Spawn P workers, release them together, sum their completed routes.
+run_concurrent(Shape, N, Impl, P, DurationMs, WarmupMs) ->
+    Subs = subscriptions(Shape, N),
+    Env = setup(Impl, Subs),
+    ok = register_all(Env, Subs),
+    Dest = destination(Shape, Subs),
+    Ctx = #route_ctx{tenant_id = <<"default">>, publisher = undefined,
+                     reliability = os_buffer},
+    %% Warm whatever persistent_term / ETS caches the path needs before timing.
+    _ = warmup(Impl, Dest, Ctx, Env, WarmupMs),
+    Parent = self(),
+    Pids =
+        [spawn(fun() ->
+                       receive go -> ok end,
+                       {Ops, _Us} = drive(Impl, Dest, Ctx, Env, DurationMs),
+                       Parent ! {done, self(), Ops}
+               end)
+         || _ <- lists:seq(1, P)],
+    [Pid ! go || Pid <- Pids],
+    Total = collect(Pids, 0),
+    %% Route once more and check it matched, for the same reason the
+    %% single-process path does: a row that routes nothing is not a measurement.
+    {ok, [{_Part, Matched}]} = route_one(Impl, Dest, Ctx, Env),
+    Matched =/= [] orelse erlang:error({no_match, concurrent, Impl, P}),
+    true = lists:member(wildcard_hash, Matched),
+    teardown(),
+    Total.
+
+collect([], Acc) ->
+    Acc;
+collect(Pids, Acc) ->
+    receive
+        {done, Pid, Ops} ->
+            collect(lists:delete(Pid, Pids), Acc + Ops)
+    after 120000 ->
+            erlang:error({worker_timeout, length(Pids)})
+    end.
 
 %%%_* The three implementations -------------------------------------------
 
-%% Change 1 + 2: the shipping code. `current_env/0' reads persistent_term, the
-%% index is a trie.
-env_route(Dest, Ctx, Env) -> ?HASH:route(Dest, Ctx, Env).
+%% Exactly one variable between neighbours:
+%%
+%%   old  -- flat index, env fetched by gen_server:call (pre-change-1)
+%%   env  -- flat index, env read without a call (change 1)
+%%   trie -- trie index, env read without a call (change 1 + 2)
+%%
+%% The first version of this file made `env' and `trie' the same call, so the
+%% report's "change 1 alone fixes almost everything" was unsupported -- both
+%% rows measured the trie. The flat table below exists so `env' really is
+%% change 1 only.
 
-%% Before change 1/2, reproduced faithfully: take the env through a
-%% gen_server:call (that is what `table/1' is), then scan the whole table with a
-%% linear matcher and an O(N^2) dedupe. Written here rather than kept behind a
-%% flag so the old cost cannot drift from the code the report compares against.
-old_route(Dest, Ctx, #{store := Store} = Env) ->
-    Tab = broker_router_hash_store:table(Store),
-    Tenant = case Ctx of
-                 #route_ctx{tenant_id = T} when is_binary(T), T =/= <<>> -> T;
-                 _ -> <<"default">>
-             end,
+%% Change 1 + 2: the shipping code.
+trie_route(Dest, Ctx, Env) -> ?HASH:route(Dest, Ctx, Env).
+
+%% Change 1 only: env is already in hand, but the index is still one row per
+%% filter, scanned linearly.
+env_route(Dest, Ctx, #{flat := Tab} = Env) ->
+    flat_route(Tab, Dest, Ctx, Env).
+
+%% Pre-change-1: the env (and with it the table ref) arrives through a
+%% gen_server:call, exactly as `current_env/0' did.
+old_route(Dest, Ctx, Env) ->
+    Tab = flat_env:table(),
+    flat_route(Tab, Dest, Ctx, Env).
+
+flat_route(Tab, Dest, Ctx, Env) ->
+    Tenant = ctx_tenant(Ctx),
     TopicLevels = levels(Dest),
     Matches = lists:flatmap(
-                fun({{EntryTenant, Filter}, Payload}) ->
+                fun({{EntryTenant, Filter}, Subs}) ->
                         case tenant_visible(EntryTenant, Tenant) of
                             false -> [];
                             true ->
-                                case old_row(Filter, Payload) of
-                                    {filter, Subs} ->
-                                        case match(TopicLevels, old_levels(Filter)) of
-                                            true -> Subs;
-                                            false -> []
-                                        end;
-                                    intermediate ->
-                                        []
+                                case match(TopicLevels, levels(Filter)) of
+                                    true -> Subs;
+                                    false -> []
                                 end
                         end
                 end,
                 ets:tab2list(Tab)),
     #{partitions := N} = Env,
-    {ok, [{erlang:phash2(Dest, N), old_ordered_unique(lists:keysort(2, Matches))}]}.
+    {ok, [{erlang:phash2(Dest, N), flat_ordered_unique(lists:keysort(2, Matches))}]}.
+
+ctx_tenant(#route_ctx{tenant_id = T}) when is_binary(T), T =/= <<>> -> T;
+ctx_tenant(_) -> <<"default">>.
 
 levels(T) -> binary:split(T, <<"/">>, [global]).
-
-%% Change 2 stores a filter as its path (`[<<"a">>,<<"b">>]') instead of the
-%% binary it came from, so the baseline reads whichever shape the table holds.
-%% It also has to skip the trie's intermediate rows: only a row with `Subs' is a
-%% registered filter, and only its `Path' is the filter (the same distinction the
-%% old index got for free, because every row *was* a filter).
-old_levels(Filter) when is_binary(Filter) ->
-    levels(Filter);
-old_levels(Path) when is_list(Path) ->
-    Path.
-
-%% Every trie row is `{Children, Subs}', including the row of a filter that is
-%% also a prefix of others (`bench/#' has children `1', `+', ... and its own
-%% subscriptions). So "is this a filter" is decided by `Subs', not by the shape:
-%% a non-empty `Subs' means this path is a registered filter, empty means it is
-%% only an intermediate node. Judging on the tuple shape instead silently
-%% dropped `bench/#' -- the row the report's own wildcard assertion needs.
-old_row(_Filter, {_Children, [_ | _] = Subs}) -> {filter, Subs};
-old_row(_Filter, {_Children, []}) -> intermediate;
-%% Rows from a flat (pre-change-2) table: the payload is the subscription list.
-old_row(_Filter, Subs) when is_list(Subs) -> {filter, Subs}.
 
 tenant_visible(<<"*">>, _) -> true;
 tenant_visible(T, T) -> true;
@@ -274,32 +343,49 @@ match([_ | T], [<<"+">> | F]) -> match(T, F);
 match([L | T], [L | F]) -> match(T, F);
 match(_, _) -> false.
 
-old_ordered_unique(Pairs) -> old_ordered_unique(Pairs, [], []).
-old_ordered_unique([], _Seen, Acc) -> lists:reverse(Acc);
-old_ordered_unique([{R, _} | Rest], Seen, Acc) ->
+%% The pre-change dedupe, O(N^2) by design: it is what the old code did.
+flat_ordered_unique(Pairs) -> flat_ordered_unique(Pairs, [], []).
+flat_ordered_unique([], _Seen, Acc) -> lists:reverse(Acc);
+flat_ordered_unique([{R, _} | Rest], Seen, Acc) ->
     case lists:member(R, Seen) of
-        true -> old_ordered_unique(Rest, Seen, Acc);
-        false -> old_ordered_unique(Rest, [R | Seen], [R | Acc])
+        true -> flat_ordered_unique(Rest, Seen, Acc);
+        false -> flat_ordered_unique(Rest, [R | Seen], [R | Acc])
     end.
 
 %%%_* Setup / teardown -----------------------------------------------------
 
+%% Both structures are built and populated from the same subscription list, so
+%% `env' and `trie' see identical data and differ only in the index shape.
 setup(_Impl, _Subs) ->
     teardown(),
     _ = application:load(broker_router),
     ok = application:set_env(broker_router, partitions, 4),
     ok = application:set_env(broker_router, backend, ?HASH),
     {ok, Env} = ?HASH:init(#{partitions => 4, name => ?STORE}),
-    Env.
+    Flat = ets:new(flat_index, [set, protected, {read_concurrency, true}]),
+    {ok, _} = flat_env:start(Flat),
+    Env#{flat => Flat}.
 
-register_all(_Env, []) ->
-    ok;
-register_all(Env, [{SubRef, Filter} | Rest]) ->
-    ok = ?HASH:register(Env, Filter, SubRef, #{tenant_id => <<"default">>}),
-    register_all(Env, Rest).
+%% Register into the trie through the real writer and into the flat table
+%% directly. The flat table is populated in one pass during setup, not timed.
+register_all(Env, Subs) ->
+    Flat = maps:get(flat, Env),
+    lists:foreach(
+      fun({SubRef, Filter}) ->
+              ok = ?HASH:register(Env, Filter, SubRef, #{tenant_id => <<"default">>}),
+              Key = {<<"default">>, Filter},
+              case ets:lookup(Flat, Key) of
+                  [] -> ets:insert(Flat, {Key, [{SubRef, SubRef}]});
+                  [{_, Existing}] ->
+                      ets:insert(Flat, {Key, [{SubRef, SubRef} | Existing]})
+              end
+      end, Subs),
+    ok.
 
 teardown() ->
     catch gen_server:stop(?STORE, normal, 1000),
+    catch gen_server:stop(flat_env, normal, 1000),
+    catch ets:delete(flat_index),
     timer:sleep(20),
     ok.
 
