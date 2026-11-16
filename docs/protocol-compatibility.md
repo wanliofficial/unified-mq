@@ -1951,7 +1951,7 @@ S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻�
 | `GET /a/b` + `Observe=0` / `Observe=1` | 照常返回当前表示，另由 listener 注册 / 注销观察关系（§4.24.6）：`Observe=0` 的 2.05 带 `Observe:0`，`Observe=1` 的**不带** Observe 选项 | `2.05 Content` |
 | 空 destination | 根路径不是合法发布目标 → `4.00` | — |
 | 超过 `broker_limits:max_message_bytes/0` | 写路径先于任何工作拒绝 → `4.13` | — |
-| ACL | `broker_security:authorize/2`：GET 用 `subscribe`、写用 `publish`；匿名（`principal => undefined`）在 `acl => allow` 下放行 | 拒绝 → `4.03` |
+| ACL | `broker_security:authorize/2`：GET 用 `subscribe`、写用 `publish`；匿名（`principal => undefined`）在 `acl => allow` 下放行。**plain UDP 上 principal 恒 `undefined`，故 S11-B 的 ACL 实际无法拒绝一个 datagram**（接入鉴权待 S11-C DTLS）；S11-B 能产出的 `4.03` 只有容量路径（`max_observes` 满） | S11-C 接入鉴权前，`4.03` 仅来自容量 |
 
 写入构造的是普通 `#broker_message{}`（`proto_meta` 记 `client => <<"coap">>`、`content_format`、`retain`、`method`），因此路由、事件策略、订阅投递、retain 全部复用既有层——**没有 CoAP 专属存储或投递分支**。
 
@@ -1968,7 +1968,7 @@ S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻�
 | 限流 | 每端点令牌桶（`max_requests_per_second`，按秒回填），**在解码前**扣减；端点表超过 `max_endpoints` 时拒绝新来源（不驱逐已有桶） |
 | 超长 | 原始 datagram 超过 `max_message_bytes` → 解码前丢弃 |
 | 畸形 | `coap_codec:decode/1` 返回 `{error, _}` → 静默丢弃、不崩、不影响后续 datagram |
-| 有界状态 | 三张表（dedup / endpoints / block1）都在 1 s tick 上按 `dedup_window_ms` 清理；dedup 另受 `max_dedup_entries` 上限约束（超限丢三分之一）。**S11-B 再加两张**（`observes` / `pending`，见 §4.24.6），同样在 1 s tick 上清扫 |
+| 有界状态 | 三张表（dedup / endpoints / block1）都在 1 s tick 上按 `dedup_window_ms` 清理；dedup 另受 `max_dedup_entries` 上限约束（超限丢三分之一）。**S11-B 再加两张**（`observes` / `pending`，见 §4.24.6）：`observes` 在 1 s tick 上按 `Max-Age` 清扫；`pending` **不按 tick 清扫**，由 NSTART=1 与每条通知的重传 timer 在 ≤ 关系数内自收（ACK/RST/替换/重传耗尽即出表） |
 | 指标 | 只 inc 既有键：`bytes_in`（收到即计）、`frame_decode_errors`（超长或解码失败）、`protocol_errors`（限流拒绝）——**不扩冻结键集**（ADR-016） |
 
 ### 4.24.4 已声明的限制 / 边界
@@ -2003,13 +2003,13 @@ S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻�
 | 注册 `Observe=0` | GET 照常应答**当前表示**（piggybacked 2.05 + `Observe:0`，**不是**裸 2.01）；同时 `broker_subscription:subscribe(<<"coap">>, Destination, 0, Tenant)` + `attach(listener, persist=false)` |
 | `ClientId` | 固定 `<<"coap">>`：**所有观察共用一个匿名内核会话**，区分粒度是 filter（= destination，按 §D4/OQ-5 的 path→destination 映射），不是会话 |
 | notify pid | **listener 自己**（`coap_observe` 纯函数只算策略，无子进程）：`{broker_deliver,…}` → 对 `dest` 匹配的每条关系各发一条通知；`{active,100}` 预算不受影响（通知是发送不是接收） |
-| 通知形状 | CON 或 NON（由**注册请求**的类型决定，RFC 7641 §3.4）+ `2.05` + `Observe` = 递增序列（0..2^24-1，`(Seq+1) band 16#FFFFFF`）+ 复用注册 token + 镜像 `content_format` |
+| 通知形状 | CON 或 NON（**本实现选择镜像注册请求的类型**；RFC 7641 §4.5 把每条通知的类型交给服务端决定、并不绑定请求类型——这是一处工程选择，不是规范强制）+ `2.05` + `Observe` = 递增序列（0..2^24-1，`(Seq+1) band 16#FFFFFF`）+ 复用注册 token + 镜像 `content_format` |
 | CON 通知 | **datagram 级重传**（ADR-031 §D3）：发 CON、记 `pending[{IP,Port,MsgId}] = {关系, 字节, 剩余次数, timer}`；`ACK_TIMEOUT`（2000 ms）内未确认则按 timer 精确定位重发，`MAX_RETX`（3）次后放弃该关系。**不是 QoS 1、不落盘、不在内核重投** |
 | NON 通知 | **至多一次**：发一个 NON，不重传、不超时、不记 `pending`。丢失是协议固有 |
 | 空 ACK（RFC 7252 §4.1） | TKL=0、**无 token**，只能按 **Message ID** 关联 → 取消该条重传 timer，关系**存活**（序列已推进） |
 | 空 RST（RFC 7641 §4.5） | 同样无 token，按 **Message ID** 关联 → 取消重传 + **注销关系**；查找**限定在发送者端点** `{IP,Port,_}` 内（16-bit Message ID 空间可枚举，若不限定，任一客户端能猜/看到一个 ID 就拆掉别的端点的观察）。未知 id 的 RST **不崩、关系存活** |
 | NSTART=1（§4.5.1） | 同一关系的新 CON 通知**替换**仍未确认的旧通知（先取消旧的），`pending` 恒 ≤ 关系数 |
-| `Observe=1` 注销 | 按常规 GET 应答（当前表示，无 `Observe` option），并注销关系；注销不存在的观察不是错误（§3.5） |
+| `Observe=1` 注销 | 按常规 GET 应答（当前表示，无 `Observe` option），并注销关系；注销不存在的观察不是错误（§4.1：处理 GET as usual） |
 | 刷新（同 token re-GET） | 保留序列（§4.4，通知永不倒退），清掉继承的未确认通知 |
 | `Max-Age` 兜底 | 每关系取客户端 `Max-Age`（缺省 30 s），钳到 `[1 s, observe_max_age_s]`；静默超过窗口即关系消亡（1 s tick 上的 `sweep_observes/1`） |
 | 双粒度回收 | `maybe_unsubscribe/2` 只在**没有其它活关系**观察同一 dest 时退订共享 filter；`maybe_detach/1` 只在关系表**空**时 detach 共享的 `<<"coap">>` 会话（共享 ClientId 使 `detach` 会连带拆掉所有观察） |

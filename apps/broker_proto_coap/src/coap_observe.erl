@@ -1,7 +1,7 @@
 %% @doc RFC 7641 Observe relationship bookkeeping for the CoAP listener.
 %%
 %% Pure functions only -- no process, no socket. The listener owns the maps
-%% (`observes' keyed by {IP,Port,Token}, `pending' keyed by {IP,Port,Token})
+%% (`observes' keyed by {IP,Port,Token}, `pending' keyed by {IP,Port,MsgId})
 %% and calls into here, so the whole subscription/notification policy is
 %% unit-testable without a datagram in flight. ADR-031 §D2: the subscription
 %% itself lives in `broker_subscription'; this module only mints the filter,
@@ -24,9 +24,12 @@
                           seq := non_neg_integer(),
                           last_notified := integer(),
                           %% The registering request's type (CON or NON), which
-                          %% decides the notification type (RFC 7641 §3.4/§4.1), set
-                          %% by the listener when it records the relationship. A GET is
-                          %% never an ACK/RST, so when present it is always `con|non'.
+                          %% this implementation mirrors as the notification type
+                          %% -- a project choice under RFC 7641 §4.5 (the server
+                          %% picks each notification's type; the spec does NOT tie
+                          %% it to the request's type). Set by the listener when it
+                          %% records the relationship. A GET is never an ACK/RST,
+                          %% so when present it is always `con|non'.
                           req_type => con | non,
                           %% Message ID of the most recent notification, set by the
                           %% listener when it sends one. Used to correlate a conformant
