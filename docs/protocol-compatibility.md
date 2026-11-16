@@ -631,7 +631,7 @@ ADR-020 冻结了 MQTT 的 Binding 细节（`mqtt_user_properties` 通道）。S
 
 **已声明的限制 / 边界**：
 
-- **无 DTLS**：本阶段只跑明文 UDP；DTLS 列为后续待办（设计 §1.2），因此这里是唯一**明文且没有 TLS 路径**的 listener（QUIC 的 14567 也只把 `tls.enabled` 当证书来源，但它强制 TLS 1.3）。
+- **无 DTLS**：本阶段只跑明文 UDP；DTLS 列为后续待办（设计 §1.2）。**S11-C 之后**「明文且没有 TLS 路径」不再由 MQTT-SN 独占——CoAP 的明文 UDP listener（5683）同样如此（CoAP 另有 `coaps` DTLS-PSK 方向，见 §4.24.8）；QUIC 的 14567 也只把 `tls.enabled` 当证书来源，但它强制 TLS 1.3。
 - **无 Forwarder Encapsulation**（1.2 §5.5）与串口桥：设计 §1.2 明确不做。
 - **休眠期 QoS 0 丢弃**：QoS 0 从不进存储，睡眠期间无处可取；要「一条不丢」就用 QoS 1/2。
 - **第三方客户端覆盖不到三处**：`mqtt-sn-tools` 0.0.7 **无 QoS 2 代码路径**、**无 Will 选项**、其 PINGREQ 不带 client id（无法按名唤醒休眠会话）。这三项只由 `mqtt_sn_conn_SUITE` 覆盖，Gate 文本单列，不以「第三方全绿」含混带过。
