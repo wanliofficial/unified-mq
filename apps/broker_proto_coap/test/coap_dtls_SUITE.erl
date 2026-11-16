@@ -37,12 +37,14 @@ all() ->
      dtls_psk_write_and_read,
      unknown_identity_is_refused,
      dtls_con_dedup,
+     identity_does_not_leak_between_handshakes,
      acl_denies_on_dtls,
      acl_allows_on_dtls,
      tenant_isolation_on_dtls,
      dtls_observe_registers_and_notifies,
      dtls_session_cap,
      dtls_per_principal_cap,
+     dtls_abandoned_releases_slot,
      dtls_close_cleans_up,
      plain_udp_unaffected].
 
@@ -366,6 +368,65 @@ unknown_identity_is_refused(Config) ->
     #{code := ?OK} = expect(S, ack, ?OK),
     close(S).
 
+%% The identity race §3.2 constraint 2 exists to prevent, as a regression test.
+%%
+%% The PSK identity is only observable inside the lookup callback, which runs in
+%% the acceptor's process; a rejected peer's identity message lands in that
+%% mailbox exactly like an accepted one's. Two things must therefore hold, and
+%% both are asserted here:
+%%
+%%   1. NO ACCUMULATION -- repeated rejected handshakes must not pile up identity
+%%      messages in the acceptor's mailbox. One leftover is benign: the lookup
+%%      callback for a failed handshake can post after the failure path already
+%%      drained, so a single stale name is normal and the NEXT handshake's
+%%      pre-flush discards it. What must not happen is the mailbox growing with
+%%      every rejection -- that is what a skipped drain looks like, and it is
+%%      the state from which a stale name can be handed out.
+%%   2. ATTRIBUTION -- good sessions interleaved with bad ones each write into
+%%      THEIR OWN tenant, read back from the retain store. A leaked identity
+%%      stamps the wrong tenant on the write.
+identity_does_not_leak_between_handshakes(Config) ->
+    Port = ?config(port, Config),
+    %% (1) No accumulation: N rejections leave at most one identity behind,
+    %% regardless of N. One is the benign post-failure race; growing with N is
+    %% the bug.
+    Before = length(stale_identities(listener_pid())),
+    [begin
+         {error, _} = connect(<<"device-99">>, <<"nope">>, Port, 1500)
+     end || _ <- lists:seq(1, 8)],
+    After = length(stale_identities(listener_pid())),
+    ?assert(After =< 1),
+    ?assert(After =< Before + 1),
+    %% (2) Attribution: alternate a failing peer with a good one, per tenant.
+    [begin
+         {error, _} = connect(<<"device-99">>, <<"nope">>, Port, 1500),
+         {ok, S} = connect(<<"device-01">>, <<"secret-01">>, Port),
+         Dest = <<"leak/t1/", (integer_to_binary(N))/binary>>,
+         send(S, request(con, put, 100 + N, [{uri_path, Dest}], <<"t1">>)),
+         #{code := ?OK} = expect(S, ack, ?OK),
+         ?assertEqual(<<"t1">>, retained_tenant(Dest)),
+         close(S)
+     end || N <- lists:seq(1, 3)],
+    [begin
+         {error, _} = connect(<<"no-such-user">>, <<"x">>, Port, 1500),
+         {ok, S} = connect(<<"tenant-b">>, <<"secret-b">>, Port),
+         Dest = <<"leak/t2/", (integer_to_binary(N))/binary>>,
+         send(S, request(con, put, 200 + N, [{uri_path, Dest}], <<"t2">>)),
+         #{code := ?OK} = expect(S, ack, ?OK),
+         ?assertEqual(<<"t2">>, retained_tenant(Dest)),
+         close(S)
+     end || N <- lists:seq(1, 3)],
+    %% And still bounded after the mixed run (same benign-at-most-one rule).
+    ?assert(length(stale_identities(listener_pid())) =< 1).
+
+%% Identity messages the acceptor is still holding. The acceptor runs as a plain
+%% process, so its messages are readable directly; the listener's state carries
+%% its pid (`dtls_acceptor', field 12).
+stale_identities(ListenerPid) ->
+    Acceptor = element(12, sys:get_state(ListenerPid)),
+    {messages, Msgs} = process_info(Acceptor, messages),
+    [M || M = {psk_identity, _} <- Msgs].
+
 %% RFC 7252 §4.8.2 over DTLS: a retransmitted CON (same Message ID, same token,
 %% same body) is answered from the dedup cache and not executed twice. This is
 %% the case that proves the five bounded tables still key on `{IP, Port}' when
@@ -511,13 +572,52 @@ dtls_per_principal_cap(Config) ->
     close(A2),
     close(B).
 
+%% A session the listener admitted but could not take ownership of must not
+%% hold its slot for ever. The acceptor answers `{dtls_admit, Socket, ok}' (the
+%% listener records the session) and only THEN calls `controlling_process/2';
+%% if that fails the socket never becomes the listener's, so no `{ssl_closed,_}'
+%% ever arrives to trigger `drop_session/2'. The acceptor therefore sends
+%% `{dtls_abandoned, Socket}', and this case pins that the record is released.
+%%
+%% Driven at the protocol level on purpose: real `controlling_process/2' failure
+%% is not reproducible on demand, but the consequence -- a recorded session with
+%% no live socket -- is exactly what the message describes. With the
+%% per-principal cap at one, a reconnect proves the slot really came back.
+dtls_abandoned_releases_slot(Config) ->
+    Port = ?config(port, Config),
+    Pid = listener_pid(),
+    %% Establish one real session, then abandon a SECOND endpoint's record the
+    %% way the acceptor would after a failed transfer.
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 90, [{uri_path, <<"ab">>}], <<"a">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    ?assertEqual(1, maps:get(<<"device-01">>,
+                              element(16, sys:get_state(Pid)))),
+    GhostSocket = make_ref(),
+    GhostPeer = {{10, 0, 0, 1}, 65000},
+    Pid ! {dtls_handshake_ok, self(), GhostSocket, GhostPeer, <<"device-01">>},
+    %% The listener records it and answers `ok' -- the session is counted.
+    receive {dtls_admit, GhostSocket, ok} -> ok after 2000 -> exit(no_admit) end,
+    ?assertEqual(2, maps:get(<<"device-01">>, element(16, sys:get_state(Pid)))),
+    %% The acceptor then reports the abandoned transfer.
+    Pid ! {dtls_abandoned, GhostSocket},
+    ok = wait_until(fun() ->
+                            maps:get(<<"device-01">>,
+                                     element(16, sys:get_state(Pid)), 0) =:= 1
+                    end, 2000),
+    St = sys:get_state(Pid),
+    ?assertEqual(1, maps:get(<<"device-01">>, element(16, St))),
+    ?assertNot(maps:is_key(GhostSocket, element(13, St))),   %% peers
+    ?assertNot(maps:is_key(GhostPeer, element(14, St))),     %% socks
+    ?assertNot(maps:is_key(GhostPeer, element(15, St))),     %% idents
+    close(A).
+
 %% A closed DTLS session is a positive fact, unlike a UDP endpoint that just goes
 %% silent, so every table entry for that peer is dropped at once. Proven by
 %% capacity rather than by poking at state: with the per-principal cap at one, a
 %% reconnect as the same identity can only succeed if the previous session's
 %% counter was released.
-dtls_close_cleans_up(Config) ->
-    Port = ?config(port, Config),
+dtls_close_cleans_up(Config) ->    Port = ?config(port, Config),
     {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
     send(A, request(con, put, 80, [{uri_path, <<"cl">>}], <<"a">>)),
     #{code := ?OK} = expect(A, ack, ?OK),
