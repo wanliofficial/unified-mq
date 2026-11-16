@@ -145,3 +145,8 @@ spikes/*/.data/
 /test/protocol-compatibility/s10/bench/node.out
 /test/protocol-compatibility/s10/bench/node.err
 /test/protocol-compatibility/s10/bench/results/*.err
+
+# S11-C CoAP bench: the raw results JSON + harness are committed; the
+# transient run log and compiled beams are not.
+/test/protocol-compatibility/s11c/bench/*.beam
+/test/protocol-compatibility/s11c/bench/results/run.log
