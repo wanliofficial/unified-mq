@@ -12,12 +12,13 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include("broker_router.hrl").
 
--export([init/1, route/3, register/4, unregister/2, current_env/0]).
+-export([init/1, route/3, register/4, unregister/2, current_env/0, gen/0]).
 
 -type env() :: #{store := pid(),
                  tab := ets:tid(),
                  partitions := pos_integer(),
-                 hash := phash2}.
+                 hash := phash2,
+                 gen => atomics:atomics_ref()}.
 
 -export_type([env/0]).
 
@@ -35,10 +36,12 @@ init(Config) ->
             Name = maps:get(name, Config, broker_router_hash_store),
             case broker_router_hash_store:start_link(Name) of
                 {ok, Pid} ->
-                    {ok, #{store => Pid,
-                           tab => broker_router_hash_store:table(Pid),
-                           partitions => N,
-                           hash => Hash}};
+                    %% Same shape as current_env/0, gen included: a caller that
+                    %% got its env from init/1 (tests) and one that got it from
+                    %% current_env/0 (publishers) must not see two different
+                    %% maps -- the cache rules in design §2.4 depend on it.
+                    {ok, Published} = broker_router_hash_store:env(Name),
+                    {ok, Published#{store => Pid, partitions => N, hash => Hash}};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -107,25 +110,46 @@ unregister(#{store := Store}, SubRef) ->
 %% the supervisor's registered child or leak an untracked process. Not a
 %% behavior callback -- ADR-010 is frozen; this is the assembly-time accessor
 %% the frozen signatures never had a story for (design §13 I12-class gap).
+%%
+%% S11x (docs/design/router-read-path.md §2): this used to end in
+%% `broker_router_hash_store:table/1', a `gen_server:call' -- so every publish
+%% in the node queued on the index writer to re-learn a table id that never
+%% changes. ADR-010 §10.1 only bites the *inside* of `route/3', but the metric
+%% that matters is "publish to `[{Partition, Refs}]'", and that path was
+%% serialized. The store now publishes the env once; this reads it, plus the
+%% partition count from app env (an ETS read, not a call).
+%%
+%% Error precedence is unchanged: a missing store outranks a bad partition
+%% count, because the former is an assembly bug and the latter a typo.
 -spec current_env() -> {ok, env()} | {error, term()}.
 current_env() ->
-    Partitions = application:get_env(broker_router, partitions, undefined),
-    case {whereis(store_name()), partitions_ok(Partitions)} of
-        {undefined, _} ->
-            {error, router_store_not_started};
-        {_, false} ->
-            {error, {invalid_partitions, Partitions}};
-        %% Same guard as init/1: an out-of-range count would make modulo
-        %% arithmetic on the first publish crash, and here it is caught at boot
-        %% instead. The hash stays phash2 -- S1 offers no other, and the app env
-        %% has no `hash' key (init/1 took it from a Config map nobody builds at
-        %% boot; see design §6 'two partition keys').
-        {Pid, true} ->
-            {ok, #{store => Pid,
-                   tab => broker_router_hash_store:table(Pid),
-                   partitions => Partitions,
-                   hash => phash2}}
+    case broker_router_hash_store:env(store_name()) of
+        {ok, Env} ->
+            Partitions = application:get_env(broker_router, partitions, undefined),
+            case partitions_ok(Partitions) of
+                %% Same guard as init/1: an out-of-range count would make modulo
+                %% arithmetic on the first publish crash, and here it is caught at
+                %% boot instead. The hash stays phash2 -- S1 offers no other, and
+                %% the app env has no `hash' key (init/1 took it from a Config map
+                %% nobody builds at boot; see design §6 'two partition keys').
+                true ->
+                    {ok, Env#{partitions => Partitions, hash => phash2}};
+                false ->
+                    {error, {invalid_partitions, Partitions}}
+            end;
+        {error, _} = Error ->
+            Error
     end.
+
+%% @doc Monotonic write counter of the index behind the configured store.
+%%
+%% Exposed for the route-plan cache described in design §4, which is not
+%% implemented: a cache is only correct if it reads this *before* reading the
+%% index and tags the plan with the value it saw. Nothing on the current read
+%% path calls it, so it costs nothing today.
+-spec gen() -> non_neg_integer() | undefined.
+gen() ->
+    broker_router_hash_store:gen(store_name()).
 
 partitions_ok(N) ->
     is_integer(N) andalso N > 0.

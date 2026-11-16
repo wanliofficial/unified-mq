@@ -26,9 +26,16 @@ all() ->
      register_twice_for_one_subref_is_rejected,
      unmatched_topic_returns_empty_sub_list,
      route_reads_are_served_without_the_writer,
+     env_is_served_without_the_writer,
+     gen_advances_on_successful_writes_only,
+     env_rejects_a_dead_store,
      on_partition_change_stays_unimplemented_in_s1].
 
 init_per_testcase(_Case, Config) ->
+    %% current_env/0 takes the partition count from app env (init/1 takes it
+    %% from the Config map), so the two paths must agree for the env tests.
+    _ = application:load(broker_router),
+    ok = application:set_env(broker_router, partitions, 4),
     {ok, Env} = ?HASH:init(#{partitions => 4}),
     [{env, Env} | Config].
 
@@ -211,6 +218,91 @@ on_partition_change_stays_unimplemented_in_s1(_Config) ->
         lists:sort(Cbs),
     [{on_partition_change, 2}] = Opts,
     false = lists:member({on_partition_change, 2}, ?HASH:module_info(exports)),
+    ok.
+
+%% The other half of §10.1【F3】, and the one the case above cannot see: that
+%% case holds an env it already had and proves route/3 does not call the writer.
+%% Getting the env was itself a call, so a publisher still queued on the index
+%% writer once per message (design §1.1). With the writer suspended, acquiring
+%% an env must still succeed.
+env_is_served_without_the_writer(_Config) ->
+    {ok, Env} = ?HASH:current_env(),
+    ok = ?HASH:register(Env, <<"sport/#">>, 1, #{}),
+    Parent = self(),
+    sys:suspend(?STORE),
+    Helper =
+        spawn(fun() ->
+                  ok = ?HASH:register(Env, <<"blocked/topic">>, 99, #{}),
+                  Parent ! {helper, self(), returned}
+              end),
+    try
+        %% Bounded wait, so a regression fails the case instead of hanging the
+        %% suite until the CT timeout.
+        Lookup =
+            spawn(fun() -> Parent ! {env_lookup, self(), ?HASH:current_env()} end),
+        receive
+            {env_lookup, Lookup, Result} ->
+                {ok, EnvNow} = Result,
+                {ok, [{_, [1]}]} = ?HASH:route(<<"sport/tennis">>, ctx(), EnvNow)
+        after 1000 ->
+            ct:fail(env_lookup_blocked_on_the_writer)
+        end,
+        false = helper_returned_in(300, Helper),
+        true = is_process_alive(Helper),
+        ok
+    after
+        sys:resume(?STORE),
+        true = helper_returned_in(2000, Helper)
+    end.
+
+%% The invalidation contract a route-plan cache would rely on (design §2.4):
+%% a successful write moves gen, a rejected one must not. A bump on failure
+%% would be harmless but would mean the counter tracks attempts, not index
+%% versions, and every caller of gen/0 would have to know which.
+gen_advances_on_successful_writes_only(Config) ->
+    Env = env(Config),
+    G0 = ?HASH:gen(),
+    true = is_integer(G0),
+    ok = ?HASH:register(Env, <<"a/b">>, 1, #{}),
+    G1 = ?HASH:gen(),
+    true = G1 > G0,
+    %% Duplicate register is rejected and the index is unchanged, so gen stays.
+    {error, {already_registered, 1}} = ?HASH:register(Env, <<"a/b">>, 1, #{}),
+    G2 = ?HASH:gen(),
+    G2 = G1,
+    %% Unregistering something that is not there is also a no-op.
+    {error, {not_found, 2}} = ?HASH:unregister(Env, 2),
+    G3 = ?HASH:gen(),
+    G3 = G2,
+    ok = ?HASH:unregister(Env, 1),
+    G4 = ?HASH:gen(),
+    true = G4 > G3,
+    ok.
+
+%% A stale env must be reported, not handed out: the table it names is gone, so
+%% a publisher that got it would crash on the first read. Two shutdown paths,
+%% because only one of them reaches terminate/2.
+env_rejects_a_dead_store(_Config) ->
+    {ok, Env} = ?HASH:current_env(),
+    ok = ?HASH:register(Env, <<"x/y">>, 1, #{}),
+    %% Graceful stop: terminate/2 erases the published env.
+    ok = gen_server:stop(?STORE, normal, 1000),
+    {error, router_store_not_started} = ?HASH:current_env(),
+    %% Supervisor-style kill: a non-trapping gen_server never runs terminate/2,
+    %% so the published env survives the process. The aliveness check is what
+    %% makes that harmless.
+    {ok, _} = ?HASH:init(#{partitions => 4}),
+    {ok, _} = ?HASH:current_env(),
+    Pid = whereis(?STORE),
+    OldTrap = process_flag(trap_exit, true),
+    exit(Pid, kill),
+    receive
+        {'EXIT', Pid, killed} -> ok
+    after 1000 ->
+        ct:fail(store_did_not_die)
+    end,
+    process_flag(trap_exit, OldTrap),
+    {error, router_store_not_started} = ?HASH:current_env(),
     ok.
 
 %%%_* Helpers ------------------------------------------------------------
