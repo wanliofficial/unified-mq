@@ -249,6 +249,20 @@ close(S) ->
 send(S, Msg) ->
     ok = ssl:send(S, coap_codec:encode(Msg)).
 
+%% A probe for a socket that is expected to be CLOSED: we must not write to it
+%% and demand `ok', because admission is refused after the TLS handshake and the
+%% acceptor then closes the socket -- that close races our next `ssl:send', and
+%% when it wins the send returns `{error, closed}' (measured flaky). So both the
+%% write and the read are treated as observations of the same fact: either of
+%% them coming back closed proves the peer was refused; data coming back proves
+%% it was not.
+probe_closed(S) ->
+    case ssl:send(S, <<>>) of
+        ok -> recv(S, ?POLL_BUDGET_MS);
+        {error, closed} -> closed;
+        {error, _Other} -> closed
+    end.
+
 recv(S) ->
     recv(S, ?POLL_BUDGET_MS).
 
@@ -469,10 +483,10 @@ dtls_session_cap(Config) ->
     send(A, request(con, put, 60, [{uri_path, <<"cap">>}], <<"a">>)),
     #{code := ?OK} = expect(A, ack, ?OK),
     %% A second peer: the handshake may complete, but admission is refused and the
-    %% acceptor closes the socket, so nothing is readable on it.
+    %% acceptor closes the socket. We never write a real request to it (see
+    %% `probe_closed/1'): proving refusal is the socket closing, not a response.
     {ok, B} = connect(<<"device-02">>, <<"secret-02">>, Port),
-    send(B, request(con, get, 61, [{uri_path, <<"cap">>}])),
-    ?assertEqual(closed, waiting_or_closed(B, 1500)),
+    ?assertEqual(closed, probe_closed(B)),
     %% The first session was not disturbed.
     send(A, request(con, get, 62, [{uri_path, <<"cap">>}])),
     #{code := ?CONTENT, payload := <<"a">>} = expect(A, ack, ?CONTENT),
@@ -488,8 +502,7 @@ dtls_per_principal_cap(Config) ->
     send(A, request(con, put, 70, [{uri_path, <<"pp">>}], <<"a">>)),
     #{code := ?OK} = expect(A, ack, ?OK),
     {ok, A2} = connect(<<"device-01">>, <<"secret-01">>, Port),
-    send(A2, request(con, get, 71, [{uri_path, <<"pp">>}])),
-    ?assertEqual(closed, waiting_or_closed(A2, 1500)),
+    ?assertEqual(closed, probe_closed(A2)),
     %% A different identity is unaffected: the cap is per principal.
     {ok, B} = connect(<<"device-02">>, <<"secret-02">>, Port),
     send(B, request(con, get, 72, [{uri_path, <<"pp">>}])),
@@ -561,26 +574,6 @@ listener_pid() ->
                   element(1, Id) =:= coap_listener] of
         [Pid | _] -> Pid;
         [] -> exit(no_listener)
-    end.
-
-%% `ok' if the peer produced `{error, closed}' (or nothing) within the window --
-%% which is how a refused admission looks from the client: the socket was
-%% accepted, then closed by the acceptor. Returns `got_data' if the peer could
-%% still read something, meaning the refusal did not happen.
-waiting_or_closed(S, Window) ->
-    waiting_or_closed_until(S, erlang:monotonic_time(millisecond) + Window).
-
-waiting_or_closed_until(S, Deadline) ->
-    Left = Deadline - erlang:monotonic_time(millisecond),
-    case Left > 0 of
-        false ->
-            closed;
-        true ->
-            case recv(S, Left) of
-                closed -> closed;
-                timeout -> closed;
-                #{type := _} -> got_data
-            end
     end.
 
 wait_until(Fun, Budget) when Budget =< 0 ->
