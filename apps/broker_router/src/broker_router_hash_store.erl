@@ -43,7 +43,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/1, start_link/2, register/4, unregister/2, table/1, env/1, gen/1]).
+-export([start_link/1, start_link/2, register/4, unregister/2, env/1, gen/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -75,12 +75,11 @@ unregister(Store, SubRef) ->
 
 %% The env handed to callers carries the table id, taken once at init.
 %%
-%% Kept so a caller that only has the registered name can still ask the process
-%% directly; `env/1' is the path the publish hot path uses, and the one new code
-%% should take. Retaining this export is also the rollback route for change 1:
-%% reverting means pointing `broker_router_hash:current_env/0' back at this.
-table(Store) ->
-    gen_server:call(Store, index_table).
+%% There is deliberately no `table/1' accessor any more. It used to be a
+%% `gen_server:call' that re-learned a value `env/1' already hands out for free;
+%% leaving it exported would have kept a convenient-looking way to put the write
+%% process back on the read path, which is the exact regression change 1 exists to
+%% prevent (design §2.2). Rollback is `git revert', not a retained call.
 
 %% @doc Serving copy of the env, readable without messaging the writer.
 %%
@@ -189,10 +188,7 @@ handle_call({unregister, SubRef}, _From, #st{trie = Trie, subs = Subs} = State) 
             {reply, ok, State};
         [] ->
             {reply, {error, {not_found, SubRef}}, State}
-    end;
-
-handle_call(index_table, _From, #st{trie = Trie} = State) ->
-    {reply, Trie, State}.
+    end.
 
 handle_cast(Msg, State) ->
     {stop, {unexpected_cast, Msg}, State}.
