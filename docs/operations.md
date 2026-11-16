@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）；S10-D D.1/D.2 交付真实第三方 aiortc 证据与不落盘证明，D.3 交付安全专项（8 冻结用例 + 缺口/不可达留痕），D.4 交付结构化脱敏日志（`webrtc_conn`/`turn_allocation`，永不记 data/口令/SDP，`broker_metrics` 冻结键集不扩容），D.5 更新 §2 能力矩阵两行口径 + 追加 §4.23 S10 能力/限制清单与 ADR-028/029 一致性**
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）；S10-D D.1/D.2 交付真实第三方 aiortc 证据与不落盘证明，D.3 交付安全专项（8 冻结用例 + 缺口/不可达留痕），D.4 交付结构化脱敏日志（`webrtc_conn`/`turn_allocation`，永不记 data/口令/SDP，`broker_metrics` 冻结键集不扩容），D.5 更新 §2 能力矩阵两行口径 + 追加 §4.23 S10 能力/限制清单与 ADR-028/029 一致性；S11-A/B/C 追加 §1.8 与端口表两行（CoAP 明文 UDP 5683 与 `coaps` DTLS 1.2/PSK 5684，同一 app、逐 listener `transport => dtls` 开启，出厂 `enabled => false` 零 socket；含 PSK 派生与 realm 绑定、`require_auth` 分协议门控、串行握手 ~41/s 的冷启动错峰、诱饵密钥挡用户名枚举、九张表关闭清理，以及 §9 容量报告指针与 §10 四条真实症状）**
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -28,11 +28,15 @@
 | ACP (v1) | **无（仅 stdio，无 listener）** | 子进程管道（无网络） | `broker_proto_acp`（S9-E）。出厂 `agents => []`，不跑任何 agent；语义是 Broker 作 Client、agent 是本地子进程。见 §1.5 |
 | WebRTC 信令 (WSS) | **无（默认不监听）** | WebSocket（明文可 TLS，wss） | `broker_proto_webrtc`（S10-A/B）。示例部署端口 8084，`listeners => []` 是出厂值。连接层（子协议 `webrtc.v1`、认证窗口、保活、帧上限）+ 房间注册表 + 五类事件 + `to` 进程直投 + 房间隔离/ACL；**媒体面不做**。见 §1.6 |
 | STUN / TURN | **无（默认不监听）** | STUN/TURN over **UDP**（无 TLS、无 DTLS） | `broker_ice`（S10-C）。出厂 `enabled => false`，**零 socket**；开了之后是 `3478/UDP`（STUN Binding + TURN）+ relay 段 `49152-65535/UDP`（可配窄区间）。TURN over TCP / 5349/TLS 与 DTLS **不做**（ADR-029 §D2）。见 §1.7 |
+| CoAP（明文 UDP） | **无（默认不监听）** | **UDP**（无 TLS；CON 去重 + Block1） | `broker_proto_coap`（S11-A/B）。出厂 `enabled => false` **零 socket**；开了之后 `5683/UDP`。明文方向没有 TLS 路径（见下行 coaps）。见 §1.8 |
+| CoAP over DTLS（coaps） | **无（默认不监听）** | **DTLS 1.2 / PSK**（cert-free） | `broker_proto_coap`（S11-C，同一 app）。listener 用 `transport => dtls` 逐个开启，建议端口 5684。**无证书 / 无 mTLS / 无 OSCORE**；PSK 由 `users` 表派生、realm 绑定。见 §1.8 |
 | 管理 API | 8090 | HTTP | `broker_admin`，默认只绑 `127.0.0.1` |
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener 共用同一份证书配置同时切换（含 S10-A 起的 WebRTC 信令 listener）。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
 
 **例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一**明文且没有 TLS 路径**的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
+
+**CoAP 是 UDP，但两个方向都有**：明文 UDP listener（默认 5683）与 `coaps`（DTLS 1.2 / PSK，默认建议 5684）由**同一个** `broker_proto_coap` 提供。明文 UDP 这条和 MQTT-SN 一样没有 TLS 路径，但 CoAP 整体不算「只有明文」——它另有 DTLS 方向。DTLS 是 cert-free PSK-only，不读 `broker_security.tls` 的证书，PSK 由 `users` 表派生、realm 绑定（见 §1.8）。
 
 **QUIC 是另一个方向的例外**：它**没有明文模式**，握手本身就是 TLS 1.3，所以 `broker_security.tls.enabled` 对它不是「开关」而是「证书来源」——关掉这个开关不会让 14567 变明文，只会让 listener 找不到证书而**拒绝启动**（`{quic_requires_tls, Key}`，只影响这一个 app）。
 
@@ -503,6 +507,60 @@ const pc = new RTCPeerConnection({
 
 **日志（S10-D D.4，生命周期）**：`turn_allocation` 发两条 `?LOG_INFO`——`allocated`（`client` 5-tuple + `relay_port` + `username`）与 `released`（同上 + 粗粒度 `reason`：`normal`/`shutdown`/`abnormal`）。**永不记 key / 口令**（key 只在进程状态里）。排查 allocation 为何消失看 `released` 的 `reason`；排查建立速率看 `allocated` 的频率。`turn_auth` 仍是零 `logger` 调用（认证失败照旧纯状态转移）。
 
+### 1.8 CoAP / coaps（UDP 5683 明文 · 5684 DTLS-PSK，默认关闭，S11-A/B/C）
+
+`broker_proto_coap` 是 CoAP（RFC 7252）的 UDP 前端，同一 app 提供两个方向：**明文 UDP**（S11-A，5683）与 **`coaps`（DTLS 1.2 / PSK，S11-C，建议 5684）**。资源路径**就是** `broker_router` 的 destination，没有第二套命名空间；`/.well-known/core` 由 retain / router / event 自动汇聚。出厂 `enabled => false` **零 socket**，装配进 release 但 `listeners => []` 时不开任何端口。
+
+**配置**（出厂值在 `broker_proto_coap.app.src`；`config/sys.config.src` 里**没有这一段**，要开就自己加，最小形态是 `{enabled, true}, {listeners, [#{port => 5683}]}`）：
+
+```erlang
+{broker_proto_coap, [
+  {enabled, false},
+  %% 明文 UDP listener；coaps listener 见下。port => 0 由内核分配。
+  {listeners, [#{port => 5683},                          %% 明文
+                #{port => 5684, transport => dtls}]},     %% coaps：DTLS-PSK
+  {max_message_bytes, 65535},
+  {dedup_window_ms, 247000},                              %% RFC 7252 §4.8.2 EXCHANGE_LIFETIME
+  {max_dedup_entries, 4096},
+  {max_requests_per_second, 100},                         %% 每端点令牌桶（放大防御）
+  {max_endpoints, 4096},                                 %% 新来源上限，满了拒绝新桶而非驱逐
+  {block_size, 1024},                                     %% Block1/2 的 SZX 单元（草案对齐）
+  {max_block1_bytes, 262144},                             %% 每端点 Block1 重组缓冲上限
+  {resources, []},                                        %% 静态资源（保留态自动通告）
+  {recbuf_bytes, 65536},
+  %% Observe（RFC 7641，S11-B）
+  {max_observes, 4096},
+  {observe_ack_timeout_ms, 2000},
+  {observe_max_retrans, 3},
+  {observe_max_age_s, 30},
+  %% DTLS（S11-C）
+  {dtls_transport_accept_timeout_ms, 1000},               %% accept 超时
+  {dtls_handshake_timeout_ms, 2000},                      %% 握手超时
+  {max_dtls_sessions, 1024},                              %% DTLS 会话表上限
+  {dtls_max_sessions_per_principal, 16}                   %% 每身份会话上限
+]}.
+```
+
+- **两个方向由 listener spec 决定**：`listeners` 里一条 spec 就是一个 socket，`transport => dtls` 的走 DTLS、其余走明文 UDP。想只开明文、只开 coaps、或都开都行；**默认 `[]` 一个都不开**。
+- **`coaps` 的 PSK 来自 `users` 表，realm 绑定**：`broker_security:psk_for_identity/1` 对 identity 查 `users` 的 `password`，派生 `SHA-256("unifiedmq-coaps-psk" ‖0‖ identity ‖0‖ realm ‖0‖ password)`（域分隔，含 0 分隔符防拼接歧义）。**realm 取自 `broker_security.coaps.realm`（默认 `<<"unifiedmq">>`，与 `broker_security.tls` 那份证书配置完全无关）**；realm 一旦上线不要改——改了等于让所有客户端手里的 PSK 失效（realm 是 key 的一部分）。
+- **`require_auth` 对两个方向分别校验**（`broker_proto_coap_app:guard/0`）：`coap`（明文）**不可能携带凭据**，出现在 `require_auth` 里直接启动失败 `{error, {require_auth_unsupported, coap}}`；`coaps` 要求认证时，**所有** enabled listener 必须都是 DTLS，否则 `{error, {require_auth_needs_dtls, coaps}}`。想强制认证就只开 coaps、并把 `coaps` 放进 `broker_security.require_auth`。
+- **PSK-only，没有证书 / 没有 mTLS**：DTLS 不加载任何证书，服务端从不证明自己；`ssl:listen` 强制 `{mode, binary}`。cert-based DTLS、OSCORE、CoAP over TCP/WebSocket、服务端 Block2 **均不做**（ADR-031 非目标，见 `docs/security.md` §12.6）。
+- **串行握手是硬约束，不是可调旋钮**：PSK identity 只能被同步 `user_lookup_fun` 观察到，并发握手会串身份，因此 DTLS acceptor **单进程串行**跑 `accept → handshake → drain identity → offer → controlling_process → 移交`。代价是**握手速率约 41 次/秒**（p50 ~22 ms）——**冷启动时大批设备必须错峰上线**（见下「排查」与容量报告）。
+- **会话有界**：DTLS 会话表（`{IP,Port}` → socket）与每主体计数（`principal`/`tenant` → 会话数）都是**硬上限**（`max_dtls_sessions` / `dtls_max_sessions_per_principal`），超限拒绝新会话而非驱逐；关闭即释放（`terminate` 先关 listen socket 再关每条 peer）。九张运行期表里，随 peer 存活而存在的那**六张**（`peers`/`socks`/`idents`/`principal_sessions`/`observes`/`pending`）在关闭后归零（`dtls_close_cleans_up` 断言），其余三张（`dedup`/`endpoints`/`block1`）由 1 s tick 清扫。
+- **未知身份不发 TLS alert，回诱饵密钥**：实测未知 identity 的 alert 在 20–200 ms 返回、「用户存在+口令错」走 Finished 校验失败 → 客户端 3 s 超时，二者可区分 ⇒ 用户名枚举 oracle。故未知 / 错口令统一回诱饵密钥 `SHA-256("unifiedmq-coaps-psk-decoy" ‖0‖ 每 listener 随机 32 字节 ‖0‖ Identity)`，让两条错误路径**不可区分**。**诱饵是缓解不是证明**（`docs/security.md` §12.6）。
+- **明文 UDP 端点无身份**：明文 listener 上 `principal` 恒 `undefined`，ACL 只在 `acl => allow` 下放行；要真正的身份/ACL 就走 coaps。`max_requests_per_second`（默认 100）对明文与 coaps 都按端点 `{IP,Port}` 计——**注意先抬高它再压测**，否则失败会恰好从第 100 个请求开始、每 4 个失败 1 个，极易误判。
+
+**防火墙**：只开 UDP。明文 5683 与 coaps 5684 按需放行；`ss -lunp | grep 5683` / `grep 5684` 确认在听。coaps 的握手与重传走同一 UDP 端口。
+
+**指标**：CoAP 不写专属指标（ADR-016 冻结键集），只 inc 既有 `bytes_in` / `frame_decode_errors` / `protocol_errors`；DTLS 握手超时、会话上限拒绝目前**没有独立计数**——排查主要看进程存活与 `logger`。容量/握手延迟以 `docs/benchmarks/2026-11-16-s11c-dtls-capacity.md` 为准（握手 41/s、RTT p50 347µs / p95 447µs、稳态 ~4.4k req/s 零错误、DTLS ≈ 明文 1.8×）。
+
+**排查**：
+- 客户端连不上先确认是 **UDP** 且端口对得上（5683 明文 / 5684 coaps）；TCP 连必然超时。coaps 握手失败先查 identity 是否在 `users` 表、realm 是否与客户端一致。
+- **冷启动大批设备同时上线，只有少数握手成功**：这是串行握手 ~41/s 的硬上界 + DTLS 客户端重传退避（1/3/7/15 s）叠加的表现，**不是故障**。让客户端错峰（≥150 ms）上线即可全成功；容量报告 §3.5 有对照数据。
+- `require_auth` 配了 `coap`（明文）导致 app 拒绝启动：把 `coap` 从 `require_auth` 移除，或改用只开 coaps 的方向。
+- DTLS 握手后立刻断、且日志有移交相关错误：检查 `dtls_handshake_timeout_ms`（默认 2000）是否够客户端完成；`{active,N}` 只能在移交后 arm，非 owner 调用返回 `ok` 但会静默错投（内部约束，一般无需运维介入）。
+- 压测吞吐数字异常低：确认已把 `max_requests_per_second` 抬高（默认 100），否则请求在第 100 个处被静默拒绝。
+
 ---
 
 ## 2. 管理 API
@@ -740,6 +798,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 - 快速结论（本机 16 逻辑核 / ext4 / OTP 28）：1 KiB 8 连接约 900 msg/s（fsync 档），吞吐随消息大小下降，1 MiB 约 11 msg/s；`kill -9` 恢复到首个 CONNACK 约 3.4–3.6 s。
 - 容量估算以「持久化 msg/s × 消息大小 ÷ 副本因子 × 安全系数」为起点，必须用目标硬件复测，不要直接外推本机数字。
 - **WebRTC 信令与 ICE 的容量基准**（不落盘路径，与上面持久化口径不可直接比较）：`docs/benchmarks/2026-11-14-s10-capacity.md`，复跑 `test/protocol-compatibility/s10/bench/run_bench.sh`（自带内存守卫与断点续跑，只绑回环临时端口）。快速结论：信令 32 连接并发 1498.7/s（p50 1.6 ms）、ICE allocation 顺序 p50 893 µs、relay 中继约 5.2k datagrams/s。**信令与 ICE 都不写 WAL**，它们的容量不受磁盘 fsync 约束，受 CPU/调度与 socket 缓冲约束；relay 在无上层流控的突发下会丢包（实测送达率 0.77），容量规划必须留余量。
+- **CoAP / coaps（DTLS-PSK）的容量基准**：`docs/benchmarks/2026-11-16-s11c-dtls-capacity.md`，复跑 `test/protocol-compatibility/s11c/bench/run_bench.sh`（只绑回环临时端口，会覆写 `results/dtls_capacity.json`，跑完 `git checkout --` 还原）。快速结论：**握手串行约 41/s**（p50 ~22 ms，冷启动大批设备须错峰 ≥150 ms）、**DTLS 单次往返 ≈ 明文 1.8×**、稳态单 listener **约 4.4k req/s 零错误**（单进程瓶颈）、冷启动风暴 32 并发仅 5 成功 vs 错峰 32/32。吞吐须「先顺序建会话、再并发打请求」，与持久化口径不可直接比较。
 
 ---
 
@@ -755,3 +814,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | `authz_failures` 激增 | `config` 的 `acl` | ACL 规则过严或租户不符 |
 | 集群写失败 `no_quorum` | `cluster_*` | 存活节点不足多数派 |
 | 管理 API 401 | `broker_admin.token` | 未带 Bearer 或 token 不符 |
+| CoAP 连不上 | `ss -lunp \| grep 5683` / `5684` | 用 TCP 连、或 `enabled => false` / `listeners => []` 未开 |
+| coaps 握手失败 | `users` 表、`broker_security.coaps.realm` | identity 不在表、口令错、realm 与客户端不一致 |
+| 冷启动大批 DTLS 设备仅少数连上 | 容量报告 §3.5 | 串行握手 ~41/s 上界 + 客户端重传退避；错峰 ≥150 ms |
+| CoAP 压测吞吐异常低 | `max_requests_per_second` | 默认 100/端点，未抬高则第 100 个请求起被静默拒绝 |
