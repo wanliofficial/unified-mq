@@ -259,11 +259,11 @@ delete(Req, Ctx) ->
 
 %%%_* Authorization ---------------------------------------------------------
 
-%% ADR-031 §D5: the identity table is `broker_security''s, and plain UDP has no
-%% credential, so `principal' is `undefined' here and `broker_security' treats
-%% that as anonymous/allowed. Per-resource ACLs only bite once S11-C's DTLS
-%% client identity exists -- calling the same facade now means the policy hook
-%% is wired, not that it can distinguish anyone yet.
+%% ADR-031 §D5: the identity table is `broker_security''s. On plain UDP there is
+%% no credential at all, so `principal' is `undefined' and `broker_security'
+%% treats that as anonymous/allowed; over DTLS (S11-C) the handshake has proven
+%% an identity, so `principal' is the device's username and its tenant, and this
+%% same call is what produces a real `4.03 Forbidden'.
 authorized(Ctx, Action, Destination) ->
     Principal = maps:get(principal, Ctx, undefined),
     broker_security:authorize(Principal, #{action => Action,

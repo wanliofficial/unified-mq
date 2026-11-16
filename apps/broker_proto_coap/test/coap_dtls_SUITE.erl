@@ -36,7 +36,15 @@ all() ->
     [dtls_psk_handshake_and_get,
      dtls_psk_write_and_read,
      unknown_identity_is_refused,
-     dtls_con_dedup].
+     dtls_con_dedup,
+     acl_denies_on_dtls,
+     acl_allows_on_dtls,
+     tenant_isolation_on_dtls,
+     dtls_observe_registers_and_notifies,
+     dtls_session_cap,
+     dtls_per_principal_cap,
+     dtls_close_cleans_up,
+     plain_udp_unaffected].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -96,8 +104,8 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_security, coaps, #{realm => ?DEFAULT_REALM}),
     ok = application:set_env(broker_proto_coap, enabled, true),
     %% `transport => dtls' is the opt-in: no plain UDP socket is opened at all.
-    ok = application:set_env(broker_proto_coap, listeners,
-                             [#{port => 0, transport => dtls}]),
+    %% The one case about the plain path overrides this (see `case_env/2').
+    ok = application:set_env(broker_proto_coap, listeners, listener_spec(Case)),
     ok = application:set_env(broker_proto_coap, resources, []),
     ok = case_env(Case, Config0),
     {ok, _} = application:ensure_all_started(broker_storage),
@@ -109,6 +117,12 @@ end_per_testcase(_Case, Config) ->
     stop_all(),
     restore_env(?config(saved_env, Config)),
     ok.
+
+%% The plain-path control runs a UDP listener instead of a DTLS one; every other
+%% case opts into DTLS. Plain UDP is the default, so omitting `transport' is
+%% exactly what an operator who never heard of S11-C gets.
+listener_spec(plain_udp_unaffected) -> [#{port => 0}];
+listener_spec(_Case) -> [#{port => 0, transport => dtls}].
 
 %% The per-principal cap case allows a single session per identity so the second
 %% one is refused deterministically; everything else keeps the shipped default.
@@ -359,3 +373,254 @@ dtls_con_dedup(Config) ->
     send(S, request(con, get, 22, [{uri_path, <<"dd">>}])),
     #{payload := <<"once">>} = expect(S, ack, ?CONTENT),
     close(S).
+
+%% The gap S11-B left open, closed: with a real principal on the wire, an ACL
+%% `deny' finally produces 4.03 for a CoAP request. On plain UDP this case is
+%% impossible to write -- `principal' is `undefined' and `broker_security' allows
+%% anonymous traffic outright.
+acl_denies_on_dtls(Config) ->
+    Port = ?config(port, Config),
+    ok = application:set_env(broker_security, acl,
+                             [rule(deny, <<"device-01">>, <<"*">>, <<"secret/#">>)]),
+    {ok, S} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(S, request(con, get, 30, [{uri_path, <<"secret/plans">>}])),
+    %% 4.03 Forbidden -- not 4.04 (nothing there), not 5.00.
+    #{code := {response, 4, 3}} = expect(S, ack, {response, 4, 3}),
+    close(S).
+
+%% The positive control for the case above. Without it, a listener that refused
+%% every request would pass the deny case and look correct.
+acl_allows_on_dtls(Config) ->
+    Port = ?config(port, Config),
+    ok = application:set_env(broker_security, acl,
+                             [rule(allow, <<"device-01">>, <<"*">>, <<"pub/#">>)]),
+    {ok, S} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(S, request(con, put, 31, [{uri_path, <<"pub/x">>}], <<"v">>)),
+    #{code := ?OK} = expect(S, ack, ?OK),
+    send(S, request(con, get, 32, [{uri_path, <<"pub/x">>}])),
+    #{code := ?CONTENT, payload := <<"v">>} = expect(S, ack, ?CONTENT),
+    %% And a destination outside the granted prefix is still refused, so the pass
+    %% above is the rule's doing and not a blanket allow.
+    send(S, request(con, get, 33, [{uri_path, <<"other/x">>}])),
+    #{code := {response, 4, 3}} = expect(S, ack, {response, 4, 3}),
+    close(S).
+
+%% The tenant stamped on a CoAP write comes from the authenticated principal, not
+%% from anything the client sends. That is the property S11-C makes reachable: on
+%% plain UDP every message lands in the default tenant, because there is no
+%% identity to derive one from.
+%%
+%% Note what this does NOT claim: a CoAP destination is a resource path, not a
+%% tenant-qualified topic, so there is no "device names another tenant" attack to
+%% refuse here (unlike MQTT, where the topic carries the tenant). The boundary is
+%% that a device cannot choose its tenant at all, plus the ACL, which the two
+%% cases above exercise. Confining a device to its own prefix is an ACL pattern
+%% (`t1/#'), written by an operator, not a built-in path rule.
+tenant_isolation_on_dtls(Config) ->
+    Port = ?config(port, Config),
+    ok = application:set_env(broker_security, acl, allow),
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 40, [{uri_path, <<"shared/x">>}], <<"from-t1">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    {ok, B} = connect(<<"tenant-b">>, <<"secret-b">>, Port),
+    send(B, request(con, put, 41, [{uri_path, <<"shared/y">>}], <<"from-t2">>)),
+    #{code := ?OK} = expect(B, ack, ?OK),
+    %% Each write is stamped with its own device's tenant, as recorded by the
+    %% retain store (the same `#broker_message{}' the kernel dispatches).
+    ?assertEqual(<<"t1">>, retained_tenant(<<"shared/x">>)),
+    ?assertEqual(<<"t2">>, retained_tenant(<<"shared/y">>)),
+    close(A),
+    close(B).
+
+retained_tenant(Destination) ->
+    {ok, Msg} = broker_retain:lookup(Destination),
+    %% `#broker_message.tenant_id' (element 3: tag, message_id, tenant_id).
+    element(3, Msg).
+
+%% Observe works over DTLS with no change to the relationship machinery: the
+%% tables are keyed by `{IP,Port}' and `ssl:peername/1' supplies the same tuple
+%% `gen_udp' does. The tenant the subscription lives under is now the device's
+%% real tenant rather than the default.
+dtls_observe_registers_and_notifies(Config) ->
+    Port = ?config(port, Config),
+    {ok, S} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    Token = <<"obs">>,
+    send(S, request(con, put, 50, [{uri_path, <<"o">>}], <<"init">>)),
+    _ = expect(S, ack, ?OK),
+    send(S, (request(con, get, 51, [{uri_path, <<"o">>}, {observe, 0}]))
+             #{token => Token}),
+    First = expect(S, ack, ?CONTENT),
+    ?assertEqual(Token, coap_codec:token(First)),
+    ?assertEqual(0, coap_codec:option(observe, First)),
+    send(S, request(con, put, 52, [{uri_path, <<"o">>}], <<"v1">>)),
+    _ = expect(S, ack, ?OK),
+    Note = expect(S, con, ?CONTENT),
+    ?assertEqual(Token, coap_codec:token(Note)),
+    ?assertEqual(1, coap_codec:option(observe, Note)),
+    send(S, ack_of(Note)),
+    close(S).
+
+%% The total session cap bounds memory. With a cap of one, the second peer is
+%% refused after its handshake (the listener owns the table, so it decides) and
+%% the first session keeps working -- a new client must never evict a live one.
+dtls_session_cap(Config) ->
+    Port = ?config(port, Config),
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 60, [{uri_path, <<"cap">>}], <<"a">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    %% A second peer: the handshake may complete, but admission is refused and the
+    %% acceptor closes the socket, so nothing is readable on it.
+    {ok, B} = connect(<<"device-02">>, <<"secret-02">>, Port),
+    send(B, request(con, get, 61, [{uri_path, <<"cap">>}])),
+    ?assertEqual(closed, waiting_or_closed(B, 1500)),
+    %% The first session was not disturbed.
+    send(A, request(con, get, 62, [{uri_path, <<"cap">>}])),
+    #{code := ?CONTENT, payload := <<"a">>} = expect(A, ack, ?CONTENT),
+    close(A),
+    close(B).
+
+%% One device must not hold the whole table. A second session for the SAME
+%% identity is refused at the per-principal cap, while a different identity still
+%% gets in -- so the cap is per identity and not a global second-session ban.
+dtls_per_principal_cap(Config) ->
+    Port = ?config(port, Config),
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 70, [{uri_path, <<"pp">>}], <<"a">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    {ok, A2} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A2, request(con, get, 71, [{uri_path, <<"pp">>}])),
+    ?assertEqual(closed, waiting_or_closed(A2, 1500)),
+    %% A different identity is unaffected: the cap is per principal.
+    {ok, B} = connect(<<"device-02">>, <<"secret-02">>, Port),
+    send(B, request(con, get, 72, [{uri_path, <<"pp">>}])),
+    #{code := ?CONTENT, payload := <<"a">>} = expect(B, ack, ?CONTENT),
+    close(A),
+    close(A2),
+    close(B).
+
+%% A closed DTLS session is a positive fact, unlike a UDP endpoint that just goes
+%% silent, so every table entry for that peer is dropped at once. Proven by
+%% capacity rather than by poking at state: with the per-principal cap at one, a
+%% reconnect as the same identity can only succeed if the previous session's
+%% counter was released.
+dtls_close_cleans_up(Config) ->
+    Port = ?config(port, Config),
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 80, [{uri_path, <<"cl">>}], <<"a">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    %% Register an observation too, so the cleanup has a relationship to remove.
+    send(A, (request(con, get, 81, [{uri_path, <<"cl">>}, {observe, 0}]))
+             #{token => <<"cltok">>}),
+    _ = expect(A, ack, ?CONTENT),
+    Pid = listener_pid(),
+    ?assertEqual(1, maps:get(<<"device-01">>,
+                             element(16, sys:get_state(Pid)))),
+    close(A),
+    %% Wait for the {ssl_closed, _} to be processed.
+    ok = wait_until(fun() -> maps:size(element(13, sys:get_state(Pid))) =:= 0 end,
+                    2000),
+    St = sys:get_state(Pid),
+    ?assertEqual(0, maps:size(element(13, St))),   %% peers
+    ?assertEqual(0, maps:size(element(14, St))),   %% socks
+    ?assertEqual(0, maps:size(element(15, St))),   %% idents
+    ?assertEqual(0, maps:size(element(16, St))),   %% principal_sessions
+    ?assertEqual(0, maps:size(element(9, St))),    %% observes
+    ?assertEqual(0, maps:size(element(10, St))),   %% pending
+    %% And a reconnect as the same identity works (the counter really was freed).
+    {ok, B} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(B, request(con, get, 82, [{uri_path, <<"cl">>}])),
+    #{code := ?CONTENT, payload := <<"a">>} = expect(B, ack, ?CONTENT),
+    close(B).
+
+%% Plain UDP is untouched by all of the above, and its posture is unchanged on
+%% purpose: a datagram carries no credential, so `principal' is `undefined' and
+%% `broker_security' allows anonymous traffic. This is the honest floor -- an
+%% operator who wants authorization must use `coaps'.
+plain_udp_unaffected(Config) ->
+    Port = ?config(port, Config),
+    %% A restrictive ACL that would deny any real principal.
+    ok = application:set_env(broker_security, acl,
+                             [rule(deny, <<"*">>, <<"*">>, <<"*">>)]),
+    S = udp_open(),
+    udp_send(S, Port, request(con, put, 90, [{uri_path, <<"u">>}], <<"plain">>)),
+    #{code := ?OK} = udp_expect(S, ack, ?OK),
+    udp_send(S, Port, request(con, get, 91, [{uri_path, <<"u">>}])),
+    #{code := ?CONTENT, payload := <<"plain">>} = udp_expect(S, ack, ?CONTENT),
+    udp_close(S).
+
+%%%_* Helpers ---------------------------------------------------------------
+
+%% The ACL rule shape `broker_security' consumes (`rule_matches/4').
+rule(Effect, Principal, Action, Pattern) ->
+    #{effect => Effect, principal => Principal,
+      action => Action, pattern => Pattern}.
+
+listener_pid() ->
+    case [Pid || {Id, Pid, worker, _} <- supervisor:which_children(
+                                                 broker_proto_coap_sup),
+                  element(1, Id) =:= coap_listener] of
+        [Pid | _] -> Pid;
+        [] -> exit(no_listener)
+    end.
+
+%% `ok' if the peer produced `{error, closed}' (or nothing) within the window --
+%% which is how a refused admission looks from the client: the socket was
+%% accepted, then closed by the acceptor. Returns `got_data' if the peer could
+%% still read something, meaning the refusal did not happen.
+waiting_or_closed(S, Window) ->
+    waiting_or_closed_until(S, erlang:monotonic_time(millisecond) + Window).
+
+waiting_or_closed_until(S, Deadline) ->
+    Left = Deadline - erlang:monotonic_time(millisecond),
+    case Left > 0 of
+        false ->
+            closed;
+        true ->
+            case recv(S, Left) of
+                closed -> closed;
+                timeout -> closed;
+                #{type := _} -> got_data
+            end
+    end.
+
+wait_until(Fun, Budget) when Budget =< 0 ->
+    case Fun() of
+        true -> ok;
+        false -> timeout
+    end;
+wait_until(Fun, Budget) ->
+    case Fun() of
+        true -> ok;
+        false -> timer:sleep(?POLL_MS), wait_until(Fun, Budget - ?POLL_MS)
+    end.
+
+udp_open() ->
+    {ok, S} = gen_udp:open(0, [binary, {active, false}]),
+    S.
+
+udp_close(S) ->
+    gen_udp:close(S).
+
+udp_send(S, Port, Msg) ->
+    ok = gen_udp:send(S, ?HOST, Port, coap_codec:encode(Msg)).
+
+udp_expect(S, Type, Code) ->
+    Deadline = erlang:monotonic_time(millisecond) + ?POLL_BUDGET_MS,
+    udp_expect(S, Type, Code, Deadline).
+
+udp_expect(S, Type, Code, Deadline) ->
+    Left = Deadline - erlang:monotonic_time(millisecond),
+    case Left > 0 andalso gen_udp:recv(S, 0, Left) of
+        false -> exit({timeout_waiting_for, Type, Code});
+        {error, timeout} -> exit({timeout_waiting_for, Type, Code});
+        {ok, {_IP, _Port, Bin}} ->
+            {ok, Msg} = coap_codec:decode(Bin),
+            case Msg of
+                #{type := Type, code := Code} -> Msg;
+                _Other -> udp_expect(S, Type, Code, Deadline)
+            end
+    end.
+
+%% A conformant empty ACK: TKL 0, echoing the notification's Message ID.
+ack_of(Note) ->
+    coap_codec:ack(Note).
