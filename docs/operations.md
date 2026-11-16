@@ -1,6 +1,6 @@
 # 运维手册（S6）
 
-- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）；S10-D D.1/D.2 交付真实第三方 aiortc 证据与不落盘证明，D.3 交付安全专项（8 冻结用例 + 缺口/不可达留痕），D.4 交付结构化脱敏日志（`webrtc_conn`/`turn_allocation`，永不记 data/口令/SDP，`broker_metrics` 冻结键集不扩容），D.5 更新 §2 能力矩阵两行口径 + 追加 §4.23 S10 能力/限制清单与 ADR-028/029 一致性；S11-A/B/C 追加 §1.8 与端口表两行（CoAP 明文 UDP 5683 与 `coaps` DTLS 1.2/PSK 5684，同一 app、逐 listener `transport => dtls` 开启，出厂 `enabled => false` 零 socket；含 PSK 派生与 realm 绑定、`require_auth` 分协议门控、串行握手 ~41/s 的冷启动错峰、诱饵密钥挡用户名枚举、九张表关闭清理，以及 §9 容量报告指针与 §10 四条真实症状）**
+- **状态**：S6 交付事实文档 v1.0（2026-11-09）；S8-B/S8-C/S8-D 追加 §1 的 8083、UDP 1884 与 UDP 14567；S9-A/B/C/D/E 追加 §1.3~§1.5；S10-A 追加 §1.6 与端口表的 WebRTC 信令行（出厂 `listeners => []`，零端口）；S10-B 把 §1.6 补成连接层 + 房间/事件/`to` 转发/ACL；**S10-C 追加 §1.7（`broker_ice`，3478/UDP + relay 段 + 防火墙与 `iceServers` 示例，出厂 `enabled => false`，零 socket）；S10-D D.1/D.2 交付真实第三方 aiortc 证据与不落盘证明，D.3 交付安全专项（8 冻结用例 + 缺口/不可达留痕），D.4 交付结构化脱敏日志（`webrtc_conn`/`turn_allocation`，永不记 data/口令/SDP，`broker_metrics` 冻结键集不扩容），D.5 更新 §2 能力矩阵两行口径 + 追加 §4.23 S10 能力/限制清单与 ADR-028/029 一致性；S11-A/B/C 追加 §1.8 与端口表两行（CoAP 明文 UDP 5683 与 `coaps` DTLS 1.2/PSK 5684，同一 app、逐 listener `transport => dtls` 开启，出厂 `enabled => false` 零 socket；含 PSK 派生与 realm 绑定、`require_auth` 分协议门控、串行握手 ~41/s 的冷启动错峰、诱饵密钥挡用户名枚举、九张表关闭清理，以及 §9 容量报告指针与 §10 四条真实症状）**。2026-11-16 追加：`test/protocol-compatibility/s11c/libcoap/` 落盘 **libcoap v4.3.5 真实客户端证据**，并据其修正两条 Block1 互操作缺陷（`2.31` 回收到的块号、重组流键改用 `Request-Tag`）；**Block2 未实现，因此单个响应实际上限约 1 KB**（§1.8 已改写旧的「65535」措辞）。
 - **对应**：`docs/roadmap.md` §8.2；Gate S6 第 4 项（运维手册与告警规则）
 - **实现**：`apps/broker_admin/`（`broker_admin_http`、`broker_admin_listener`、`broker_backup`、`broker_config_audit`、`broker_version`）
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
@@ -36,7 +36,7 @@ TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 li
 
 **例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。**它不再是唯一**「明文且没有 TLS 路径」的端口——CoAP 的明文 UDP listener（5683）同样如此（见下一段）。
 
-**CoAP 是 UDP，但两个方向都有**：明文 UDP listener（默认 5683）与 `coaps`（DTLS 1.2 / PSK，默认建议 5684）由**同一个** `broker_proto_coap` 提供。明文 UDP 这条和 MQTT-SN 一样没有 TLS 路径，但 CoAP 整体不算「只有明文」——它另有 DTLS 方向。DTLS 是 cert-free PSK-only，不读 `broker_security.tls` 的证书，PSK 由 `users` 表派生、realm 绑定（见 §1.8）。
+**CoAP 是 UDP，但两个方向都有**：明文 UDP listener（默认 5683）与 `coaps`（DTLS 1.2 / PSK，默认建议 5684）由**同一个** `broker_proto_coap` 提供。明文 UDP 这条和 MQTT-SN 一样没有 TLS 路径，但 CoAP 整体不算「只有明文」——它另有 DTLS 方向。DTLS 是 cert-free PSK-only，不读 `broker_security.tls` 的证书，PSK 由 `users` 表派生、realm 绑定（见 §1.8）。**请求方向支持 Block1 分块，响应方向不支持 Block2，故单个响应上限约 1 KB**（见 §1.8）。
 
 **QUIC 是另一个方向的例外**：它**没有明文模式**，握手本身就是 TLS 1.3，所以 `broker_security.tls.enabled` 对它不是「开关」而是「证书来源」——关掉这个开关不会让 14567 变明文，只会让 listener 找不到证书而**拒绝启动**（`{quic_requires_tls, Key}`，只影响这一个 app）。
 
@@ -524,7 +524,7 @@ const pc = new RTCPeerConnection({
   {max_dedup_entries, 4096},
   {max_requests_per_second, 100},                         %% 每端点令牌桶（放大防御）
   {max_endpoints, 4096},                                 %% 新来源上限，满了拒绝新桶而非驱逐
-  {block_size, 1024},                                     %% Block1/2 的 SZX 单元（草案对齐）
+  {block_size, 1024},                                     %% 预留（Block2 未实现，当前无效果；Block1 用客户端 SZX）
   {max_block1_bytes, 262144},                             %% 每端点 Block1 重组缓冲上限
   {resources, []},                                        %% 静态资源（保留态自动通告）
   {recbuf_bytes, 65536},
@@ -544,7 +544,8 @@ const pc = new RTCPeerConnection({
 - **两个方向由 listener spec 决定**：`listeners` 里一条 spec 就是一个 socket，`transport => dtls` 的走 DTLS、其余走明文 UDP。想只开明文、只开 coaps、或都开都行；**默认 `[]` 一个都不开**。
 - **`coaps` 的 PSK 来自 `users` 表，realm 绑定**：`broker_security:psk_for_identity/1` 对 identity 查 `users` 的 `password`，派生 `SHA-256("unifiedmq-coaps-psk" ‖0‖ identity ‖0‖ realm ‖0‖ password)`（域分隔，含 0 分隔符防拼接歧义）。**realm 取自 `broker_security.coaps.realm`（默认 `<<"unifiedmq">>`，与 `broker_security.tls` 那份证书配置完全无关）**；realm 一旦上线不要改——改了等于让所有客户端手里的 PSK 失效（realm 是 key 的一部分）。
 - **`require_auth` 对两个方向分别校验**（`broker_proto_coap_app:guard/0`）：`coap`（明文）**不可能携带凭据**，出现在 `require_auth` 里直接启动失败 `{error, {require_auth_unsupported, coap}}`；`coaps` 要求认证时，**所有** enabled listener 必须都是 DTLS，否则 `{error, {require_auth_needs_dtls, coaps}}`。想强制认证就只开 coaps、并把 `coaps` 放进 `broker_security.require_auth`。
-- **PSK-only，没有证书 / 没有 mTLS**：DTLS 不加载任何证书，服务端从不证明自己；`ssl:listen` 强制 `{mode, binary}`。cert-based DTLS、OSCORE、CoAP over TCP/WebSocket、服务端 Block2 **均不做**（ADR-031 非目标，见 `docs/security.md` §12.6）。
+- **PSK-only，没有证书 / 没有 mTLS**：DTLS 不加载任何证书，服务端从不证明自己；`ssl:listen` 强制 `{mode, binary}`。cert-based DTLS、OSCORE、CoAP over TCP/WebSocket **均不做**（ADR-031 非目标，见 `docs/security.md` §12.6）。
+- **Block1 互通，Block2 不做 ⇒ 响应实际上限约 1 KB**：请求方向按 RFC 7959 分块重组（流键优先 `Request-Tag`、缺省 token；`2.31` 回**收到的**块号）。**响应方向不分块**，整条响应一个数据报发出；真实客户端（libcoap v4.3.5，默认接收 PDU 1500 B）会丢弃超过约 1.1 KB 的响应（`coap_pdu_resize: pdu too big`）。所以 `max_message_bytes`（65535）**不是**可用上限——一个 2 KB 的 retained payload 写得进去、**读不回来**。要读大对象请把响应压到 1 KB 以内，或等 Block2。实测证据见 `test/protocol-compatibility/s11c/libcoap/`。
 - **串行握手是硬约束，不是可调旋钮**：PSK identity 只能被同步 `user_lookup_fun` 观察到，并发握手会串身份，因此 DTLS acceptor **单进程串行**跑 `accept → handshake → drain identity → offer → controlling_process → 移交`。代价是**握手速率约 41 次/秒**（p50 ~22 ms）——**冷启动时大批设备必须错峰上线**（见下「排查」与容量报告）。
 - **会话有界**：DTLS 会话表（`{IP,Port}` → socket）与每主体计数（`principal`/`tenant` → 会话数）都是**硬上限**（`max_dtls_sessions` / `dtls_max_sessions_per_principal`），超限拒绝新会话而非驱逐；关闭即释放（`terminate` 先关 listen socket 再关每条 peer）。九张运行期表里，随 peer 存活而存在的那**六张**（`peers`/`socks`/`idents`/`principal_sessions`/`observes`/`pending`）在关闭后归零（`dtls_close_cleans_up` 断言），其余三张（`dedup`/`endpoints`/`block1`）由 1 s tick 清扫。
 - **未知身份不发 TLS alert，回诱饵密钥**：实测未知 identity 的 alert 在 20–200 ms 返回、「用户存在+口令错」走 Finished 校验失败 → 客户端 3 s 超时，二者可区分 ⇒ 用户名枚举 oracle。故未知 / 错口令统一回诱饵密钥 `SHA-256("unifiedmq-coaps-psk-decoy" ‖0‖ 每 listener 随机 32 字节 ‖0‖ Identity)`，让两条错误路径**不可区分**。**诱饵是缓解不是证明**（`docs/security.md` §12.6）。

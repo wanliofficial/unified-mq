@@ -178,7 +178,7 @@ ADR-030 §D1 把 CoAP 定为 S11 唯一进入实现评审的协议。`s11-coap.m
 
 ### S11-C 首个安全交付（2026-11-16）
 
-> DTLS 1.2（PSK）落地：`coap_listener` 新增 `transport => dtls` 分支 + 新模块 `coap_dtls_acceptor`，身份 → `principal`/`tenant`、ACL 生效、会话/每主体双上限、六表关闭清理。CT 112 例（CoAP 六套，新增 `coap_dtls_SUITE` 14 例）、全量 `rebar3 ct` 1378/1378、dialyzer 0、容量报告落盘。**D1~D7 仍然成立**；以下是 D 条文没写死、实现时必须选择的地方，以及本期**没有**落地的 D 条目。
+> DTLS 1.2（PSK）落地：`coap_listener` 新增 `transport => dtls` 分支 + 新模块 `coap_dtls_acceptor`，身份 → `principal`/`tenant`、ACL 生效、会话/每主体双上限、六表关闭清理。CT 112 例（CoAP 六套，新增 `coap_dtls_SUITE` 14 例）、全量 `rebar3 ct` 1378/1378〔**注**：该数取自含 S11x router 测试的树，main 上是 1372/1372；见本节末「互操作证据补充」〕、dialyzer 0、容量报告落盘。**D1~D7 仍然成立**；以下是 D 条文没写死、实现时必须选择的地方，以及本期**没有**落地的 D 条目。
 
 1. **D5 的「DTLS」具体化为 PSK-only、cert-free，且 realm 放在 `broker_security.coaps` 而不是 `broker_security_tls`**
    - 计划（D5）：只说「接 `broker_security`、默认不自签」，隐含「DTLS 可能带证书」。
@@ -210,4 +210,40 @@ ADR-030 §D1 把 CoAP 定为 S11 唯一进入实现评审的协议。`s11-coap.m
    - 为什么：容量是「表」的属性，acceptor 看不到表；把判定放在 acceptor 会需要跨进程同步，而 `{dtls_abandoned}` 这条补丁正是「只记不释放」的必然结果（规格复审 B1）。表从 S11-B 的五张扩到六张（+`principal_sessions`），姿态不变。
    - 留痕：`coap_listener.erl` 的 `admit_session/4`、`drop_session/2`、`dtls_abandoned` 分支；`coap_dtls_SUITE` 的 `dtls_session_cap` / `dtls_per_principal_cap` / `dtls_abandoned_releases_slot` / `dtls_close_cleans_up`。
 
-- **对照结论**：D2（Observe 归订阅层）、D3（CON 通知是 datagram 级重传、不是 QoS 1）、D4（filter 即 destination）、D6（metrics 不扩容、有界簿记）在 S11-C 继续成立；D5（DTLS）**按 PSK-only 交付**，证书/mTLS 是已决非目标；D7（Block1 草案、无 Block2）不变。**D5 的「DTLS」不再是「未做」**，但 libcoap 真实客户端证据按 S11-C 的明确决定单列推迟。**冻结文本未改**，本节只追加落地事实。
+- **对照结论**：D2（Observe 归订阅层）、D3（CON 通知是 datagram 级重传、不是 QoS 1）、D4（filter 即 destination）、D6（metrics 不扩容、有界簿记）在 S11-C 继续成立；D5（DTLS）**按 PSK-only 交付**，证书/mTLS 是已决非目标；D7（Block1、无 Block2）不变。**D5 的「DTLS」不再是「未做」**；libcoap 真实客户端证据当时单列推迟，**已由下一节补齐**。**冻结文本未改**，本节只追加落地事实。
+
+### S11-C 互操作证据补充（2026-11-16）
+
+> `test/protocol-compatibility/s11c/libcoap/` 落盘 **libcoap v4.3.5 `coap-client`** 对真实 DTLS-PSK 监听器的证据（8/8 PASS），**据其修正两条 Block1 实现缺陷**。CT **113 例**（CoAP 六套）、全量 `rebar3 ct` **1373/1373、84 套件**零 FAILED。D1~D6 不变；**D7 的「草案对齐」一半被实测推翻**——决定互通的是 RFC 7959 的报文语义，不是草案编号。
+
+1. **D7 的 Block1 应答块号：从「回 `Num + 1`」改为「回收到的 `Num`」**
+   - 计划（D7）：只说按 `draft-ietf-core-block-18` 实现分块重组，没写 `2.31 Continue` 的块号语义；实现时读成「已收到，请给下一块」，回 `Num + 1`。
+   - 实际：**回收到的 `Num`**。RFC 7959 §3.2 图 7 中请求 `1:0/1/128` 的应答是 `1:0/1/128`——`NUM` 确认的是**刚存下**的那一块。
+   - 为什么：自编对端按 `Num + 1` 期待，所以一直绿；libcoap 严格比对，`Num + 1` 被当成协议错位。`coap_listener_SUITE` 的 `block1_reassembles_a_multidatagram_body` 现断言 `{0,true,16}`，把修复 revert 即红。
+   - 留痕：`coap_listener.erl` 的 `continue_reply/3`、`block1_stream/5`；`docs/protocol-compatibility.md` §4.24.9.1。
+
+2. **D7 的流键：从「token」改为「`Request-Tag` 优先、缺省 token」**
+   - 计划（S11-A 落地时）：键为「请求 token + 目的地 + 端点四元组」，依据是草案 §2.1「token 标识一次 block-wise 请求」。
+   - 实际：**libcoap 每块换 token**（block 0 空 token、block 1 八字节），跨块稳定的只有 `Request-Tag`（RFC 9175 §3.1，option 292）。键改为「有 `Request-Tag` 用它，否则退回 token」。
+   - 为什么：只删 token 会让**同端点并发**的两条分块流串在一起；`Request-Tag` 正是 RFC 9175 为此设的标识。`coap_codec` 对未知 option 保留整数键与原始 binary，292 可直接透传，无需改编解码。护栏 `block1_keyed_by_request_tag_across_changing_tokens` 把「换 token、同 `Request-Tag` 必须重组」钉死。
+   - 留痕：`coap_listener.erl` 的 `block1_tag/1`、`?REQUEST_TAG`；`coap_listener_SUITE` 同名用例；§4.24.9.1。
+
+3. **`block_size` 从未被读取，「Block1/2 的 SZX 单元」是空声明**
+   - 计划（D7 + `docs/operations.md` §1.8 的配置示例）：`block_size` 是分块的 SZX 单元。
+   - 实际：**没有任何代码读它**；Block1 用的是客户端给的 SZX。配置注释已改为「预留（Block2 未实现，当前无效果）」。
+   - 为什么：一条不起作用但看起来会起作用的配置，比没有配置更坏——运维改它、行为不变、就开始怀疑别的东西。
+   - 留痕：`docs/operations.md` §1.8。
+
+4. **Block2 仍不做，且「响应上限 `max_message_bytes`（65535）」是错的**
+   - 计划（D7）：不做服务端 Block2，未给端到端可用上限。
+   - 实际：响应不分块、整条一个数据报。libcoap 默认接收 PDU 1500 B，**超过约 1.1 KB 的响应被客户端丢弃**（`coap_pdu_resize: pdu too big`）；实测 1100 B 可读、1150 B 起失败。
+   - 为什么：把**服务端**配置当成端到端上限，会让读者以为 2 KB payload 能读回。事实是写得进去、读不回来。
+   - 留痕：§4.24.4；`docs/operations.md` §1.8；`test/protocol-compatibility/s11c/libcoap/README.md`。
+
+5. **负向证据的形态：静默丢弃，不是 alert**
+   - 计划（D5 第 4 条）：未知身份回诱饵密钥，让握手走到 Finished 校验失败。
+   - 实际：真实 libcoap 上「错 PSK」与「未知身份」都表现为**无响应**（服务端先发 identity hint，之后不再回应），客户端超时；两者不可区分。
+   - 为什么：这正是 D5 第 4 条想要的形态，现在由本仓库不控制的实现对**外部**确认了一遍——诱饵密钥不只对自编对端成立。
+   - 留痕：`coap_dtls_SUITE` 的 `unknown_identity_is_refused`；`libcoap_compat.py` 的 `coaps-wrong-psk` / `coaps-unknown-identity`。
+
+- **对照结论（补充）**：D1（自写编解码）被证据反向确认——`coap_codec` 从未充当客户端，全部互通结论来自本仓库控制的实现之外。D5 的 PSK-only 姿态在真实客户端上成立。**D7 的两条 Block1 语义按 RFC 7959 校正，Block2 仍未做**，且已作为限制写进能力矩阵。「libcoap 证据单列推迟」这一状态**结束**。**冻结文本未改**，本节只追加落地事实。

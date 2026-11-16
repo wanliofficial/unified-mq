@@ -591,7 +591,7 @@ broker_proto_coap_sup (one_for_all, 1/5s)
 
 **关系表与订阅表是两套粒度，回收也必须分两级。** 所有观察共用一个 `<<"coap">>` 匿名内核会话、filter 就是 destination，因此：`maybe_unsubscribe/2` 只在**没有其它活关系**观察同一 destination 时才退订该 filter（否则两个客户端观察同一资源时，先注销的那个会饿死后到者）；`maybe_detach/1` 只在关系表**空**时才 detach 共享会话（`detach` 会拆掉该 ClientId 的**全部**订阅）。这两级都写进了 §4.24.6 与 ADR-031「落地偏差记录」。
 
-**去重键是 Message ID，Block1 键是 token——这不是不一致。** 去重的对象是「同一个 CON 报文被重传」，RFC 7252 §4.8.2 的重复判定就是 Message ID + 端点；Block1 的对象是「一次请求的分块序列」，RFC 7959 草案 §2.1 用 **token** 标识这次请求，而每个分块都有自己的 Message ID。用 Message ID 做分块键会让每个分块都开一条新流，重组永远只剩最后一块（`coap_listener_SUITE` 的 `block1_reassembles_a_multidatagram_body` 特意让两个分块用不同 Message ID、同一 token 来钉死这一点）。
+**去重键是 Message ID，Block1 键是 `Request-Tag`（缺省 token）——这不是不一致。** 去重的对象是「同一个 CON 报文被重传」，RFC 7252 §4.8.2 的重复判定就是 Message ID + 端点；Block1 的对象是「一次请求的分块序列」，每个分块都有自己的 Message ID，用 Message ID 做分块键会让每个分块各开一条流、重组永远只剩最后一块（`coap_listener_SUITE` 的 `block1_reassembles_a_multidatagram_body` 特意让两个分块用不同 Message ID 来钉死这一点）。**流键优先取 `Request-Tag`（RFC 9175 §3.1，option 292），缺省才退回 token**——真实 libcoap 每块换 token（block 0 空、block 1 八字节）但 `Request-Tag` 不变，只按 token 建键会让分块永远拼不起来；只删 token 又会让同端点并发两条分块流串在一起，这正是 `block1_keyed_by_request_tag_across_changing_tokens` 钉住的形态（`docs/protocol-compatibility.md` §4.24.9.1）。
 
 **回复回显 Message ID 与 token。** piggybacked ACK 必须能让客户端配到请求上（§5.2.1），所以 `coap_codec:response/3` 造出的空壳会先被填上 `id` 与 `token` 再编码；NON 请求的回包同理（只是 type 是 NON）。`coap_listener_SUITE` 的 `con_get_returns_piggybacked_content` 直接断言 `id` 回显。
 
