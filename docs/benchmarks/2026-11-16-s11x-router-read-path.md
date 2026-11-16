@@ -120,6 +120,7 @@ v1 的根本缺陷是 `env` 和 `trie` 都调用 `broker_router_hash:route/3`—
 3. **没测内存** —— 已另行补测（[`2026-11-16-s11x-router-index-memory.md`](2026-11-16-s11x-router-index-memory.md)）。
 4. **每个点只跑一轮**，没有多轮重复取中位数；1k 档与 10k 档的相对高低（53,623 vs 51,928）在噪声内，不要解读。
 5. **绝对数字受机器负载影响**（§1）。
+6. **没测有写入并发时的读延迟/吞吐**。每次测量索引都是冻结的。**正确性**已单独覆盖：`broker_router_hash_SUITE:route_sees_stable_subscriptions_while_the_index_churns` 在并发 churn 下跑 4.2 万次 route，断言从未注销的订阅必须每次都被匹配，0 漏匹配；并用变异测试确认该断言能失败。但「churn 期间的 route 延迟」没有数字。
 
 ---
 

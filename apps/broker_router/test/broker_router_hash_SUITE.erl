@@ -32,6 +32,7 @@ all() ->
      trie_matches_the_reference_matcher,
      tenant_roots_are_independent_and_legacy_is_visible,
      unregister_prunes_the_trie,
+     route_sees_stable_subscriptions_while_the_index_churns,
      on_partition_change_stays_unimplemented_in_s1].
 
 init_per_testcase(_Case, Config) ->
@@ -286,6 +287,163 @@ route_reads_are_served_without_the_writer(Config) ->
     after
         sys:resume(?STORE),
         true = helper_returned_in(2000, Helper)
+    end.
+
+%% The gap the read-path reports could not close (docs/benchmarks/
+%% 2026-11-16-s11x-router-{read-path,index-memory,concurrency}.md, "没测什么"):
+%% every read measurement ran against a frozen index. Production registers and
+%% unregisters while publishes are in flight, and change 2 made a route READ a
+%% *multi-row* traversal instead of one `ets:tab2list/1' -- one publish now takes
+%% several ETS reads that are individually atomic but collectively are not. The
+%% writer's unregister deletes rows as it prunes them (`prune/3').
+%%
+%% The claim under test is an invariant, not a probability: a subscription that
+%% is never unregistered must be reported by every route/3 that runs after its
+%% register/4 returned. A torn read that hid a live subscriber would break
+%% ADR-007 ("SUBACK 之后必须可投递"): the publish is appended, no subscriber is
+%% delivered, and nothing errors.
+%%
+%% The walk is Ex ++ Plus ++ Hash at every level, and each node is its own ETS
+%% read, so the loop below keeps all three branches live at once and churns rows
+%% the reader is walking:
+%%
+%%   a/b/c   literal   -- its own path rows are deleted and re-added by churn
+%%   a/+/c   plus      -- forces the reader down the `+' branch at [a]
+%%   a/#     hash      -- forces the Hash branch at [a], ends the branch early
+%%   a/b     ancestor  -- a filter that is also a node on a/b/c's path, so
+%%                        prune/3 must NOT delete its row (the defect recorded
+%%                        in docs/design/router-read-path.md on 28453c9)
+%%
+%% The churner also runs against the legacy `<<"*">>' tenant, because
+%% `visible_roots/1' makes every route read that root: a torn read there would
+%% be visible to all tenants at once.
+route_sees_stable_subscriptions_while_the_index_churns(Config) ->
+    Env = env(Config),
+    Tenant = <<"spec">>,
+    %% {Filter, SubRef, Topic it must match}
+    Expected = [{<<"a/b/c">>, 1, <<"a/b/c">>},
+                {<<"a/+/c">>, 2, <<"a/b/c">>},
+                {<<"a/#">>, 3, <<"a/b/c">>},
+                {<<"a/b">>, 4, <<"a/b">>}],
+    [ok = ?HASH:register(Env, F, Ref, #{tenant_id => Tenant})
+     || {F, Ref, _Topic} <- Expected],
+    %% Sanity: a quiet index returns exactly the registered refs, so a later
+    %% subset check operates against a known-good baseline.
+    {ok, [{_, Quiet}]} = ?HASH:route(<<"a/b/c">>, ctx(Tenant), Env),
+    [1, 2, 3] = lists:sort(Quiet),
+    {ok, [{_, QuietAncestor}]} = ?HASH:route(<<"a/b">>, ctx(Tenant), Env),
+    [3, 4] = lists:sort(QuietAncestor),
+
+    Parent = self(),
+    Stop = make_ref(),
+    %% Two churners: one on the reader's own tenant (rows the reader walks) and
+    %% one on the shared legacy root (a root every reader reads).
+    Churners = [spawn(fun() -> churn_loop(Env, Stop, T) end)
+                || T <- [Tenant, <<"*">>]],
+    Readers = 8,
+    ReaderPids = [begin
+                      {Pid, MRef} = spawn_monitor(
+                                      fun() ->
+                                              reader_loop(Env, Stop, Tenant, Expected,
+                                                          Parent, 0, [])
+                                      end),
+                      {Pid, MRef}
+                  end
+                  || _ <- lists:seq(1, Readers)],
+    %% Wall-clock budget, not a fixed iteration count: the point is overlap
+    %% between readers and the pruner, and iteration counts cannot guarantee it
+    %% under a loaded machine. 1.5 s comfortably exceeds one churn cycle.
+    timer:sleep(1500),
+    [P ! {stop, Stop} || P <- Churners ++ [Pid || {Pid, _} <- ReaderPids]],
+    %% Collect one report per reader. `self()' is a call, not a pattern, so the
+    %% parent has to arrive bound. Collection is by arrival, not by list order:
+    %% a reader that was descheduled may report after another one, and a fixed
+    %% order would look like a missing report.
+    Reports = collect_reports(Parent, [Pid || {Pid, _} <- ReaderPids], []),
+    [receive
+         {'DOWN', MRef, process, Pid, normal} -> ok;
+         {'DOWN', MRef, process, Pid, Reason} ->
+             ct:fail({reader_died, Pid, Reason})
+     after 5000 ->
+         ct:fail({reader_not_reaped, Pid})
+     end
+     || {Pid, MRef} <- ReaderPids],
+    %% A reader that was starved would report zero routes; an empty report must
+    %% not be able to look like a pass.
+    true = lists:all(fun({_, N, _}) -> N > 0 end, Reports),
+    AllMisses = lists:append([M || {_, _, M} <- Reports]),
+    ct:comment("routes=~p misses=~p", [lists:sum([N || {_, N, _} <- Reports]),
+                                       length(AllMisses)]),
+    case AllMisses of
+        [] ->
+            ok;
+        _ ->
+            ct:fail({live_suppressed_by_concurrent_prune, lists:sublist(AllMisses, 5)})
+    end.
+
+%% Read until told to stop. `Count' is the number of routes performed; `Misses'
+%% accumulates the first few failures, because one failure is enough to fail and
+%% a per-iteration list would grow without bound.
+reader_loop(Env, Stop, Tenant, Expected, Parent, Count, Misses) ->
+    case stopped(Stop) of
+        true ->
+            Parent ! {reader, self(), Count, Misses};
+        false ->
+            RouteOne =
+                fun({_F, Ref, Topic}) ->
+                    {ok, [{_P, Refs}]} = ?HASH:route(Topic, ctx(Tenant), Env),
+                    case lists:member(Ref, Refs) of
+                        true -> ok;
+                        false -> {Topic, Ref, Refs}
+                    end
+                end,
+            Found = [M || E <- Expected, (M = RouteOne(E)) =/= ok],
+            Misses1 = case Found of
+                          [] -> Misses;
+                          _ -> lists:sublist(Misses ++ Found, 5)
+                      end,
+            reader_loop(Env, Stop, Tenant, Expected, Parent, Count + length(Expected),
+                        Misses1)
+    end.
+
+%% Register/unregister the four shapes in a cycle, so every row a reader walks is
+%% repeatedly created and pruned. Refs are unique per cycle so a stale row would
+%% be recognisable in the report; the reader only asserts on the stable refs, so
+%% seeing a churn ref is legitimate (it may be registered at that instant).
+churn_loop(Env, Stop, Tenant) ->
+    case stopped(Stop) of
+        true ->
+            ok;
+        false ->
+            Filters = [<<"a/b/c">>, <<"a/b/c/d">>, <<"a/+/c">>, <<"a/#">>, <<"a/b">>],
+            [begin
+                 Ref = {churn, Tenant, F, make_ref()},
+                 _ = ?HASH:register(Env, F, Ref, #{tenant_id => Tenant}),
+                 _ = ?HASH:unregister(Env, Ref)
+             end
+             || F <- Filters],
+            churn_loop(Env, Stop, Tenant)
+    end.
+
+%% Wait for one `{reader, ...}' per spawned reader, in whatever order they
+%% arrive. A reader that never reports is named so the failure is actionable.
+collect_reports(_Parent, [], Acc) ->
+    Acc;
+collect_reports(Parent, Pending, Acc) ->
+    receive
+        {reader, Pid, Count, Misses} ->
+            case lists:member(Pid, Pending) of
+                true -> collect_reports(Parent, Pending -- [Pid], [{Pid, Count, Misses} | Acc]);
+                false -> collect_reports(Parent, Pending, Acc)
+            end
+    after 10000 ->
+        ct:fail({readers_did_not_report, Pending})
+    end.
+
+stopped(Stop) ->
+    receive
+        {stop, Stop} -> true
+    after 0 -> false
     end.
 
 %% §10.5: S1 leaves the partition-change hook unimplemented; the behavior marks
