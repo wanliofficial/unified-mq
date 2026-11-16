@@ -150,3 +150,9 @@ spikes/*/.data/
 # transient run log and compiled beams are not.
 /test/protocol-compatibility/s11c/bench/*.beam
 /test/protocol-compatibility/s11c/bench/results/run.log
+
+# S11-C CoAP-over-DTLS third-party evidence: broker data volume, boot-module
+# beam, report, and the libcoap build tree
+/test/protocol-compatibility/s11c/libcoap/data/
+/test/protocol-compatibility/s11c/libcoap/run/
+/test/protocol-compatibility/s11c/libcoap/_build/
