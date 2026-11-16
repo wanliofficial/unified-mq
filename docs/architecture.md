@@ -902,7 +902,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | `require_auth` 接进 MQTT CONNECT | S7 之后 | `mqtt_conn_fsm` 的私有 `authenticate/2` 增加 `auth_required(<<"mqtt">>)` 分支 | MQTT 现有的匿名 `client_id` 即 principal 语义（S1 冻结）不变；见 `docs/security.md` §2.2 现状边界 |
 | `broker_meta` 用户表接进数据面认证 | S7 之后 | `broker_security` 的私有 `users/0` 增加 mnesia 读取源 | `authenticate/2`、`authenticate_conn/1` 的对外形态与错误语义不变；ADR-021 §D7 冻结后补充 |
 | `topic_meta` / `queue_meta` / `binding_meta` 的运行时读取方 | S7 之后 | 路由/队列/Topic-Binding 管理路径 | 三张表已建表、有泛型 CRUD；接入读取方不改变现有路由与队列语义 |
-| MQTT-SN over DTLS | S8 之后 | `broker_proto_mqtt_sn` 的 socket 换成 `ssl` 的 dtls 档 | MQTT-SN 1.2 报文与 topic id 模型不变；1884 目前是唯一**明文且无 TLS 路径**的端口（`docs/security.md` §12 第 8 条） |
+| MQTT-SN over DTLS | S8 之后 | `broker_proto_mqtt_sn` 的 socket 换成 `ssl` 的 dtls 档 | MQTT-SN 1.2 报文与 topic id 模型不变；1884 是**明文且无 TLS 路径**的端口之一（S11-C 后 CoAP 明文 5683 亦然，但 CoAP 另有 `coaps`；`docs/security.md` §12 第 8 条） |
 | QUIC 0-RTT early data 与多流模式 | 不做（CN 可选项 / EMQX 私有扩展） | — | 单流模式是 CN Draft 3 的全部内容；ADR-024 已冻结该边界 |
 | MQTT-SN 转发器封装与串口桥 | 不做（设计 §1.2） | — | 网关只终结，不做 bridge 到外部 MQTT Broker |
 | A2A Task 状态机与 `$a2a/task/<id>` 日志 | **已交付（S9-B）** | `broker_proto_a2a` 新增 `a2a_task`（状态机）/`a2a_event`（事件 → `#broker_message{}`）/`a2a_task_projection`（纯折叠）/`a2a_task_shard` + `a2a_task_registry`（分片串行化，listener 之前的子进程）/`a2a_task_recovery`（boot 全量重放）；`GetTask`/`ListTasks`/`CancelTask` 落地 | ADR-025：Task 事件就是普通 `#broker_message{}`，复用 ADR-007 可靠性 / ADR-014 游标 / ADR-013 retention，不引入第二套消息内核（已实现） |
