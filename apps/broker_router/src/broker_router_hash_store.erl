@@ -22,6 +22,23 @@
 %%      cleanup belongs to `terminate/2', with `is_process_alive/1' covering the
 %%      shutdown path where `terminate/2' does not run (a gen_server that does
 %%      not trap exits is killed by the supervisor's shutdown signal).
+%%
+%% S11x change 2 (design §3): the index is a trie, not a `{Filter, Subs}'
+%% flat table. One row per filter *node*:
+%%
+%%     {{Tenant, Path}, Children, Subs}
+%%       Path     :: [Level]          levels from the root that name the node
+%%       Children :: #{Level => true} the next level of every filter below it
+%%       Subs     :: [{SubRef, Seq}]  filters that end exactly here
+%%
+%% The read path then walks the destination's levels instead of copying every
+%% filter in the node (`ets:tab2list/1' cost scaled with total subscriptions,
+%% not with matches). `+` and `#` are ordinary keys in `Children`, so they share
+%% the literal path's code instead of being special rows.
+%%
+%% Deletes prune: a node with no children and no subscriptions is removed, and
+%% its link is removed from its parent -- otherwise churn over a long uptime
+%% would leave the skeleton of every filter ever registered.
 -module(broker_router_hash_store).
 
 -behaviour(gen_server).
@@ -31,7 +48,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(st, {name :: atom(),
-             index :: ets:tid(),
+             trie :: ets:tid(),
              subs :: ets:tid(),
              gen :: atomics:atomics_ref(),
              seq = 0 :: non_neg_integer()}).
@@ -95,40 +112,49 @@ gen(Name) ->
 %%%_* gen_server ---------------------------------------------------------
 
 init([Name]) ->
-    Index = ets:new(index, [set, protected, {read_concurrency, true}]),
+    Trie = ets:new(trie, [set, protected, {read_concurrency, true}]),
     Subs = ets:new(subs, [set, protected, {read_concurrency, true}]),
     Gen = atomics:new(1, [{signed, false}]),
-    persistent_term:put(key(Name), #{store => self(), tab => Index, gen => Gen}),
-    {ok, #st{name = Name, index = Index, subs = Subs, gen = Gen}}.
+    persistent_term:put(key(Name), #{store => self(), tab => Trie, gen => Gen}),
+    {ok, #st{name = Name, trie = Trie, subs = Subs, gen = Gen}}.
 
-%% {{Tenant, Filter}, [{SubRef, Seq}]} -- Seq is monotonic, so each filter's
-%% list is already in registration order and route/3 can restore a global order
-%% cheaply. The tenant in the key is what makes cross-tenant delivery impossible
-%% at the read path: a publisher with tenant T never even sees another tenant's
-%% entries.
-handle_call({register, Tenant, Filter, SubRef}, _From, #st{index = Index, subs = Subs} = State) ->
+%% A write is: link the leaf into the tree (one row per ancestor), then append
+%% to the leaf's own list. Seq is monotonic, so a leaf's list is already in
+%% registration order and route/3 can restore a global order with one keysort.
+handle_call({register, Tenant, Filter, SubRef}, _From,
+            #st{trie = Trie, subs = Subs} = State) ->
     #st{seq = Seq} = State,
     case ets:lookup(Subs, SubRef) of
         [_] ->
             {reply, {error, {already_registered, SubRef}}, State};
         [] ->
-            Key = {normalize_tenant(Tenant), Filter},
-            New = existing(Key, Index) ++ [{SubRef, Seq + 1}],
-            true = ets:insert(Index, {Key, New}),
-            true = ets:insert(Subs, {SubRef, Key}),
+            T = normalize_tenant(Tenant),
+            Path = levels(Filter),
+            ok = link(T, Trie, [], Path),
+            {Children, AtLeaf} = node(Trie, T, Path),
+            true = ets:insert(Trie, {{T, Path}, {Children, AtLeaf ++ [{SubRef, Seq + 1}]}}),
+            true = ets:insert(Subs, {SubRef, {T, Path}}),
             %% Bumped after the index is written and before the caller is told
             %% `ok', so "subscribe returned" implies "gen already moved".
             _ = bump(State),
             {reply, ok, State#st{seq = Seq + 1}}
     end;
 
-handle_call({unregister, SubRef}, _From, #st{index = Index, subs = Subs} = State) ->
+handle_call({unregister, SubRef}, _From, #st{trie = Trie, subs = Subs} = State) ->
     case ets:lookup(Subs, SubRef) of
-        [{SubRef, Key}] ->
-            Rest = lists:filter(fun({S, _Seq}) -> S =/= SubRef end, existing(Key, Index)),
-            case Rest of
-                [] -> true = ets:delete(Index, Key);
-                _ -> true = ets:insert(Index, {Key, Rest})
+        [{SubRef, {T, Path}}] ->
+            {Children, AtLeaf} = node(Trie, T, Path),
+            Rest = lists:keydelete(SubRef, 1, AtLeaf),
+            %% The row may look deletable but still be an ancestor: with both
+            %% `a/b' and `a/b/c' registered, removing `a/b' must leave `[a,b]'
+            %% in place, because that row is the only link from `[a]' to
+            %% `[a,b,c]'. Delete only a node with neither subs nor children.
+            case {Rest, map_size(Children)} of
+                {[], 0} ->
+                    true = ets:delete(Trie, {T, Path}),
+                    ok = prune(T, Trie, Path);
+                _ ->
+                    true = ets:insert(Trie, {{T, Path}, {Children, Rest}})
             end,
             true = ets:delete(Subs, SubRef),
             _ = bump(State),
@@ -137,8 +163,8 @@ handle_call({unregister, SubRef}, _From, #st{index = Index, subs = Subs} = State
             {reply, {error, {not_found, SubRef}}, State}
     end;
 
-handle_call(index_table, _From, #st{index = Index} = State) ->
-    {reply, Index, State}.
+handle_call(index_table, _From, #st{trie = Trie} = State) ->
+    {reply, Trie, State}.
 
 handle_cast(Msg, State) ->
     {stop, {unexpected_cast, Msg}, State}.
@@ -160,10 +186,50 @@ key(Name) ->
 bump(#st{gen = Gen}) ->
     atomics:add(Gen, 1, 1).
 
-existing(Key, Index) ->
-    case ets:lookup(Index, Key) of
-        [{Key, Subs}] -> Subs;
-        [] -> []
+%% The store owns its own split so a write never needs the filter binary again
+%% after the caller validated it: the path *is* the filter.
+levels(Filter) ->
+    binary:split(Filter, <<"/">>, [global]).
+
+%% Link `Path' into the trie by making sure every ancestor lists the next level.
+%% Rows that already list the child are left alone, so re-registering a sibling
+%% filter costs one write, not depth writes.
+link(_T, _Trie, _Prefix, []) ->
+    ok;
+link(T, Trie, Prefix, [Level | Rest]) ->
+    {Children, Subs} = node(Trie, T, Prefix),
+    case maps:is_key(Level, Children) of
+        true ->
+            ok;
+        false ->
+            true = ets:insert(Trie, {{T, Prefix}, {Children#{Level => true}, Subs}})
+    end,
+    link(T, Trie, Prefix ++ [Level], Rest).
+
+%% Remove `Path's link from its parent, and keep walking up while the parent
+%% became empty. A node that still has children or subscriptions stays: it is
+%% still on some other filter's path.
+prune(_T, _Trie, []) ->
+    ok;
+prune(T, Trie, Path) ->
+    Parent = lists:droplast(Path),
+    Level = lists:last(Path),
+    {Children, Subs} = node(Trie, T, Parent),
+    Remaining = maps:remove(Level, Children),
+    case {map_size(Remaining), Subs} of
+        {0, []} ->
+            true = ets:delete(Trie, {T, Parent}),
+            prune(T, Trie, Parent);
+        _ ->
+            true = ets:insert(Trie, {{T, Parent}, {Remaining, Subs}}),
+            ok
+    end.
+
+-spec node(ets:tid(), binary(), [binary()]) -> {map(), [{term(), pos_integer()}]}.
+node(Trie, T, Path) ->
+    case ets:lookup(Trie, {T, Path}) of
+        [{{T, Path}, {Children, Subs}}] -> {Children, Subs};
+        [] -> {#{}, []}
     end.
 
 normalize_tenant(T) when is_binary(T), T =/= <<>> -> T;

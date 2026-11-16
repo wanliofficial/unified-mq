@@ -29,6 +29,9 @@ all() ->
      env_is_served_without_the_writer,
      gen_advances_on_successful_writes_only,
      env_rejects_a_dead_store,
+     trie_matches_the_reference_matcher,
+     tenant_roots_are_independent_and_legacy_is_visible,
+     unregister_prunes_the_trie,
      on_partition_change_stays_unimplemented_in_s1].
 
 init_per_testcase(_Case, Config) ->
@@ -154,6 +157,84 @@ route_lists_every_matching_subref_once(Config) ->
     %% Three overlapping filters match this topic; all three subs are reported.
     [7, 8, 9] = Subs,
     Subs = lists:usort(Subs),
+    ok.
+
+%% Change 2 (design §7.2): the trie must answer exactly what the linear scan
+%% answered. The oracle is the matcher it replaced, evaluated here over the same
+%% registrations, so a trie bug shows up as a list mismatch instead of a lucky
+%% pass on hand-picked topics.
+trie_matches_the_reference_matcher(Config) ->
+    Env = env(Config),
+    _ = rand:seed(exsss, {11, 22, 33}),
+    Registered =
+        [begin
+             Tenant = random_tenant(),
+             Filter = random_filter(),
+             ok = ?HASH:register(Env, Filter, I, Tenant),
+             {I, Filter, filter_tenant(Tenant)}
+         end
+         || I <- lists:seq(1, 400)],
+    lists:foreach(
+        fun(_) ->
+            Topic = random_topic(),
+            PubTenant = random_publisher_tenant(),
+            Expected = [I || {I, Filter, Tenant} <- Registered,
+                             tenant_visible(Tenant, PubTenant),
+                             ref_match(levels(Topic), levels(Filter))],
+            {ok, [{_, Subs}]} = ?HASH:route(Topic, ctx(PubTenant), Env),
+            case Subs of
+                Expected ->
+                    ok;
+                _ ->
+                    ct:fail({trie_and_reference_disagree, Topic, PubTenant,
+                             Expected, Subs})
+            end
+        end,
+        lists:seq(1, 400)),
+    ok.
+
+%% S6 tenancy at the read path, now expressed by which root the walk starts
+%% from: the same filter under two tenants is two independent leaves, and `*'
+%% stays visible to every tenant (legacy sessions predating tenant metadata).
+tenant_roots_are_independent_and_legacy_is_visible(Config) ->
+    Env = env(Config),
+    ok = ?HASH:register(Env, <<"a/b">>, 1, #{tenant_id => <<"t1">>}),
+    ok = ?HASH:register(Env, <<"a/b">>, 2, #{tenant_id => <<"t2">>}),
+    ok = ?HASH:register(Env, <<"a/#">>, 3, #{}),
+    {ok, [{_, [1, 3]}]} = ?HASH:route(<<"a/b">>, ctx(<<"t1">>), Env),
+    {ok, [{_, [2, 3]}]} = ?HASH:route(<<"a/b">>, ctx(<<"t2">>), Env),
+    {ok, [{_, [3]}]} = ?HASH:route(<<"a/b">>, ctx(<<"other">>), Env),
+    ok.
+
+%% Change 2 memory bound (design §3.6): deleting a subscription must remove the
+%% nodes it created, or every filter ever registered would leave a skeleton
+%% behind. The shared prefix `a/b' must survive while a sibling still uses it.
+unregister_prunes_the_trie(Config) ->
+    Env = env(Config),
+    #{tab := Trie} = Env,
+    0 = ets:info(Trie, size),
+    %% Rows for a/b/c: [] , [a] , [a,b] (child links) and [a,b,c] (the leaf).
+    ok = ?HASH:register(Env, <<"a/b/c">>, 1, #{}),
+    4 = ets:info(Trie, size),
+    %% a/b/d shares three of them and adds one leaf.
+    ok = ?HASH:register(Env, <<"a/b/d">>, 2, #{}),
+    5 = ets:info(Trie, size),
+    ok = ?HASH:unregister(Env, 2),
+    4 = ets:info(Trie, size),
+    {ok, [{_, [1]}]} = ?HASH:route(<<"a/b/c">>, ctx(), Env),
+    ok = ?HASH:unregister(Env, 1),
+    0 = ets:info(Trie, size),
+    {ok, [{_, []}]} = ?HASH:route(<<"a/b/c">>, ctx(), Env),
+    %% A node that is also an ancestor must survive losing its own subscriptions:
+    %% `a/b' is the only row linking `[a]' to `[a,b,c]'.
+    ok = ?HASH:register(Env, <<"a/b">>, 3, #{}),
+    ok = ?HASH:register(Env, <<"a/b/c">>, 4, #{}),
+    4 = ets:info(Trie, size),
+    ok = ?HASH:unregister(Env, 3),
+    4 = ets:info(Trie, size),
+    {ok, [{_, [4]}]} = ?HASH:route(<<"a/b/c">>, ctx(), Env),
+    ok = ?HASH:unregister(Env, 4),
+    0 = ets:info(Trie, size),
     ok.
 
 unregister_removes_the_subscription(Config) ->
@@ -324,3 +405,53 @@ helper_returned_in(Ms, Helper) ->
         {helper, Helper, returned} -> true
     after Ms -> false
     end.
+
+%%%_* Oracles for the trie equivalence case ---------------------------------
+
+%% The matcher change 2 replaced (broker_router_hash before the trie). Kept only
+%% here, as the reference the trie is compared against -- if the two ever
+%% disagree, the index is wrong, not the oracle.
+ref_match(_Topic, [<<"#">>]) -> true;
+ref_match([], []) -> true;
+ref_match([_ | Topic], [<<"+">> | Filter]) -> ref_match(Topic, Filter);
+ref_match([Level | Topic], [Level | Filter]) -> ref_match(Topic, Filter);
+ref_match(_Topic, _Filter) -> false.
+
+levels(Topic) ->
+    binary:split(Topic, <<"/">>, [global]).
+
+random_tenant() ->
+    case rand:uniform(3) of
+        1 -> #{tenant_id => <<"t1">>};
+        2 -> #{tenant_id => <<"t2">>};
+        3 -> #{}
+    end.
+
+filter_tenant(#{tenant_id := T}) -> T;
+filter_tenant(_) -> <<"*">>.
+
+random_publisher_tenant() ->
+    lists:nth(rand:uniform(3), [<<"t1">>, <<"t2">>, <<"other">>]).
+
+tenant_visible(<<"*">>, _Tenant) -> true;
+tenant_visible(Tenant, Tenant) -> true;
+tenant_visible(_, _) -> false.
+
+random_filter() ->
+    Levels = [random_level() || _ <- lists:seq(1, rand:uniform(4))],
+    WithHash = case rand:uniform(5) of
+                   1 -> Levels ++ [<<"#">>];
+                   _ -> Levels
+               end,
+    iolist_to_binary(lists:join(<<"/">>, WithHash)).
+
+random_level() ->
+    case rand:uniform(4) of
+        1 -> <<"+">>;
+        _ -> lists:nth(rand:uniform(3), [<<"a">>, <<"b">>, <<"c">>])
+    end.
+
+random_topic() ->
+    Levels = [lists:nth(rand:uniform(3), [<<"a">>, <<"b">>, <<"c">>])
+              || _ <- lists:seq(1, rand:uniform(5))],
+    iolist_to_binary(lists:join(<<"/">>, Levels)).

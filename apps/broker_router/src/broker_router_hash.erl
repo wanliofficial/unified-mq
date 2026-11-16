@@ -5,6 +5,9 @@
 %% calling process; only `register/4' and `unregister/2' hand work to the single
 %% writer. That split is the frozen point 【F3】 of §10.1 -- routing must not
 %% serialize through one gen_server (README §7.2).
+%%
+%% The index itself is a trie (docs/design/router-read-path.md §3): matching
+%% walks the destination instead of scanning every registered filter.
 -module(broker_router_hash).
 
 -behaviour(broker_router).
@@ -60,31 +63,68 @@ init(Config) ->
 %% tenant's subscriptions plus legacy entries registered as `<<"*">>' (the
 %% pre-S6 shape, kept so existing sessions keep working). This is the read-path
 %% half of tenant isolation; the write path is `broker_security:authorize/2'.
-route(Destination, Ctx, #{tab := Tab, partitions := N, hash := Hash} = Env) ->
-    Tenant = ctx_tenant(Ctx),
-    TopicLevels = levels(Destination),
-    Matches =
-        lists:flatmap(
-            fun({{EntryTenant, Filter}, Subs}) ->
-                case tenant_visible(EntryTenant, Tenant) of
-                    false -> [];
-                    true ->
-                        case match(TopicLevels, levels(Filter)) of
-                            true -> Subs;
-                            false -> []
-                        end
-                end
-            end,
-            ets:tab2list(Tab)),
-    _ = Env,
+%%
+%% S11x change 2 (docs/design/router-read-path.md §3): the index is a trie, so
+%% this walks the destination's levels (two ETS lookups per visited node) instead
+%% of copying every registered filter with `ets:tab2list/1'. The old shape made
+%% a publish cost O(total subscriptions) regardless of how many matched.
+route(Destination, Ctx, #{tab := Tab, partitions := N, hash := Hash}) ->
+    Topic = levels(Destination),
+    Matches = lists:append([walk(Tab, Root, [], Topic)
+                            || Root <- visible_roots(ctx_tenant(Ctx))]),
     {ok, [{partition(Destination, N, Hash), ordered_unique(lists:keysort(2, Matches))}]}.
+
+%% `<<"*">>' subscriptions are visible to every tenant, including the legacy
+%% tenant that reads them directly -- querying it twice would double every hit.
+visible_roots(<<"*">>) ->
+    [<<"*">>];
+visible_roots(Tenant) ->
+    [Tenant, <<"*">>].
+
+%% Topic exhausted: filters ending at this node are exact matches, and a `#'
+%% child also matches the parent itself (MQTT §4.7: "sport/#" matches "sport").
+walk(Tab, Tenant, Path, []) ->
+    {Children, Subs} = node(Tab, Tenant, Path),
+    case maps:is_key(<<"#">>, Children) of
+        true -> Subs ++ subs_at(Tab, Tenant, Path ++ [<<"#">>]);
+        false -> Subs
+    end;
+%% Otherwise three branches at most: the literal level, `+', and `#' (which
+%% ends that branch because it already covers every depth below).
+walk(Tab, Tenant, Path, [Level | Rest]) ->
+    {Children, _Subs} = node(Tab, Tenant, Path),
+    Exact =
+        case maps:is_key(Level, Children) of
+            true -> walk(Tab, Tenant, Path ++ [Level], Rest);
+            false -> []
+        end,
+    Plus =
+        case maps:is_key(<<"+">>, Children) of
+            true -> walk(Tab, Tenant, Path ++ [<<"+">>], Rest);
+            false -> []
+        end,
+    Hash =
+        case maps:is_key(<<"#">>, Children) of
+            true -> subs_at(Tab, Tenant, Path ++ [<<"#">>]);
+            false -> []
+        end,
+    Exact ++ Plus ++ Hash.
+
+subs_at(Tab, Tenant, Path) ->
+    {_Children, Subs} = node(Tab, Tenant, Path),
+    Subs.
+
+%% Row shape is owned by `broker_router_hash_store': `{{Tenant, Path},
+%% Children, Subs}'. A missing row is an empty node, not an error: the writer
+%% prunes rows as soon as they are empty.
+node(Tab, Tenant, Path) ->
+    case ets:lookup(Tab, {Tenant, Path}) of
+        [{{Tenant, Path}, {Children, Subs}}] -> {Children, Subs};
+        [] -> {#{}, []}
+    end.
 
 ctx_tenant(#route_ctx{tenant_id = T}) when is_binary(T), T =/= <<>> -> T;
 ctx_tenant(_) -> <<"default">>.
-
-tenant_visible(<<"*">>, _Tenant) -> true;
-tenant_visible(Tenant, Tenant) -> true;
-tenant_visible(_, _) -> false.
 
 -spec register(env(), binary(), broker_router:sub_ref(), map()) -> ok | {error, term()}.
 register(#{store := Store}, Filter, SubRef, SubOpts) ->
@@ -178,19 +218,6 @@ partition(Destination, N, phash2) ->
 levels(Topic) ->
     binary:split(Topic, <<"/">>, [global]).
 
-%% MQTT 3.1.1 §4.7: # stands for the parent level and any number below it, so
-%% "sport/#" matches "sport" as well as "sport/a/b".
-match(_TopicLevels, [<<"#">>]) ->
-    true;
-match([], []) ->
-    true;
-match([_ | Topic], [<<"+">> | Filter]) ->
-    match(Topic, Filter);
-match([Level | Topic], [Level | Filter]) ->
-    match(Topic, Filter);
-match(_Topic, _Filter) ->
-    false.
-
 %% A malformed filter would silently never match (or match the wrong thing), so
 %% it is rejected when it is registered instead of at publish time.
 valid_filter(<<>>) ->
@@ -216,16 +243,17 @@ has_wildcard(Level) ->
     binary:match(Level, [<<"+">>, <<"#">>]) =/= nomatch.
 
 %% Input is sorted by registration sequence, so keeping the first occurrence of
-%% each SubRef preserves index order and drops the duplicates.
+%% each SubRef preserves index order and drops the duplicates. The seen-set is a
+%% map, not a list: with N subscriptions matching one topic, `lists:member/2'
+%% made this O(N^2) (design §0 P3).
 ordered_unique(Pairs) ->
-    ordered_unique(Pairs, [], []).
-
-ordered_unique([], _Seen, Acc) ->
-    lists:reverse(Acc);
-ordered_unique([{SubRef, _Seq} | Rest], Seen, Acc) ->
-    case lists:member(SubRef, Seen) of
-        true ->
-            ordered_unique(Rest, Seen, Acc);
-        false ->
-            ordered_unique(Rest, [SubRef | Seen], [SubRef | Acc])
-    end.
+    {Acc, _Seen} =
+        lists:foldl(fun({SubRef, _Seq}, {Acc, Seen}) ->
+                            case maps:is_key(SubRef, Seen) of
+                                true -> {Acc, Seen};
+                                false -> {[SubRef | Acc], Seen#{SubRef => true}}
+                            end
+                    end,
+                    {[], #{}},
+                    Pairs),
+    lists:reverse(Acc).
