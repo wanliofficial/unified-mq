@@ -1,9 +1,9 @@
 # 路由读路径：env 串行点与全表扫描的收敛设计
 
 - **文档版本**：v0.2（2026-11-16）
-- **状态**：**改动 1 与改动 2 已实现（见 §9 交付表）**。改动 3 只有设计，无代码、无「已实测」性能数字。
+- **状态**：**改动 1 与改动 2 已实现（见 §9 交付表）**。改动 3 经命中率模型扫描后**否决**（§8 OQ-5），不实现。
 - **关联**：ADR-010 §10.1（读路径不得进程串行化）/§10.3（hash 后端）；ADR-008 §8.4（append 路径不得付共识成本）；ADR-016（指标键集）；`docs/architecture.md` §2.1（`broker_router` 行）；`docs/benchmarks/2026-11-08-s2-baseline.md` §154
-- **证据口径**：所有代码位置为 2026-11-16 工作区实际行号；所有「未实测」明确标注；不含任何吞吐/延迟数字，性能结论待 §7.3 的压测报告落盘。
+- **证据口径**：所有代码位置为 2026-11-16 工作区实际行号；所有「未实测」明确标注；性能结论见 §7.3 的五份报告（其中计划缓存那份是模型，已注明）。
 
 ---
 
@@ -205,16 +205,24 @@ ETS trie: set, protected, read_concurrency
 
 ---
 
-## 4. 改动 3：计划缓存（设计，未实现，可选）
+## 4. 改动 3：计划缓存（**已否决，不实现**——见 §8 OQ-5）
 
-只在「高扇出 + 重复 topic」场景有收益（例如 1 万设备都发 `devices/+/status`）。
+原设计：只在「高扇出 + 重复 topic」场景有收益（例如 1 万设备都发 `devices/+/status`）。
 
 - 位置：每连接进程内（`mqtt_conn_fsm` 的 `#st{}`）或每调度器一张 ETS；**不做全局单表**，避免又造一个热点。
 - 键：`{Tenant, Destination, Gen}`。
 - 容量：LRU 上限（配置项），避免高基数 topic 撑爆内存。
 - 失效：只靠 gen（§2.4），无 TTL。
 
-**不做 3 也不影响正确性** —— 改动 2 已经把 P2/P3 消掉，3 只是常数因子。
+**否决理由**：`gen` 是单一全局计数器，任何订阅写都使全部计划失效，因此缓存窗口 = 两次订阅变更之间的间隔。命中率模型扫描（[`2026-11-16-s11x-router-plan-cache.md`](../benchmarks/2026-11-16-s11x-router-plan-cache.md)）显示：
+
+- `fleet` 形状（5 万 topic、一设备一 topic）在**任何** churn 下都零命中——而这正是最需要缓存的形状；
+- `hot` 形状（20 个 topic）99.8% → churn 0.01 时降到 80%，但那类负载的 route 本来只要几十微秒；
+- `bursty` 的收益上限就是热头流量占比（50%），churn 一上来退到 20%。
+
+也就是说，**只有「少热 topic + 低 churn」同时成立时才划算，而那恰好是不需要优化的负载**。要让缓存在真实负载下稳健，前提是把失效粒度做成 per-prefix 或 per-partition，那是索引层面的重新设计，不是加一层缓存。
+
+**不做 3 也不影响正确性** —— 改动 2 已经把 P2/P3 消掉，3 最多是常数因子。
 
 ---
 
@@ -278,13 +286,15 @@ ETS trie: set, protected, read_concurrency
 
    **改动 1 只在索引极小时有意义**（省一次约 8 µs 的调用）；1k 订阅以上几乎无效（仅快 5%），因为全表拷贝盖过了它。**大表收益全部来自改动 2**（1k: 118x，10k: 1,236x）。trie 在 1 订阅时略慢于平表（19 vs 13 µs），是「按层走 map」的固定成本。
 
-2. **高扇出**（[`2026-11-16-s11x-router-fanout.md`](../benchmarks/2026-11-16-s11x-router-fanout.md)）：N 个订阅者挂同一 filter。1 万扇出下 old/env 均约 6 ops/s（p50 158–165 ms，被 O(N²) 去重拖死），trie **87 ops/s、p50 11.7 ms**，快 15x。差距主因是 map 去重取代 `lists:member`。**计划缓存（改动 3）在此形状下确有可缓存的工作量**，但因失效粒度为全局 `gen`，是否值得取决于「订阅变更频率 / 同 topic 重复发布频率」，该比值尚无数据。
+2. **高扇出**（[`2026-11-16-s11x-router-fanout.md`](../benchmarks/2026-11-16-s11x-router-fanout.md)）：N 个订阅者挂同一 filter。1 万扇出下 old/env 均约 6 ops/s（p50 158–165 ms，被 O(N²) 去重拖死），trie **87 ops/s、p50 11.7 ms**，快 15x。差距主因是 map 去重取代 `lists:member`。**计划缓存（改动 3）在此形状下确有可缓存的工作量**，但因失效粒度为全局 `gen`，是否值得取决于「订阅变更频率 / 同 topic 重复发布频率」。该比值已用模型扫描（见下条），结论是**不做**。
 
 3. **索引内存 / OQ-2**（[`2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md)）：10 万 filter 下写放大上界精确成立（无共享前缀 = 4.000 行/filter、约 129 MB），典型形状远低于上界（设备集群 10 万订阅仅 4.7 MB）。剪枝后行数回到 0。**结论：不需要配置项，但需按行数而非订阅数做监控。**
 
 4. **并发扩展性**（[`2026-11-16-s11x-router-concurrency.md`](../benchmarks/2026-11-16-s11x-router-concurrency.md)）：小表下 `old` 的聚合吞吐封顶在 **18.6 万 ops/s / 4.16x（P=16）**，`env`/`trie` 达 7.48x/7.91x（62 万/58 万）。**改动 1 的真正价值是移除这个并发天花板**，而非单进程吞吐。大表下 `old` 也完美线性扩展（8.00x），因为拷贝发生在调用方进程——串行化只限制上限，不拖慢单条。
 
-四份报告都写明没测什么；机器测量期间有外部负载，**绝对数字偏低，引用请复跑**。
+5. **计划缓存命中率模型**（[`2026-11-16-s11x-router-plan-cache.md`](../benchmarks/2026-11-16-s11x-router-plan-cache.md)）：**模型而非实测**，只有 miss 代价（11,734 µs）取自扇出报告。全局 `gen` 使缓存窗口等于两次订阅变更之间的间隔：fleet 形状任何 churn 下都零命中；hot 从 99.8% 随 churn 降到 80%（0.01）；bursty 上限即热头占比 50%。**结论：不做（OQ-5）**。
+
+五份报告都写明没测什么；机器测量期间有外部负载，**绝对数字偏低，引用请复跑**。
 
 ---
 
@@ -296,6 +306,7 @@ ETS trie: set, protected, read_concurrency
 | OQ-2 | trie 化的写入放大（每层一行）在 10 万 filter 下的内存上限是否需要配置项 | **已答（2026-11-16）**：不需要配置项（最坏 129 MB / 10 万 filter），但需导出**行数**而非订阅数作监控指标——二者可差 19 倍。见 [`docs/benchmarks/2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md) |
 | OQ-3 | `services_search` 等价物是否随 S12-A 的管理 API 一起做 | S12-0 |
 | OQ-4 | 跨节点订阅索引（若 S12-B 引入跨节点投递）与本地 trie 的关系 | S12-0 |
+| OQ-5 | 计划缓存（改动 3）是否值得做 | **已答（2026-11-16）：不做**。`gen` 是全局计数器、任何订阅写都使缓存整体失效，因此缓存窗口 = 两次订阅变更之间。模型扫描显示：fleet 形状（5 万 topic、一设备一 topic）在任何 churn 下都零命中；hot 形状 99.8% → churn 0.01 时降到 80%；bursty 上限即热头占比（50%）。只有「少热 topic + 低 churn」同时成立才划算，而那种负载的 route 本来只要几十微秒。若未来要重开，前提是 per-prefix / per-partition 失效——那是重新设计。见 [`docs/benchmarks/2026-11-16-s11x-router-plan-cache.md`](../benchmarks/2026-11-16-s11x-router-plan-cache.md) |
 
 ---
 
@@ -305,5 +316,5 @@ ETS trie: set, protected, read_concurrency
 |---|---|---|
 | 1. env 缓存 + gen | ✅ 已实现（分支 `s11x-router-env-cache`） | `broker_router_hash_store.erl`（`env/1`、`gen/1`、`bump/1`）、`broker_router_hash.erl`（`current_env/0`、`gen/0`、`init/1`）。`gen/0` 只放在后端模块：行为门面 `broker_router.erl` 未改，ADR-010 冻结的 5 个回调与 `env/0` 签名不动 |
 | 2. trie 索引 | ✅ 已实现（分支 `s11x-router-trie-index`，叠在改动 1 之上） | `broker_router_hash_store.erl`（节点行、`link/4`、`prune/3`）、`broker_router_hash.erl`（`route/3` 改为按层走、删除 `match/2` 与 `tenant_visible/3`）；测试见 §7.2 |
-| 3. 计划缓存 | ⬜ 未实现（可选） | 本文 §4 |
+| 3. 计划缓存 | ❌ 不做（OQ-5，模型扫描后否决；`gen` 全局失效使 fleet 形状零命中） | 本文 §4 |
 | ADR-010 §10.1 增补 | ⬜ 未改 | OQ-1 |
