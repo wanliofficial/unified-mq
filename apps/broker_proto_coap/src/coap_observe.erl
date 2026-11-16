@@ -27,7 +27,12 @@
                           %% decides the notification type (RFC 7641 §3.4/§4.1), set
                           %% by the listener when it records the relationship. A GET is
                           %% never an ACK/RST, so when present it is always `con|non'.
-                          req_type => con | non}.
+                          req_type => con | non,
+                          %% Message ID of the most recent notification, set by the
+                          %% listener when it sends one. Used to correlate a conformant
+                          %% empty RST (which carries no token) to a relationship
+                          %% (RFC 7641 §4.5); absent until the first notification.
+                          req_id => non_neg_integer()}.
 -type observes() :: #{key() => relationship()}.
 
 %% The CoAP-Observe filter: the resource path IS the broker destination

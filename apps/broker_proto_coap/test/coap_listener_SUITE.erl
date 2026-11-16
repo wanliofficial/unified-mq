@@ -45,6 +45,7 @@ all() ->
      observe_deregister_with_observe_1,
      observe_rst_deregisters,
      observe_bounded_table_refuses,
+     observe_stray_rst_does_not_crash,
      observe_plain_udp_principal_is_allowed,
      observe_max_age_expires_relationship,
      observe_two_observers_same_dest_both_notified].
@@ -124,6 +125,10 @@ case_env(observe_con_retries_then_gives_up, _Config) ->
 case_env(observe_con_notifies_and_acks, _Config) ->
     %% Pin a short ACK timeout so the post-ACK silence window can actually catch a
     %% broken retransmit-cancel (the default 2000 ms would mask it).
+    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300);
+%% The RST case pins a short ACK timeout so the RST reliably lands before a
+%% retransmit (set_env here runs before the listener starts, so it takes effect).
+case_env(observe_rst_deregisters, _Config) ->
     ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300);
 %% The bounded-table case shrinks the relationship table to a single slot.
 case_env(observe_bounded_table_refuses, _Config) ->
@@ -516,10 +521,6 @@ observe_deregister_with_observe_1(Config) ->
 observe_rst_deregisters(Config) ->
     Port = ?config(port, Config),
     S = open(),
-    %% CON notifications retransmit on the ACK-timeout; pin it short so the RST
-    %% below lands well before a retransmit (which would arrive as a second
-    %% notification the test does not expect).
-    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
     Token = <<"rsttok">>,
     send(S, Port, request(con, put, 1, [{uri_path, <<"rst1">>}], <<"a">>)),
     _ = expect(S, ack, {response, 2, 4}),
@@ -536,6 +537,27 @@ observe_rst_deregisters(Config) ->
     send(S, Port, request(con, put, 4, [{uri_path, <<"rst1">>}], <<"c">>)),
     _ = expect(S, ack, {response, 2, 4}),
     refute(S, con, {response, 2, 5}, 400),
+    close(S).
+
+%% A stray empty RST (unknown Message ID) from a client that has a live, but
+%% never-yet-notified, relationship must NOT crash the listener: the fold over
+%% `observes' uses maps:get(req_id,...,undefined), so a relationship without a
+%% req_id is simply skipped. The relationship survives and still notifies.
+%% (Regression for a function_clause that took the whole CoAP app down.)
+observe_stray_rst_does_not_crash(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(non, put, 1, [{uri_path, <<"stray">>}], <<"init">>)),
+    _ = expect(S, non, {response, 2, 4}),
+    send(S, Port, (request(non, get, 2, [{uri_path, <<"stray">>}, {observe, 0}]))
+                   #{token => <<"stok">>}),
+    _ = expect(S, non, {response, 2, 5}),
+    %% An RST echoing an id no notification ever used.
+    send(S, Port, rst_of(60000)),
+    %% The relationship is untouched: a later publish still notifies.
+    send(S, Port, request(non, put, 3, [{uri_path, <<"stray">>}, {observe, 0}])),
+    Note = expect(S, non, {response, 2, 5}),
+    ?assertEqual(<<"stok">>, coap_codec:token(Note)),
     close(S).
 
 %% A full relationship table refuses the observation with 4.03.

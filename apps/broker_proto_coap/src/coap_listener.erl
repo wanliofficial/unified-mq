@@ -183,10 +183,10 @@ handle_info({udp, _Socket, IP, Port, Bin}, #st{pending = Pend} = St0) ->
             %% scanning `observes' for a matching notification id (RFC 7641
             %% §4.5) -- this works whether or not the notification is still in
             %% `pending', so a client may RST immediately.
-            case observe_by_notify_id(Rid, St1#st.observes) of
+            case observe_by_notify_id(IP, Port, Rid, St1#st.observes) of
                 undefined ->
-                    %% No such notification: a stray/late RST. Not a request, no
-                    %% response owed (RFC 7252 §4.3).
+                    %% No such notification on this endpoint: a stray/late RST. Not
+                    %% a request, no response owed (RFC 7252 §4.3).
                     {noreply, St1};
                 {_, _, _} = Key ->
                     {noreply, deregister_observe(element(1, Key), element(2, Key),
@@ -539,18 +539,22 @@ register_observe(IP, Port, Token, Req, Cfg, #st{observes = Obs} = St) ->
 %% token, so this scan of `observes' is how a client's RST is matched to a
 %% relationship (RFC 7641 §4.5). Returns the relationship key, or `undefined' when
 %% no live relationship has such a notification (a stray/late RST).
-observe_by_notify_id(Id, Observes) ->
+%% Find the observe relationship, ON THE SENDER'S ENDPOINT, whose MOST RECENT
+%% notification carries Message ID `Id'. A conformant empty RST has no token, so
+%% this scan of `observes' is how a client's RST is matched to a relationship
+%% (RFC 7641 §4.5). It is scoped to `{IP,Port,_}' so a RST from one client can
+%% never tear down another endpoint's relationship. Returns the relationship key,
+%% or `undefined' when no relationship on that endpoint has such a notification.
+observe_by_notify_id(IP, Port, Id, Observes) ->
     lists:foldl(
-      fun({Key, #{req_id := Id0}}, Found) ->
-              case Found of
-                  undefined ->
-                      case Id0 =:= Id of
-                          true -> Key;
-                          false -> undefined
-                      end;
-                  _ ->
-                      Found
-              end
+      fun({{SIP, SPort, _} = Key, Rel}, Found) when SIP =:= IP,
+                                                   SPort =:= Port ->
+              case maps:get(req_id, Rel, undefined) of
+                  Id -> Key;
+                  _ -> Found
+              end;
+         ({_OtherKey, _Rel}, Found) ->
+              Found
       end, undefined, maps:to_list(Observes)).
 
 %% Called by respond/5 for a GET with Observe=1, and by the udp clause for an
