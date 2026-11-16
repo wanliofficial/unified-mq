@@ -977,36 +977,36 @@ Task 3 已交付并经**四轮独立复审**返工（`5d38cbf` → `363612b` →
 
 **Files:** 无代码改动（除非 dialyzer/xref 指出问题）
 
-- [ ] **Step 1: 编译 + CoAP 四套件**
+- [ ] **Step 1: 编译 + CoAP 五套件**
 
-Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_coap/test/coap_observe_SUITE.erl,apps/broker_proto_coap/test/coap_codec_SUITE.erl,apps/broker_proto_coap/test/coap_resource_SUITE.erl,apps/broker_proto_coap/test/coap_listener_SUITE.erl 2>&1 | tail -4`
-Expected: `All 93 tests passed.`（codec 48 + resource 15 + listener 15 + observe 10 + app 5；若资源/listener 用例数与计划略有出入，以实跑为准并在文档里写实际数）
+Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_coap/test/coap_observe_SUITE.erl,apps/broker_proto_coap/test/coap_codec_SUITE.erl,apps/broker_proto_coap/test/coap_resource_SUITE.erl,apps/broker_proto_coap/test/coap_listener_SUITE.erl,apps/broker_proto_coap/test/coap_app_SUITE.erl 2>&1 | tail -4`
+Expected: `All 96 tests passed.`（codec 48 + resource 14 + listener 19 + observe 10 + app 5；以实跑为准并在文档里写实际数）
 
 - [ ] **Step 2: 全量 CT**
 
-Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && rm -rf _build/test/extras && timeout 3000 rebar3 ct > /tmp/opencode/ct_s11b.log 2>&1; echo exit=$?; tail -3 /tmp/opencode/ct_s11b.log`
-Expected: `All <N> tests passed.`，N = 1324 + 本阶段新增（1 + 8 + 2 + 10 = 21，全量约 1345），零 FAILED。新增数 = listener 1（Task 2）+ listener 8（Task 3）+ resource 2（Task 3）+ observe 10（Task 1）。以实际跑出的数为准。
+Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; rm -rf _build/test/extras && timeout 3000 rebar3 ct > /tmp/opencode/ct_s11b.log 2>&1; echo exit=$?; tail -3 /tmp/opencode/ct_s11b.log`
+Expected: `All <N> tests passed.`，N = 1324 基线 + 本阶段新增（以实际跑出的数为准；CoAP 5 套件合计 96）。零 FAILED。
 
 - [ ] **Step 3: dialyzer + xref**
 
-Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && timeout 900 rebar3 dialyzer 2>&1 | tail -3; echo "=== xref ==="; timeout 600 rebar3 xref 2>&1 | grep -c Warning`
-Expected: dialyzer 0 warning；xref 计数 = 302 基线 + 本阶段新增（coap_observe 8 个导出在 Task 1 后未接线 = +8 → 310；Task 2/3 接线后回落到 302 + coap_listener/coap_resource 自身的新增未用导出，以实跑为准）。
+Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; timeout 900 rebar3 dialyzer 2>&1 | tail -3; echo "=== xref ==="; timeout 600 rebar3 xref 2>&1 | grep -c Warning`
+Expected: dialyzer 0 warning；xref 计数 = 302 基线（Task 2/3 接线后 `register_observe/6` 已用，回落到 302，以实跑为准）。
 
 - [ ] **Step 4: release 装配**
 
-Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; cd /home/wanli/workspace/unified-mq && timeout 600 rebar3 release 2>&1 | tail -3`
+Run: `export PATH="/home/wanli/Development/otp-28.3.1/bin:$PATH"; timeout 600 rebar3 release 2>&1 | tail -3`
 Expected: `Release successfully assembled`。
 
 - [ ] **Step 5: 文档同步**
 
 按 `docs/design/s11b-coap-observe.md` §9 与仓库既有口径，更新：
-- `docs/protocol-compatibility.md` §4.24：能力矩阵 CoAP 行追加 Observe（已支持：注册/通知/取消 + CON datagram 级重传 + NON 至多一次 + max_age）；§4.24.4 加「无跨节点崩溃恢复、通知非 QoS1、无 Block2、无 OSCORE」；§4.24 证据计数改新数；「本套件抓到的真实缺陷」追加 Observe 相关（如 notify 需入 observes 表、ACK 匹配 pending、max_age 兜底）；头部「最近一次追加」改 2026-11-15 S11-B。
+- `docs/protocol-compatibility.md` §4.24：能力矩阵 CoAP 行追加 Observe（已支持：注册/通知/取消 + CON datagram 级重传 + NON 至多一次 + max_age）；§4.24.4 加「无跨节点崩溃恢复、通知非 QoS1、无 Block2、无 OSCORE」；§4.24 证据计数改新数；「本套件抓到的真实缺陷」追加 Observe 相关（**空 ACK/RST 无 token 必须按 Message ID 关联**、共享订阅按 dest 粒度退订、NSTART=1、RST 端点作用域、max_age 兜底）；头部「最近一次追加」改 2026-11-15 S11-B。
 - `docs/architecture.md` §3.18：observes/pending 两张表 + listener 兼 notify pid 的说明；§4.1 启动实测不变。
 - `docs/roadmap.md` §13.1 S11-B 行改「🟡 已交付（2026-11-15）」+ 证据；§13.2 Gate S11 勾选项对应更新；状态口径改 S11-B 已交付、S11-C 未开工。
-- `docs/security.md`：新增 §12.5 S11-B 未实现项（跨节点恢复、Block2、OSCORE、通知非 QoS1、observe_max_age 兜底）。
-- `docs/adr/031-coap-frontend-boundary.md`「落地偏差记录」追加 S11-B 段（listener 兼 notify pid、ClientId=<<"coap">>、CON 通知一律入 pending、max_age 兜底）——冻结文本不改。
+- `docs/security.md`：新增 §12.5 S11-B 未实现项（跨节点恢复、Block2、OSCORE、通知非 QoS1、observe_max_age 兜底、plain UDP principal=undefined 故 ACL 无法拒绝 datagram 直至 S11-C DTLS）。
+- `docs/adr/031-coap-frontend-boundary.md`「落地偏差记录」追加 S11-B 段（listener 兼 notify pid、ClientId=<<"coap">>、CON 通知一律入 pending+按 Message ID 关联+NSTART=1、RST 端点作用域、max_age 兜底、observe_acl_denied 降级）——冻结文本不改。
 - `README.md` / `progress.md`：计数改新数，追加 S11-B 交付段。
-- 提交：`git add docs/protocol-compatibility.md docs/architecture.md docs/roadmap.md docs/security.md docs/adr/031-coap-frontend-boundary.md README.md progress.md && git commit -q -m "docs(s11b): S11-B Observe 交付——能力矩阵/架构/roadmap/security/ADR 同步"`
+- 提交：`git add docs/protocol-compatibility.md docs/architecture.md docs/roadmap.md docs/security.md docs/adr/031-coap-frontend-boundary.md README.md progress.md && git commit -q -m "docs(s11b): S11-B Observe 交付——能力矩阵/架构/roadmap/security/ADR 同步"`（**不要** `git add -A`，**不要**提交 `docs/compatibility/`）。
 
 - [ ] **Step 6: 最终提交确认**
 
@@ -1018,6 +1018,5 @@ Expected：S11-B 相关提交齐全，工作树干净（`docs/compatibility/` �
 ## Self-Review 记录
 
 - **Spec 覆盖**：设计稿 §2 进程模型→Task2/3；§3 会话归属→Task2（observes 表 + max_age sweep）；§4 可靠性分档→Task2（CON 重传）/Task3（NON 至多一次）；§5 数据流→Task2/3 各分支；§6 组件清单→Task1/2/3；§7 测试→Task1/3 逐条；§8 ADR 偏差→Task4 Step5；§9 收口→Task4。
-- **类型一致**：`coap_observe:relationship()` 的字段是 dest/tenant/sub_ref/max_age/seq/last_notified（**注意 `req_type` 不在其中**——它由 listener 在 `register_observe` 里以 `Rel#{req_type => ...}` 附加，是 listener 侧的表项元数据，不进纯模块的类型）；listener 侧 `observes` 表项 = `relationship() + req_type`，`pending` 表项 = `{Bytes, RetransLeft, TimerRef}`；ClientId 恒 `<<"coap">>`；`coap_observe:filter/1` 在 register 与 sweep/deregister 复用。
 - **已知坑**：`sweep_observes/1` 因需 side-effect（unsubscribe）放在 tick 而非纯 `prune/1`（Task2 Step5 已给完整实现），`observe_max_age_expires_relationship` 钉住。`notify pid = listener` 意味着 `attach(<<"coap">>, self(), false)` 的 self 是 listener 进程。**空 ACK/RST 不带 token**（`coap_codec:ack/1`/`reset/1` 产出 TKL=0），测试助手 `ack_of/1`/`rst_of/1` 必须产出符合 RFC 的空消息并由 listener 按 **Message ID** 关联（见 Task 3 定稿段）。
 - **类型一致（Task 3 定稿后）**：`coap_observe:relationship()` 的必填字段是 dest/tenant/sub_ref/max_age/seq/last_notified；`req_type => con|non` 与 `req_id => non_neg_integer()` 是**可选**字段（`=>`），由 listener 在 `register_observe`（req_type）和 `notify_one`（req_id）附加——纯模块 `register/5` 不设它们。listener 侧 `observes` 表项 = `relationship() + req_type + req_id`；`pending` 表项 = `{ObsKey, Bytes, RetransLeft, TimerRef}`，键 `{IP,Port,MsgId}`（NSTART=1）；ClientId 恒 `<<"coap">>`；`coap_observe:filter/1` 在 register 与 sweep/deregister 复用。
