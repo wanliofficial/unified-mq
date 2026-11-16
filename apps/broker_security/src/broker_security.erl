@@ -159,23 +159,38 @@ long_term_key(_Username, _Realm) ->
 %% client derives, the password never crosses.
 %%
 %% Domain separation is what makes this safe to co-exist with the TURN key: a
-%% distinct label plus three NUL separators makes `(Identity, Realm, Password)'
-%% unambiguous, and SHA-256 over a different label cannot collide with TURN's
+%% distinct label plus NUL separators cannot collide with TURN's
 %% `MD5(user ":" realm ":" pass)'.
+%%
+%% The separator encoding is only injective when the identity and the realm are
+%% NUL-free, so both are rejected outright if they contain one (the password may
+%% contain anything: with two NUL-free leading fields, the first two NULs are the
+%% separators and the remainder is the password, unambiguously).
 %%
 %% A missing user and a user without a password fail identically, so the handshake
 %% never reveals which names exist.
 -spec psk_for_identity(binary()) -> {ok, <<_:256>>} | {error, term()}.
 psk_for_identity(Identity) when is_binary(Identity) ->
-    case user_record(Identity) of
-        #{password := Password} when is_binary(Password) ->
-            {ok, crypto:hash(sha256, [<<"unifiedmq-coaps-psk">>, 0,
-                                      Identity, 0, coaps_realm(), 0, Password])};
-        _ ->
-            {error, bad_username_or_password}
+    Realm = coaps_realm(),
+    case separator_safe(Identity) andalso separator_safe(Realm) of
+        false ->
+            {error, bad_username_or_password};
+        true ->
+            case user_record(Identity) of
+                #{password := Password} when is_binary(Password) ->
+                    {ok, crypto:hash(sha256, [<<"unifiedmq-coaps-psk">>, 0,
+                                              Identity, 0, Realm, 0, Password])};
+                _ ->
+                    {error, bad_username_or_password}
+            end
     end;
 psk_for_identity(_Other) ->
     {error, bad_username_or_password}.
+
+%% A field that must act as a separator-delimited prefix cannot contain the
+%% separator, or the encoding stops being injective.
+separator_safe(Field) ->
+    binary:match(Field, <<0>>) =:= nomatch.
 
 %% The realm the derivation is bound to. Separate from `broker_security.tls'
 %% on purpose: that block describes certificate-based TCP TLS, and DTLS/PSK has

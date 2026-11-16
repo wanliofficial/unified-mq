@@ -21,6 +21,8 @@ all() ->
      psk_changes_with_realm,
      psk_is_not_the_password,
      psk_unknown_identity_is_an_error,
+     psk_rejects_separator_in_identity,
+     psk_rejects_separator_in_realm,
      psk_missing_password_is_same_error,
      psk_is_not_in_redacted_config].
 
@@ -96,6 +98,13 @@ authorize_stub_always_allows(_Config) ->
 psk_for_known_identity(_Config) ->
     {ok, Psk} = broker_security:psk_for_identity(<<"alice">>),
     ?assertEqual(32, byte_size(Psk)),
+    %% The exact derivation, pinned literally: the four properties below are
+    %% about behavior, this one is about the wire contract a client must
+    %% reproduce to compute the same key.
+    ?assertEqual(crypto:hash(sha256,
+                             [<<"unifiedmq-coaps-psk">>, 0, <<"alice">>, 0,
+                              <<"unifiedmq">>, 0, <<"s3cret">>]),
+                 Psk),
     ok.
 
 psk_is_deterministic(_Config) ->
@@ -134,6 +143,25 @@ psk_unknown_identity_is_an_error(_Config) ->
                  broker_security:psk_for_identity(<<"nobody">>)),
     ok.
 
+psk_rejects_separator_in_identity(_Config) ->
+    %% The identity is a separator-delimited prefix of the hashed input, so a NUL
+    %% inside it would make two (Identity, Realm, Password) triples encode
+    %% identically. Refuse rather than hash something ambiguous -- even though an
+    %% operator would have to configure such a username for it to matter.
+    ?assertEqual({error, bad_username_or_password},
+                 broker_security:psk_for_identity(<<"al", 0, "ice">>)),
+    ok.
+
+psk_rejects_separator_in_realm(_Config) ->
+    Saved = application:get_env(broker_security, coaps, undefined),
+    try
+        ok = application:set_env(broker_security, coaps, #{realm => <<"a", 0, "b">>}),
+        ?assertEqual({error, bad_username_or_password},
+                     broker_security:psk_for_identity(<<"alice">>))
+    after
+        restore_env(broker_security, coaps, Saved)
+    end.
+
 psk_missing_password_is_same_error(_Config) ->
     %% A user record with no password must fail exactly like an unknown user:
     %% differentiating them would be an enumeration oracle on the handshake.
@@ -151,10 +179,26 @@ psk_missing_password_is_same_error(_Config) ->
 
 psk_is_not_in_redacted_config(_Config) ->
     {ok, Psk} = broker_security:psk_for_identity(<<"alice">>),
-    %% The admin/log view must never carry the derived key; a hex or term form
-    %% of it appearing there would be a credential leak.
-    Rendered = iolist_to_binary(io_lib:format("~p", [broker_security:redacted_config()])),
-    ?assertEqual(nomatch, binary:match(Rendered, Psk)).
+    %% The admin/log view must never carry the derived key. `~p' would render a
+    %% binary as `<<1,2,...>>', so matching on the rendered string cannot detect
+    %% a leak at all -- walk the term and look for the PSK as an actual subterm.
+    ?assertNot(subterm_present(Psk, broker_security:redacted_config())),
+    %% Positive control: the walker must find a key that IS in the term, or the
+    %% assertion above would pass vacuously.
+    ?assert(subterm_present(Psk, #{leak => Psk})).
+
+%% True when `Needle' occurs anywhere in `Term', at any depth.
+subterm_present(Needle, Needle) -> true;
+subterm_present(Needle, Term) when is_map(Term) ->
+    lists:any(fun({K, V}) -> subterm_present(Needle, K)
+                              orelse subterm_present(Needle, V) end,
+              maps:to_list(Term));
+subterm_present(Needle, Term) when is_list(Term) ->
+    lists:any(fun(E) -> subterm_present(Needle, E) end, Term);
+subterm_present(Needle, Term) when is_tuple(Term) ->
+    subterm_present(Needle, tuple_to_list(Term));
+subterm_present(_Needle, _Term) ->
+    false.
 
 restore_env(App, Key, undefined) ->
     application:unset_env(App, Key);

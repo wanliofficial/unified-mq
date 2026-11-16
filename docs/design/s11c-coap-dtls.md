@@ -90,7 +90,7 @@ PSK = SHA-256( "unifiedmq-coaps-psk" || 0x00 || Identity || 0x00 || Realm || 0x0
 ```
 
 - **口令不过线**：服务端自己派生，客户端用同一 KDF 从自己的 password 算出 PSK（与 TURN 的 `broker_security:long_term_key/2`（`MD5(user ":" realm ":" pass)`）**同一先例**：复用同一张 `users` 表、同一个「服务端派生」姿态）。
-- **域分隔**：标签 `"unifiedmq-coaps-psk"` + 三道 `0x00` 保证 `(a,b,c)` 三元组无歧义，且与 TURN 的派生结果**不可能相撞**（不同 hash、不同标签）。
+- **域分隔**：标签 `"unifiedmq-coaps-psk"` + 三道 `0x00` 保证 `(Identity, Realm, Password)` 在上游字段 NUL-free 时无歧义；因此 **identity 与 realm 含 `0x00` 时直接拒绝派生**（`{error, bad_username_or_password}`，握手失败即拒绝），password 不受限（前两段 NUL-free 时前两个 NUL 就是分隔符，余下全是 password）。与 TURN 的派生结果**不可能相撞**（不同 hash、不同标签）。
 - **Realm**：`broker_security` 新 env `coaps` = `#{realm => binary()}`，缺省 `<<"unifiedmq">>`。**不塞进 `broker_security_tls`**——那是证书导向的 TCP TLS 配置，类型是封闭 map，塞 DTLS 的 realm 会污染其语义并向 dialyzer 撒谎；`coaps` 单独一块，语义自洽（「CoAP 安全前端」而非「TLS 证书」）。
 - **不改既有语义**：`authenticate/2`、`authenticate_conn/1`、`authorize/2`、`long_term_key/2` 一字不动；`psk_for_identity/1` 是**新增**只读导出；密码与 PSK 均不落日志（`redacted_config/0` 不暴露）。
 - **失败原因不泄露**：未知用户与「用户存在但无 password」返回同一个 `{error, bad_username_or_password}`（与 `authenticate/2` 的口径一致）。
