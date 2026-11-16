@@ -311,11 +311,28 @@ ETS trie: set, protected, read_concurrency
 
 | 编号 | 问题 | 需要谁决定 |
 |---|---|---|
-| OQ-1 | ADR-010 §10.1 的「读侧」定义是否按本文口径收窄/澄清？ | ADR 修订 |
+| OQ-1 | ADR-010 §10.1 的「读侧」定义是否按本文口径收窄/澄清？ | **已拟稿（2026-11-16），待采纳**：建议按 §10.5「冻结后补充」的既有体例，在 §10.1 末尾追加一段**不改任何签名**的冻结后批注（见下）。不直接改 ADR 的原因：OQ-1 的决策方是 ADR 修订 |
 | OQ-2 | trie 化的写入放大（每层一行）在 10 万 filter 下的内存上限是否需要配置项 | **已答（2026-11-16）**：不需要配置项（最坏 129 MB / 10 万 filter），但需导出**行数**而非订阅数作监控指标——二者可差 19 倍。见 [`docs/benchmarks/2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md) |
 | OQ-3 | `services_search` 等价物是否随 S12-A 的管理 API 一起做 | S12-0 |
 | OQ-4 | 跨节点订阅索引（若 S12-B 引入跨节点投递）与本地 trie 的关系 | S12-0 |
 | OQ-5 | 计划缓存（改动 3）是否值得做 | **已答（2026-11-16）：不做**。`gen` 是全局计数器、任何订阅写都使缓存整体失效，因此缓存窗口 = 两次订阅变更之间。模型扫描显示：fleet 形状（5 万 topic、一设备一 topic）在任何 churn 下都零命中；hot 形状 99.8% → churn 0.01 时降到 80%；bursty 上限即热头占比（50%）。只有「少热 topic + 低 churn」同时成立才划算，而那种负载的 route 本来只要几十微秒。若未来要重开，前提是 per-prefix / per-partition 失效——那是重新设计。见 [`docs/benchmarks/2026-11-16-s11x-router-plan-cache.md`](../benchmarks/2026-11-16-s11x-router-plan-cache.md) |
+
+### 8.1 OQ-1 的拟稿：ADR-010 §10.1 建议追加的冻结后批注
+
+> **【冻结后补充 S11x，2026-11-16】「读侧」包含取 `router_env()` 这一步。**
+>
+> §10.1 上文把「读路径」定义为 `route/3` 本身不经 Router 进程。实测发现这个定义**不完整**：发布路径的形式是
+>
+> ```erlang
+> {ok, Env} = broker_router:env(),          %% ① 取 env
+> {ok, Routed} = broker_router_hash:route(Destination, Ctx, Env),   %% ② 路由
+> ```
+>
+> ① 在每条 PUBLISH 上都会执行（`mqtt_conn_fsm:handle_publish_allowed/7`）。若 ① 是 `gen_server:call`，则即使 ② 完全无锁，整条读路径仍然串行化过索引写者——即上文所禁的那件事，只是换了一步。S11x 改动前 ① 正是 `broker_router_hash_store:table/1` 的一次调用。
+>
+> 因此补充一条**不改变任何 callback 签名**的约束：**`router_env()` 的获取必须免调用**（S1 实现为 `persistent_term` 读 + 存活检查），且不得在每次获取时重新读取启动期配置或重建 env（同机实测这部分曾占 1.67–1.77 µs 的七成）。详见 [`docs/design/router-read-path.md`](../design/router-read-path.md) §2.2 三条硬约束与 [`docs/benchmarks/2026-11-16-s11x-router-env-cost.md`](../benchmarks/2026-11-16-s11x-router-env-cost.md)。
+>
+> 该批注与 §10.1 的冻结文本**不冲突**：`route/3` 仍由发布者进程直接调用、`router_env()` 仍是 `term()`、`env/0` 签名不变。它只是把「读侧无进程串行化」的判据从 `route/3` 内部扩展到它的整条调用前导。
 
 ---
 
@@ -326,4 +343,4 @@ ETS trie: set, protected, read_concurrency
 | 1. env 缓存 + gen | ✅ 已实现（分支 `s11x-router-env-cache`） | `broker_router_hash_store.erl`（`env/1`、`gen/1`、`bump/1`）、`broker_router_hash.erl`（`current_env/0`、`gen/0`、`init/1`）。`gen/0` 只放在后端模块：行为门面 `broker_router.erl` 未改，ADR-010 冻结的 5 个回调与 `env/0` 签名不动。**补充（`7f87e28`）**：`env/1` 起初只发布 `#{store, tab, gen}`，`current_env/0` 仍每次 `application:get_env(partitions)` 并重建 map。现由 store 在 `init/1` 发布完整 env（含 `partitions`/`hash`），backend 由 `broker_router_sup:init/1` 发布进 `persistent_term`，取 env 从 1.67–1.77 µs 降到 0.37–0.39 µs（见 §2.2 约束 3） |
 | 2. trie 索引 | ✅ 已实现（分支 `s11x-router-trie-index`，叠在改动 1 之上） | `broker_router_hash_store.erl`（节点行、`link/4`、`prune/3`）、`broker_router_hash.erl`（`route/3` 改为按层走、删除 `match/2` 与 `tenant_visible/3`）；测试见 §7.2（读侧 churn 可见性 + 写侧并发不丢更新） |
 | 3. 计划缓存 | ❌ 不做（OQ-5，模型扫描后否决；`gen` 全局失效使 fleet 形状零命中） | 本文 §4 |
-| ADR-010 §10.1 增补 | ⬜ 未改 | OQ-1 |
+| ADR-010 §10.1 增补 | 🟡 已拟稿待采纳（OQ-1） | 建议按 §10.5 体例在 §10.1 追加一段**不改签名**的冻结后批注，把「读侧无进程串行化」的判据从 `route/3` 内部扩到其取 env 的前导。拟稿见 §8.1。未直接改 ADR：决策方是 ADR 修订 |
