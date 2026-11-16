@@ -227,9 +227,10 @@ start_after_settle() ->
                     timer:sleep(50),
                     _ = application:stop(broker_subscription),
                     start_after_settle();
-                Worker ->
-                    true = is_process_alive(Worker),
-                    ok
+                _Worker ->
+                    %% The next line in the caller reads the index ETS tables,
+                    %% so "started" has to mean "recovered", not "registered".
+                    ok = await_worker_ready()
             end
     end.
 
@@ -369,7 +370,7 @@ the_zero_regress_tier_flushes_every_ack(_Config) ->
     %% R3's zero-window tier: kill right after an ack and the cursor comes
     %% back from disk at the acked point -- no rewind to re-deliver.
     exit(whereis(broker_subscription_worker), kill),
-    await_worker_restart(),
+    await_worker_ready(),
     timer:sleep(50),
     {ok, 2} = broker_subscription:cursor(SubRef, 0),
     ok.
@@ -382,7 +383,7 @@ the_default_tier_rewinds_to_the_last_flush_never_loser_acks(_Config) ->
     ok = broker_subscription:ack(SubRef, 0, 1, <<"c1">>),
     ok = broker_subscription:ack(SubRef, 0, 2, <<"c1">>),
     exit(whereis(broker_subscription_worker), kill),
-    await_worker_restart(),
+    await_worker_ready(),
     timer:sleep(50),
     %% Gate S1 R3: the cursor may regress to the last flush (origin 1 here),
     %% which means already-acked offsets may be delivered *again* (duplicates
@@ -447,7 +448,7 @@ inflight_is_an_opaque_blob_that_may_only_staleness_lag(_Config) ->
     ok = broker_subscription:inflight(<<"c1">>, #{v => 2}),
     timer:sleep(100),
     exit(whereis(broker_subscription_worker), kill),
-    await_worker_restart(),
+    await_worker_ready(),
     timer:sleep(50),
     %% R7: the recovered blob is whichever flush last landed -- never
     %% invented, never empty-with-a-sub-session.
@@ -1205,10 +1206,51 @@ route_refs(Dest) ->
     {ok, [{_Partition, Refs}]} = broker_router_hash:route(Dest, #{}, Env),
     Refs.
 
-await_worker_restart() ->
-    case whereis(broker_subscription_worker) of
-        undefined -> timer:sleep(10), await_worker_restart();
-        _Pid -> ok
+%% Readiness barrier for `broker_subscription_worker'.
+%%
+%% `gen_server:start_link' registers the name *before* `init/1' runs, and
+%% init/1 is where the worker loads sessions, cursors and inflight blobs
+%% (boot steps 2/3). Waiting for `whereis' therefore says "the name exists",
+%% not "the state is readable": both `the_zero_regress_tier_flushes_every_ack'
+%% (cursor after a kill) and `inflight_is_an_opaque_blob_that_may_only_staleness_lag'
+%% (session after a kill) failed intermittently by reading empty ETS tables in
+%% that window.
+%%
+%% A system message is answered from the worker's loop, and the loop is only
+%% entered after init/1 returns, so this needs no production callback. The
+%% deadline keeps a genuine boot failure failing fast with a name instead of
+%% burning the whole CT timeout.
+await_worker_ready() ->
+    await_worker_ready(erlang:monotonic_time(millisecond) + 10000).
+
+await_worker_ready(Deadline) ->
+    Ready =
+        case whereis(broker_subscription_worker) of
+            undefined ->
+                false;
+            Pid ->
+                %% Also covers the moment right after a kill, when the lookup
+                %% may still hand back the dying pid.
+                try sys:get_state(Pid, 5000) of
+                    _State -> true
+                catch
+                    exit:{noproc, _} -> false;
+                    exit:{normal, _} -> false;
+                    exit:{shutdown, _} -> false;
+                    exit:{timeout, _} -> false
+                end
+        end,
+    case Ready of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(10),
+                    await_worker_ready(Deadline);
+                false ->
+                    ct:fail(broker_subscription_worker_never_became_ready)
+            end
     end.
 
 sessions_dir() ->
