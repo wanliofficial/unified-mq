@@ -263,9 +263,11 @@ ETS trie: set, protected, read_concurrency
 
 原计划的另两条没有单独成例：**「`reductions` 增量为 0」**已由改动 1 的 `env_is_served_without_the_writer` + `route_reads_are_served_without_the_writer` 覆盖（读路径不经过写者）；**「订阅后立即发布的顺序」**由上面的 oracle 用例的同序断言覆盖（顺序就是 `Seq` 序）。
 
-### 7.3 压测口径（待落盘）
+### 7.3 压测口径（已落盘）
 
-在 `docs/benchmarks/` 新增一份，必须写清三组数：**1 / 1k / 10k 订阅** 下的 QoS0 发布吞吐与 p99，旧实现 vs 改动 1 vs 改动 1+2。缺任何一档都不算证据 —— 旧实现的成本曲线是本次结论的全部意义。
+见 [`docs/benchmarks/2026-11-16-s11x-router-read-path.md`](../benchmarks/2026-11-16-s11x-router-read-path.md)：1 / 1k / 10k 订阅 × 旧实现 / 改动 1 / 改动 1+2，共 9 个点。
+
+关键数字（单进程 `route/3`，p50）：旧实现在 10k 订阅时 **19.7 ms/条**、45 ops/s；改动 1 与改动 1+2 都在 **19 µs/条、约 5 万 ops/s**，且不随订阅数增长。该报告同时写明**没测什么**（高扇出、多进程并发、内存），不要把它读成端到端吞吐。
 
 ---
 
