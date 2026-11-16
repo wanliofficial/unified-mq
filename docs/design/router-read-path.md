@@ -189,6 +189,7 @@ ETS trie: set, protected, read_concurrency
 
 - 写侧：register 从 O(1) 变 O(层级) 的 ETS 写，但写是低频路径，且同前缀兄弟只写一次；unregister 多 O(层级) 剪枝。
 - 内存：每个中间节点一行，共享前缀只存一份；剪枝保证不随历史注册数单调增长。
+  **已实测**（[`2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md)）：写放大的上界「每层一行」精确成立且不随规模漂移（4 层无共享前缀 = 4.000 行/filter）；但典型形状远低于上界（`bench/<n>/<m>/dev<i>` 为 1.04 行/filter，1000 topic × 100 订阅的低至 0.021 行/filter）。剪枝后行数回到 0，残留仅为 ETS 固定的 ~2311 word 空闲空间，不随 N 或 churn 轮次增长。
 - 迁移：`broker_subscription` 的 backfill（boot step 3）通过同一 `register/4` 入口重建，无需额外迁移代码。
 
 ### 3.7 等价性验证
@@ -278,7 +279,7 @@ ETS trie: set, protected, read_concurrency
 | 编号 | 问题 | 需要谁决定 |
 |---|---|---|
 | OQ-1 | ADR-010 §10.1 的「读侧」定义是否按本文口径收窄/澄清？ | ADR 修订 |
-| OQ-2 | trie 化的写入放大（每层一行）在 10 万 filter 下的内存上限是否需要配置项 | 改动 2 实现时 |
+| OQ-2 | trie 化的写入放大（每层一行）在 10 万 filter 下的内存上限是否需要配置项 | **已答（2026-11-16）**：不需要配置项（最坏 129 MB / 10 万 filter），但需导出**行数**而非订阅数作监控指标——二者可差 19 倍。见 [`docs/benchmarks/2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md) |
 | OQ-3 | `services_search` 等价物是否随 S12-A 的管理 API 一起做 | S12-0 |
 | OQ-4 | 跨节点订阅索引（若 S12-B 引入跨节点投递）与本地 trie 的关系 | S12-0 |
 
