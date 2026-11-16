@@ -34,7 +34,7 @@
 
 TLS 由 `broker_security.tls.enabled` 一个开关统一控制，所有协议 listener 共用同一份证书配置同时切换（含 S10-A 起的 WebRTC 信令 listener）。见 `docs/security.md` §9。两个例外是 MQTT-SN（UDP 无 TLS，见下）与 MQTT over QUIC（只读证书，开关不是开关）。
 
-**例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP；这是当前唯一**明文且没有 TLS 路径**的协议端口，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。
+**例外是 MQTT-SN**：它的 payload 走 **UDP**，TLS 在这里不适用（需要 DTLS）。`broker_security.tls.enabled` **不影响 1884**，1884 永远是明文 UDP，DTLS 列为后续待办（`docs/security.md` §12 第 8 条）。**它不再是唯一**「明文且没有 TLS 路径」的端口——CoAP 的明文 UDP listener（5683）同样如此（见下一段）。
 
 **CoAP 是 UDP，但两个方向都有**：明文 UDP listener（默认 5683）与 `coaps`（DTLS 1.2 / PSK，默认建议 5684）由**同一个** `broker_proto_coap` 提供。明文 UDP 这条和 MQTT-SN 一样没有 TLS 路径，但 CoAP 整体不算「只有明文」——它另有 DTLS 方向。DTLS 是 cert-free PSK-only，不读 `broker_security.tls` 的证书，PSK 由 `users` 表派生、realm 绑定（见 §1.8）。
 
