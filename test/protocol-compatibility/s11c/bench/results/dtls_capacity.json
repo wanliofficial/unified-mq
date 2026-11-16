@@ -1,0 +1,86 @@
+{
+  "connect_storm": {
+  "by_status": {
+  "handshake_timeout": 27,
+  "ok": 5
+}
+,
+  "connected": 5,
+  "latencies_ms": [32, 1028, 3030, 7032, 15030, 20003, 20004, 20004, 20004, 20004, 20004, 20004, 20005, 20005, 20005, 20005, 20005, 20005, 20005, 20006, 20006, 20006, 20006, 20006, 20006, 20006, 20006, 20007, 20007, 20007, 20007, 20008],
+  "max_ms": 20008,
+  "p50_ms": 20005,
+  "p95_ms": 20007,
+  "staggered": {
+  "connected": 32,
+  "gap_ms": 150,
+  "max_ms": 27,
+  "p50_ms": 22,
+  "p95_ms": 25,
+  "wall_us": 4831755
+}
+,
+  "wall_us": 20009252,
+  "workers": 32
+}
+,
+  "generated_at": "2026-11-16T08:58:21Z",
+  "handshake": {
+  "count": 200,
+  "max_us": 216251,
+  "mean_us": 24621,
+  "p50_us": 22139,
+  "p95_us": 29923,
+  "per_sec": 41
+}
+,
+  "otp_release": "28",
+  "plain_udp_control": {
+  "max_us": 383,
+  "p50_us": 189,
+  "p95_us": 263,
+  "port": 41488,
+  "requests": 100
+}
+,
+  "rtt": {
+  "max_us": 559,
+  "mean_us": 356,
+  "p50_us": 347,
+  "p95_us": 447,
+  "payload_bytes": 64,
+  "samples": 500
+}
+,
+  "suite_set": ["aes_256_gcm/dhe_psk", "aes_256_gcm/psk", "aes_256_ccm/dhe_psk", "aes_256_ccm_8/dhe_psk", "aes_256_ccm/psk", "aes_256_ccm_8/psk", "aes_128_gcm/ecdhe_psk", "aes_128_ccm/ecdhe_psk", "aes_128_ccm_8/ecdhe_psk", "aes_128_gcm/dhe_psk", "aes_128_gcm/psk", "aes_128_gcm/ecdhe_psk", "aes_128_ccm_8/ecdhe_psk", "aes_128_ccm/dhe_psk", "aes_128_ccm_8/dhe_psk", "aes_128_ccm/psk", "aes_128_ccm_8/psk"],
+  "throughput": {
+  "1": {
+  "errors": 0,
+  "ok": 100,
+  "req_per_sec": 2839,
+  "requests": 100,
+  "wall_us": 35226,
+  "workers": 1
+}
+,
+  "32": {
+  "errors": 0,
+  "ok": 3200,
+  "req_per_sec": 4440,
+  "requests": 3200,
+  "wall_us": 720684,
+  "workers": 32
+}
+,
+  "8": {
+  "errors": 0,
+  "ok": 800,
+  "req_per_sec": 4747,
+  "requests": 800,
+  "wall_us": 168542,
+  "workers": 8
+}
+
+}
+,
+  "transport": [100, 116, 108, 115]
+}
