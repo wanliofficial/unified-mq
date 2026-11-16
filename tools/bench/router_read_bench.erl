@@ -93,9 +93,19 @@ measure(Impl, N, DurationMs, WarmupMs) ->
     %% The index must actually match, or every row would measure "no
     %% subscriber" work -- both a wrong destination and a wrong row shape
     %% produced such rows while building this script. And no matched SubRef may
-    %% be phantom, or a baseline would look fast for the wrong reason.
+    %% be phantom, or a baseline would look fast for the wrong reason. Both are
+    %% errors in the harness, and a benchmark that silently measures nothing is
+    %% worse than one that crashes.
     Matched =/= [] orelse erlang:error({no_match, Impl, N, Dest}),
     true = lists:all(fun(R) -> lists:keymember(R, 1, Subs) end, Matched),
+    %% Every destination is written under `bench/', so the `bench/#' filter
+    %% always matches and `old'/`env'/`trie' must agree on it. If they ever
+    %% disagree the row is measuring a different index than the baseline.
+    %% `route/3' yields bare SubRefs (`[1, wildcard_hash]'), not `{Ref, Seq}'
+    %% pairs: the seq ordering is applied inside the router. Matching them as
+    %% pairs yields an empty list, so this assertion was checking nothing --
+    %% which is how a correct `old' row came out failing.
+    true = lists:member(wildcard_hash, Matched),
     _ = warmup(Impl, Dest, Ctx, Env, WarmupMs),
     {Ops, Us} = drive(Impl, Dest, Ctx, Env, DurationMs),
     %% One route, measured in isolation and repeated: the p50 is what a single
@@ -210,14 +220,16 @@ old_levels(Filter) when is_binary(Filter) ->
 old_levels(Path) when is_list(Path) ->
     Path.
 
-%% Payload shape distinguishes a filter row from a trie intermediate row:
-%% `[{SubRef, Seq}]' is a filter, `[]' (or any list) is an empty node, and
-%% `{Children, Subs}' is a node that still holds subscriptions deeper down. A
-%% filter with no subscribers left has already been pruned by the writer.
-old_row(_Filter, [{_, _} | _] = Subs) -> {filter, Subs};
-old_row(_Filter, []) -> {filter, []};
-old_row(_Filter, {_Children, Subs}) when is_list(Subs) -> {filter, Subs};
-old_row(_Filter, {_Children, _Subs}) -> intermediate.
+%% Every trie row is `{Children, Subs}', including the row of a filter that is
+%% also a prefix of others (`bench/#' has children `1', `+', ... and its own
+%% subscriptions). So "is this a filter" is decided by `Subs', not by the shape:
+%% a non-empty `Subs' means this path is a registered filter, empty means it is
+%% only an intermediate node. Judging on the tuple shape instead silently
+%% dropped `bench/#' -- the row the report's own wildcard assertion needs.
+old_row(_Filter, {_Children, [_ | _] = Subs}) -> {filter, Subs};
+old_row(_Filter, {_Children, []}) -> intermediate;
+%% Rows from a flat (pre-change-2) table: the payload is the subscription list.
+old_row(_Filter, Subs) when is_list(Subs) -> {filter, Subs}.
 
 tenant_visible(<<"*">>, _) -> true;
 tenant_visible(T, T) -> true;
