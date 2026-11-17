@@ -46,8 +46,8 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([start_link/0,
-         subscribe/3, subscribe/4, join/5, join/6, unsubscribe/2, leave/2,
-         ack/4, claim/4, release/4, retry/4,
+         subscribe/3, subscribe/4, join/5, join/6, join/7, unsubscribe/2,
+         leave/2, ack/4, claim/4, release/4, retry/4,
          inflight/2, attach/3, detach/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -76,7 +76,14 @@ join(Kind, Group, ClientId, Filter, QoS) ->
     join(Kind, Group, ClientId, Filter, QoS, <<"*">>).
 
 join(Kind, Group, ClientId, Filter, QoS, Tenant) ->
-    gen_server:call(?MODULE, {join, Kind, Group, ClientId, Filter, QoS, Tenant}).
+    join(Kind, Group, ClientId, Filter, QoS, Tenant, #{}).
+
+%% RQ-01: `Opts' carries the entity-birth anchor (`anchor => earliest | tail`,
+%% default tail). Only a NEWLY created group consults it; joining an existing
+%% group never moves cursors.
+join(Kind, Group, ClientId, Filter, QoS, Tenant, Opts) when is_map(Opts) ->
+    gen_server:call(?MODULE, {join, Kind, Group, ClientId, Filter, QoS,
+                              Tenant, Opts}).
 
 unsubscribe(ClientId, Filter) ->
     gen_server:call(?MODULE, {unsubscribe, ClientId, Filter}).
@@ -182,8 +189,13 @@ handle_call({subscribe, ClientId, Filter, QoS, Tenant}, _From, State) ->
 handle_call({join, Kind, Group, ClientId, Filter, QoS}, From, State)
   when Kind =:= shared; Kind =:= failover ->
     handle_call({join, Kind, Group, ClientId, Filter, QoS, <<"*">>}, From, State);
-handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant}, _From, State)
+handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant}, From, State)
   when Kind =:= shared; Kind =:= failover ->
+    handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant, #{}},
+                From, State);
+handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant, Opts}, _From,
+            State)
+  when Kind =:= shared; Kind =:= failover, is_map(Opts) ->
     SubRef = {Kind, Group, Filter},
     case ets:lookup(?ENTITIES, SubRef) of
         [{_, #{consumers := Consumers, qos := OldQoS} = Info}] ->
@@ -224,7 +236,8 @@ handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant}, _From, State)
                             Result =:= {error, {already_registered, SubRef}} ->
                     Info = #{kind => Kind, key => Group, filter => Filter,
                              qos => QoS, tenant_id => Tenant,
-                             consumers => [ClientId]},
+                             consumers => [ClientId],
+                             anchor => anchor_opt(Opts)},
                     reply_new_subscribe2(SubRef, Info, State);
                 {error, Reason} ->
                     {reply, {error, {router_register, Reason}}, State}
@@ -233,7 +246,11 @@ handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant}, _From, State)
 
 handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS}, From, State) ->
     handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, <<"*">>}, From, State);
-handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, _Tenant}, _From, State) ->
+handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, Tenant}, From, State) ->
+    handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, Tenant, #{}},
+                From, State);
+handle_call({join, _Kind, _Group, _ClientId, _Filter, _QoS, _Tenant, _Opts},
+            _From, State) ->
     {reply, {error, wrong_kind}, State};
 
 handle_call({unsubscribe, ClientId, Filter}, _From, State) ->
@@ -631,7 +648,7 @@ reply_new_subscribe(SubRef, Info, State) ->
 
 reply_new_subscribe2(SubRef, Info, State) ->
     #{partitions := Partitions} = State,
-    case tail_offsets(Partitions, []) of
+    case init_cursors(Info, Partitions) of
         {ok, InitCursors} ->
             Full = Info#{init_cursors => InitCursors,
                          created_at => erlang:system_time(millisecond)},
@@ -658,6 +675,24 @@ reply_new_subscribe2(SubRef, Info, State) ->
         {error, Reason} ->
             _ = broker_router:unregister(SubRef),
             {reply, {error, {watermarks, Reason}}, State}
+    end.
+
+%% RQ-01: `anchor => earliest' (AMQP queues) anchors every partition at 0 so a
+%% consumer that joins after the messages were written still reads them; the
+%% default `tail' keeps the §4.6 no-replay contract (MQTT/NATS/WS). The anchor
+%% rides `Info' into `.subs', so the boot restore (`restored_row/5') keeps the
+%% same origin for partitions born after the subscribe.
+init_cursors(Info, Partitions) ->
+    case maps:get(anchor, Info, tail) of
+        %% Log offsets are 1-based: the first slot ever written is 1.
+        earliest -> {ok, [{P, 1} || P <- Partitions]};
+        _ -> tail_offsets(Partitions, [])
+    end.
+
+anchor_opt(Opts) ->
+    case maps:get(anchor, Opts, tail) of
+        earliest -> earliest;
+        _ -> tail
     end.
 
 tail_offsets([P | Rest], Acc) ->

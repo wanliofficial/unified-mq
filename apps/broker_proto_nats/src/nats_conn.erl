@@ -587,14 +587,18 @@ claim_and_pull(P, Ref, St) ->
             St
     end.
 
+%% Ascending offset order (see amqp_conn:read_offsets -- reversed folds
+%% delivered multi-message claim pages backwards).
 read_offsets(P, Offsets) ->
-    lists:foldl(
-      fun(O, {Acc, Missing}) ->
-              case (catch broker_queue:read_from(P, O, 1)) of
-                  {ok, [{O, Msg}], _Next} -> {[{O, Msg} | Acc], Missing};
-                  _ -> {Acc, [O | Missing]}
-              end
-      end, {[], []}, Offsets).
+    {Read, Missing} = lists:foldl(
+                        fun(O, {Acc, Miss}) ->
+                                case (catch broker_queue:read_from(P, O, 1)) of
+                                    {ok, [{O, Msg}], _Next} ->
+                                        {[{O, Msg} | Acc], Miss};
+                                    _ -> {Acc, [O | Miss]}
+                                end
+                        end, {[], []}, lists:sort(Offsets)),
+    {lists:reverse(Read), lists:reverse(Missing)}.
 
 deliver_shared(P, Ref, O, Msg, St) ->
     case should_echo(Msg, St) of
