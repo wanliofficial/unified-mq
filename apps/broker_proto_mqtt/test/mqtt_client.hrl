@@ -51,7 +51,8 @@ mqtt_open_v5(Knobs) ->
 
 mqtt_connect_frame_v5(Knobs) ->
     (mqtt_connect_frame(Knobs))#connect{
-      proto_level = 5, props = maps:get(props, Knobs, #{})}.
+      proto_level = 5, props = maps:get(props, Knobs, #{}),
+      will_props = maps:get(will_props, Knobs, #{})}.
 
 mqtt_send_v5(#{sock := Client}, Frame) ->
     ok = gen_tcp:send(Client, mqtt_frame:encode(Frame, 5)).
@@ -65,6 +66,12 @@ mqtt_publish_v5(Conn, PacketId, Topic, Payload, QoS, Props) ->
     ok = mqtt_send_v5(Conn, #publish{qos = QoS, topic = Topic,
                                      packet_id = PacketId, payload = Payload,
                                      props = Props}).
+
+%% The RETAIN flag lives in the fixed header, not the property list.
+mqtt_publish_v5_retain(Conn, PacketId, Topic, Payload, QoS, Props) ->
+    ok = mqtt_send_v5(Conn, #publish{qos = QoS, topic = Topic,
+                                     packet_id = PacketId, payload = Payload,
+                                     retain = 1, props = Props}).
 
 mqtt_puback_v5(Conn, PacketId) ->
     ok = mqtt_send_v5(Conn, #puback{packet_id = PacketId}).

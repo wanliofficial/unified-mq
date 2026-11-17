@@ -54,12 +54,23 @@ all() ->
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
      v5_receive_maximum_bounds_the_outbound_window,
+     v5_subscription_identifier_rides_the_delivery,
+     v5_overlapping_subscriptions_carry_both_identifiers,
+     v5_retain_handling_two_skips_the_replay,
+     v5_retain_handling_one_replays_only_the_first,
+     v5_no_local_suppresses_own_publishes,
+     v5_retain_as_published_keeps_the_flag,
+     v5_retain_handling_three_closes_the_connection,
+     v5_publish_with_subscription_identifier_is_a_protocol_error,
+     v5_no_local_on_a_shared_subscription_is_a_protocol_error,
+     v5_will_delay_is_cancelled_by_a_reconnect,
+     v5_will_delay_fires_when_nobody_reconnects,
      connect_wrong_protocol_level_is_refused_1,
      frame_before_connect_closes_the_connection,
      connect_on_an_established_session_closes,
      will_is_published_on_tcp_close,
      will_is_not_published_on_disconnect,
-     will_is_published_on_takeover,
+     will_is_not_published_on_takeover,
      will_retain_updates_the_tree,
      will_is_published_on_a_keepalive_timeout,
      will_is_not_republished_after_a_broker_restart,
@@ -86,7 +97,7 @@ all() ->
      puback_for_a_qos2_delivery_does_not_advance_the_cursor,
      reconnect_before_pubrec_resends_a_dup_publish,
      reconnect_after_pubrec_resends_pubrel_only,
-     inflight_blob_is_v2_and_skips_retained_entries,
+     inflight_blob_is_v3_and_skips_retained_entries,
      subscribe_receives_retained_after_suback,
      retained_qos_is_capped_by_the_grant,
      retained_wildcard_delivers_each_topic_in_topic_order,
@@ -494,6 +505,217 @@ v5_receive_maximum_bounds_the_outbound_window(_Config) ->
     {ok, normal} = mqtt_close(Sub),
     ok.
 
+%%%_* MQTT 5 §3.3.4 / §3.8.3.1 / §3.1.3.2.2 conformance -----------------------
+
+%% MQTT-3.3.4-4: a PUBLISH caused by a subscription carries its Subscription
+%% Identifier; one copy carries every matching identifier.
+v5_subscription_identifier_rides_the_delivery(_Config) ->
+    ok = boot(),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"v5sid">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"sid/#">>, 1}],
+                          #{subscription_identifier => 9}),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5sidp">>, props => #{}}),
+    mqtt_publish_v5(Pub, 1, <<"sid/a">>, <<"x">>, 1, #{}),
+    #puback{reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    #publish{packet_id = Pid, props = Props} = mqtt_recv_v5(csock(Sub)),
+    ?assertEqual(9, maps:get(subscription_identifier, Props)),
+    mqtt_puback_v5(Sub, Pid),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+v5_overlapping_subscriptions_carry_both_identifiers(_Config) ->
+    ok = boot(),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"v5sid2">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"sid2/+">>, 1}],
+                          #{subscription_identifier => 9}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 2, [{<<"sid2/a">>, 1}],
+                          #{subscription_identifier => 10}),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"v5sid2p">>, props => #{}}),
+    mqtt_publish_v5(Pub, 1, <<"sid2/a">>, <<"x">>, 1, #{}),
+    #puback{reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    #publish{packet_id = Pid, props = Props} = mqtt_recv_v5(csock(Sub)),
+    %% One copy of the message, both matching identifiers (usort order).
+    ?assertEqual([9, 10], maps:get(subscription_identifier, Props)),
+    mqtt_puback_v5(Sub, Pid),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+%% §3.8.3.1 Retain Handling 2: the subscribe must NOT replay retained state.
+v5_retain_handling_two_skips_the_replay(_Config) ->
+    ok = boot(),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"rh2p">>, props => #{}}),
+    mqtt_publish_v5_retain(Pub, 1, <<"rh2/a">>, <<"kept">>, 1, #{}),
+    %% No live subscriber yet: 0x10 (No matching subscribers) is fine here.
+    #puback{packet_id = 1} = mqtt_recv_v5(csock(Pub)),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"rh2s">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"rh2/#">>, 1, 0, 0, 2}], #{}),
+    true = mqtt_silence(csock(Sub), 500),
+    %% A later live publish still reaches the RH=2 subscriber.
+    mqtt_publish_v5(Pub, 2, <<"rh2/a">>, <<"live">>, 1, #{}),
+    #puback{reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    #publish{packet_id = Pid, payload = <<"live">>} = mqtt_recv_v5(csock(Sub)),
+    mqtt_puback_v5(Sub, Pid),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+%% §3.8.3.1 Retain Handling 1: retained state replays only for the FIRST
+%% subscription with that filter in the session.
+v5_retain_handling_one_replays_only_the_first(_Config) ->
+    ok = boot(),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"rh1p">>, props => #{}}),
+    mqtt_publish_v5_retain(Pub, 1, <<"rh1/a">>, <<"kept">>, 1, #{}),
+    #puback{packet_id = 1} = mqtt_recv_v5(csock(Pub)),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"rh1s">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"rh1/#">>, 1, 0, 0, 1}], #{}),
+    #publish{packet_id = Pid, payload = <<"kept">>} = mqtt_recv_v5(csock(Sub)),
+    mqtt_puback_v5(Sub, Pid),
+    %% The resubscribe (RH=1 again) must stay silent -- the session already
+    %% holds a subscription with this filter.
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 2, [{<<"rh1/#">>, 1, 0, 0, 1}], #{}),
+    true = mqtt_silence(csock(Sub), 500),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+%% §3.8.3.1 No Local: this connection's own publishes never come back to it.
+v5_no_local_suppresses_own_publishes(_Config) ->
+    ok = boot(),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"nl1">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Sub, 1, [{<<"nl/#">>, 1, 1, 0, 0}], #{}),
+    %% Own publish: suppressed.
+    mqtt_publish_v5(Sub, 1, <<"nl/a">>, <<"mine">>, 1, #{}),
+    #puback{packet_id = 1, reason_code = 0} = mqtt_recv_v5(csock(Sub)),
+    true = mqtt_silence(csock(Sub), 500),
+    %% Another connection's publish: delivered.
+    {Other, _} = mqtt_open_v5(#{client_id => <<"nl2">>, props => #{}}),
+    mqtt_publish_v5(Other, 1, <<"nl/a">>, <<"theirs">>, 1, #{}),
+    #puback{reason_code = 0} = mqtt_recv_v5(csock(Other)),
+    #publish{packet_id = Pid, payload = <<"theirs">>} = mqtt_recv_v5(csock(Sub)),
+    mqtt_puback_v5(Sub, Pid),
+    {ok, normal} = mqtt_close(Other),
+    {ok, normal} = mqtt_close(Sub),
+    ok.
+
+%% §3.8.3.1 Retain As Published: the original retain flag travels on live
+%% forwarding when the subscription asked for it.
+v5_retain_as_published_keeps_the_flag(_Config) ->
+    ok = boot(),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"rapp">>, props => #{}}),
+    mqtt_publish_v5_retain(Pub, 1, <<"rap/a">>, <<"kept">>, 1, #{}),
+    #puback{packet_id = 1} = mqtt_recv_v5(csock(Pub)),
+    {Rap, _} = mqtt_open_v5(#{client_id => <<"rap1">>, props => #{}}),
+    %% RH=2 keeps the retained replay out of the picture so the assertion is
+    %% purely about the live forwarding flag.
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Rap, 1, [{<<"rap/#">>, 1, 0, 1, 2}], #{}),
+    {Plain, _} = mqtt_open_v5(#{client_id => <<"rap0">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Plain, 1, [{<<"rap/#">>, 1, 0, 0, 2}], #{}),
+    mqtt_publish_v5_retain(Pub, 2, <<"rap/a">>, <<"live">>, 1, #{}),
+    #puback{reason_code = 0} = mqtt_recv_v5(csock(Pub)),
+    #publish{packet_id = Pid1, retain = 1} = mqtt_recv_v5(csock(Rap)),
+    #publish{packet_id = Pid2, retain = 0} = mqtt_recv_v5(csock(Plain)),
+    mqtt_puback_v5(Rap, Pid1),
+    mqtt_puback_v5(Plain, Pid2),
+    {ok, normal} = mqtt_close(Pub),
+    {ok, normal} = mqtt_close(Rap),
+    {ok, normal} = mqtt_close(Plain),
+    ok.
+
+%% Retain Handling 3 is a protocol error (§3.8.3.1) -- the raw option byte is
+%% sent by hand because the encoder refuses to build one.
+v5_retain_handling_three_closes_the_connection(_Config) ->
+    ok = boot(),
+    {Client, Pid} = mqtt_pair(),
+    ok = gen_tcp:send(Client, mqtt_frame:encode(
+                               mqtt_connect_frame_v5(#{client_id => <<"rh3">>}), 5)),
+    #connack{return_code = 0} = mqtt_recv_v5(Client),
+    %% SUBSCRIBE pid=1, no properties, filter "rh3/#" with options 0x31
+    %% (QoS 1, Retain Handling 3).
+    Body = <<0, 1, 0, 0, 5, $r, $h, $3, $/, 16#23, 16#31>>,
+    ok = gen_tcp:send(Client, <<(8 bsl 4 bor 2):8, (byte_size(Body)):8,
+                                Body/binary>>),
+    %% §4.13: a protocol error disconnects -- no SUBACK, then EOF.
+    {error, closed} = gen_tcp:recv(Client, 0, 5000),
+    {ok, normal} = mqtt_close(#{sock => Client, pid => Pid}),
+    ok.
+
+%% MQTT-3.3.4-5: a PUBLISH from the client carries no Subscription Identifier.
+v5_publish_with_subscription_identifier_is_a_protocol_error(_Config) ->
+    ok = boot(),
+    {Conn, _} = mqtt_open_v5(#{client_id => <<"v5badp">>, props => #{}}),
+    ok = mqtt_send_v5(Conn, #publish{qos = 1, topic = <<"bad/t">>,
+                                     packet_id = 5, payload = <<"x">>,
+                                     props = #{subscription_identifier => 3}}),
+    #disconnect{reason_code = 16#82} = mqtt_recv_v5(csock(Conn)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% §3.8.3-4: No Local on a shared subscription is a protocol error.
+v5_no_local_on_a_shared_subscription_is_a_protocol_error(_Config) ->
+    ok = boot(),
+    {Conn, _} = mqtt_open_v5(#{client_id => <<"v5nlshare">>, props => #{}}),
+    ok = mqtt_send_v5(Conn, #subscribe{packet_id = 1,
+                                       topics = [{<<"$share/g/nl/#">>, 1, 1, 0, 0}],
+                                       props = #{}}),
+    #disconnect{reason_code = 16#82} = mqtt_recv_v5(csock(Conn)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% §3.1.3.2.2: the Will Delay Interval parks the Will; a new Network Connection
+%% for the same ClientID cancels it before it fires.
+v5_will_delay_is_cancelled_by_a_reconnect(_Config) ->
+    ok = boot(),
+    {Watcher, _} = mqtt_open_v5(#{client_id => <<"wdwatch">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Watcher, 1, [{<<"wd/#">>, 1}], #{}),
+    {Dying, _} = mqtt_open_v5(#{client_id => <<"wd1">>, clean => false,
+                                props => #{session_expiry_interval => 300},
+                                will_topic => <<"wd/x">>, will_payload => <<"bye">>,
+                                will_qos => 1,
+                                will_props => #{will_delay_interval => 3}}),
+    Monitor = mqtt_monitor(Dying),
+    ok = gen_tcp:close(csock(Dying)),
+    {ok, normal} = expect_down(Monitor, cpid(Dying)),
+    %% The Will is parked for 3s -- silence well past a 0-delay will would fire.
+    true = mqtt_silence(csock(Watcher), 800),
+    %% A new connection for the same ClientID cancels the parked Will.
+    {New, _} = mqtt_open_v5(#{client_id => <<"wd1">>, clean => false,
+                              props => #{session_expiry_interval => 300}}),
+    true = mqtt_silence(csock(Watcher), 2500),
+    {ok, normal} = mqtt_close(New),
+    {ok, normal} = mqtt_close(Watcher),
+    ok.
+
+%% §3.1.3.2.2: a parked Will fires when its interval elapses (session end).
+v5_will_delay_fires_when_nobody_reconnects(_Config) ->
+    ok = boot(),
+    {Watcher, _} = mqtt_open_v5(#{client_id => <<"wdwatch2">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Watcher, 1, [{<<"wd2/#">>, 1}], #{}),
+    {Dying, _} = mqtt_open_v5(#{client_id => <<"wd2">>, clean => false,
+                                props => #{session_expiry_interval => 300},
+                                will_topic => <<"wd2/x">>, will_payload => <<"late">>,
+                                will_qos => 1,
+                                will_props => #{will_delay_interval => 1}}),
+    Monitor = mqtt_monitor(Dying),
+    ok = gen_tcp:close(csock(Dying)),
+    {ok, normal} = expect_down(Monitor, cpid(Dying)),
+    #publish{topic = <<"wd2/x">>, payload = <<"late">>} =
+        mqtt_recv_v5(csock(Watcher)),
+    {ok, normal} = mqtt_close(Watcher),
+    ok.
+
 frame_before_connect_closes_the_connection(_Config) ->
     ok = boot(),
     {Client, Pid} = mqtt_pair(),
@@ -546,7 +768,7 @@ will_is_not_published_on_disconnect(_Config) ->
     {ok, normal} = mqtt_close(Watcher),
     ok.
 
-will_is_published_on_takeover(_Config) ->
+will_is_not_published_on_takeover(_Config) ->
     ok = boot(),
     {Watcher, _} = open(<<"watch">>),
     1 = sub(Watcher, 1, <<"will/#">>, 1),
@@ -555,12 +777,12 @@ will_is_published_on_takeover(_Config) ->
                       will_qos => 1}),
     OldPid = cpid(Old),
     Monitor = mqtt_monitor(Old),
-    %% §3.1.4 + §3.1.2.5 taken literally: the old connection is closed without
-    %% DISCONNECT, so its Will fires even though the client id lives on.
+    %% §3.1.2.5 taken literally: the Will is NOT published when "a new Network
+    %% Connection for the ClientIdentifier is opened". A takeover is that
+    %% event, so the evicted connection's Will is cancelled, not fired.
     {_New, _} = open(#{client_id => <<"c1">>, clean => false}),
     {ok, takeover} = expect_down(Monitor, OldPid),
-    {Pub, _} = recv_publish(csock(Watcher)),
-    #publish{topic = <<"will/c1">>, payload = <<"evicted">>} = Pub,
+    true = mqtt_silence(csock(Watcher), 600),
     {ok, normal} = mqtt_close(Watcher),
     ok.
 
@@ -1037,26 +1259,34 @@ reconnect_after_pubrec_resends_pubrel_only(_Config) ->
     {ok, normal} = mqtt_close(Publisher),
     ok.
 
-%% The blob is what makes the two cases above survive a process death: shape v2
-%% carries the level, the release marks and the inbound set, and a retained
-%% replay (no {Partition, Offset}) is deliberately absent.
-inflight_blob_is_v2_and_skips_retained_entries(_Config) ->
+%% The blob is what makes the two cases above survive a process death: shape
+%% v3 carries the level, the release marks, the inbound set and the §3.8.4
+%% subscription state, and a retained replay (no {Partition, Offset}) is
+%% deliberately absent.
+inflight_blob_is_v3_and_skips_retained_entries(_Config) ->
     ok = boot(),
-    {Conn, _} = open(<<"c1">>),
-    1 = sub(Conn, 1, <<"b/#">>, 1),
-    #puback{} = pub(Conn, 1, <<"b/a">>, <<"durable">>, 1),
-    {Pub, _} = recv_publish(csock(Conn)),
-    #publish{packet_id = OutPid} = Pub,
+    {Conn, _} = mqtt_open_v5(#{client_id => <<"c1">>, props => #{}}),
+    %% A Subscription Identifier and No Local / RAP flags are §3.8.4 session
+    %% state, so the v5 subscribe stamps them into the blob.
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Conn, 1, [{<<"b/#">>, 1, 0, 1, 0}],
+                          #{subscription_identifier => 7}),
+    ok = mqtt_publish_v5(Conn, 2, <<"b/a">>, <<"durable">>, 1, #{}),
+    #puback{packet_id = 2} = mqtt_recv_v5(csock(Conn)),
+    #publish{packet_id = OutPid, props = PubProps} = mqtt_recv_v5(csock(Conn)),
+    7 = maps:get(subscription_identifier, PubProps),
     %% An inbound QoS2 half-handshake belongs in the same blob. The topic is
     %% deliberately OUTSIDE `b/#' above: a topic the client also subscribes to
     %% would loop back and add an outbound entry of its own.
-    ok = mqtt_publish(Conn, 11, <<"in/in">>, <<"inbound">>, 2),
-    #pubrec{packet_id = 11} = mqtt_recv(csock(Conn)),
+    ok = mqtt_publish_v5(Conn, 11, <<"in/in">>, <<"inbound">>, 2, #{}),
+    #pubrec{packet_id = 11} = mqtt_recv_v5(csock(Conn)),
     Blob = wait_inflight(<<"c1">>, fun(B) ->
-                                           maps:get(vsn, B, 0) =:= 2 andalso
+                                           maps:get(vsn, B, 0) =:= 3 andalso
                                            maps:size(maps:get(released, B, #{})) =:= 0
                                    end),
-    #{vsn := 2, pending := Pending, qos := Qos, received := Received} = Blob,
+    #{vsn := 3, pending := Pending, qos := Qos, received := Received} = Blob,
+    %% The SUBSCRIBE above rides the blob as §3.8.4 subscription state.
+    [{<<"b/#">>, 7, 0, 1}] = maps:get(subs, Blob, []),
     %% One positional entry: the delivery owed a PUBACK. Its offset is the
     %% stored message's own, so only the partition is pinned here.
     [{OutPid, {[{exclusive, <<"c1">>, <<"b/#">>}], {Part, Off}}}] = Pending,
@@ -1064,9 +1294,9 @@ inflight_blob_is_v2_and_skips_retained_entries(_Config) ->
     ?assert(is_integer(Off)),
     ?assertEqual(#{OutPid => 1}, Qos),
     ?assertEqual(#{11 => true}, Received),
-    ok = mqtt_puback(Conn, OutPid),
-    ok = mqtt_pubrel(Conn, 11),
-    #pubcomp{packet_id = 11} = mqtt_recv(csock(Conn)),
+    ok = mqtt_puback_v5(Conn, OutPid),
+    ok = mqtt_send_v5(Conn, #pubrel{packet_id = 11}),
+    #pubcomp{packet_id = 11} = mqtt_recv_v5(csock(Conn)),
     {ok, normal} = mqtt_close(Conn),
     ok.
 

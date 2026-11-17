@@ -59,8 +59,13 @@
                   reason_code = 0 :: 0..255,
                   props = #{}     :: map()}).
 
+%% `topics' carries one entry per Topic Filter. 3.1.1 has only the QoS byte;
+%% MQTT 5 §3.8.3.1 subscription options are kept as the full 5-tuple
+%% `{Filter, QoS, NoLocal, RetainAsPublished, RetainHandling}' so the conn can
+%% apply them instead of silently dropping the bits.
 -record(subscribe, {packet_id :: pos_integer(),
-                    topics = [] :: [{binary(), 0..2}],
+                    topics = [] :: [{binary(), 0..2} |
+                                    {binary(), 0..2, 0 | 1, 0 | 1, 0..2}],
                     props = #{} :: map()}).
 
 -record(suback, {packet_id :: pos_integer(),
