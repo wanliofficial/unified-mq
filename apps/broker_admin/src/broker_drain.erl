@@ -47,6 +47,7 @@
 
 -record(s, {state = up :: state(),
             suspended = [] :: [term()],
+            gen = 0 :: non_neg_integer(),
             timer = undefined :: reference() | undefined}).
 
 %%%_* API -------------------------------------------------------------------
@@ -109,10 +110,15 @@ handle_cast(_Msg, S) ->
 %% The grace period elapsed: advance to `down'. In-use connections are
 %% deliberately left alone (D2 forbids disconnecting them); `down' is the signal
 %% that the node may now be stopped.
-handle_info(drain_timeout, #s{state = draining} = S) ->
+%%
+%% The generation tag is what makes a stale timer harmless: `cancel_timer/1'
+%% cannot retract a message that has already been delivered to this mailbox, so a
+%% timer from an earlier drain must be recognisable and dropped rather than
+%% advancing a drain that asked for a longer grace period.
+handle_info({drain_timeout, Gen}, #s{state = draining, gen = Gen} = S) ->
     set_state(down, S#s.state, S#s.suspended),
     {noreply, S#s{state = down, timer = undefined}};
-handle_info(drain_timeout, S) ->
+handle_info({drain_timeout, _StaleGen}, S) ->
     {noreply, S};
 handle_info(_Info, S) ->
     {noreply, S}.
@@ -131,14 +137,21 @@ do_drain(#s{state = down} = S, _Timeout) ->
     {reply, {error, down}, S};
 do_drain(#s{} = S, Timeout) ->
     Suspended = suspend_all(ranch_refs()),
-    Timer = arm_timer(Timeout),
-    NewS = #s{state = draining, suspended = Suspended, timer = Timer},
+    %% A new generation retires every timer armed by an earlier drain. Without
+    %% it, re-draining with a *longer* grace period would still advance on the
+    %% old, shorter deadline: `cancel_timer/1' cannot recall a message that has
+    %% already been delivered, so the message itself has to be disowned.
+    Gen = S#s.gen + 1,
+    _ = cancel_timer(S#s.timer),
+    Timer = arm_timer(Timeout, Gen),
+    NewS = #s{state = draining, suspended = Suspended, gen = Gen, timer = Timer},
     set_state(draining, S#s.state, Suspended),
     {reply, {ok, draining, Suspended}, NewS}.
 
 do_undrain(#s{} = S) ->
     _ = resume_all(S#s.suspended),
-    NewS = #s{state = up, suspended = [], timer = cancel_timer(S#s.timer)},
+    NewS = #s{state = up, suspended = [], gen = S#s.gen + 1,
+              timer = cancel_timer(S#s.timer)},
     set_state(up, S#s.state, S#s.suspended),
     {reply, {ok, up}, NewS}.
 
@@ -178,9 +191,9 @@ safe_resume(Ref) ->
 
 %% `0' means "go down now", so the grace period has to be armed rather than
 %% skipped; only `infinity' means "wait for an explicit undrain".
-arm_timer(infinity) -> undefined;
-arm_timer(TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
-    erlang:send_after(TimeoutMs, self(), drain_timeout).
+arm_timer(infinity, _Gen) -> undefined;
+arm_timer(TimeoutMs, Gen) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+    erlang:send_after(TimeoutMs, self(), {drain_timeout, Gen}).
 
 cancel_timer(undefined) -> undefined;
 cancel_timer(TRef) ->

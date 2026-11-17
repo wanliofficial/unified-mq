@@ -28,6 +28,7 @@ all() ->
      drain_keeps_in_use_connections_and_blocks_new_ones,
      undrain_resumes_accepting_and_readyz_recovers,
      drain_timeout_advances_state_to_down,
+     redrain_replaces_the_earlier_grace_period,
      drain_rejects_a_malformed_body,
      node_view_reports_state_and_connections,
      insecure_bind_with_empty_token_refuses_to_start].
@@ -418,6 +419,26 @@ drain_timeout_advances_state_to_down(Config) ->
         ok = gen_tcp:send(Old, <<"still">>),
         {ok, <<"still">>} = gen_tcp:recv(Old, 0, 3000),
         ok = gen_tcp:close(Old)
+    after
+        restore_state()
+    end.
+
+%% A second drain must *replace* the first one's deadline rather than run beside
+%% it. An operator who re-drains with a longer grace period is extending the
+%% window; honouring the older, shorter timer would take the node down early.
+%%
+%% `cancel_timer/1' alone cannot guarantee this: a message already delivered to
+%% the mailbox cannot be recalled, so the fix tags each timer with a generation
+%% and disowns stale ones.
+redrain_replaces_the_earlier_grace_period(Config) ->
+    try
+        %% Short deadline, then a much longer one.
+        {200, _} = drain(Config, #{timeout_ms => 150}),
+        {200, _} = drain(Config, #{timeout_ms => 30000}),
+        %% Well past the first deadline, nowhere near the second.
+        timer:sleep(600),
+        %% The old 150ms timer must not have advanced us.
+        draining = broker_drain:status()
     after
         restore_state()
     end.

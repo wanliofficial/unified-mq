@@ -156,13 +156,16 @@ D2 的其余三条已落地，**D2 冻结文本仍一字未改**。
   - `down` 之后再 `drain` → **409**。`drain/1` 的宽限期上限 `16#FFFFFFFF`（与 `send_after` 同界）。
 - **`drain_timeout_ms` 有真实消费者（R-E6）**：`config/sys.config.src` 的 `broker_admin` 块新增该键，默认 `infinity`；到期 `draining -> down`。**到达 `down` 也不断开在用连接**——它只是「可以停进程了」的信号。
 - **启动校验（D2 末条）**：`broker_admin_sup:init/1` 在 `bind` 非回环且 `token` 为空时 `{stop, {insecure_bind, Bind, empty_token}}`，应用启动失败。`enabled => false` 不校验（没有 listener 就没有暴露）。这条此前只写在注释（`broker_admin_http.erl:19-22`）与文档（`docs/operations.md:9`）里。
-- **测试**（`broker_admin_SUITE`，共 **19** 例，新增 7 例）：
+- **测试**（`broker_admin_SUITE`，共 **20** 例，新增 8 例）：
   - 用**真实 ranch listener**（`broker_admin_drain_probe`，`port => 0`）证明：drain 后 `ranch:info(Ref).status` 为 `suspended`、新连接 `econnrefused`、**在用连接仍能收发**；undrain 后恢复。
   - `timeout_ms => 0` 走异步 `send_after`，因此**轮询等状态**而不是假设回复即已迁移。
   - bind/token 用例覆盖两侧：空 token + `{0,0,0,0}` 启动失败且 `broker_admin_listener:port() =:= undefined`；带 token 时同一 bind 可以起来。
-  - **七条都做过反证**（逐条临时改坏再跑）：drain 不挂起 → 3 例挂；drain 改成 `stop_listener`（真正断开连接）→ 5 例挂；`/readyz` 不看 drain → 2 例挂；校验放行宽 bind → 1 例挂。即这些测试不是空跑。
+  - **反证过四种失效模式**（逐条临时改坏再跑全量套件）：drain 不挂起 → 3 例挂；drain 改成 `stop_listener`（真正断开连接）→ 5 例挂；`/readyz` 不看 drain → 2 例挂；校验放行宽 bind → 1 例挂。即这些测试不是空跑。
+  - **另跑了一次真实数据面验证**（不只在测试桩上）：起 `broker_storage` + `broker_proto_mqtt`（真实 ranch listener）+ `broker_admin`，先建一条真 TCP 连接，drain 后该连接**仍能完成 MQTT CONNECT 并收到 CONNACK**，新连接 `econnrefused`，`/readyz` = 503 `draining`，`/healthz` = 200，undrain 后恢复。固定端口（非 `port => 0`）在 drain/undrain 前后端口不变；`port => 0` 的 listener 在 undrain 时会重新取一个临时端口，这是测试桩的产物而非 drain 的语义。
 - **顺带修掉的两个真实缺陷**（都由测试逼出来，不是重构）：
   1. `json_safe/1` 没有布尔分支，`true`/`false` 被编码成字符串 `"true"`/`"false"`。`/api/v1/node` 的 `ready` 若回 `"false"`，按布尔比较的 LB 会读反。加了 `json_safe(true|false)` 分支（既有端点未用过布尔，故无行为变化）。
   2. `broker_admin_listener` 未 `trap_exit`，supervisor 关停时 `terminate/2` 不执行，`persistent_term` 留下**过期端口**，`port/0` 会对已无人监听的端口作答。加 `process_flag(trap_exit, true)`。
-- **验证**：admin 套件 **19/19**；全量 `rebar3 ct` **1381/1381**（1374 + 7）；`dialyzer` 0 warning；`xref` **302** 条全 unused-export（不变，新模块的导出计入既有 unused-export 口径，未新增其他类别）。
+  3. **重复 drain 不取消旧定时器**（提交后自查发现）：先用 200ms 宽限期 drain、再用 30s 重新 drain，节点仍会在 200ms 后转 `down`——运维的「延长宽限期」被静默忽略。`cancel_timer/1` 不足以修好，因为**已投递到邮箱的消息无法撤回**，所以改为给定时器打**代际号**（`{drain_timeout, Gen}`），`do_drain`/`do_undrain` 各自递增 `gen`，`handle_info` 丢弃代际不匹配的消息。回归测试 `redrain_replaces_the_earlier_grace_period`；**反证**：撤掉代际/取消逻辑后，恰好且仅有该用例失败。
+- **重复 drain 的幂等性已核实**（不是假设）：第二次 drain 会重新算一遍 `Suspended` 列表，若此时 `ranch:suspend_listener/1` 对已挂起的 listener 报错，`Suspended` 会变成 `[]`，`undrain` 就不知道该恢复谁——节点会永久失聪。查 `ranch.erl:234-241`：`get_status(Ref)` 为 `suspended` 时直接返回 `ok`，`resume_listener/1` 同理。实测 `drain → drain → undrain` 后 listener 回到 `running`。
+- **验证**：admin 套件 **20/20**；全量 `rebar3 ct` **1382/1382**（1374 + 8）；`dialyzer` 0 warning；`xref` **302** 条全 unused-export（不变，新模块的导出计入既有 unused-export 口径，未新增其他类别）。
 - **S12-A 仍未完成**：D1 的「节点视图唯一真相」在**成员/归属**侧的落地（`broker_meta` 的 `cluster_node`/`partition_meta` 退役为遗留形状）不在本次交付内；本次只落了**节点自身**的 drain 状态与对外视图。QUIC/CoAP 的摘流边界待定。

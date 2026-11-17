@@ -610,6 +610,7 @@ curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 - 入参严格校验（R-LB8）：未知字段、类型错误、非法 JSON 一律 **400**，且**不会**改变状态。
 - 宽限期到期自动 `draining -> down`（`drain_timeout_ms`，默认 `infinity`）；到 `down` 后 `drain` 回 **409**，`undrain` 仍可恢复。
 - **任何路径都不主动断开在用连接**：`down` 只是「可以停进程了」的信号。
+- **覆盖范围**：drain 挂起的是 ranch listener（TCP 系协议）。QUIC（`mqtt_quic_listener`）与 CoAP（`coap_listener`）是自定义 `gen_udp`/`gen_server`，**不在挂起范围**——这两个协议目前需要靠停进程来摘流。
 - drain 状态是**节点本地**的，不进 ra：失去多数派时摘流仍然可用（ADR-032 D1）。
 - 排空顺序建议：`/readyz` 已 503 → 等 LB 摘除 → 观察 `/api/v1/node` 的 `connections.active` 归零 → 停进程。
 
