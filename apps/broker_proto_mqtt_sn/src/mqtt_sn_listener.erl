@@ -19,6 +19,17 @@
 %% `controlling_process' on send), so no hand-off dance and no reply port are
 %% needed.
 %%
+%% DTLS (SN-01, 2026-11-17): a listener spec with `transport => dtls' runs the
+%% S11-C pattern (PSK-only, serial acceptor, the LISTENER owns every
+%% established socket). The routing tables stay keyed by `{IP, Port}' because
+%% `ssl:peername/1' reports the same tuple `gen_udp' does, so endpoint
+%% routing, takeover and the sleeping-client rebind are transport-blind.
+%% Replies converge on one exit: the sessions cast `{sn_send, Endpoint,
+%% Data}' and this process writes gen_udp or ssl depending on the endpoint.
+%% ADVERTISE broadcast is a UDP-only feature (a DTLS peer is a known,
+%% authenticated endpoint; broadcast discovery of an encrypted gateway is
+%% meaningless).
+%%
 %% The endpoint table, not `client_id', is the routing key, because a MQTT-SN
 %% client has no identity until it CONNECTs. Once it has, the session asks this
 %% process to bind the id (`{sn_bind, Pid, ClientId}'), which is what makes two
@@ -39,10 +50,20 @@
 -define(ACTIVE_N, 100).
 
 -record(st, {
-    socket :: gen_udp:socket(),
+    transport = udp :: udp | dtls,
+    socket :: gen_udp:socket() | undefined,
     port :: inet:port_number(),
     conn_sup :: atom() | pid(),
     cfg :: map(),
+    %% DTLS: the listen socket + serial acceptor (S11-C pattern).
+    dtls_listen = undefined :: term() | undefined,
+    dtls_acceptor = undefined :: pid() | undefined,
+    %% Established DTLS socket -> {IP, Port}; the reverse lookup for replies.
+    peers = #{} :: map(),
+    socks = #{} :: map(),
+    %% {IP, Port} -> #{principal, tenant}: the identity the handshake proved.
+    idents = #{} :: map(),
+    principal_sessions = #{} :: map(),
     %% {IP, Port} -> session pid. The routing table.
     endpoints = #{} :: map(),
     %% ClientId -> session pid, populated by `{sn_bind, ...}'.
@@ -96,6 +117,14 @@ init(Spec) ->
             gateway_id => GatewayId,
             max_inflight => env(max_inflight, 20)},
     Port = maps:get(port, Spec),
+    Transport = maps:get(transport, Spec, udp),
+    case Transport of
+        udp -> init_udp(Port, Cfg, Interval, Address, AdvertisePort);
+        dtls -> init_dtls(Port, Cfg, Address, AdvertisePort);
+        Other -> {stop, {unknown_transport, Other}}
+    end.
+
+init_udp(Port, Cfg, Interval, Address, AdvertisePort) ->
     case gen_udp:open(Port, [binary, {active, ?ACTIVE_N}, {reuseaddr, true},
                              {broadcast, true}]) of
         {ok, Socket} ->
@@ -115,8 +144,92 @@ init(Spec) ->
             {stop, {udp_open_failed, Port, Reason}}
     end.
 
-terminate(_Reason, #st{socket = Socket}) ->
+%% A DTLS listener refuses to start without credentials: no `users' row means
+%% no peer can ever complete the PSK handshake, which is a configuration
+%% error, not a safe default (the CoAP S11-C posture).
+init_dtls(Port, Cfg, Address, AdvertisePort) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    case has_users() of
+        false ->
+            {stop, {dtls_no_credentials}};
+        true ->
+            start_dtls(Port, Cfg, Address, AdvertisePort)
+    end.
+
+has_users() ->
+    Users = maps:get(users, broker_security:redacted_config(), []),
+    Users =/= [].
+
+start_dtls(Port, Cfg, Address, AdvertisePort) ->
+    Suites = cert_free_psk_suites(),
+    case Suites of
+        [] ->
+            {stop, {dtls_no_suites}};
+        _ ->
+            Self = self(),
+            DtlsCfg = Cfg#{dtls_transport_accept_timeout_ms =>
+                               env(dtls_transport_accept_timeout_ms, 1000),
+                           dtls_handshake_timeout_ms =>
+                               env(dtls_handshake_timeout_ms, 2000),
+                           max_dtls_sessions =>
+                               env(max_dtls_sessions, 1024),
+                           dtls_max_sessions_per_principal =>
+                               env(dtls_max_sessions_per_principal, 16)},
+            {ok, Acceptor} = mqtt_sn_dtls_acceptor:start_link(Self, DtlsCfg),
+            DecoySecret = crypto:strong_rand_bytes(32),
+            ListenOpts = [{protocol, dtls},
+                          {ciphers, Suites},
+                          {user_lookup_fun,
+                           {psk_lookup(Acceptor, DecoySecret), undefined}},
+                          {reuseaddr, true},
+                          {mode, binary},
+                          {active, false}],
+            case ssl:listen(Port, ListenOpts) of
+                {ok, Listen} ->
+                    {ok, {_Addr, ActualPort}} = ssl:sockname(Listen),
+                    Acceptor ! {listen_socket, Listen},
+                    St = #st{transport = dtls, socket = undefined,
+                             port = ActualPort, conn_sup = mqtt_sn_conn_sup,
+                             cfg = DtlsCfg, max_asleep = env(max_asleep_clients, 1024),
+                             advertise_interval_ms = 0,
+                             advertise_address = Address,
+                             advertise_port = AdvertisePort,
+                             dtls_listen = Listen, dtls_acceptor = Acceptor},
+                    {ok, St};
+                {error, Reason} ->
+                    {stop, {bind_failed, Port, Reason}}
+            end
+    end.
+
+%% PSK callback (see coap_listener:psk_lookup/2 for the decoy rationale): the
+%% identity is a username in `broker_security''s table; the key derives from
+%% the stored password under the MQTT-SN label. Unknown identity -> decoy key
+%% so username enumeration cannot ride a distinct TLS alert.
+psk_lookup(Acceptor, DecoySecret) ->
+    fun(psk, Identity, _State) ->
+            Acceptor ! {psk_identity, Identity},
+            case broker_security:mqttsn_psk_for_identity(Identity) of
+                {ok, Psk} -> {ok, Psk};
+                {error, _} -> {ok, decoy_psk(Identity, DecoySecret)}
+            end
+    end.
+
+decoy_psk(Identity, Secret) ->
+    crypto:hash(sha256, [<<"unifiedmq-mqttsn-psk-decoy">>, 0, Secret, 0, Identity]).
+
+cert_free_psk_suites() ->
+    [S || S <- ssl:cipher_suites(anonymous, 'dtlsv1.2'),
+          lists:member(maps:get(key_exchange, S, none), [psk, dhe_psk, ecdhe_psk]),
+          lists:member(maps:get(cipher, S, none),
+                       [aes_128_gcm, aes_256_gcm, aes_128_ccm, aes_256_ccm,
+                        aes_128_ccm_8, aes_256_ccm_8])].
+
+terminate(_Reason, #st{transport = udp, socket = Socket}) ->
     _ = gen_udp:close(Socket),
+    ok;
+terminate(_Reason, #st{transport = dtls, dtls_listen = Listen, peers = Peers}) ->
+    _ = ssl:close(Listen),
+    lists:foreach(fun(Sock) -> _ = ssl:close(Sock) end, maps:keys(Peers)),
     ok.
 
 code_change(_OldVsn, St, _Extra) ->
@@ -162,6 +275,10 @@ handle_cast({sn_sleep, Pid}, #st{asleep = N, max_asleep = Max} = St) ->
     end;
 handle_cast({sn_wake, Pid}, St) ->
     {noreply, release_sleep(Pid, St)};
+%% The unified reply exit for sessions (mqtt_sn_conn:reply/2). One process
+%% owns every socket in either transport, so one cast is the whole protocol.
+handle_cast({sn_send, Endpoint, Data}, St) ->
+    {noreply, send_to(Endpoint, Data, St)};
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -173,6 +290,49 @@ handle_info({udp_passive, Socket}, #st{socket = Socket} = St) ->
 handle_info({udp_error, Socket, Reason}, #st{socket = Socket} = St) ->
     logger:warning("mqtt_sn listener socket error: ~p", [Reason]),
     {noreply, St};
+%% --- DTLS (SN-01) ----------------------------------------------------------
+
+handle_info({dtls_handshake_ok, From, Socket, Peer, Identity}, St) ->
+    case admit_session(Identity, Peer, Socket, St) of
+        {ok, St1} ->
+            From ! {dtls_admit, Socket, ok},
+            {noreply, St1};
+        {refuse, Why} ->
+            logger:notice("mqtt_sn dtls session refused (~p) peer=~p identity=~p",
+                          [Why, Peer, Identity]),
+            From ! {dtls_admit, Socket, refuse},
+            {noreply, St}
+    end;
+handle_info({dtls_owned, Socket}, #st{peers = Peers} = St) ->
+    case maps:is_key(Socket, Peers) of
+        true -> _ = ssl:setopts(Socket, [{active, ?ACTIVE_N}]);
+        false -> ok
+    end,
+    {noreply, St};
+handle_info({dtls_abandoned, Socket}, St) ->
+    {noreply, drop_session(Socket, St)};
+handle_info({ssl, Socket, Bin}, #st{peers = Peers} = St) ->
+    logger:log(warning, "DBG ssl data ~p bytes hex=~w peers=~p",
+               [byte_size(Bin), Bin, maps:size(Peers)]),
+    case maps:find(Socket, Peers) of
+        {ok, {IP, Port}} ->
+            {noreply, on_datagram(IP, Port, Bin, St)};
+        error ->
+            {noreply, St}
+    end;
+handle_info({ssl_closed, Socket}, St) ->
+    {noreply, drop_session(Socket, St)};
+handle_info({ssl_error, Socket, Reason}, St) ->
+    logger:debug("mqtt_sn dtls socket error: ~p", [Reason]),
+    {noreply, drop_session(Socket, St)};
+handle_info({ssl_passive, Socket}, #st{peers = Peers} = St) ->
+    case maps:is_key(Socket, Peers) of
+        true -> _ = ssl:setopts(Socket, [{active, ?ACTIVE_N}]);
+        false -> ok
+    end,
+    {noreply, St};
+handle_info({'EXIT', Acceptor, Reason}, #st{dtls_acceptor = Acceptor} = St) ->
+    {stop, {dtls_acceptor_died, Reason}, St};
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, St) ->
     {noreply, forget(Pid, St)};
 handle_info(advertise_tick, St) ->
@@ -200,7 +360,7 @@ on_datagram(IP, Port, Bin, St) ->
                                            gw_id => maps:get(gateway_id,
                                                              St#st.cfg),
                                            gw_add => <<>>}),
-            _ = gen_udp:send(St#st.socket, IP, Port, Reply),
+            _ = send_to(Endpoint, Reply, St),
             _ = Radius,
             St;
         {ok, #{type := connect} = Packet} ->
@@ -268,17 +428,34 @@ route_by_client(Endpoint, ClientId, Packet, St) ->
                     %% The gateway does not know this client (it slept past its
                     %% duration, or another gateway took it). MQTT-SN §6.13: say
                     %% so with DISCONNECT rather than leave it pinging.
-                    _ = gen_udp:send(St#st.socket, element(1, Endpoint),
-                                     element(2, Endpoint),
-                                     mqtt_sn_codec:encode(#{type => disconnect,
-                                                            duration => 0})),
+                    _ = send_to(Endpoint,
+                                mqtt_sn_codec:encode(#{type => disconnect,
+                                                       duration => 0}),
+                                St),
                     St
             end
     end.
 
 start_session(Endpoint, Packet, St) ->
+    logger:log(warning, "DBG start_session endpoint=~p", [Endpoint]),
+    %% DTLS: the handshake-proven identity rides the session config, so
+    %% CONNECT cannot claim a principal the socket did not prove (MQTTSN-003).
+    Cfg = case St#st.transport of
+              dtls ->
+                  Id = maps:get(Endpoint, St#st.idents, #{}),
+                  Base = St#st.cfg,
+                  Base#{principal => maps:get(principal, Id, undefined),
+                        tenant_id => maps:get(tenant, Id,
+                                              broker_security:default_tenant()),
+                        transport => dtls};
+              udp ->
+                  Base = St#st.cfg,
+                  Base#{principal => undefined,
+                        tenant_id => broker_security:default_tenant(),
+                        transport => udp}
+          end,
     case mqtt_sn_conn_sup:start_conn(St#st.conn_sup, self(), St#st.socket,
-                                     Endpoint, St#st.cfg) of
+                                     Endpoint, Cfg) of
         {ok, Pid} ->
             Ref = erlang:monitor(process, Pid),
             Pid ! {sn_packet, Packet},
@@ -367,6 +544,10 @@ arm_advertise(#st{advertise_interval_ms = 0} = St) ->
 arm_advertise(#st{advertise_interval_ms = Ms} = St) ->
     St#st{advertise = erlang:send_after(Ms, self(), advertise_tick)}.
 
+send_advertise(#st{transport = dtls}) ->
+    %% Broadcast discovery of an authenticated, encrypted gateway is
+    %% meaningless; DTLS listeners do not advertise (documented limit).
+    ok;
 send_advertise(#st{socket = Socket, advertise_address = Addr,
                    advertise_port = Port} = St) ->
     Packet = mqtt_sn_codec:encode(#{type => advertise,
@@ -379,6 +560,92 @@ send_advertise(#st{socket = Socket, advertise_address = Addr,
 %% advertised as "0", which means "stop advertising".
 advertise_seconds(#st{advertise_interval_ms = Ms}) ->
     max(1, (Ms + 999) div 1000).
+
+%%%_* DTLS session admission / reply exit -----------------------------------
+
+%% The caps and tables live here, so this is the single place that admits.
+admit_session(Identity, Peer, Socket, #st{peers = Peers, cfg = Cfg} = St) ->
+    Max = maps:get(max_dtls_sessions, Cfg, 1024),
+    case maps:size(Peers) >= Max of
+        true ->
+            {refuse, session_cap};
+        false ->
+            case Identity of
+                undefined ->
+                    {refuse, no_identity};
+                _ ->
+                    Principal = Identity,
+                    PerCap = maps:get(dtls_max_sessions_per_principal,
+                                      Cfg, 16),
+                    case maps:get(Principal, St#st.principal_sessions, 0) >= PerCap of
+                        true -> {refuse, principal_cap};
+                        false -> {ok, record_session(Peer, Socket, Principal, St)}
+                    end
+            end
+    end.
+
+record_session({IP, Port} = Peer, Socket, Principal,
+               #st{peers = Peers, socks = Socks, idents = Idents,
+                   principal_sessions = Counts} = St) ->
+    St#st{peers = maps:put(Socket, Peer, Peers),
+          socks = maps:put({IP, Port}, Socket, Socks),
+          idents = maps:put({IP, Port},
+                            #{principal => Principal,
+                              tenant => broker_security:tenant_id(Principal)},
+                            Idents),
+          principal_sessions =
+              maps:update_with(Principal, fun(N) -> N + 1 end, 1, Counts)}.
+
+drop_session(Socket, #st{peers = Peers} = St) ->
+    case maps:take(Socket, Peers) of
+        {Peer, Peers1} ->
+            St1 = forget_endpoint(Peer, St),
+            %% A live session at this endpoint just lost its transport: to the
+            %% gateway the client vanished, which is an abnormal ending (the
+            %% Will fires). Without this the session would linger until its
+            %% keepalive gave up.
+            case maps:find(Peer, St1#st.endpoints) of
+                {ok, Pid} -> Pid ! {sn_socket_gone};
+                error -> ok
+            end,
+            St1#st{peers = Peers1};
+        error ->
+            St
+    end.
+
+forget_endpoint(Peer, #st{socks = Socks, idents = Idents,
+                          principal_sessions = Counts} = St) ->
+    Principal = case maps:find(Peer, Idents) of
+                    {ok, #{principal := P}} -> P;
+                    error -> undefined
+                end,
+    Counts1 = case Principal of
+                  undefined -> Counts;
+                  _ -> maps:update_with(Principal, fun(N) -> max(N - 1, 0) end,
+                                        0, Counts)
+              end,
+    St#st{socks = maps:remove(Peer, Socks),
+          idents = maps:remove(Peer, Idents),
+          principal_sessions = Counts1}.
+
+%% One write exit for both transports. UDP: any process may send on the
+%% listener's socket. DTLS: only this process owns the peer socket, so replies
+%% MUST come through here (a session writing `ssl:send' on a socket it does
+%% not own is an error).
+send_to(Endpoint, Data, #st{transport = udp, socket = Socket} = St) ->
+    _ = gen_udp:send(Socket, element(1, Endpoint), element(2, Endpoint), Data),
+    broker_metrics:inc(bytes_out, byte_size(Data)),
+    St;
+send_to(Endpoint, Data, #st{transport = dtls, socks = Socks} = St) ->
+    case maps:find(Endpoint, Socks) of
+        {ok, Socket} ->
+            _ = ssl:send(Socket, Data),
+            broker_metrics:inc(bytes_out, byte_size(Data));
+        error ->
+            %% The peer is gone (drop_session raced a reply): nothing to send.
+            ok
+    end,
+    St.
 
 %%%_* Misc ------------------------------------------------------------------
 

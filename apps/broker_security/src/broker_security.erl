@@ -22,7 +22,7 @@
 %% is the safe direction.
 -module(broker_security).
 
--export([authenticate/2, authorize/2, tenant_id/1,
+-export([authenticate/2, authorize/2, tenant_id/1, mqttsn_psk_for_identity/1,
          authorized/2, acl_rules/0, redacted_config/0,
          authenticate_conn/1, auth_required/1, default_tenant/0,
          long_term_key/2, psk_for_identity/1]).
@@ -198,6 +198,35 @@ separator_safe(Field) ->
 %% derived PSK, which is the point -- realm is part of the key.
 coaps_realm() ->
     case application:get_env(broker_security, coaps, #{}) of
+        #{realm := R} when is_binary(R), byte_size(R) > 0 -> R;
+        _ -> <<"unifiedmq">>
+    end.
+
+%% MQTT-SN over DTLS (SN-01, 2026-11-17): the same identity-is-the-username
+%% contract as `psk_for_identity/1', with its own derivation label and realm
+%% (`broker_security.mqttsn #{realm => ...}') so an MQTT-SN PSK can never equal
+%% a CoAPS PSK for the same user -- a captured key on one transport must not be
+%% replayable on the other.
+-spec mqttsn_psk_for_identity(binary()) -> {ok, <<_:256>>} | {error, term()}.
+mqttsn_psk_for_identity(Identity) when is_binary(Identity) ->
+    Realm = mqttsn_realm(),
+    case separator_safe(Identity) andalso separator_safe(Realm) of
+        false ->
+            {error, bad_username_or_password};
+        true ->
+            case user_record(Identity) of
+                #{password := Password} when is_binary(Password) ->
+                    {ok, crypto:hash(sha256, [<<"unifiedmq-mqttsn-psk">>, 0,
+                                              Identity, 0, Realm, 0, Password])};
+                _ ->
+                    {error, bad_username_or_password}
+            end
+    end;
+mqttsn_psk_for_identity(_Other) ->
+    {error, bad_username_or_password}.
+
+mqttsn_realm() ->
+    case application:get_env(broker_security, mqttsn, #{}) of
         #{realm := R} when is_binary(R), byte_size(R) > 0 -> R;
         _ -> <<"unifiedmq">>
     end.
