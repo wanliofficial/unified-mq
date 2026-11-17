@@ -20,7 +20,7 @@
 | MQTT | 1 | Eclipse Paho / mosquitto_pub-sub | Python / CLI | paho-mqtt 2.x / mosquitto 2.1.2 | ✅（**T15 + S2-C**：10/10 用例） | QoS0/1/2、Retain、Will 已实现并实测；MQTT 5.0 语义在 S2.5 补；逐条限制见本文 §4 |
 | WebSocket | 2 | Python `websocket-client`（应用层帧为 Broker 自有 JSON/二进制） | Python | websocket-client 1.7.0 | ✅（**S5-WS：10/10 用例**） | 传输层用 `websocket-client`，应用层帧由 S5 设计，见 §4.5 |
 | NATS | 3 | `nats.go` / `nats.js` | Go / JS | nats.go v1.48.0 | ✅（**S5-NATS：11/11 用例**） | core NATS：Pub/Sub、Queue Group、Request/Reply、wildcard、auth、HPUB/HMSG headers；无 JetStream，见 §4.6 |
-| AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack；见 §4.7 |
+| AMQP | 4 | Qpid Proton / amqp091 | Python / Java / Go | amqp091-go v1.10.0 | ✅（**S5-AMQP：13/13 用例**；2026-11-17 整改后复跑 PASS） | AMQP 0-9-1 子集：direct/fanout/topic、queue 生命周期、publish/consume/ack/nack、publisher confirm、mandatory→basic.return、属性往返；见 §4.7 |
 | Kafka | 5 | `kafka-clients` / `librdkafka` | Java / C | kafka-clients 3.7.1 | ✅（**S5-Kafka：12/12 用例**） | Produce/Fetch/Metadata/ListOffsets、经典消费组、OffsetCommit/Fetch、RecordBatch v2；单节点协调器、offset 内存态、无压缩/事务/Admin API，见 §4.8 |
 | Pulsar | 6 | **官方 Pulsar Java Client** | Java | pulsar-client 3.3.1 | ✅（**S5-Pulsar：8/8 用例**） | 官方 Java Client 实测：produce/consume、properties、key、batch、ack/redelivery、seek、unsubscribe、producer name；无 BookKeeper/事务/压缩/Key_Shared，见 §4.9 |
 | MQTT over WebSocket | S8-B | `paho-mqtt`（`transport="websockets"`） | Python | paho-mqtt 2.1.0 | ✅（**S8-B：8/8 用例** +1 raw framing 探针单列） | 同一 `mqtt_conn_fsm`，RFC 6455 binary 帧；子协议 `mqtt`/`mqttv3.1`/`mqttv3.1.1` 硬门槛，见 §4.13 |
@@ -54,7 +54,7 @@ S5 为每个协议交付「一份独立测试套件 + 能力矩阵的一行」�
 | MQTT-SN | 已支持（S8-C） | MQTT-SN 1.2 over UDP（默认 1884）：全部 27 种报文、QoS −1/0/1/2、Retain、Will（CONNECT 标记 → WILLTOPICREQ/WILLTOPIC/WILLMSGREQ/WILLMSG，含 `WILLTOPICUPD`/`WILLMSGUPD`）、三种 TopicIdType（预定义 / 每客户端 normal 双向 REGISTER / 两字符 short）、休眠与 `PINGREQ(client_id)` 唤醒、SEARCHGW/ADVERTISE 网关发现、keepalive 1.5×/2× | 无 DTLS（明文 UDP）；QoS 0 在休眠期间丢弃；无串口桥 / 转发器（Forwarder Encapsulation）不实现；CONNECT 无凭据字段，`require_auth` 配 `mqtt_sn` 时拒绝启动（见 §4.11、`docs/security.md` §2.2） | `apps/broker_proto_mqtt_sn/test/`、`test/protocol-compatibility/mqtt_sn/` |
 | MQTT over QUIC | 已支持（S8-D） | MQTT over QUIC（OASIS TC《Single Stream Mode》CN Draft 3）over UDP（默认 14567）：同一份 `mqtt_conn_fsm`，因此 QoS0/1/2、Retain、Will、持久会话、MQTT 5.0 properties 与 1883 完全一致；ALPN 固定 `mqtt`；一条客户端发起的双向流承载整条 MQTT 连接；流关闭 ≠ 连接关闭（同连接新流 = 新会话）；强制 TLS 1.3 | 无 0-RTT early data；无多流（EMQX 私有扩展）；无运行期流信用补充（`max_streams_per_conn` 建连时给足）；默认不监听（无证书即拒绝启动）；只有 `rebar3 as quic` 构建才带 NIF；见 §4.12 | `apps/broker_proto_mqtt_quic/test/`、`test/protocol-compatibility/mqtt_quic/` |
 | NATS | 已支持 | core NATS：PUB/SUB/UNSUB、subject wildcard（`*`/`>`）、Queue Group、Request/Reply、INFO/CONNECT/PING/PONG、auth、HPUB/HMSG headers（`ce-*`） | 无 JetStream、无集群路由；见 §4.6 | `apps/broker_proto_nats/test/`、`test/protocol-compatibility/nats/` |
-| AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties | 无事务、无 publisher confirm 全档、无流控 tuning、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
+| AMQP | 支持子集 | AMQP 0-9-1：direct/fanout/topic exchange、queue declare/bind/consume、publish、ack/nack、basic properties 全量往返、publisher confirm、mandatory→basic.return、协议错误可见（540/503/406/404） | 事务显式 540 拒绝、无流控 tuning（heartbeat 0）、无 headers exchange 路由、无 AMQP 1.0；见 §4.7 | `apps/broker_proto_amqp/test/`、`test/protocol-compatibility/amqp/` |
 | Kafka | 支持子集 | Produce 8 / Fetch 11 / ListOffsets 5 / Metadata 8 / OffsetCommit 7 / OffsetFetch 5 / FindCoordinator 2 / JoinGroup 5 / Heartbeat 3 / LeaveGroup 3 / SyncGroup 3 / InitProducerId 0；RecordBatch v2（无压缩）；经典消费组 | 单节点协调器、offset 内存态、无压缩/事务/幂等/Admin API；见 §4.8 | `apps/broker_proto_kafka/test/`、`test/protocol-compatibility/kafka/` |
 | Pulsar | 支持子集 | 官方 Java Client 路径：Connect、Lookup、PartitionedMetadata、Producer、Send（单条+batch）、Subscribe、Flow、Ack、Seek、Unsubscribe、Ping、GetLastMessageId；properties/key/event_time/sequence_id；CONNECT 凭据（`token` / SASL PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）、无事务/压缩/Key_Shared/schema；TLS 由 S6 统一覆盖；订阅游标内存态；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0；见 §4.9 | `apps/broker_proto_pulsar/test/`、`test/protocol-compatibility/pulsar/` |
 | A2A（1.0.0 JSON-RPC + SSE） | 支持子集（S9-A~S9-C，**Broker 作网关**） | JSON-RPC 2.0 传输绑定：`SendMessage`（含 `task_auto_complete` 内建 echo 执行器）、`GetTask`、`ListTasks`、`message/send` 别名；Task 状态机（SUBMITTED→WORKING→COMPLETED / FAILED / CANCELED / REJECTED / INPUT_REQUIRED）+ 事件溯源 + boot 全量重放（无 checkpoint）；Agent Card 发现（`/.well-known/agent-card.json`、`/agents/<id>`，按 tenant 隔离）；SSE 任务事件流（ack-first + 增量 + 优雅关流）；出站 Push Notification（HMAC-SHA256 签名 + SSRF 防护 + 防重放 + DLQ） | 单节点（跨节点 Task 访问无重定向/代理）；全量重放是可扩展性上界；无 JWT/JWKS/OAuth AS（`securitySchemes` 只声明外部 scheme，card 无签名，push 密钥在 env 非 KMS）；失败路径计数器未加（S9-F 定稿不加，见 `docs/security.md` §12.1 第 17 条）；`/agents` 是项目私有接口；默认 `listeners => []`；见 §4.14/§4.15/§4.16/§4.19 | `apps/broker_proto_a2a/test/`、`test/protocol-compatibility/a2a/`（S9-F 官方 SDK 证据在 `test/protocol-compatibility/s9f/a2a/`） |
@@ -146,7 +146,8 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 **Will（ADR-018 §18.1，O5 已签认）**
 
 - CONNECT 保存 topic/payload/qos/retain；**仅内存，不持久化**——broker 重启不补发（与 mosquitto 默认一致）。
-- 发布时机：TCP 异常关闭、keepalive 超时、协议错误、内部失败、takeover 都会发布；**正常 DISCONNECT 与 broker shutdown 不发布**。
+- 发布时机：TCP 异常关闭、keepalive 超时、协议错误、内部失败都会发布；**正常 DISCONNECT、broker shutdown 与 takeover 不发布**。takeover 的修正在 2026-11-17 整改：§3.1.2.5 规定同一 ClientID 的新网络连接**取消** Will 而不是触发它，此前实现会在 takeover 时误发。
+- Will Delay（v5 §3.1.3.2.2，2026-11-17 补齐）：CONNECT 的 `will_delay_interval` 生效。持久会话（session expiry > 0）把 Will 停靠 `mqtt_will_server`，延迟 = `min(delay, session expiry)`，停靠期间同 ClientID 的重连取消 Will；会话随断开结束（expiry 0 / 3.1.1 clean）时立即发布。停靠的 Will 与内存 Will 同一姿态：**不跨 broker 重启**。
 - 发布路径与普通 PUBLISH 一致：QoS>0 走 append（fsync）后 dispatch，QoS0 直接 dispatch；`retain=1` 同步更新 retained 树。
 - 全程 `catch`：queue 已停时失败只记日志（不能因为遗嘱发布失败而掩盖真正的停机原因）。
 
@@ -155,7 +156,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 | 层 | 用例 |
 |---|---|
 | 帧（`mqtt_frame_SUITE`） | 27 例（S2-C 时点；S2.5 扩 v5 属性/原因码后共 31 例），含 PUBREC/PUBREL/PUBCOMP 双向、QoS2 PUBLISH/Will、reserved flags |
-| 连接（`mqtt_conn_SUITE`） | 50 例（S2-C 时点；S2.5/S3/S8-A 追加后共 70 例），其中 QoS2/Retain/Will 共 20 例：四步双向、DUP 去重、重连重发两半、未知帧幂等、状态超限、补发/清除/持久化/上限、Will 四种触发 + 重启不补发 |
+| 连接（`mqtt_conn_SUITE`） | 50 例（S2-C 时点；S2.5/S3/S8-A 追加后 70 例；2026-11-17 整改后 **81 例**），其中 QoS2/Retain/Will 共 20 例：四步双向、DUP 去重、重连重发两半、未知帧幂等、状态超限、补发/清除/持久化/上限、Will 触发 + 重启不补发 + **takeover 不发布** + **延迟与重连取消**；整改新增 sub-id 投递、RH 0/1/2、No Local、RAP、`0x82`/`0x94` 协议错误 10 例 |
 | retain app（`broker_retain_SUITE`） | 17 例：可见性、覆盖、清除、排序、同步/异步落盘、三个上限、损坏文件 |
 | 崩溃（T14 R8） | QoS2 收 `PUBREC` 后 `kill -9`；重启后客户端重发 `PUBREL`，broker 幂等回 `PUBCOMP`；消息至少投递一次、cursor 最终推进。**默认档与零回退档都 PASS** |
 | 真实客户端（T15） | `paho-qos2`（双向四步 + 字节一致）、`paho-retain`（补发 retain=1 / 转发 retain=0 / 空 payload 清除）、`paho-will`（异常断连发布）、`paho-will-skipped`（DISCONNECT 抑制）、`mosq-qos2`（mosquitto 2.1.2 双向） |
@@ -182,6 +183,9 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 - reason code：v5 PUBACK 无匹配订阅回 `0x10`；CONNACK 拒绝按 3.1.1 码映射（1→`0x84`、2→`0x85`、4→`0x86`）。
 - session expiry：`Persist = session_expiry > 0`（3.1.1 仍由 `clean_session` 决定）；断开时把 `session_expires_at` 写入 `.inflight` blob；boot 扫描过期会话并按 clean-session 顺序拆除（disk → Router → memory）。
 - `$share/{group}/{filter}`：非空 group、无通配符、合法真实 filter；`join(shared, ...)` 建组，UNSUBSCRIBE 走 `leave`；SUBACK 返回请求 QoS。
+- Subscription Identifier（v5 §3.3.4，2026-11-17 补齐）：SUBSCRIBE 的 `subscription_identifier`（单个正整数；多个 = 0x82 断连）按真实 filter 存入会话并随 `.inflight` blob **v3** 跨重连保留；单副本投递的出站 PUBLISH 携带**全部**匹配订阅的 identifier（可重复 0x0B 属性），No-Local 抑制的订阅不计入。客户端→服务端的 PUBLISH 携带该属性 = 协议错误 **0x82 断连**。
+- SUBSCRIBE 选项（v5 §3.8.3.1，2026-11-17 补齐）：**No Local**（本连接自己的发布不再回投，共享订阅上置位 = 0x82 断连）、**Retain As Published**（置位时转发保留消息原 retain 位）、**Retain Handling**（0 = 补发；1 = 会话已有同 filter 订阅则不补发；2 = 不补发；3 = 畸形断连）。选项随 blob v3 跨重连保留；UNSUBSCRIBE 一并清除 id 与选项。
+- topic_alias：本 broker 不宣告 Topic Alias Maximum（=0），客户端 PUBLISH 携带 `topic_alias` 按 **0x94** 断连（v5 §3.3.2.3.4）。
 
 **证据**
 
@@ -391,24 +395,29 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 - 通道：`channel.open`/`open-ok`、`channel.close`/`close-ok`（服务端错误以 `channel.close` 回复并关闭该通道，不影响连接）。
 - 交换机：`exchange.declare`/`delete`，类型 `direct` / `fanout` / `topic`；`headers` 声明接受但不参与路由。
 - 队列：`queue.declare`（含服务端生成名 `amq.gen-*`；`passive` 声明不存在队列返回 404）、`bind`/`unbind`、`purge`、`delete`。
-- 发布/消费：`basic.publish`（方法 + content header + body 分帧）、`basic.qos`（prefetch 限流）、`basic.consume`/`cancel`、`basic.deliver`、`basic.ack`/`nack`/`reject`（`requeue` 走 `release`，重新投递）、`basic.recover`（回 `recover-ok`）。
-- 路由：queue 映射 destination `amqp/<queue>`，消费者用 `shared` 订阅（`join(shared, Queue, ...)` + claim/read/ack），同一队列的多个消费者获得竞争消费语义（每条消息恰好一个成员）。
+- 发布/消费：`basic.publish`（方法 + content header + body 分帧；`mandatory` 不可路由时回 **`basic.return` 312 NO_ROUTE** + 原内容，`immediate` 回通道 540）、`basic.qos`（prefetch 限流）、`basic.consume`/`cancel`、`basic.deliver`、`basic.ack`/`nack`/`reject`（`requeue` 走 `release`，重新投递且 **redelivered=1**）、`basic.recover`（重投本通道全部未 ack 投递，redelivered=1）。
+- publisher confirm（2026-11-17 整改）：`confirm.select` 回 `select-ok`；此后每条发布在 fsync 成功后回 `basic.ack`（tag 从 1 递增）、入库失败回 `basic.nack`；unroutable 的 mandatory 消息先 return 再 ack。
+- 事务：`tx.select/commit/rollback` **明确拒绝**（通道 540 NOT_IMPLEMENTED），不再静默丢弃（静默忽略 = 假装成功，违反 §4.2 对未实现方法的处理）。
+- basic properties（2026-11-17 整改）：发布侧全量属性（`content-type`、`content-encoding`、`delivery-mode`、`priority`、`correlation-id`、`reply-to`、`expiration`、`message-id`、`timestamp`、`type`、`user-id`、`app-id`、`headers`）经 `proto_meta` 的 `amqp_props` 保留，投递时原样写回 content header（RPC 的最低条件）。字段表支持全部 0-9-1 类型 `t b B s u I i l f d D S x A T F V`；未知类型字节按帧错误关闭连接（503），不再错位解析。
+- 错误可见性（2026-11-17 整改）：未知 method = 通道 540（channel 0 = 连接 503），带 class-id/method-id；未知 delivery-tag 的 ack/nack/reject = 通道 406；未知 consumer tag 的 cancel = 通道 404；认证失败的 `connection.close` 用 **short 403** + shortstr + class/method id（此前把 code 编成 shortstr 字符串，真实客户端直接解码失败）；未解析帧 = 连接 503。`connection.start` 宣告 `server-properties.capabilities`（只列已实现：`publisher_confirms`、`basic.nack`、`authentication_failure_close`）。
+- 路由：queue 映射 destination `amqp/<queue>`，消费者用 `shared` 订阅（`join(shared, Queue, ...)` + claim/read/ack），同一队列的多个消费者获得竞争消费语义（每条消息恰好一个成员）。消费组以 `anchor => earliest` 诞生（RQ-01，2026-11-17）：先发布、后加入的消费者按入队顺序读完全部积压；`broker_subscription:join/7` 的新选项只影响实体诞生时的锚，MQTT `$share`/NATS queue group/exclusive 订阅保持 tail 锚不变。
+- `basic.get`（RQ-09，2026-11-17 随 RQ-01 解锁）：claim 一条就绪消息回 `get-ok`（delivery-tag 进入通道 unacked，可 ack），队列空回 `get-empty`；缺失队列 404。message-count 暂报 0。
 - 手动 ack：`delivery-tag` → `{Ref, PartitionId, Offset}` 映射；未 ack 的投递在连接断开时 `release` 回池；`nack(requeue=true)`/`reject(requeue=true)` 立即释放并重新投递。
 
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、`start-ok` 的 SASL/PLAIN 凭据（走统一身份表）、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、prefetch 限流、多通道隔离 | 无 `basic.get`（回 get-empty）、无 `mandatory` 的 `basic.return`、无 headers exchange 路由、拓扑瞬态（重启不保留 exchange/queue/binding）、无 publisher confirm/事务；未配 `require_auth` 时匿名连接按部署默认租户运行 | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
+| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、`start-ok` 的 SASL/PLAIN 凭据（走统一身份表）+ capabilities 宣告、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、**publisher confirm**、**mandatory→basic.return**、**basic properties 全量往返**、字段表全类型、prefetch 限流、多通道隔离、协议错误可见（540/503/406/404） | `basic.get` 回 get-empty（积压读取受"消费者加入前消息不回放"限制约束）；事务显式 540 拒绝（不假装支持）；无 headers exchange 路由；拓扑瞬态（重启不保留 exchange/queue/binding）；redelivered 位连接内跟踪（跨连接不携带）；heartbeat 固定 0（接受对端心跳帧但不检测）；未配 `require_auth` 时匿名连接按部署默认租户运行 | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
 
-1. **拓扑瞬态**：exchange/queue/binding 存在 `amqp_topo` 的 ETS 中，broker 重启即丢失；消息体本身仍 fsync 到 `broker_queue`。v1 不承诺 durable queue 的元数据恢复。
-2. **无 `basic.get`**：同步拉取回 `basic.get-empty`；请使用 `basic.consume`。
-3. **无 `basic.return`**：`mandatory=true` 的不可路由消息被丢弃且不回报（不静默改变路由，但也不回 `basic.return`）。
+1. **拓扑瞬态**：exchange/queue/binding 存在 `amqp_topo` 的 ETS 中，broker 重启即丢失；消息体本身仍 fsync 到 `broker_queue`。v1 不承诺 durable queue 的元数据恢复（重启后 exchange/queue 需重新声明）。
+
+3. **事务显式拒绝**：`tx.select/commit/rollback` 回通道 540 NOT_IMPLEMENTED——不静默忽略（那等于假装成功）。
 4. **headers exchange 不路由**：可声明，但不会按 headers 匹配投递。
-5. **消费者加入前已入队的消息不回放**：共享游标在消费者 join 时锚定到分区尾部；v1 的消费语义针对“消费者已在线时发布的消息”。这与 durable queue 的完整语义有差距，已显式记录。
-6. **无 publisher confirm / 事务**：`start-ok` 现在按 SASL/PLAIN 解析 `\0user\0pass` 并交给 `broker_security:authenticate_conn/1`，租户来自匹配到的用户记录（`docs/security.md` §2.1）；空响应的匿名连接按部署默认租户运行，凭据错误回 `ACCESS_REFUSED` 并关闭连接。
+6. **redelivered 位连接内跟踪**：nack(requeue)/recover/消费者掉线释放后的重投，本连接内 redelivered=1；换连接消费时无法携带（需要队列级投递计数，随 RQ-01/RQ-02 里程碑落地）。
+6. **heartbeat 固定 0**：tune 提案 heartbeat=0，接受对端心跳帧但不做死链检测（§2.3.7 允许 0 = 双方关闭检测）；客户端 tune-ok 提案非 0 值当前被忽略。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -419,8 +428,8 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 
 | 层 | 用例 |
 |---|---|
-| AMQP 帧/字段表（`amqp_codec_SUITE`） | 14 例（S5 时点；S6 追加 `properties_roundtrip_with_ce_headers` 后共 15 例）：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
-| AMQP 连接/通道（`amqp_conn_SUITE`） | **17 例（当前）**：S5 时点 14 例（握手+通道、direct publish/consume/ack、routing key 隔离、fanout、topic、unbind、queue delete、passive 缺失、nack requeue、prefetch、多通道、connection.close、heartbeat、坏帧尾断开）；S7 追加有效/错误凭据、`require_auth` 三例 |
+| AMQP 帧/字段表（`amqp_codec_SUITE`） | 15 例（S5 时点 14 例；S6 追加 `properties_roundtrip_with_ce_headers`；2026-11-17 全类型字段表改造后全绿）：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
+| AMQP 连接/通道（`amqp_conn_SUITE`） | **31 例（当前）**：S5 时点 14 例 + S7 凭据三例；2026-11-17 整改追加 14 例：close 帧编码（short 403）、mandatory/basic.return、immediate 540、confirm ack 序列、tx 540、recover + redelivered、nack requeue redelivered、properties 往返、未知 method 540、未知 delivery-tag 406、未知 consumer tag 404、字段表类型往返、未知类型字节 503、capabilities 宣告 |
 | 真实第三方客户端（`amqp_compat.py` + `amqp091-go`） | 13/13 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：
@@ -2059,6 +2068,51 @@ S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻�
 3. **诱饵密钥 vs TLS alert 的可区分性**（实测发现）：初版对未知身份直接 `alert`——与「口令错」在时延与错误形态上都不同，等于把用户枚举做成一个可靠性不同的信号。改为诱饵密钥（§4.24.8 未知身份行），`unknown_identity_is_refused` 断言两条路径错误项相等。
 
 另有两处**测试/工程**而非产品缺陷，一并留痕：`{active, N}` 在非 owner 上调用返回 `ok` 但静默错投（必须在移交后才 arm）；半死 DTLS 客户端 `ssl:close/1` 会从 `dtls_client_connection:init` 抛 `{bad_action_from_state_function, …}`，容量 bench 因此改用 `spawn_monitor` + `catch`（报告 §5 第 3 条）。
+
+---
+
+### 4.25 兼容性整改（2026-11-17）：按 `docs/compatibility/` 需求对齐协议标准
+
+> 输入是 `docs/compatibility/` 六份文档点名的、**标准违反类**缺口（协议 MUST 被静默丢弃、线协议编码错误、未知方法被静默吞掉）。可选扩展（topic alias 实现、0-RTT、permessage-deflate、JetStream 等）不在本次范围；语义/架构类里程碑（RQ-01 消费锚点、RQ-02 durable 拓扑、RQ-06 vhost、MQTT-SN DTLS、QUIC 流信用）维持各自路线图，本节不重复。
+
+**MQTT（共享 `mqtt_conn_fsm`，TCP/WS/QUIC 三条入口同享）**
+
+1. **Subscription Identifier 投递**（原 MQ-01）：SUBSCRIBE 的 id 按 filter 保存、随 blob v3 跨重连保留，出站 PUBLISH 携带全部匹配订阅的 identifier；UNSUBSCRIBE 清除。客户端 PUBLISH 带 id = 0x82 断连。
+2. **Will Delay**（原 MQ-02）：`will_delay_interval` 生效，停靠 `mqtt_will_server`（新模块），延迟 = min(delay, session expiry)，重连取消；**takeover 不再发布 Will**（原实现违反 §3.1.2.5，测试 `will_is_published_on_takeover` 已改为断言标准行为）。
+3. **SUBSCRIBE 选项**（原 MQ-03）：No Local / Retain As Published / Retain Handling 全部生效并跨重连保留；共享订阅 + No Local = 0x82；RH=3 = 畸形断连。
+4. 入站 PUBLISH 携带 `topic_alias` = 0x94 断连（本端宣告 0）。
+
+**AMQP 0-9-1（`broker_proto_amqp`）**
+
+1. **`connection.close` 编码**（原 RQ-20）：reply-code 用 short（认证失败 403），补齐 class-id/method-id——amqp091-go 此前无法解码拒绝帧，现在得到可读的 403 异常。
+2. **字段表全类型 + 不再错位**（原 RQ-04）：`t b B s u I i l f d D S x A T F V` 全部按精确长度解析；未知类型字节 = 连接 503（帧守卫捕获，带日志）；整数回写按范围选 `$I`/`$l`，不再 badarg。
+3. **mandatory → basic.return**（原 RQ-05）：312 NO_ROUTE 带原内容；`immediate` = 通道 540。
+4. **publisher confirm**（原 RQ-07）：`confirm.select` → `select-ok`，fsync 成功逐条 `basic.ack`、失败 `basic.nack`。
+5. **事务显式拒绝**（原 RQ-08）：class 90 → 通道 540。
+6. **错误可见**（原 RQ-19）：未知 method 540/503（带 class/method id）、未知 delivery-tag ack = 406、未知 consumer tag cancel = 404、queue.unbind 缺绑定 404。
+7. **recover + redelivered**（原 RQ-10/RQ-11）：recover 重投全部未 ack；nack(requeue)/recover 后的重投 redelivered=1（真实客户端 `amqp-nack-requeue` 已观察到 `redelivered:true`）。
+8. **basic properties 往返**（原 RQ-03）：全量属性经 `proto_meta` 回写投递帧。
+9. **capabilities 宣告**（原 RQ-21）：只列 `publisher_confirms` / `basic.nack` / `authentication_failure_close`；未实现的键不存在（不宣称）。
+10. `basic.get` 维持 get-empty（RQ-09 被 RQ-01 的消费锚点语义阻塞，原因写入 §4.7 已知限制 2）。
+
+**测试基线（整改后）**
+
+| 套件 | 整改前 | 整改后 |
+|---|---|---|
+| `mqtt_frame_SUITE` | 31 | 31 |
+| `mqtt_conn_SUITE` | 70 | **81**（+11：sub-id×2、RH=1、RH=2、no-local、RAP、RH=3、0x82×2、will-delay×2；takeover 用例改断言标准行为；blob v3） |
+| 其余 MQTT 套件（listener/tls/backpressure/transport） | 26 | 26 |
+| WS + S1 集成 | 33 | 33 |
+| MQTT-SN 三套件 | 84 | 84 |
+| `amqp_codec_SUITE` | 15 | 15 |
+| `amqp_conn_SUITE` | 17 | **31**（+14，见上） |
+| amqp091-go 真实客户端 | 13/13（拒绝帧当时无法被客户端解码的场景未覆盖） | **13/13**（`amqp-nack-requeue` 断言 `redelivered:true`） |
+
+配套文件：`apps/broker_proto_mqtt/src/mqtt_will_server.erl`（新增）、`apps/broker_proto_mqtt/src/{mqtt_frame,mqtt_conn_fsm,broker_proto_mqtt_sup}.erl`、`apps/broker_proto_amqp/src/{amqp_codec,amqp_conn}.erl`、`test/protocol-compatibility/amqp/amqp_broker_boot.erl`（身份表与 CT 套件对齐，空表会拒绝一切凭据）。
+
+**M1 追加（2026-11-17 同日第二批，边界项推进）**：RQ-01 落地——`broker_subscription:join/7` 新增 `anchor => earliest` 实体诞生锚选项（AMQP 消费组与 basic.get 使用），消费者加入前的积压按入队顺序可读（真实客户端 `amqp-backlog-before-consume`：100 条先发后收、顺序一致）；RQ-09 随之解锁（basic.get 真实读积压，空队列回 get-empty）。同时修复两个适配器（amqp/nats）`read_offsets` 反序 fold 造成的多消息批量投递倒序的既有缺陷。CT：subscription 55（+2 anchor 用例）、amqp_conn 33（+2）、真实客户端 14/14（+1）。锚点实现细节：日志偏移 1-based，earliest 锚为 1；组游标随 `.subs` 的 anchor 字段重启恢复。
+
+**整改中明确不改的行为（按文档口径是设计选择，不是缺陷）**：QoS 2 跨崩溃至少一次（MQ-08）、共享订阅单节点（MQ-15）、MQTT 3.1 拒绝（MQ-16）、QoS 0 睡眠丢弃（SN）、`ce-` 前缀与 CloudEvents 百分号编码的既有决策（NATS/Kafka/Pulsar 文档已标注为内部约定）。
 
 ---
 
