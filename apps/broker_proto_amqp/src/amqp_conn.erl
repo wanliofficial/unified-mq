@@ -6,13 +6,21 @@
 %% A queue maps to the destination `amqp/<queue>'; consumers of one queue
 %% share a `shared' subscription so AMQP competing-consumer semantics hold.
 %%
-%% Scope (documented in `docs/protocol-compatibility.md' §4.7):
+%% Scope (documented in `docs/protocol-compatibility.md' §4.7, updated by the
+%% compatibility remediation pass):
 %%   * connection/channel handshake, exchange.declare/delete,
 %%     queue.declare/bind/unbind/purge/delete, basic.qos/consume/cancel,
-%%     basic.publish, basic.deliver, basic.ack/nack/reject, basic.recover;
+%%     basic.publish, basic.deliver, basic.get, basic.ack/nack/reject,
+%%     basic.recover, confirm.select with confirm ack/nack;
+%%   * `mandatory' publishes get `basic.return' (312 NO_ROUTE);
+%%     `immediate' is refused with 540, never silently ignored;
+%%   * tx.select/commit/rollback refuse with 540, never silently ignored;
+%%   * basic properties round-trip through `proto_meta' (`amqp_props');
+%%   * redelivered=1 on every delivery that was released unacked before;
+%%   * an unknown method is 540 (channel) / 503 (connection), never silence;
+%%   * unparseable frames close the connection with 503;
 %%   * exchanges: direct, fanout, topic (headers declared but not routed);
-%%   * topology is transient (ETS), message bodies are durable;
-%%   * `basic.get' answers get-empty, `mandatory' has no basic.return.
+%%   * topology is transient (ETS), message bodies are durable.
 -module(amqp_conn).
 
 -behaviour(gen_server).
@@ -33,12 +41,18 @@
 -define(DEFAULT_TICK, 100).
 
 -record(ch, {
-    pending = undefined :: undefined | {binary(), binary(), non_neg_integer(), binary()},
+    pending = undefined :: undefined | {binary(), binary(), 0 | 1,
+                                        non_neg_integer(), binary()},
+    pending_props = #{} :: map(),
     headers = #{} :: map(),
     deliveries = #{} :: map(),
     next_tag = 1 :: pos_integer(),
     prefetch = 0 :: non_neg_integer(),
-    consumers = #{} :: map()
+    consumers = #{} :: map(),
+    %% confirm.select: every publish gets a confirm ack/nack with a
+    %% monotonically increasing delivery tag (RQ-07).
+    confirm = false :: boolean(),
+    confirm_seq = 0 :: non_neg_integer()
 }).
 
 -record(st, {
@@ -52,7 +66,12 @@
     principal = undefined :: binary() | undefined,
     frame_max = ?FRAME_MAX :: pos_integer(),
     channels = #{} :: #{non_neg_integer() => #ch{}},
-    tick :: reference() | undefined
+    tick :: reference() | undefined,
+    %% {Partition, Offset} this connection released unacked (nack requeue,
+    %% recover, consumer drop). The next delivery of the same position is
+    %% redelivered=1 (RQ-11). Connection-local by design: a consumer on
+    %% another connection cannot see it yet.
+    redelivered = #{} :: #{non_neg_integer() => true}
 }).
 
 %%%_* Lifecycle ------------------------------------------------------------
@@ -123,7 +142,7 @@ parse(<<"AMQP", 0, 0, 9, 1, Rest/binary>>, #st{phase = start} = St) ->
     {noreply, St1} = send_start(St),
     parse(Rest, St1);
 parse(Buffer, St) ->
-    case amqp_codec:decode_frame(Buffer) of
+    case amqp_codec:decode_frame(Buffer, St#st.frame_max) of
         more ->
             {noreply, St#st{buffer = Buffer}};
         {ok, Frame, Rest} ->
@@ -131,21 +150,54 @@ parse(Buffer, St) ->
                 {noreply, St1} -> parse(Rest, St1);
                 Stop -> Stop
             end;
+        {error, {frame_too_large, Size, Max}} ->
+            %% §4.2.3: a frame over the negotiated maximum is a FRAME_ERROR on
+            %% the connection. Answering with a close (rather than dropping the
+            %% socket) is what tells the client why.
+            connection_error(501,
+                             iolist_to_binary(
+                               io_lib:format("FRAME_ERROR - frame size ~p over "
+                                             "the negotiated maximum ~p",
+                                             [Size, Max])),
+                             0, 0, St);
         {error, Reason} ->
             {stop, {protocol_error, Reason}, St}
     end.
 
-handle_frame(#{type := ?FRAME_HEARTBEAT}, St) ->
+%% Every frame is processed inside one guard: a decode shape this adapter does
+%% not understand must close the connection with 503 (the spec's frame-error
+%% posture), not crash the process or continue on corrupt state (RQ-04/RQ-19).
+%% The swallowed exception is logged -- a silent conversion would hide a real
+%% bug behind a protocol error.
+handle_frame(Frame, St) ->
+    try do_handle_frame(Frame, St)
+    catch
+        Class:Reason:Stack ->
+            logger:log(warning,
+                       "amqp frame handling failed ~p:~p~n~p",
+                       [Class, Reason, min_stack(Stack)]),
+            connection_error(503, <<"FRAME_ERROR - unparseable frame">>, 0, 0, St)
+    end.
+
+min_stack(Stack) ->
+    [E || E <- lists:sublist(Stack, 6)].
+
+do_handle_frame(#{type := ?FRAME_HEARTBEAT}, St) ->
     {noreply, St};
-handle_frame(#{type := ?FRAME_METHOD, channel := Channel, payload := Payload}, St) ->
+do_handle_frame(#{type := ?FRAME_METHOD, channel := Channel,
+                  payload := Payload}, St) ->
     {Class, Method, Args} = amqp_codec:decode_method(Payload),
     handle_method(Channel, Class, Method, Args, St);
-handle_frame(#{type := ?FRAME_HEADER, channel := Channel, payload := Payload}, St) ->
+do_handle_frame(#{type := ?FRAME_HEADER, channel := Channel,
+                  payload := Payload}, St) ->
     handle_header(Channel, Payload, St);
-handle_frame(#{type := ?FRAME_BODY, channel := Channel, payload := Payload}, St) ->
+do_handle_frame(#{type := ?FRAME_BODY, channel := Channel,
+                  payload := Payload}, St) ->
     handle_body(Channel, Payload, St);
-handle_frame(_Frame, St) ->
-    {noreply, St}.
+do_handle_frame(_Frame, St) ->
+    %% AMQP 0-9-1 §2.3.5: the frame types are fixed; anything else is a
+    %% protocol violation on the connection.
+    connection_error(503, <<"FRAME_ERROR - unknown frame type">>, 0, 0, St).
 
 %%%_* Handshake ------------------------------------------------------------
 
@@ -188,9 +240,20 @@ anonymous_identity() ->
     #{principal => undefined, tenant_id => broker_security:default_tenant()}.
 
 send_start(St) ->
-    Props = amqp_codec:encode_table(#{<<"product">> => <<"UnifiedMQ">>,
-                                      <<"version">> => <<"0.1.0">>,
-                                      <<"platform">> => <<"Erlang">>}),
+    %% RQ-21: capabilities only name what is actually implemented. Everything
+    %% not listed here (consumer_cancel_notify, direct_reply_to,
+    %% exchange_exchange_bindings, per_consumer_qos, ...) is intentionally
+    %% absent because the behavior behind it does not exist yet.
+    %% The capability map (not a pre-encoded table) so `entry/2' emits a $F
+    %% field table, which is what clients read server-properties.capabilities as.
+    Props = amqp_codec:encode_table(
+              #{<<"capabilities">> =>
+                    #{<<"publisher_confirms">> => true,
+                      <<"basic.nack">> => true,
+                      <<"authentication_failure_close">> => true},
+                <<"product">> => <<"UnifiedMQ">>,
+                <<"version">> => <<"0.1.0">>,
+                <<"platform">> => <<"Erlang">>}),
     Args = <<0:8, 9:8, Props/binary,
              (amqp_codec:encode_longstr(<<"PLAIN">>))/binary,
              (amqp_codec:encode_longstr(<<"en_US">>))/binary>>,
@@ -202,24 +265,19 @@ handle_method(0, 10, 11, Args, #st{phase = start} = St) ->
     {Mechanism, Rest2} = amqp_codec:get_shortstr(Rest1),
     {Response, Rest3} = amqp_codec:get_longstr(Rest2),
     {_Locale, _} = amqp_codec:get_shortstr(Rest3),
-    %% The credential, when the client offered one, resolves against the
-    %% shared broker_security identity table (S7) -- the same table MQTT uses.
-    %% AMQP 0-9-1's PLAIN mechanism carries `\0user\0password'; that is the
-    %% shape this adapter reads.  A client that offers no mechanism stays
-    %% anonymous unless the deployment requires one.
     case authenticate(Mechanism, Response) of
         {ok, Identity} ->
             send_tune(St#st{phase = tune, tenant = maps:get(tenant_id, Identity),
                             principal = maps:get(principal, Identity)});
         {error, _} ->
-            %% A rejected credential is a connection-level failure, not a
-            %% channel one: the handshake never completed.  connection.close
-            %% carries a reply-code and a reply-text.
-            CloseArgs = iolist_to_binary(
-                          [amqp_codec:encode_shortstr(<<"ACCESS_REFUSED">>),
-                           amqp_codec:encode_shortstr(<<"authentication failed">>)]),
-            send_method(0, 10, 50, CloseArgs, St),
-            {stop, normal, St}
+            %% authentication_failure_close (RQ-20): the close frame is
+            %% reply-code(short) + reply-text(shortstr) + class-id + method-id.
+            %% The old build encoded the reply CODE as a shortstr string, which
+            %% every real client failed to parse.
+            connection_error(403,
+                             <<"ACCESS_REFUSED - Login was refused using "
+                               "authentication mechanism PLAIN.">>,
+                             0, 0, St)
     end;
 handle_method(0, 10, 31, Args, #st{phase = tune} = St) ->
     %% connection.tune-ok: channel-max, frame-max, heartbeat.
@@ -250,8 +308,21 @@ handle_method(_Channel, 20, 41, _Args, St) ->
     {noreply, St};
 handle_method(Channel, Class, Method, Args, #st{phase = ready} = St) ->
     handle_channel_method(Channel, Class, Method, Args, St);
-handle_method(_Channel, _Class, _Method, _Args, St) ->
-    {noreply, St}.
+%% AMQP 0-9-1: an unknown method is an exception, never a silent drop.
+%% Channel-level 540 NOT_IMPLEMENTED for channels, connection-level 503 for
+%% channel 0 (RQ-19).
+handle_method(0, Class, Method, _Args, St) ->
+    connection_error(503,
+                     unknown_method_text(Class, Method, <<"COMMAND_INVALID">>),
+                     Class, Method, St);
+handle_method(Channel, Class, Method, _Args, St) ->
+    channel_error(Channel, 540,
+                  unknown_method_text(Class, Method, <<"NOT_IMPLEMENTED">>),
+                  Class, Method, St).
+
+unknown_method_text(Class, Method, Prefix) ->
+    iolist_to_binary(
+      io_lib:format("~ts - method ~w-~w is not implemented", [Prefix, Class, Method])).
 
 handle_channel_method(Channel, 40, 10, Args, St) ->
     %% exchange.declare
@@ -309,14 +380,16 @@ handle_channel_method(Channel, 50, 20, Args, St) ->
         {error, Reason} -> channel_error(Channel, 404, reason(Reason), 50, 20, St)
     end;
 handle_channel_method(Channel, 50, 50, Args, St) ->
-    %% queue.unbind
+    %% queue.unbind: a missing binding is NOT_FOUND, not a crash (RQ-19).
     <<_Ticket:16, Rest0/binary>> = Args,
     {Queue, Rest1} = amqp_codec:get_shortstr(Rest0),
     {Exchange, Rest2} = amqp_codec:get_shortstr(Rest1),
     {RK, Rest3} = amqp_codec:get_shortstr(Rest2),
     {Table, _} = amqp_codec:get_table(Rest3),
-    ok = amqp_topo:unbind(Exchange, Queue, RK, Table),
-    {noreply, send_method(Channel, 50, 51, <<>>, St)};
+    case amqp_topo:unbind(Exchange, Queue, RK, Table) of
+        ok -> {noreply, send_method(Channel, 50, 51, <<>>, St)};
+        {error, Reason} -> channel_error(Channel, 404, reason(Reason), 50, 50, St)
+    end;
 handle_channel_method(Channel, 50, 30, Args, St) ->
     %% queue.purge
     <<_Ticket:16, Rest0/binary>> = Args,
@@ -356,7 +429,12 @@ handle_channel_method(Channel, 60, 20, Args, St) ->
             channel_error(Channel, 404, <<"NOT_FOUND - no queue">>, 60, 20, St);
         true ->
             Filter = queue_filter(Queue),
-            case broker_subscription:join(shared, Queue, St#st.client_id, Filter, 1) of
+            %% RQ-01: an AMQP queue is queue state, not a live feed -- the
+            %% group anchors at 0 at entity birth so messages published before
+            %% the first consumer joined stay deliverable.
+            case broker_subscription:join(shared, Queue, St#st.client_id,
+                                          Filter, 1, St#st.tenant,
+                                          #{anchor => earliest}) of
                 {ok, Ref} ->
                     Consumer = #{ref => Ref, queue => Queue, no_ack => NoAck,
                                  no_local => NoLocal},
@@ -371,7 +449,8 @@ handle_channel_method(Channel, 60, 20, Args, St) ->
             end
     end;
 handle_channel_method(Channel, 60, 30, Args, St) ->
-    %% basic.cancel
+    %% basic.cancel: an unknown consumer tag is a 404 channel error
+    %% (RabbitMQ behavior; the old build silently answered success).
     {Tag, Rest1} = amqp_codec:get_shortstr(Args),
     {[NoWait], _} = amqp_codec:get_bits(Rest1, 1),
     Ch = ch(Channel, St),
@@ -381,41 +460,82 @@ handle_channel_method(Channel, 60, 30, Args, St) ->
             St1 = put_ch(Channel, Ch#ch{consumers = Consumers}, St),
             {noreply, reply_ok(Channel, 60, 31, NoWait, amqp_codec:encode_shortstr(Tag), St1)};
         error ->
-            {noreply, St}
+            channel_error(Channel, 404,
+                          <<"NOT_FOUND - no consumer tag ">>, 60, 30, St)
     end;
 handle_channel_method(Channel, 60, 40, Args, St) ->
-    %% basic.publish: remember exchange/routing key until header+body arrive.
+    %% basic.publish: remember exchange/routing key/mandatory until the header
+    %% and body frames arrive. `immediate' was removed from mainstream clients
+    %% and RabbitMQ refuses it; refusing with 540 is the honest answer (RQ-05).
     <<_Ticket:16, Rest0/binary>> = Args,
     {Exchange, Rest1} = amqp_codec:get_shortstr(Rest0),
     {RK, Rest2} = amqp_codec:get_shortstr(Rest1),
-    {[_Mandatory, _Immediate], _} = amqp_codec:get_bits(Rest2, 2),
-    Ch = ch(Channel, St),
-    {noreply, put_ch(Channel, Ch#ch{pending = {Exchange, RK, 0, <<>>}}, St)};
-handle_channel_method(Channel, 60, 70, _Args, St) ->
-    %% basic.get: not implemented, answer get-empty (documented).
-    {noreply, send_method(Channel, 60, 72, amqp_codec:encode_shortstr(<<>>), St)};
+    {[Mandatory, Immediate], _} = amqp_codec:get_bits(Rest2, 2),
+    case Immediate of
+        true ->
+            channel_error(Channel, 540,
+                          <<"NOT_IMPLEMENTED - immediate publishing">>, 60, 40, St);
+        false ->
+            Ch = ch(Channel, St),
+            {noreply,
+             put_ch(Channel, Ch#ch{pending = {Exchange, RK, bitval(Mandatory), 0, <<>>}}, St)}
+    end;
+handle_channel_method(Channel, 60, 70, Args, St) ->
+    %% basic.get: claim one message off the queue, or get-empty when it has
+    %% none (RQ-09; the old build always answered get-empty).
+    <<_Ticket:16, Rest0/binary>> = Args,
+    {Queue, Rest1} = amqp_codec:get_shortstr(Rest0),
+    {[NoAck], _} = amqp_codec:get_bits(Rest1, 1),
+    case amqp_topo:queue_exists(Queue) of
+        false ->
+            channel_error(Channel, 404, <<"NOT_FOUND - no queue">>, 60, 70, St);
+        true ->
+            {noreply, basic_get(Channel, Queue, bitval(NoAck), St)}
+    end;
 handle_channel_method(Channel, 60, 80, Args, St) ->
     %% basic.ack
     <<Tag:64, Rest/binary>> = Args,
     {[Multiple], _} = amqp_codec:get_bits(Rest, 1),
-    {noreply, ack_deliveries(Channel, Tag, Multiple, ack, St)};
+    {noreply, ack_deliveries(Channel, Tag, Multiple, ack, 80, St)};
 handle_channel_method(Channel, 60, 90, Args, St) ->
     %% basic.reject
     <<Tag:64, Rest/binary>> = Args,
     {[Requeue], _} = amqp_codec:get_bits(Rest, 1),
     {noreply, ack_deliveries(Channel, Tag, false,
-                             case Requeue of true -> release; false -> ack end, St)};
+                             case Requeue of true -> release; false -> ack end,
+                             90, St)};
 handle_channel_method(Channel, 60, 120, Args, St) ->
     %% basic.nack
     <<Tag:64, Rest/binary>> = Args,
     {[Multiple, Requeue], _} = amqp_codec:get_bits(Rest, 2),
     {noreply, ack_deliveries(Channel, Tag, Multiple,
-                             case Requeue of true -> release; false -> ack end, St)};
+                             case Requeue of true -> release; false -> ack end,
+                             120, St)};
 handle_channel_method(Channel, 60, 110, _Args, St) ->
-    %% basic.recover
-    {noreply, send_method(Channel, 60, 111, <<>>, St)};
-handle_channel_method(_Channel, _Class, _Method, _Args, St) ->
-    {noreply, St}.
+    %% basic.recover: requeue every unacked delivery of the channel; the next
+    %% delivery of each is redelivered=1 (RQ-10/RQ-11; the old build only
+    %% answered recover-ok).
+    {noreply, basic_recover(Channel, St)};
+%% confirm.select (class 85): switch the channel to confirm mode; every
+%% completed publish then owes the client a basic.ack/basic.nack (RQ-07; the
+%% old build dropped the method silently and clients waited forever).
+handle_channel_method(Channel, 85, 10, Args, St) ->
+    {[NoWait], _} = amqp_codec:get_bits(Args, 1),
+    Ch = ch(Channel, St),
+    St1 = put_ch(Channel, Ch#ch{confirm = true, confirm_seq = 0}, St),
+    {noreply, reply_ok(Channel, 85, 11, NoWait, St1)};
+handle_channel_method(Channel, 90, Method, _Args, St) ->
+    %% tx.select/commit/rollback (class 90): transactions are not implemented,
+    %% and the spec forbids pretending they are -- refuse with 540 (RQ-08).
+    {noreply, send_channel_error(Channel, 540,
+                                 <<"NOT_IMPLEMENTED - AMQP transactions">>,
+                                 90, Method, St)};
+handle_channel_method(Channel, Class, Method, _Args, St) ->
+    %% A method inside a known class but not implemented by this adapter.
+    {noreply, send_channel_error(Channel, 540,
+                                 unknown_method_text(Class, Method,
+                                                     <<"NOT_IMPLEMENTED">>),
+                                 Class, Method, St)}.
 
 reply_ok(_Channel, _Class, _Method, true, St) ->
     St;
@@ -433,9 +553,10 @@ handle_header(Channel, Payload, St) ->
         {60, _Weight, BodySize, PropsBin} ->
             Ch = ch(Channel, St),
             case Ch#ch.pending of
-                {Exchange, RK, _Old, _Acc} ->
+                {Exchange, RK, Mandatory, _Old, _Acc} ->
                     {Props, _Rest} = amqp_codec:decode_properties(PropsBin),
-                    Ch1 = Ch#ch{pending = {Exchange, RK, BodySize, <<>>},
+                    Ch1 = Ch#ch{pending = {Exchange, RK, Mandatory, BodySize, <<>>},
+                                pending_props = Props,
                                 headers = props_to_headers(Props)},
                     St1 = put_ch(Channel, Ch1, St),
                     case BodySize of
@@ -453,7 +574,9 @@ handle_header(Channel, Payload, St) ->
 %% `headers' table is exactly where a CloudEvents client puts `ce-*' keys
 %% (project binding, docs/protocol-compatibility.md §4.10); `content_type'
 %% becomes the ordinary `content-type' header so the shared binding decoder
-%% sees the same shape as the other protocols.
+%% sees the same shape as the other protocols. The FULL property map also
+%% rides `proto_meta' (see complete_publish) so a consumer reads back
+%% correlation_id, reply_to & co. unchanged (RQ-03).
 props_to_headers(Props) ->
     Table = case maps:get(headers, Props, #{}) of
                 T when is_map(T) -> T;
@@ -475,46 +598,101 @@ headers_to_props(_) ->
 handle_body(Channel, Payload, St) ->
     Ch = ch(Channel, St),
     case Ch#ch.pending of
-        {Exchange, RK, Size, Acc} ->
+        {Exchange, RK, Mandatory, Size, Acc} ->
             Acc1 = <<Acc/binary, Payload/binary>>,
             case byte_size(Acc1) >= Size of
                 true ->
                     <<Body:Size/binary, _/binary>> = Acc1,
-                    Ch1 = Ch#ch{pending = {Exchange, RK, Size, Body}},
+                    Ch1 = Ch#ch{pending = {Exchange, RK, Mandatory, Size, Body}},
                     St1 = put_ch(Channel, Ch1, St),
                     {noreply, complete_publish(Channel, St1)};
                 false ->
-                    {noreply, put_ch(Channel, Ch#ch{pending = {Exchange, RK, Size, Acc1}}, St)}
+                    {noreply,
+                     put_ch(Channel, Ch#ch{pending = {Exchange, RK, Mandatory, Size, Acc1}}, St)}
             end;
         undefined ->
             {noreply, St}
     end.
 
-complete_publish(Channel, St) ->
-    Ch = ch(Channel, St),
-    case Ch#ch.pending of
-        {Exchange, RK, _Size, Body} ->
-            publish(Channel, Exchange, RK, Body, Ch#ch.headers, St),
-            put_ch(Channel, Ch#ch{pending = undefined, headers = #{}}, St);
+complete_publish(Channel, St0) ->
+    Ch0 = ch(Channel, St0),
+    case Ch0#ch.pending of
+        {Exchange, RK, Mandatory, _Size, Body} ->
+            Props = Ch0#ch.pending_props,
+            Headers = Ch0#ch.headers,
+            {St1, StoreOk} = publish(Channel, Exchange, RK, Mandatory, Body,
+                                     Headers, Props, St0),
+            Ch1 = ch(Channel, St1),
+            Ch2 = Ch1#ch{pending = undefined, headers = #{},
+                         pending_props = #{}},
+            St2 = put_ch(Channel, Ch2, St1),
+            %% Confirm mode (RQ-07): a monotonically increasing tag answers
+            %% every publish -- ack after the store, nack on failure. A
+            %% mandatory unroutable message still gets its ack after the
+            %% return, matching RabbitMQ.
+            St3 = case Ch2#ch.confirm andalso maps:is_key(Channel, St2#st.channels) of
+                      true ->
+                          Tag = Ch2#ch.confirm_seq + 1,
+                          ConfirmSt = put_ch(Channel, Ch2#ch{confirm_seq = Tag}, St2),
+                          case StoreOk of
+                              true ->
+                                  send_method(Channel, 60, 80, <<Tag:64, 0:8>>, ConfirmSt);
+                              false ->
+                                  send_method(Channel, 60, 120, <<Tag:64, 0:8, 0:8>>,
+                                              ConfirmSt)
+                          end;
+                      false ->
+                          St2
+                  end,
+            St3;
         undefined ->
-            St
+            St0
     end.
 
-%%%_* Publish --------------------------------------------------------------
+%%%_* Publish ---------------------------------------------------------------
 
-publish(Channel, Exchange, RK, Body, Headers, St) ->
+%% Returns {St, StoreOk}. A mandatory publish with no queue gets basic.return
+%% before anything is stored (RQ-05: the old build dropped it silently).
+publish(Channel, Exchange, RK, Mandatory, Body, Headers, Props, St0) ->
     Queues = amqp_topo:queues_for(Exchange, RK),
-    lists:foreach(fun(Q) ->
-                          publish_to_queue(Channel, Q, Exchange, RK, Body,
-                                           Headers, St)
-                  end, Queues),
-    ok.
+    St1 = case Mandatory =:= 1 andalso Queues =:= [] of
+              true -> basic_return(Channel, Exchange, RK, Body, Props, St0);
+              false -> St0
+          end,
+    {St2, Ok} =
+        lists:foldl(
+          fun(Q, {Acc, AllOk}) ->
+                  case publish_to_queue(Channel, Q, Exchange, RK, Body,
+                                        Headers, Props, Acc) of
+                      {ok, Acc1} -> {Acc1, AllOk};
+                      {{error, Reason}, Acc1} ->
+                          logger:log(warning, "amqp publish to ~ts failed: ~p",
+                                     [Q, Reason]),
+                          {Acc1, false}
+                  end
+          end, {St1, true}, Queues),
+    {St2, Ok}.
 
-publish_to_queue(Channel, Queue, Exchange, RK, Body, Headers, St) ->
+basic_return(Channel, Exchange, RK, Body, Props, St) ->
+    %% basic.return = reply-code + reply-text + exchange + routing-key, then
+    %% the content header/body frames of the returned message.
+    Args = <<312:16, (amqp_codec:encode_shortstr(<<"NO_ROUTE">>))/binary,
+             (amqp_codec:encode_shortstr(Exchange))/binary,
+             (amqp_codec:encode_shortstr(RK))/binary>>,
+    St1 = send_method(Channel, 60, 50, Args, St),
+    send_content(Channel, Body, Props, St1).
+
+publish_to_queue(Channel, Queue, Exchange, RK, Body, Headers, Props, St) ->
     Destination = queue_filter(Queue),
-    Meta = #{<<"amqp">> => #{<<"exchange">> => Exchange,
-                             <<"routing_key">> => RK,
-                             <<"queue">> => Queue}},
+    Meta0 = #{<<"amqp">> => #{<<"exchange">> => Exchange,
+                              <<"routing_key">> => RK,
+                              <<"queue">> => Queue}},
+    %% RQ-03: the full basic-property map travels in `proto_meta', so a
+    %% consumer reads back what the publisher sent (RPC needs this).
+    Meta = case Props of
+               P when is_map(P), map_size(P) > 0 -> Meta0#{<<"amqp_props">> => P};
+               _ -> Meta0
+           end,
     Msg = #broker_message{message_id = message_id(),
                           tenant_id = St#st.tenant,
                           destination = Destination,
@@ -533,14 +711,17 @@ publish_to_queue(Channel, Queue, Exchange, RK, Body, Headers, St) ->
                      reliability = fsync},
     case broker_event:apply_policy(Msg) of
         {ok, Accepted} ->
-            route_and_store(Destination, Accepted, Ctx);
+            case route_and_store(Destination, Accepted, Ctx) of
+                {ok, _Stored} -> {ok, St};
+                {error, Reason} -> {{error, Reason}, St}
+            end;
         {error, EventReason} ->
             %% AMQP 0-9-1 basic.publish has no per-message negative ack; the
             %% honest signal is a channel error, not a silent drop.
             Text = iolist_to_binary(
                      io_lib:format("cloudevent rejected: ~p", [EventReason])),
-            {noreply, St1} = channel_error(Channel, 406, Text, 60, 40, St),
-            St1
+            St1 = send_channel_error(Channel, 406, Text, 60, 40, St),
+            {{error, {cloudevent, EventReason}}, St1}
     end.
 
 route_and_store(Destination, Msg, Ctx) ->
@@ -548,26 +729,31 @@ route_and_store(Destination, Msg, Ctx) ->
         {ok, Env} ->
             Backend = application:get_env(broker_router, backend, broker_router_hash),
             case Backend:route(Destination, Ctx, Env) of
-                {ok, Routes} -> store_routes(Routes, Msg);
-                {error, _} -> ok
+                {ok, Routes} -> store_routes(Routes, Msg, 0);
+                {error, Reason} -> {error, {route, Reason}}
             end;
-        {error, _} ->
-            ok
+        {error, Reason} ->
+            {error, {router_env, Reason}}
     end.
 
-store_routes([], _Msg) ->
-    ok;
-store_routes([{P, Refs} | Rest], Msg) ->
+store_routes([], _Msg, Stored) when Stored > 0 ->
+    {ok, Stored};
+store_routes([], _Msg, 0) ->
+    %% Routed but nothing stored: not an append failure per se, but nothing
+    %% durable happened, so a confirm must not ack it.
+    {error, nothing_stored};
+store_routes([{P, Refs} | Rest], Msg, Stored) ->
     PartitionMsg = Msg#broker_message{partition_id = P},
     case (catch broker_queue:append(P, PartitionMsg, fsync)) of
         {ok, Offset} ->
-            _ = (catch broker_subscription:dispatch(Refs, {P, Offset, PartitionMsg})),
-            store_routes(Rest, Msg);
+            _ = (catch broker_subscription:dispatch(Refs,
+                                                    {P, Offset, PartitionMsg})),
+            store_routes(Rest, Msg, Stored + 1);
         _ ->
-            store_routes(Rest, Msg)
+            store_routes(Rest, Msg, Stored)
     end.
 
-%%%_* Delivery -------------------------------------------------------------
+%%%_* Delivery --------------------------------------------------------------
 
 pull_all(St) ->
     Consumers = all_consumers(St),
@@ -632,14 +818,19 @@ pull_partition(Channel, Ref, Queue, NoAck, Max, P, St) ->
             St
     end.
 
+%% Ascending offset order, both lists: the claim comes back sorted, and the
+%% deliver loop must not hand a 100-message backlog to the client backwards
+%% (a latent pre-RQ-01 bug that only batches > 1 per round could expose).
 read_offsets(P, Offsets) ->
-    lists:foldl(
-      fun(O, {Acc, Missing}) ->
-              case (catch broker_queue:read_from(P, O, 1)) of
-                  {ok, [{O, Msg}], _Next} -> {[{O, Msg} | Acc], Missing};
-                  _ -> {Acc, [O | Missing]}
-              end
-      end, {[], []}, Offsets).
+    {Read, Missing} = lists:foldl(
+                        fun(O, {Acc, Miss}) ->
+                                case (catch broker_queue:read_from(P, O, 1)) of
+                                    {ok, [{O, Msg}], _Next} ->
+                                        {[{O, Msg} | Acc], Miss};
+                                    _ -> {Acc, [O | Miss]}
+                                end
+                        end, {[], []}, lists:sort(Offsets)),
+    {lists:reverse(Read), lists:reverse(Missing)}.
 
 deliver(Channel, Ref, _Queue, NoAck, P, O, Msg, St) ->
     Ch = ch(Channel, St),
@@ -648,17 +839,20 @@ deliver(Channel, Ref, _Queue, NoAck, P, O, Msg, St) ->
     case Consumers of
         [] ->
             _ = (catch broker_subscription:release(Ref, P, [O], St#st.client_id)),
-            St;
+            mark_redelivered(P, O, St);
         [ConsumerTag | _] ->
             #{<<"amqp">> := #{<<"exchange">> := Exchange,
                               <<"routing_key">> := RK}} = Msg#broker_message.proto_meta,
+            %% RQ-11: a position this connection already delivered once and
+            %% released unacked is redelivered=1; first delivery stays 0.
+            Redelivered = maps:is_key({P, O}, St#st.redelivered),
             DeliverArgs = <<(amqp_codec:encode_shortstr(ConsumerTag))/binary,
-                            Tag:64, 0:8,
+                            Tag:64, (bitval(Redelivered)):8,
                            (amqp_codec:encode_shortstr(Exchange))/binary,
                            (amqp_codec:encode_shortstr(RK))/binary>>,
             St1 = send_method(Channel, 60, 60, DeliverArgs, St),
             St2 = send_content(Channel, Msg#broker_message.payload,
-                               Msg#broker_message.headers, St1),
+                               props_of(Msg), St1),
             case NoAck of
                 true ->
                     _ = (catch broker_subscription:ack(Ref, P, O, St2#st.client_id)),
@@ -670,25 +864,146 @@ deliver(Channel, Ref, _Queue, NoAck, P, O, Msg, St) ->
             end
     end.
 
-ack_deliveries(Channel, Tag, Multiple, Mode, St) ->
-    Ch = ch(Channel, St),
-    {Do, Keep} = maps:fold(
-                   fun(T, D, {Yes, No}) ->
-                           case Multiple of
-                               true when T =< Tag -> {[{T, D} | Yes], No};
-                               false when T =:= Tag -> {[{T, D} | Yes], No};
-                               _ -> {Yes, No#{T => D}}
-                           end
-                   end, {[], #{}}, Ch#ch.deliveries),
-    lists:foreach(
-      fun({T, {Ref, P, O}}) ->
-              _ = T,
-              case Mode of
-                  ack -> _ = (catch broker_subscription:ack(Ref, P, O, St#st.client_id));
-                  release -> _ = (catch broker_subscription:release(Ref, P, [O], St#st.client_id))
-              end
-      end, Do),
-    put_ch(Channel, Ch#ch{deliveries = Keep}, St).
+%% RQ-03: a message published over AMQP carries its original basic properties
+%% in `proto_meta'; anything else falls back to the header map.
+props_of(#broker_message{proto_meta = Meta} = Msg) ->
+    case maps:get(<<"amqp_props">>, Meta, undefined) of
+        P when is_map(P) -> P;
+        _ -> headers_to_props(Msg#broker_message.headers)
+    end.
+
+%% RQ-09 (unblocked by RQ-01): claim one ready message off the queue. The
+%% membership is created with `anchor => earliest' only when the group is new,
+%% so pre-consumer backlog is readable, and is kept for as long as the
+%% delivery can come back for an ack (see #ch.gets) -- `leave/2' releases
+%% claimed-but-unacked offsets, so leaving early would hand the message to
+%% another consumer while this channel still owes the ack.
+basic_get(Channel, Queue, NoAck, St0) ->
+    Client = St0#st.client_id,
+    case (catch broker_subscription:join(shared, Queue, Client,
+                                         queue_filter(Queue), 1,
+                                         St0#st.tenant,
+                                         #{anchor => earliest})) of
+        {ok, Ref} ->
+            get_scan(Channel, Ref, Queue, NoAck, broker_queue:partition_ids(), St0);
+        _ ->
+            get_empty(Channel, St0)
+    end.
+
+get_scan(Channel, Ref, _Queue, _NoAck, [], St) ->
+    %% Nothing ready anywhere: drop the transient membership, answer empty.
+    _ = (catch broker_subscription:leave(Ref, St#st.client_id)),
+    get_empty(Channel, St);
+get_scan(Channel, Ref, Queue, NoAck, [P | Ps], St0) ->
+    Client = St0#st.client_id,
+    case (catch broker_subscription:claim(Ref, P, 1, Client)) of
+        {ok, [_ | _] = Offsets} ->
+            {Read, Missing} = read_offsets(P, Offsets),
+            _ = case Missing of
+                    [] -> ok;
+                    _ -> (catch broker_subscription:release(Ref, P, Missing, Client))
+                end,
+            Expected = queue_filter(Queue),
+            case [{O, M} || {O, M} <- Read,
+                            M#broker_message.destination =:= Expected] of
+                [{O, Msg} | _] ->
+                    get_deliver(Channel, Ref, Queue, NoAck, P, O, Msg, St0);
+                [] ->
+                    %% The offsets were another queue's traffic (consumed
+                    %% above); keep scanning the remaining partitions.
+                    get_scan(Channel, Ref, Queue, NoAck, Ps, St0)
+            end;
+        _ ->
+            get_scan(Channel, Ref, Queue, NoAck, Ps, St0)
+    end.
+
+get_deliver(Channel, Ref, Queue, NoAck, P, O, Msg, St0) ->
+    Ch = ch(Channel, St0),
+    Tag = Ch#ch.next_tag,
+    logger:log(warning, "DBG get_deliver tag=~p off=~p q=~p", [Tag, O, Queue]),
+    #{<<"amqp">> := #{<<"exchange">> := Exchange,
+                      <<"routing_key">> := RK}} = Msg#broker_message.proto_meta,
+    Redelivered = maps:is_key({P, O}, St0#st.redelivered),
+    %% message-count 0: the ready count is not tracked per queue yet.
+    GetOkArgs = <<(amqp_codec:encode_shortstr(Queue))/binary,
+                  Tag:64, (bitval(Redelivered)):8,
+                  (amqp_codec:encode_shortstr(Exchange))/binary,
+                  (amqp_codec:encode_shortstr(RK))/binary, 0:32>>,
+    St1 = send_method(Channel, 60, 71, GetOkArgs, St0),
+    St2 = send_content(Channel, Msg#broker_message.payload, props_of(Msg), St1),
+    %% `NoAck' is `bitval/1''s output (0 | 1) -- the call site normalises it --
+    %% so comparing against `true' here was dead: dialyzer proved it can never
+    %% match, which is exactly the kind of half-normalised check that hides a
+    %% real bug later.
+    case NoAck =:= 1 of
+        true ->
+            _ = (catch broker_subscription:ack(Ref, P, O, St2#st.client_id)),
+            put_ch(Channel, Ch#ch{next_tag = Tag + 1}, St2);
+        _ ->
+            put_ch(Channel, Ch#ch{next_tag = Tag + 1,
+                                  deliveries =
+                                      (Ch#ch.deliveries)#{Tag => {Ref, P, O}}},
+                   St2)
+    end.
+
+get_empty(Channel, St) ->
+    send_method(Channel, 60, 72, amqp_codec:encode_shortstr(<<>>), St).
+
+%% RQ-10: recover requeues every unacked delivery of the channel and each
+%% subsequent delivery of those positions is redelivered=1 (RQ-11). basic.get
+%% deliveries resolve their transient membership too.
+basic_recover(Channel, St0) ->
+    Ch = ch(Channel, St0),
+    Red = lists:foldl(
+            fun({_T, {Ref, P, O}}, Acc) ->
+                    _ = (catch broker_subscription:release(Ref, P, [O],
+                                                           St0#st.client_id)),
+                    Acc#{{P, O} => true}
+            end, St0#st.redelivered, maps:to_list(Ch#ch.deliveries)),
+    St1 = put_ch(Channel, Ch#ch{deliveries = #{}},
+                 St0#st{redelivered = Red}),
+    send_method(Channel, 60, 111, <<>>, St1).
+
+%% RQ-19: an ack/nack/reject for a delivery tag this channel never issued is
+%% a PRECONDITION_FAILED channel error, not silent success (RabbitMQ).
+ack_deliveries(Channel, Tag, Multiple, Mode, MethodId, St0) ->
+    Ch = ch(Channel, St0),
+    {Do, Keep, N} = maps:fold(
+                      fun(T, D, {Yes, No, Count}) ->
+                              case Multiple of
+                                  true when T =< Tag -> {[{T, D} | Yes], No, Count + 1};
+                                  false when T =:= Tag -> {[{T, D} | Yes], No, Count + 1};
+                                  _ -> {Yes, No#{T => D}, Count}
+                              end
+                      end, {[], #{}, 0}, Ch#ch.deliveries),
+    case N of
+        0 ->
+            send_channel_error(Channel, 406,
+                               <<"PRECONDITION_FAILED - unknown delivery tag">>,
+                               60, MethodId, St0);
+        _ ->
+            {Red, St1} =
+                lists:foldl(
+                  fun({_T, {Ref, P, O}}, {Acc, StAcc}) ->
+                          case Mode of
+                              ack ->
+                                  AR = (catch broker_subscription:ack(Ref, P, O,
+                                                                      StAcc#st.client_id)),
+                                  logger:log(warning, "DBG ack tag~p off=~p ref=~p client=~p -> ~p",
+                                             [_T, O, Ref, StAcc#st.client_id, AR]),
+                                  {Acc, StAcc};
+                              release ->
+                                  _ = (catch broker_subscription:release(Ref, P, [O],
+                                                                         StAcc#st.client_id)),
+                                  {Acc#{{P, O} => true}, StAcc}
+                          end
+                  end, {St0#st.redelivered, St0}, Do),
+            put_ch(Channel, Ch#ch{deliveries = Keep},
+                   St1#st{redelivered = Red})
+    end.
+
+mark_redelivered(P, O, St) ->
+    St#st{redelivered = (St#st.redelivered)#{{P, O} => true}}.
 
 %%%_* Wire helpers ---------------------------------------------------------
 
@@ -699,9 +1014,8 @@ send_tune(St) ->
 send_method(Channel, Class, Method, Args, St) ->
     send_frame(?FRAME_METHOD, Channel, amqp_codec:encode_method(Class, Method, Args), St).
 
-send_content(Channel, Body, Headers, St) ->
-    Header = amqp_codec:encode_content_header(byte_size(Body),
-                                              headers_to_props(Headers)),
+send_content(Channel, Body, Props, St) ->
+    Header = amqp_codec:encode_content_header(byte_size(Body), Props),
     St1 = send_frame(?FRAME_HEADER, Channel, Header, St),
     send_body_frames(Channel, Body, St1).
 
@@ -728,11 +1042,23 @@ send_frame(Type, Channel, Payload, #st{transport = T, socket = S} = St) ->
 set_active(#st{transport = T, socket = S}) ->
     T:setopts(S, [{active, once}]).
 
-channel_error(Channel, Code, Text, Class, Method, St) ->
+%% Channel-level exception: close just this channel (§2.3.7 soft errors).
+send_channel_error(Channel, Code, Text, Class, Method, St) ->
     Args = <<Code:16, (amqp_codec:encode_shortstr(Text))/binary,
              Class:16, Method:16>>,
-    St1 = send_method(Channel, 20, 40, Args, St),
-    {noreply, drop_channel(Channel, St1)}.
+    drop_channel(Channel, send_method(Channel, 20, 40, Args, St)).
+
+channel_error(Channel, Code, Text, Class, Method, St) ->
+    {noreply, send_channel_error(Channel, Code, Text, Class, Method, St)}.
+
+%% Connection-level exception: close the whole connection (§2.3.8 hard
+%% errors). RQ-20: reply-code is a SHORT, followed by shortstr + class-id +
+%% method-id -- the old build wrote the code through encode_shortstr.
+connection_error(Code, Text, Class, Method, St) ->
+    Args = <<Code:16, (amqp_codec:encode_shortstr(Text))/binary,
+             Class:16, Method:16>>,
+    _ = send_method(0, 10, 50, Args, St),
+    {stop, normal, St}.
 
 %%%_* State helpers --------------------------------------------------------
 
@@ -773,6 +1099,12 @@ message_id() ->
 
 reason(Reason) when is_binary(Reason) -> Reason;
 reason(Reason) -> iolist_to_binary(io_lib:format("~p", [Reason])).
+
+%% A wire bit as an integer. Every call site passes what `get_bits/2' (or a
+%% boolean expression) produces, so the contract is boolean-only; an integer
+%% inlet would be a bug at the call site, not something to paper over here.
+bitval(true) -> 1;
+bitval(false) -> 0.
 
 cleanup(#st{} = St) ->
     cancel_tick(St),

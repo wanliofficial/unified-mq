@@ -24,7 +24,11 @@ run() ->
     ok = application:set_env(broker_subscription, data_dir, DataDir),
     ok = application:set_env(broker_retain, data_dir, DataDir),
     ok = application:set_env(broker_event, policy, pass_through),
-    ok = application:set_env(broker_security, users, []),
+    %% Same identity table as `amqp_conn_SUITE init_per_testcase' (whose
+    %% client dials guest/guest): an empty table rejects every credential.
+    ok = application:set_env(broker_security, users,
+                             [{<<"guest">>, #{password => <<"guest">>,
+                                             tenant_id => <<"t0">>}}]),
     ok = application:set_env(broker_security, acl, allow),
     ok = application:set_env(broker_proto_amqp, listeners,
                              [#{port => 0, ref => {amqp, 0},
