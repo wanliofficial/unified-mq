@@ -23,6 +23,7 @@
 -module(broker_metrics).
 
 -export([init/0, inc/1, inc/2, observe/2, gauge/2, gauge_add/2,
+         connection_opened/0, connection_closed/1,
          snapshot/0, reset/0, keys/0, key_types/0, p99/1]).
 
 -export_type([key/0, histogram/0]).
@@ -133,6 +134,44 @@ gauge_add(Key, Delta) when is_integer(Delta) ->
     end;
 gauge_add(_Key, Delta) ->
     {error, {invalid_gauge_delta, Delta}}.
+
+%% @doc Record one live connection in the node-level gauges: `connections_current'
+%% goes up, and `connections_peak' follows when this is a new high-water mark.
+%%
+%% This exists so every protocol frontend counts the same way. Before S12-B only
+%% the MQTT family wrote these gauges, so `connections_current' did not describe
+%% the node. The two keys are ADR-016's existing ones: this adds no key, and it
+%% is deliberately a helper rather than new counters (`conn_waiting',
+%% `conn_rejected_total' are S12 non-deliverables, ADR-032 D7).
+%%
+%% The return value is what makes the pair safe when metrics are off: pass it
+%% back to `connection_closed/1' so a connection that was never counted is never
+%% decremented.
+-spec connection_opened() -> boolean().
+connection_opened() ->
+    case gauge_add(connections_current, 1) of
+        N when is_integer(N), N >= 1 ->
+            bump_peak(N),
+            true;
+        _ ->
+            %% Metrics disabled, or not started: nothing was added.
+            false
+    end.
+
+-spec connection_closed(boolean()) -> ok.
+connection_closed(true) ->
+    _ = gauge_add(connections_current, -1),
+    ok;
+connection_closed(_NotCounted) ->
+    ok.
+
+%% Best-effort high-water mark: a lost update under a connect storm can only
+%% under-report, never over-report.
+bump_peak(N) ->
+    case gauge_add(connections_peak, 0) of
+        Peak when is_integer(Peak), N > Peak -> _ = gauge(connections_peak, N), ok;
+        _ -> ok
+    end.
 
 -spec observe(key(), non_neg_integer()) -> ok | {error, term()}.
 observe(Key, Us) when is_integer(Us), Us >= 0 ->

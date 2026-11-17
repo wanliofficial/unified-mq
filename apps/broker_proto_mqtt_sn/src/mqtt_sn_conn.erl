@@ -137,10 +137,7 @@ terminate(Reason, #st{} = St) ->
         true -> publish_will(St);
         false -> ok
     end,
-    case St#st.counted of
-        true -> _ = broker_metrics:gauge_add(connections_current, -1);
-        false -> ok
-    end,
+    ok = broker_metrics:connection_closed(St#st.counted),
     detach(St),
     ok.
 
@@ -275,6 +272,7 @@ on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
                        true -> session_subs(ClientId);
                        false -> #{}
                    end,
+            Counted = broker_metrics:connection_opened(),
             St1 = St#st{client_id = ClientId, clean = Clean, duration = Dur,
                         subs = Subs,
                         %% A fresh CONNECT clears the topic table: ids handed out
@@ -282,8 +280,7 @@ on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
                         %% carry across a reconnect (it re-REGISTERs, which is
                         %% the contract).
                         topics = #{},
-                        counted = true},
-            _ = broker_metrics:gauge_add(connections_current, 1),
+                        counted = Counted},
             gen_server:cast(St#st.listener, {sn_bind, self(), ClientId}),
             case Will of
                 true ->
@@ -642,11 +639,11 @@ wake_and_answer(#st{asleep = true} = St) ->
     St1 = cancel_sleep(St),
     gen_server:cast(St1#st.listener, {sn_wake, self()}),
     _ = broker_subscription:attach(St1#st.client_id, self(), not St1#st.clean),
-    _ = broker_metrics:gauge_add(connections_current, 1),
+    Counted = broker_metrics:connection_opened(),
     %% Wake means "I am back": replay what piled up while detached, then answer
     %% the ping. The client sees PINGRESP after its backlog, which is the order
     %% the sleep contract implies (the backlog is owed to it either way).
-    St2 = (St1#st{asleep = false, counted = true}),
+    St2 = (St1#st{asleep = false, counted = Counted}),
     case catch_up(St2) of
         {ok, St3} -> reply(arm_keepalive(St3#st.duration, St3), #{type => pingresp});
         {stop, _Reason, St3} -> St3
@@ -681,7 +678,7 @@ enter_sleep(St) ->
     %% by definition (it never entered storage), which the capability matrix
     %% states rather than hides.
     _ = broker_subscription:detach(St#st.client_id, self()),
-    _ = broker_metrics:gauge_add(connections_current, -1),
+    ok = broker_metrics:connection_closed(St#st.counted),
     TRef = erlang:start_timer(St#st.duration * 1000, self(), sleep_expired),
     cancel_keepalive(St#st{asleep = true, counted = false, sleep_timer = TRef}).
 

@@ -2206,28 +2206,14 @@ outbound_size_ok(_Bin, _D) ->
     true.
 
 %% connections_current is a gauge tracking a live count, so it needs the atomic
-%% read-modify-write of gauge_add/2; the peak is a best-effort max (a lost
-%% update under a connect storm can only under-report, never over-report).
+%% read-modify-write of gauge_add/2; the shared helper also maintains the peak
+%% the same way for every protocol frontend (S12-B, ADR-032 D7).
 count_connection(D) ->
-    case broker_metrics:gauge_add(connections_current, 1) of
-        N when is_integer(N), N >= 1 ->
-            case broker_metrics:gauge_add(connections_peak, 0) of
-                Peak when is_integer(Peak), N > Peak ->
-                    broker_metrics:gauge(connections_peak, N);
-                _ ->
-                    ok
-            end,
-            D#st{counted = true};
-        _ ->
-            %% metrics disabled: nothing was added, so nothing may be removed
-            D
-    end.
+    D#st{counted = broker_metrics:connection_opened()}.
 
-uncount_connection(#st{counted = true} = D) ->
-    _ = broker_metrics:gauge_add(connections_current, -1),
-    D#st{counted = false};
-uncount_connection(D) ->
-    D.
+uncount_connection(#st{counted = Counted} = D) ->
+    ok = broker_metrics:connection_closed(Counted),
+    D#st{counted = false}.
 
 refuse(Code, D) ->
     RC = refuse_code(Code, D),
