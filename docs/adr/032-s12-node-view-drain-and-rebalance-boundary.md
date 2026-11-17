@@ -168,4 +168,10 @@ D2 的其余三条已落地，**D2 冻结文本仍一字未改**。
   3. **重复 drain 不取消旧定时器**（提交后自查发现）：先用 200ms 宽限期 drain、再用 30s 重新 drain，节点仍会在 200ms 后转 `down`——运维的「延长宽限期」被静默忽略。`cancel_timer/1` 不足以修好，因为**已投递到邮箱的消息无法撤回**，所以改为给定时器打**代际号**（`{drain_timeout, Gen}`），`do_drain`/`do_undrain` 各自递增 `gen`，`handle_info` 丢弃代际不匹配的消息。回归测试 `redrain_replaces_the_earlier_grace_period`；**反证**：撤掉代际/取消逻辑后，恰好且仅有该用例失败。
 - **重复 drain 的幂等性已核实**（不是假设）：第二次 drain 会重新算一遍 `Suspended` 列表，若此时 `ranch:suspend_listener/1` 对已挂起的 listener 报错，`Suspended` 会变成 `[]`，`undrain` 就不知道该恢复谁——节点会永久失聪。查 `ranch.erl:234-241`：`get_status(Ref)` 为 `suspended` 时直接返回 `ok`，`resume_listener/1` 同理。实测 `drain → drain → undrain` 后 listener 回到 `running`。
 - **验证**：admin 套件 **20/20**；全量 `rebar3 ct` **1382/1382**（1374 + 8）；`dialyzer` 0 warning；`xref` **302** 条全 unused-export（不变，新模块的导出计入既有 unused-export 口径，未新增其他类别）。
-- **S12-A 仍未完成**：D1 的「节点视图唯一真相」在**成员/归属**侧的落地（`broker_meta` 的 `cluster_node`/`partition_meta` 退役为遗留形状）不在本次交付内；本次只落了**节点自身**的 drain 状态与对外视图。QUIC/CoAP 的摘流边界待定。
+- **S12-A 收尾（第三个交付，2026-11-17）：多节点视图一致性证据**。D1 的「节点视图唯一真相是 ra」在单节点上无法证明——单节点里「读 ra」和「读本地猜测」给出同样的答案。新增 `apps/broker_admin/test/broker_admin_dist_SUITE.erl`：三个真实 peer（`peer`，OTP 28 stdlib，与 `broker_cluster_dist_SUITE` 同款）组成 ra 组，两个分区分别归属两个节点，然后**走真实 HTTP** 读每个节点的 `/api/v1/node`：
+  - 每个节点只报 `broker_cluster:owner(P) =:= {ok, node()}` 的分区，`count` 与 `epoch` 都来自 ra；
+  - 全集群的并集恰好是分配的完整分区集，**无分区被两个节点同时认领**（这条是「没有第二套真相」的判据：任何节点若读 Mnesia 或本地猜测，视图就会分歧）；
+  - `/api/v1/status` 的配置分区集按 ra 归属过滤后，必须**逐元素等于** `/api/v1/node` 的归属集——两个管理端点对归属给出不同答案，正是 D1 要防的失效；
+  - **drain 是节点本地的**：drain 一个节点后，该节点 `/readyz` 503 `draining`，其余节点的 `state` 仍是 `up`、`ready` 仍是 `true`、分区集不变、`/readyz` 也不出现 `draining`；`undrain` 同样不触碰其它节点。
+  - **三条断言都做过反证**：去掉 owner 过滤（每个节点认领所有已分配分区）→ 一致性用例挂；`ready` 恒 `false` → 本地性用例挂；`/status` 分区集置空 → 端点一致断言挂。
+- **S12-A 已完成**；如实保留的边界：① 本次落的是**节点自身**的 drain 状态与对外视图，D1 里 `broker_meta` 的 `cluster_node`/`partition_meta`「退役为遗留形状」的清理未在本阶段删除（生产已无写入者，删除属独立重构）；② QUIC / CoAP 不归 ranch 管，**不在 drain 挂起范围**，仍需停进程摘流；③ `GET /api/v1/node` 的 `weight` / `role` 属 S12-C 的再平衡器，未提前造常量。

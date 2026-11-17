@@ -217,12 +217,12 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 
 `broker_admin_http`：
 
-- 默认 `bind = {127,0,0,1}`、`port = 8090`、`token = <<>>`（空 token = 不鉴权，只允许回环）。
+- 默认 `bind = {127,0,0,1}`、`port = 8090`、`token = <<>>`（空 token = 不鉴权，只允许回环）。**非回环 `bind` 配空 `token` 现在启动即失败**（`{insecure_bind, Bind, empty_token}`，`broker_admin_sup:check_bind_auth/0`，S12-A 落地，ADR-032 D2）——这条不变式此前只写在注释与文档里；`enabled => false` 不校验（没有 listener 就没有暴露）。
 - 非空 token 时，除 `/healthz`、`/readyz` 外全部要求 `Authorization: Bearer <token>` 或 `X-Admin-Token`。
 - token 比较是常量时间（`secure_equal/2`），避免逐字节时序猜测。
 - 响应经 `json_safe/1` 收敛，避免 pid/ref/tuple 导致 500。
 
-证据：`broker_admin_SUITE`（11 例，含 401、常量时间分支、脱敏配置）。
+证据：`broker_admin_SUITE`（20 例，含 401、常量时间分支、脱敏配置、drain 三态与严格入参校验、非回环+空 token 拒启）与 `broker_admin_dist_SUITE`（3 peer 多节点视图一致性 + drain 节点本地性，S12-A）。drain / `undrain` 都在 `/api/v1/` 下，因此与其他管理端点一样要求鉴权；`/healthz`、`/readyz` 不要求。
 
 ---
 
