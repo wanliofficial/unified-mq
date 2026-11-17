@@ -40,6 +40,7 @@ all() ->
      mandatory_unroutable_gets_basic_return,
      immediate_publish_is_refused_540,
      confirm_select_acks_after_the_store,
+     confirm_select_twice_keeps_the_sequence,
      tx_select_is_refused_540,
      recover_requeues_with_the_redelivered_flag,
      nack_requeue_sets_redelivered,
@@ -439,6 +440,21 @@ confirm_select_acks_after_the_store(Config) ->
     C5 = publish(C4, 1, <<>>, <<"ct.conf">>, <<"again">>),
     {1, 60, 80, <<2:64, 0:8>>, C6} = recv_method(C5),
     close(C6),
+    ok.
+
+%% A second confirm.select must not restart the tag sequence: the tag the
+%% client already saw must not be reissued, or its outstanding-confirm
+%% bookkeeping would collide two publishes on one tag.
+confirm_select_twice_keeps_the_sequence(Config) ->
+    C0 = open_channel(connect(Config), 1),
+    C1 = confirm_select(C0, 1),
+    {_, C2} = declare_queue(C1, 1, <<"ct.conf2">>),
+    C3 = publish(C2, 1, <<>>, <<"ct.conf2">>, <<"one">>),
+    {1, 60, 80, <<1:64, 0:8>>, C4} = recv_method(C3),
+    C5 = confirm_select(C4, 1),
+    C6 = publish(C5, 1, <<>>, <<"ct.conf2">>, <<"two">>),
+    {1, 60, 80, <<2:64, 0:8>>, C7} = recv_method(C6),
+    close(C7),
     ok.
 
 tx_select_is_refused_540(Config) ->

@@ -522,7 +522,12 @@ handle_channel_method(Channel, 60, 110, _Args, St) ->
 handle_channel_method(Channel, 85, 10, Args, St) ->
     {[NoWait], _} = amqp_codec:get_bits(Args, 1),
     Ch = ch(Channel, St),
-    St1 = put_ch(Channel, Ch#ch{confirm = true, confirm_seq = 0}, St),
+    %% confirm.select is idempotent: a second call must NOT reset the
+    %% sequence. Resetting would reissue tags the client was already promised
+    %% (confirm tags start at 1 per channel), so two publishes would share a
+    %% tag and the client's outstanding-confirm bookkeeping would desync.
+    Seq = case Ch#ch.confirm of true -> Ch#ch.confirm_seq; false -> 0 end,
+    St1 = put_ch(Channel, Ch#ch{confirm = true, confirm_seq = Seq}, St),
     {noreply, reply_ok(Channel, 85, 11, NoWait, St1)};
 handle_channel_method(Channel, 90, Method, _Args, St) ->
     %% tx.select/commit/rollback (class 90): transactions are not implemented,
@@ -987,11 +992,15 @@ ack_deliveries(Channel, Tag, Multiple, Mode, MethodId, St0) ->
                   fun({_T, {Ref, P, O}}, {Acc, StAcc}) ->
                           case Mode of
                               ack ->
-                                  AR = (catch broker_subscription:ack(Ref, P, O,
-                                                                      StAcc#st.client_id)),
-                                  logger:log(warning, "DBG ack tag~p off=~p ref=~p client=~p -> ~p",
-                                             [_T, O, Ref, StAcc#st.client_id, AR]),
-                                  {Acc, StAcc};
+                                  _ = (catch broker_subscription:ack(Ref, P, O,
+                                                                     StAcc#st.client_id)),
+                                  %% An acked position can never be redelivered on
+                                  %% this connection (queue offsets are unique per
+                                  %% append), so drop its marker. Keeping it made
+                                  %% `redelivered' grow by one entry per message
+                                  %% ever delivered -- an unbounded leak on a
+                                  %% long-lived channel.
+                                  {maps:remove({P, O}, Acc), StAcc};
                               release ->
                                   _ = (catch broker_subscription:release(Ref, P, [O],
                                                                          StAcc#st.client_id)),
