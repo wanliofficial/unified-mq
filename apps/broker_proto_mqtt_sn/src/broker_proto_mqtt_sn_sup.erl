@@ -16,8 +16,17 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Children = [conn_sup_spec() | [listener_spec(S) || S <- listeners()]],
+    Children = [conn_sup_spec()
+                | [listener_spec(S, I) || {I, S} <- enumerate(listeners())]],
     {ok, {#{strategy => one_for_all, intensity => 1, period => 5}, Children}}.
+
+%% Child ids must be unique within a supervisor. `port' is NOT a usable id:
+%% `port => 0' means "let the system choose", and two such listeners (the
+%% plain/DTLS coexistence deployment) collided on {mqtt_sn_listener, 0} and
+%% failed the whole boot with duplicate_child_name. The position in the
+%% configured list is unique by construction.
+enumerate(L) ->
+    lists:zip(lists:seq(1, length(L)), L).
 
 conn_sup_spec() ->
     #{id => mqtt_sn_conn_sup,
@@ -33,9 +42,8 @@ listeners() ->
 %% The UDP socket is opened by the listener itself (`gen_udp:open/2'), not by a
 %% ranch transport: MQTT-SN has one socket for the whole gateway, and a bad bind
 %% must fail `init/1' so the application does not start half-listening.
-listener_spec(Spec) when is_map(Spec) ->
-    Port = maps:get(port, Spec),
-    #{id => {mqtt_sn_listener, Port},
+listener_spec(Spec, Index) when is_map(Spec) ->
+    #{id => {mqtt_sn_listener, Index},
       start => {mqtt_sn_listener, start_link, [Spec]},
       restart => transient,
       shutdown => 5000,
