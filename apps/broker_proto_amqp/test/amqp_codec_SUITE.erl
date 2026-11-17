@@ -24,7 +24,9 @@ all() ->
      table_nested,
      empty_table,
      content_header_roundtrip,
-     properties_roundtrip_with_ce_headers].
+     properties_roundtrip_with_ce_headers,
+     frame_over_max_is_refused_not_buffered,
+     decimal_roundtrips].
 
 suite() -> [{timetrap, {seconds, 20}}].
 
@@ -44,6 +46,36 @@ frame_bad_end(_Config) ->
     Frame = amqp_codec:encode_frame(1, 1, <<"abc">>),
     Bad = binary:replace(Frame, <<16#CE>>, <<16#FF>>, [{scope, {byte_size(Frame) - 1, 1}}]),
     ?assertEqual({error, bad_frame_end}, amqp_codec:decode_frame(Bad)).
+
+%% A frame whose declared size exceeds the negotiated `frame_max' must be
+%% refused outright -- `more' would make the connection buffer the bytes and
+%% a client could OOM the broker by announcing 4GB. `frame_max' bounds the
+%% WHOLE frame, so the payload ceiling is Max - 8.
+frame_over_max_is_refused_not_buffered(_Config) ->
+    Max = 131072,
+    ?assertEqual({error, {frame_too_large, 4000000000, Max}},
+                 amqp_codec:decode_frame(<<2:8, 1:16, 4000000000:32>>, Max)),
+    %% Exactly at the ceiling: 8 + payload == Max is still legal.
+    ?assertEqual(more, amqp_codec:decode_frame(<<8:8, 1:16, (Max - 8):32>>, Max)),
+    %% One byte over is already a frame error.
+    ?assertEqual({error, {frame_too_large, Max - 7, Max}},
+                 amqp_codec:decode_frame(<<8:8, 1:16, (Max - 7):32>>, Max)),
+    ok.
+
+%% $D must round-trip: `decode_value/2' produces `{decimal, Exp, Val}', and
+%% before this clause existed that tuple fell through to the $V (void) arm,
+%% silently erasing the value on the amqp_props round trip.
+decimal_roundtrips(_Config) ->
+    T = #{<<"d">> => {decimal, 2, 314}},
+    Enc = iolist_to_binary(amqp_codec:encode_table(T)),
+    %% The type byte must be $D (68), not $V (86).
+    <<_Len:32, 1, $d, 68, _/binary>> = Enc,
+    ?assertEqual({T, <<>>}, amqp_codec:get_table(Enc)),
+    %% And inside an array.
+    A = #{<<"arr">> => [{decimal, 1, 42}]},
+    AE = iolist_to_binary(amqp_codec:encode_table(A)),
+    ?assertEqual({A, <<>>}, amqp_codec:get_table(AE)),
+    ok.
 
 method_roundtrip(_Config) ->
     Body = amqp_codec:encode_method(60, 40, <<"rk">>),
