@@ -19,8 +19,17 @@ start_link() ->
 %% cannot bind fails `init/1', and therefore the application — the same
 %% all-or-nothing posture as boot step 1.
 init([]) ->
-    Children = [conn_sup_spec() | [listener_spec(S) || S <- listeners()]],
+    Children = [conn_sup_spec(), will_server_spec()
+                | [listener_spec(S) || S <- listeners()]],
     {ok, {#{strategy => one_for_all, intensity => 1, period => 5}, Children}}.
+
+%% §3.1.3.2.2 Will Delay Interval holder. It must outlive every connection
+%% that parks a Will in it, so it is a sibling of the conn sup; one_for_all
+%% rebuilds the pair if either dies.
+will_server_spec() ->
+    {mqtt_will_server,
+     {mqtt_will_server, start_link, []},
+     permanent, 5000, worker, [mqtt_will_server]}.
 
 conn_sup_spec() ->
     {mqtt_conn_sup,

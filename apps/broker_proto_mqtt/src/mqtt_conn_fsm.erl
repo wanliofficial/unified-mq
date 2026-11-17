@@ -84,7 +84,13 @@
              session_expiry = 0 :: non_neg_integer(),   %% seconds, v5 only
              receive_maximum = 65535 :: pos_integer(),  %% peer's outbound window
              max_packet_size = undefined :: undefined | pos_integer(),
-             sub_ids = #{} :: #{binary() => pos_integer()}}).
+             sub_ids = #{} :: #{binary() => pos_integer()},
+             %% §3.8.3.1 No Local / Retain As Published per real filter; the
+             %% Retain Handling option acts only at subscribe time.
+             sub_flags = #{} :: #{binary() => {0 | 1, 0 | 1}},
+             %% ref -> real filter, so a QoS 0 push (which names refs, not
+             %% filters) can apply No Local exactly instead of guessing.
+             sub_refs = #{} :: #{term() => binary()}}).
 
 %%%_* API ---------------------------------------------------------------------
 
@@ -204,13 +210,22 @@ event(connect, awaiting_connect, D) ->
 event({new_messages, _P, _From, _To}, StateName, D) ->
     %% J6: a wake, nothing more -- the range in it is not a delivery contract.
     wake(StateName, D);
-event({broker_deliver, _ClientId, _MaxQoS, _Refs, {undefined, undefined, Msg}},
+event({broker_deliver, _ClientId, _MaxQoS, Refs, {undefined, undefined, Msg}},
       connected, D) ->
     %% K9: the only real push. QoS0 publishes never enter the log (§4.4), so
     %% there is no offset to pull and no ack to wait for: sending at QoS1 here
     %% would strand a pending entry keyed by `undefined'.
-    note_delivery(Msg),
-    {state, connected, send_frame(publish_bin(0, 0, Msg, undefined, D), D)};
+    %% §3.8.3.1: a No Local subscription of THIS connection must not receive
+    %% its own publishes back, so a push whose only causes are such
+    %% subscriptions is dropped (the refs name exactly which subs matched).
+    case push_wanted(Refs, Msg, D) of
+        true ->
+            note_delivery(Msg),
+            {state, connected,
+             send_frame(publish_bin(0, 0, Msg, undefined, D), D)};
+        false ->
+            {state, connected, D}
+    end;
 event({broker_deliver, _ClientId, _MaxQoS, _Refs, {_P, _O, _Msg}}, StateName, D) ->
     %% a wake for a durable position; the tuple's Msg is not read -- the pull
     %% loop is the only reader (J6/K9).
@@ -395,6 +410,9 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
         {error, Code, D} ->
             refuse(Code, D);
         {ok, D1} ->
+            %% §3.1.3.2.2: a new Network Connection for this ClientID cancels a
+            %% Will that is waiting out its Will Delay Interval.
+            _ = (catch mqtt_will_server:cancel(C#connect.client_id)),
             %% ADR-018 §18.1: the Will is connection state, held in memory only
             %% (never persisted, never republished after a broker restart).
             D1a = D1#st{will = will_of(C)},
@@ -442,11 +460,19 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
     end.
 
 %% ADR-018 §18.1: the CONNECT will fields, or `undefined' when there is no Will.
+%% §3.1.3.2.2 keeps the Will Delay Interval with the will: it decides whether
+%% publish_will/1 hands the message to `mqtt_will_server' instead of sending it
+%% while the connection is dying.
 will_of(#connect{will_flag = 0}) ->
     undefined;
 will_of(#connect{will_topic = Topic, will_payload = Payload,
-                 will_qos = QoS, will_retain = Retain}) ->
-    #{topic => Topic, payload => Payload, qos => QoS, retain => Retain}.
+                 will_qos = QoS, will_retain = Retain, will_props = WProps}) ->
+    Delay = case maps:get(will_delay_interval, WProps, 0) of
+                D when is_integer(D), D >= 0 -> D;
+                _ -> 0
+            end,
+    #{topic => Topic, payload => Payload, qos => QoS, retain => Retain,
+      delay => Delay}.
 
 %% ADR-012 §12.3: "already PUBREC'd, not yet PUBCOMP'd" resumes with PUBREL
 %% alone. The restored entries were put in `released' by restore_blob/1.
@@ -592,9 +618,10 @@ clean_session_teardown(D) ->
          retained_queue = [], pending_rev = #{}, sent = #{}, sent_at = #{},
          retry_reported = #{}, next_pid = 1, inflight_dirty = false}.
 
-%% The blob is `vsn 2' (ADR-018 §18.3 R3) and a `vsn 1' blob from S1 is read
-%% as "pending, all QoS 1, no release state" -- semantically identical to S1's
-%% world, so the upgrade is safe in one direction only (D9).
+%% The blob is `vsn 3' (ADR-018 §18.3 R3; S2.5 added the §3.8.4 subscription
+%% state). A `vsn 1' blob from S1 is read as "pending, all QoS 1, no release
+%% state" -- semantically identical to S1's world, so the upgrade is safe in one
+%% direction only (D9). A `vsn 2' blob restores without the subscription map.
 restore_blob(#st{client_id = ClientId} = D) ->
     case broker_subscription:session(ClientId) of
         {ok, #{inflight := #{pending := PList} = Blob}}
@@ -624,13 +651,23 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
     %% is positional by construction -- blob/1 filtered the retained replays out
     %% before writing. No second predicate is needed (and one would be dead code).
     Rev = maps:from_list([{Pos, Pid} || {Pid, {_Refs, Pos}} <- maps:to_list(Pending)]),
+    %% vsn 3 added the §3.8.4 subscription state; earlier blobs simply keep the
+    %% connection default (no ids, no No Local / RAP flags).
+    Subs = case maps:get(vsn, Blob, 1) of
+               V when V >= 3 -> maps:get(subs, Blob, []);
+               _ -> []
+           end,
+    SubIds = maps:from_list([{F, Id} || {F, Id, _NL, _Rap} <- Subs]),
+    SubFlags = maps:from_list([{F, {NL, Rap}} || {F, _Id, NL, Rap} <- Subs]),
     D#st{next_pid = maps:get(next_pid, Blob, 1),
          pending = Pending,
          pending_qos = Qos,
          released = maps:filter(fun(Pid, _) -> maps:is_key(Pid, Pending) end,
                                 Released),
          received = Received,
-         pending_rev = Rev}.
+         pending_rev = Rev,
+         sub_ids = SubIds,
+         sub_flags = SubFlags}.
 
 %% The partition notifications this conn needs to wake on (design §5.2). The
 %% subscription set belongs to the queue worker, which monitors us, so an
@@ -647,7 +684,28 @@ subscribe_partitions(D) ->
 %%%_* PUBLISH inbound ---------------------------------------------------------
 
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
+                        payload = Payload, retain = Retain, props = Props},
+               #st{proto_level = 5} = D) ->
+    %% v5-only input validation before anything is stored:
+    %%   * §3.3.2.3.4: a PUBLISH from the client carries no Subscription
+    %%     Identifier -- that property is server-to-client only (0x82).
+    %%   * §3.3.2.3.4: Topic Aliases require a Topic Alias Maximum the server
+    %%     announced. This broker announces nothing (0), so any alias use by
+    %%     the client is a violation (0x94).
+    Idx = maps:is_key(subscription_identifier, Props),
+    Alias = maps:is_key(topic_alias, Props),
+    if
+        Idx -> protocol_error(16#82, "subscription_identifier in a client "
+                                   "PUBLISH", D);
+        Alias -> protocol_error(16#94, "topic_alias on a connection without "
+                                     "topic_alias_maximum", D);
+        true -> handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D)
+    end;
+handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain, props = Props}, D) ->
+    handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D).
+
+handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D) ->
     broker_metrics:inc(publish_total),
     %% S2-G (design §4.7): MQTT 3.1.1 has no quota frame, so an overloaded
     %% producer is told by a disconnect before the PUBACK -- never by an ack for
@@ -911,7 +969,10 @@ build_message(Topic, Payload, QoS, WirePid, Partition, Retain, Props, D) ->
       payload_encoding = raw,
       headers = TraceHeaders,
       proto_meta = maps:merge(#{qos => QoS, dup => 0, retain => Retain,
-                                packet_id => WirePid},
+                                packet_id => WirePid,
+                                %% §3.8.3.1 No Local: the delivering conn needs
+                                %% to know which connection published a message.
+                                client_id => D#st.client_id},
                               mqtt_meta(Props1)),
       persistence = case QoS of 0 -> transient; _ -> durable end,
       reliability = reliability_of(QoS),
@@ -1146,39 +1207,112 @@ expire_local(Pid, P, O, D) ->
 
 %%%_* SUBSCRIBE / UNSUBSCRIBE -------------------------------------------------
 
-handle_subscribe(#subscribe{packet_id = Pid, topics = Topics,
+%% 3.1.1 entries carry only `{Filter, QoS}'; v5 carries the §3.8.3.1 options.
+%% Everything downstream works on the 5-tuple so the options are never lost.
+handle_subscribe(#subscribe{packet_id = Pid, topics = Topics0,
                             props = Props}, D) ->
-    Pairs = [{Filter, grant(Filter, ReqQoS, D)} || {Filter, ReqQoS} <- Topics],
-    Codes = [Code || {_Filter, Code} <- Pairs],
-    Granted = [{Filter, Code} || {Filter, Code} <- Pairs, Code =/= 128],
-    D1 = send_frame(suback_bin(Pid, Codes, D), D),
+    Topics = [norm_sub_opts(T) || T <- Topics0],
+    %% §3.8.3 (MQTT-3.8.3-3/4): exactly one positive Subscription Identifier
+    %% (repeated properties decode to a list), and No Local on a Shared
+    %% Subscription is a protocol error. Both disconnect.
+    case {sub_id_ok(Props),
+          [Filter || {Filter, _, NL, _, _} <- Topics,
+                     NL =:= 1, shared_filter(Filter) =/= none]} of
+        {ok, []} ->
+            handle_subscribe1(Pid, Topics, Props, D);
+        {error, _} ->
+            log(warning, "bad subscription_identifier on SUBSCRIBE", []),
+            protocol_error(16#82, "invalid subscription_identifier", D);
+        {ok, _} ->
+            log(warning, "no_local on a shared subscription", []),
+            protocol_error(16#82, "no_local on a shared subscription", D)
+    end.
+
+sub_id_ok(Props) ->
+    case maps:get(subscription_identifier, Props, undefined) of
+        undefined -> ok;
+        I when is_integer(I), I > 0, I =< 268435455 -> ok;
+        _ -> error
+    end.
+
+handle_subscribe1(Pid, Topics, Props, D0) ->
+    %% RH=1 (§3.8.3.1): "send retained messages if there is no other
+    %% subscription with the same topic filter" -- read BEFORE this SUBSCRIBE
+    %% merges its own entries into the maps. The session's filters live in
+    %% both maps (an id is only stored when the client supplied one), so the
+    %% key sets union into the real subscription set.
+    Existing = maps:from_keys(
+                 maps:keys(D0#st.sub_ids) ++ maps:keys(D0#st.sub_flags), ok),
+    Pairs = [begin {Code, Ref} = grant(Filter, ReqQoS, D0),
+                   {{Filter, ReqQoS, NL, Rap, RH}, Code, Ref}
+             end || {Filter, ReqQoS, NL, Rap, RH} <- Topics],
+    Codes = [Code || {_, Code, _} <- Pairs],
+    %% A granted code is exactly 0, 1 or 2; 128 and 16#87 are refusals.
+    Granted = [{Filter, Code, NL, Rap, RH}
+               || {{Filter, _, NL, Rap, RH}, Code, _} <- Pairs,
+                  is_integer(Code), Code =< 2],
+    NewRefs = [{Ref, real_filter(Filter)}
+               || {{Filter, _, _, _, _}, Code, Ref} <- Pairs,
+                  is_integer(Code), Code =< 2, Ref =/= undefined],
+    D1 = send_frame(suback_bin(Pid, Codes, D0), D0),
     %% S2.5: a Subscription Identifier rides on every outbound PUBLISH that a
-    %% matching subscription caused; it never enters the message metadata.
-    D2 = remember_sub_ids(Topics, Props, D1),
+    %% matching subscription caused; it never enters the message metadata. A
+    %% refused (0x80) entry has no subscription, so it stores neither the id
+    %% nor the §3.8.3.1 flags.
+    D2 = remember_sub_ids(Granted, Props, D1),
+    D3 = remember_sub_flags(Granted, D2),
+    D4 = D3#st{sub_refs = lists:foldl(fun({Ref, F}, Acc) ->
+                                              Acc#{Ref => F}
+                                      end, D3#st.sub_refs, NewRefs)},
     %% ADR-018 §18.2: the replay comes AFTER the SUBACK (the client must know
     %% its filter was granted before retained traffic arrives) and is queued
     %% rather than sent inline, because it shares the `max_inflight' window
     %% with ordinary delivery.
-    drain_retained(enqueue_retained(Granted, D2)).
+    drain_retained(enqueue_retained(Granted, Existing, D4)).
 
-remember_sub_ids(Topics, Props, D) ->
+norm_sub_opts({Filter, QoS}) ->
+    {Filter, QoS, 0, 0, 0};
+norm_sub_opts({Filter, QoS, NL, Rap, RH}) ->
+    {Filter, QoS, NL, Rap, RH}.
+
+%% Keep a Subscription Identifier and the No Local / Retain As Published flags
+%% keyed by the real filter; the Retain Handling option has already acted at
+%% subscribe time and is not stored.
+remember_sub_ids(Granted, Props, D) ->
     case maps:get(subscription_identifier, Props, undefined) of
         undefined -> D;
         Id when is_integer(Id), Id > 0 ->
-            Ids = lists:foldl(fun({Filter, _Q}, Acc) ->
+            Ids = lists:foldl(fun({Filter, _Code, _NL, _Rap, _RH}, Acc) ->
                                       Acc#{real_filter(Filter) => Id}
-                              end, D#st.sub_ids, Topics),
+                              end, D#st.sub_ids, Granted),
             D#st{sub_ids = Ids};
         _ -> D
     end.
+
+remember_sub_flags(Granted, D) ->
+    Flags = lists:foldl(
+              fun({Filter, _Code, NL, Rap, _RH}, Acc) ->
+                      Acc#{real_filter(Filter) => {NL, Rap}}
+              end, D#st.sub_flags, Granted),
+    %% A resubscribed filter replaces the old ref entry for the same filter;
+    %% the new refs are added by the caller after this.
+    Fresh = [real_filter(Filter) || {Filter, _Code, _, _, _} <- Granted],
+    Kept = maps:filter(fun(_Ref, F) -> not lists:member(F, Fresh) end,
+                       D#st.sub_refs),
+    D#st{sub_flags = Flags, sub_refs = Kept}.
 
 %% One queue entry per topic even when several granted filters match it (MQTT
 %% §3.3.5 lets a server send duplicates; one message at the strongest granted
 %% level is the useful answer). `min(retained qos, granted qos)' is §4.8's rule
 %% applied to the replay path.
-enqueue_retained([], D) ->
+%%
+%% §3.8.3.1 Retain Handling: RH=2 never replays for that filter; RH=1 replays
+%% only when no other subscription with the same topic filter already exists
+%% (`Existing' is this session's filter map before the SUBSCRIBE). A No Local
+%% filter does not replay this connection's own publishes.
+enqueue_retained([], _Existing, D) ->
     D;
-enqueue_retained(Granted, D) ->
+enqueue_retained(Granted, Existing, D) ->
     Entries = (catch broker_retain:entries()),
     case is_list(Entries) of
         false ->
@@ -1190,27 +1324,50 @@ enqueue_retained(Granted, D) ->
         true ->
             Wanted =
                 lists:foldl(
-                  fun({Filter, GrantedQoS}, Acc0) ->
-                          lists:foldl(
-                            fun({Topic, Msg}, Acc) ->
-                                    case mqtt_filter:matches(Topic, Filter) of
-                                        true ->
-                                            Q = min(GrantedQoS, qos_of(Msg)),
-                                            case maps:find(Topic, Acc) of
-                                                {ok, {OldMsg, OldQ}} ->
-                                                    Acc#{Topic => {OldMsg, max(OldQ, Q)}};
-                                                error ->
-                                                    Acc#{Topic => {Msg, Q}}
-                                            end;
-                                        false ->
-                                            Acc
-                                    end
-                            end, Acc0, Entries)
+                  fun({Filter, GrantedQoS, NL, _Rap, RH}, Acc0) ->
+                          case replay_wanted(Filter, RH, Existing) of
+                              false ->
+                                  Acc0;
+                              true ->
+                                  lists:foldl(
+                                    fun({Topic, Msg}, Acc) ->
+                                            case mqtt_filter:matches(Topic, Filter) of
+                                                true ->
+                                                    case NL =:= 1 andalso
+                                                         publisher_of(Msg) =:=
+                                                           D#st.client_id of
+                                                        true ->
+                                                            Acc;
+                                                        false ->
+                                                            Q = min(GrantedQoS,
+                                                                    qos_of(Msg)),
+                                                            case maps:find(Topic, Acc) of
+                                                                {ok, {OldMsg, OldQ}} ->
+                                                                    Acc#{Topic => {OldMsg,
+                                                                                   max(OldQ, Q)}};
+                                                                error ->
+                                                                    Acc#{Topic => {Msg, Q}}
+                                                            end
+                                                    end;
+                                                false ->
+                                                    Acc
+                                            end
+                                    end, Acc0, Entries)
+                          end
                   end, #{}, Granted),
             Queue = [{Topic, Msg, Q}
                      || {Topic, {Msg, Q}} <- lists:sort(maps:to_list(Wanted))],
             D#st{retained_queue = D#st.retained_queue ++ Queue}
     end.
+
+%% RH=0 always replays; RH=1 only for a filter the session has not already
+%% subscribed to; RH=2 never. `Existing' is the pre-SUBSCRIBE filter set.
+replay_wanted(_Filter, 2, _Existing) ->
+    false;
+replay_wanted(Filter, 1, Existing) ->
+    not maps:is_key(real_filter(Filter), Existing);
+replay_wanted(_Filter, _RH, _Existing) ->
+    true.
 
 qos_of(#broker_message{proto_meta = Meta}) ->
     maps:get(qos, Meta, 0).
@@ -1245,14 +1402,15 @@ drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
     end.
 
 %% S2.5 (ADR-017): `$share/{group}/{filter}' becomes a Shared membership; the
-%% literal MQTT syntax never reaches the subscription layer.
+%% literal MQTT syntax never reaches the subscription layer. The ref comes back
+%% so the conn can map it to the real filter (the QoS 0 push path names refs).
 grant(Filter, ReqQoS, D) ->
     case shared_filter(Filter) of
         {shared, Group, Real} ->
             grant_shared(Group, Real, ReqQoS, D);
         invalid ->
             log(warning, "invalid shared filter ~p", [Filter]),
-            128;
+            {128, undefined};
         none ->
             grant_exclusive(Filter, ReqQoS, D)
     end.
@@ -1264,30 +1422,30 @@ grant_exclusive(Filter, ReqQoS, D) ->
                 deny ->
                     broker_metrics:inc(authz_failures),
                     log(warning, "subscribe not authorized filter=~p", [Filter]),
-                    suback_denied(D);
+                    {suback_denied(D), undefined};
                 allow ->
                     case broker_subscription:subscribe(
                            D#st.client_id, Filter, ReqQoS,
                            D#st.tenant_id) of
-                        {ok, _Ref} -> ReqQoS;
+                        {ok, Ref} -> {ReqQoS, Ref};
                         {error, Reason} ->
                             log(warning, "subscribe refused ~p: ~p",
                                 [Filter, Reason]),
-                            128
+                            {128, undefined}
                     end
             end;
         {ok, false} ->
             %% E12: an over-cap requested QoS is refused at the SUBACK, never
             %% silently downgraded and never turned into a live subscription.
             log(info, "subscribe ~p qos ~p above max ~p", [Filter, ReqQoS, D#st.max_qos]),
-            128;
+            {128, undefined};
         {{error, Reason}, _} ->
             %% The codec validates filters at parse time, so reaching this clause
             %% means a frame got past `mqtt_frame' with a bad filter in it -- the
             %% 0x80 is the SUBACK's answer either way, and the second element
             %% (over-cap or not) is irrelevant next to an illegal filter.
             log(warning, "invalid filter ~p: ~p", [Filter, Reason]),
-            128
+            {128, undefined}
     end.
 
 grant_shared(Group, Real, ReqQoS, D) ->
@@ -1298,25 +1456,25 @@ grant_shared(Group, Real, ReqQoS, D) ->
                     broker_metrics:inc(authz_failures),
                     log(warning, "shared subscribe not authorized ~p/~p",
                         [Group, Real]),
-                    suback_denied(D);
+                    {suback_denied(D), undefined};
                 allow ->
                     case broker_subscription:join(
                            shared, Group, D#st.client_id, Real, ReqQoS,
                            D#st.tenant_id) of
-                        {ok, _Ref} -> ReqQoS;
+                        {ok, Ref} -> {ReqQoS, Ref};
                         {error, Reason} ->
                             log(warning, "shared join refused ~p/~p: ~p",
                                 [Group, Real, Reason]),
-                            128
+                            {128, undefined}
                     end
             end;
         {ok, false} ->
             log(info, "shared subscribe ~p qos ~p above max ~p",
                 [Real, ReqQoS, D#st.max_qos]),
-            128;
+            {128, undefined};
         {{error, Reason}, _} ->
             log(warning, "invalid shared filter ~p/~p: ~p", [Group, Real, Reason]),
-            128
+            {128, undefined}
     end.
 
 %% `$share/{group}/{filter}': a non-empty group with no wildcards and a
@@ -1348,8 +1506,17 @@ real_filter(Filter) ->
         _ -> Filter
     end.
 
-handle_unsubscribe(#unsubscribe{packet_id = Pid, topics = Filters}, D) ->
-    lists:foreach(fun(Filter) -> unsubscribe_one(Filter, D) end, Filters),
+handle_unsubscribe(#unsubscribe{packet_id = Pid, topics = Filters}, D0) ->
+    lists:foreach(fun(Filter) -> unsubscribe_one(Filter, D0) end, Filters),
+    %% The §3.8.3.1 flags and the Subscription Identifier belong to the
+    %% subscription, so UNSUBSCRIBE drops them with it (a later resubscribe
+    %% with different options must not inherit the old ones).
+    Forgotten = [real_filter(F) || F <- Filters],
+    D = D0#st{sub_ids = maps:without(Forgotten, D0#st.sub_ids),
+              sub_flags = maps:without(Forgotten, D0#st.sub_flags),
+              sub_refs = maps:filter(fun(_Ref, F) ->
+                                             not lists:member(F, Forgotten)
+                                     end, D0#st.sub_refs)},
     %% pending is deliberately NOT pruned: a dead subscription's ack is an
     %% idempotent no-op (worker §ack), and pruning here would race the pull loop
     %% that read the subscription set one moment earlier.
@@ -1849,43 +2016,57 @@ handle_stored(P, O, Msg, Rows, D) ->
             handle_stored1(P, O, Msg, Rows, D)
     end.
 
-handle_stored1(P, O, Msg, Rows, D) ->
+handle_stored1(P, O, Msg, Rows, D0) ->
     Topic = Msg#broker_message.destination,
-    {Hits, Others} =
+    %% §3.8.3.1: a No Local subscription of this connection never receives the
+    %% connection's own publishes -- the offset is still consumed (the cursor
+    %% must move), only the delivery is suppressed.
+    Own = publisher_of(Msg) =:= D0#st.client_id,
+    {Hits, Skips, Others, D} =
         lists:foldl(
-          fun(#{ref := Ref, filter := Filter, qos := QoS, cursor := Cursor}, {H, Ot})
+          fun(#{ref := Ref, filter := Filter, qos := QoS, cursor := Cursor},
+              {H, S, Ot, Acc})
                 when Cursor =< O ->
+                  %% The pull path is where refs meet filters; refresh the
+                  %% ref map here so the QoS 0 push can apply No Local exactly.
+                  Acc1 = Acc#st{sub_refs =
+                                    (Acc#st.sub_refs)#{Ref => real_filter(Filter)}},
                   case mqtt_filter:matches(Topic, Filter) of
-                      true -> {[{Ref, QoS} | H], Ot};
-                      false -> {H, [Ref | Ot]}
+                      true ->
+                          case Own andalso nl_of(Filter, Acc1) =:= 1 of
+                              true -> {H, [Ref | S], Ot, Acc1};
+                              false -> {[{Ref, QoS, Filter} | H], S, Ot, Acc1}
+                          end;
+                      false -> {H, S, [Ref | Ot], Acc1}
                   end;
              (_Row, Acc) ->
                   Acc
-          end, {[], []}, Rows),
+          end, {[], [], [], D0}, Rows),
     case Hits of
-        [] when Others =:= [] ->
+        [] when Skips =:= [], Others =:= [] ->
             {D, idle};
         [] ->
-            %% read-and-skip: non-matching traffic still has to advance every
-            %% cursor in P, or the committed watermark pins at the first
-            %% unrelated message forever (K6).
-            lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end, Others),
+            %% read-and-skip: non-matching (and No-Local-suppressed) traffic
+            %% still has to advance every cursor in P, or the committed
+            %% watermark pins at the first unrelated message forever (K6).
+            lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end,
+                          Others ++ Skips),
             {D, progress};
         _ ->
-            Refs = [Ref || {Ref, _Q} <- Hits],
+            Refs = [Ref || {Ref, _Q, _F} <- Hits],
             %% §4.8: the delivery level is the message's own level capped by the
             %% max QoS of the subscriptions that HIT it. Since S2-C the stored
             %% message's level can be 0, 1 or 2, so this is a real `min', not
             %% the old constant 1.
-            SubMax = lists:max([Q || {_Ref, Q} <- Hits]),
+            SubMax = lists:max([Q || {_Ref, Q, _F} <- Hits]),
             case min(SubMax, qos_of(Msg)) of
                 0 ->
                     lists:foreach(fun(Ref) -> ack_skip(Ref, P, O, D#st.client_id) end,
-                                  Others ++ Refs),
+                                  Others ++ Skips ++ Refs),
                     note_delivery(Msg),
                     {send_frame(publish_bin(0, 0, Msg, undefined, D), D), progress};
                 DeliverQoS ->
-                    deliver(P, O, Msg, DeliverQoS, Refs, Others, D)
+                    deliver(P, O, Msg, DeliverQoS, Refs, Others ++ Skips, D)
             end
     end.
 
@@ -1906,13 +2087,17 @@ handle_claimed(P, O, Msg, Ref, Filter, SubQoS, D) ->
             handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D)
     end.
 
-handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D) ->
+handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D0) ->
     Topic = Msg#broker_message.destination,
+    D = D0#st{sub_refs = (D0#st.sub_refs)#{Ref => real_filter(Filter)}},
     case mqtt_filter:matches(Topic, Filter) of
         false ->
             ack_skip(Ref, P, O, D#st.client_id),
             {D, progress};
         true ->
+            %% No Local is a protocol error on a shared subscription, so the
+            %% claim path only needs the flag map for RAP; the publish_bin
+            %% retain computation reads it by filter.
             case min(SubQoS, qos_of(Msg)) of
                 0 ->
                     ack_skip(Ref, P, O, D#st.client_id),
@@ -2026,13 +2211,84 @@ publish_bin(QoS, Dup, Msg, Pid, D) ->
     publish_bin(QoS, Dup, 0, Msg, Pid, D).
 
 %% `RetainFlag' is 1 only on a retained replay (§3.3.1.3: a live subscriber
-%% always sees retain=0, a replay always sees retain=1).
+%% always sees retain=0, a replay always sees retain=1). On every other path
+%% §3.8.3.1 Retain As Published decides: when a matching subscription asked for
+%% it, the message's original retain bit travels; otherwise 0.
 publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
-    enc(#publish{qos = QoS, dup = Dup, retain = RetainFlag,
-                 topic = Msg#broker_message.destination,
+    Topic = Msg#broker_message.destination,
+    Retain = case RetainFlag of
+                 1 -> 1;
+                 _ -> rap_retain(Topic, Msg, D)
+             end,
+    Props0 = publish_props(Msg),
+    %% §3.3.4 (MQTT-3.3.4-4): one copy carries the Subscription Identifiers of
+    %% every matching subscription that is not No-Local-suppressed.
+    Props = case matching_ids(Topic, Msg, D) of
+                [] -> Props0;
+                Ids -> Props0#{subscription_identifier => Ids}
+            end,
+    enc(#publish{qos = QoS, dup = Dup, retain = Retain,
+                 topic = Topic,
                  packet_id = Pid,
                  payload = Msg#broker_message.payload,
-                 props = publish_props(Msg)}, D).
+                 props = Props}, D).
+
+matching_ids(Topic, Msg, #st{sub_ids = Ids, sub_flags = Flags} = D) ->
+    Own = publisher_of(Msg) =:= D#st.client_id,
+    lists:usort(
+      [Id || {F, Id} <- maps:to_list(Ids),
+             mqtt_filter:matches(Topic, F),
+             not (Own andalso nl_flag(F, Flags) =:= 1)]).
+
+%% Retain As Published: any matching subscription that set the bit keeps the
+%% message's original retain flag; no match means a live subscriber sees 0.
+rap_retain(Topic, Msg, #st{sub_flags = Flags} = D) ->
+    Own = publisher_of(Msg) =:= D#st.client_id,
+    Rap = [true || {F, {_NL, R}} <- maps:to_list(Flags),
+                   R =:= 1, mqtt_filter:matches(Topic, F),
+                   not (Own andalso nl_flag(F, Flags) =:= 1)],
+    case Rap of
+        [] -> 0;
+        _ -> meta_retain(Msg)
+    end.
+
+meta_retain(#broker_message{proto_meta = Meta}) ->
+    maps:get(retain, Meta, 0).
+
+publisher_of(#broker_message{proto_meta = Meta}) ->
+    maps:get(client_id, Meta, undefined).
+
+nl_of(Filter, #st{sub_flags = Flags}) ->
+    nl_flag(real_filter(Filter), Flags).
+
+nl_flag(Filter, Flags) ->
+    {NL, _} = maps:get(Filter, Flags, {0, 0}),
+    NL.
+
+push_wanted(Refs, Msg, #st{client_id = ClientId, sub_flags = Flags,
+                           sub_refs = RefMap} = D) ->
+    case publisher_of(Msg) =:= ClientId of
+        false ->
+            true;
+        true ->
+            %% Only this connection's own publishes can be No-Local-suppressed.
+            case [nl_of(F, D) || F <- [maps:get(Ref, RefMap, undefined)
+                                       || Ref <- Refs],
+                                 is_binary(F)] of
+                [] ->
+                    %% No ref mapped yet (before the first pull refreshes the
+                    %% map): a matching No Local filter is taken to be the
+                    %% push's cause.
+                    [] =:= [F || {F, {NL, _}} <- maps:to_list(Flags),
+                                 NL =:= 1,
+                                 mqtt_filter:matches(
+                                   Msg#broker_message.destination, F)];
+                NLs ->
+                    %% Exact: the push is wanted iff at least one causing
+                    %% subscription did not suppress it.
+                    lists:member(0, NLs)
+            end
+    end.
 
 %% S2.5 (ADR-017 §17.2): properties travel in `proto_meta', so an outbound
 %% PUBLISH rebuilds them from there. A 3.1.1 connection ignores the record
@@ -2125,12 +2381,20 @@ blob(D) ->
                   || {Pid, Entry} <- maps:to_list(D#st.pending),
                      is_position_entry(Entry)],
     Pids = [Pid || {Pid, _} <- Positional],
-    #{vsn => 2,
+    #{vsn => 3,
       next_pid => D#st.next_pid,
       pending => Positional,
       qos => maps:with(Pids, D#st.pending_qos),
       released => maps:with(Pids, D#st.released),
-      received => D#st.received}.
+      received => D#st.received,
+      %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
+      %% and §3.8.3.1 options across reconnects, so they ride the blob too.
+      subs => subs_blob(D)}.
+
+subs_blob(#st{sub_ids = Ids, sub_flags = Flags}) ->
+    [{F, Id, NL, Rap}
+     || {F, Id} <- maps:to_list(Ids),
+        {NL, Rap} <- [maps:get(F, Flags, {0, 0})]].
 
 %% v5 only, and only for a positive interval: 3.1.1 and session-expiry 0 keep
 %% the historical "no key means no deadline" shape (0 in v5 already tore the
@@ -2233,6 +2497,15 @@ refuse(Code, D) ->
     RC = refuse_code(Code, D),
     {stop, normal, send_frame(connack_bin(0, RC, D), D)}.
 
+%% §4.13: a protocol error on an established session answers with DISCONNECT
+%% carrying the reason code, then the network connection closes. The caller
+%% gets the `{stop, ...}' tuple so the same expression shape as `refuse/2'
+%% works inside event handlers.
+protocol_error(RC, What, D) ->
+    broker_metrics:inc(protocol_errors),
+    log(warning, "mqtt protocol error 0x~2.16.0B: ~ts", [RC, What]),
+    {stop, normal, send_frame(enc(#disconnect{reason_code = RC}, D), D)}.
+
 %% S2.5 (ADR-017): 3.1.1 return codes and v5 reason codes are different tables
 %% for the same refusal. Mapping on the way out keeps every caller on the
 %% 3.1.1 numbering it already used.
@@ -2272,11 +2545,13 @@ ka_arm(_StateName, D) ->
 %% included), so its blob write is skipped as well.
 %%
 %% Will (ADR-018 §18.1): published on every abnormal ending -- TCP death,
-%% keepalive timeout, protocol error, internal failure, takeover -- and NOT on
-%% `mqtt_disconnect' (the client said goodbye) or `shutdown' (the broker is
+%% keepalive timeout, protocol error, internal failure -- and NOT on
+%% `mqtt_disconnect' (the client said goodbye), `shutdown' (the broker is
 %% stopping; its queue workers may already be gone, and a Will storm during a
-%% restart is not useful). It runs BEFORE detach so a subscriber observing the
-%% Will still sees this session as the owner of the client id.
+%% restart is not useful) or `takeover' (§3.1.2.5: a new Network Connection for
+%% this ClientID cancels the Will instead of firing it). It runs BEFORE detach
+%% so a subscriber observing the Will still sees this session as the owner of
+%% the client id.
 terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
     _ = report_gauge(conn_mailbox_len, -D#st.reported_mailbox),
     _ = report_gauge(conn_inflight, -D#st.reported_inflight),
@@ -2312,15 +2587,44 @@ publish_will(mqtt_disconnect, _D) ->
     ok;
 publish_will(shutdown, _D) ->
     ok;
+%% §3.1.2.5 / §3.1.3.2.2: a new Network Connection for the same ClientID is
+%% exactly the event that MUST NOT publish the Will -- it cancels it (the new
+%% connection also cancels a delayed will at CONNECT).
+publish_will(takeover, _D) ->
+    ok;
 publish_will(_Reason, #st{will = undefined}) ->
     ok;
-publish_will(Reason, #st{will = Will, tenant_id = Tenant, principal = Principal}) ->
-    %% Everything about publishing a Will can fail (the queue may be down, the
-    %% retain app may be restarting). A dying process must not log a crash on
-    %% top of the reason it is dying, so the failure is contained here.
-    _ = (catch mqtt_will:publish(Will, Tenant, Principal)),
-    log(warning, "will published (reason=~p, client_id=~p)", [Reason, self()]),
-    ok.
+publish_will(Reason, #st{will = Will, tenant_id = Tenant,
+                         principal = Principal, client_id = ClientId} = D) ->
+    %% §3.1.3.2.2: the Will Delay Interval. A session that ends at disconnect
+    %% (Session Expiry 0 / 3.1.1 clean session) publishes immediately -- the
+    %% session is over, which fires the Will now regardless of the delay. A
+    %% persistent session waits min(delay, session expiry) in
+    %% `mqtt_will_server', which the next CONNECT for this ClientID cancels.
+    DelayS = case D#st.persist of
+                 true -> min(will_delay(Will), D#st.session_expiry);
+                 false -> 0
+             end,
+    case DelayS of
+        S when is_integer(S), S > 0 ->
+            _ = (catch mqtt_will_server:schedule(ClientId, Will, S * 1000,
+                                                 Tenant, Principal)),
+            log(warning, "will delayed ~ps (reason=~p, client_id=~p)",
+                [S, Reason, ClientId]),
+            ok;
+        _ ->
+            %% Everything about publishing a Will can fail (the queue may be
+            %% down, the retain app may be restarting). A dying process must
+            %% not log a crash on top of the reason it is dying, so the
+            %% failure is contained here.
+            _ = (catch mqtt_will:publish(Will, Tenant, Principal)),
+            log(warning, "will published (reason=~p, client_id=~p)",
+                [Reason, ClientId]),
+            ok
+    end.
+
+will_delay(#{delay := S}) when is_integer(S), S > 0 -> S;
+will_delay(_) -> 0.
 
 code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
