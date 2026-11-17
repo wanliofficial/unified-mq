@@ -6,7 +6,7 @@
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
 - **相关**：`docs/storage-and-recovery.md`（WAL/会话恢复）、`docs/security.md`（TLS/ACL）
 
-本手册只描述已实现的管理面。命令示例以默认配置（admin `127.0.0.1:8090`，空 token）为准；生产环境必须设置 token 并限制 bind。
+本手册只描述已实现的管理面。命令示例以默认配置（admin `127.0.0.1:8090`，空 token）为准；生产环境必须设置 token 并限制 bind。**非回环 `bind` 配空 `token` 会在启动时直接失败**（`{insecure_bind, Bind, empty_token}`）——这条不变式由代码强制，不再是注释约定。
 
 ---
 
@@ -576,17 +576,42 @@ Authorization: Bearer <token>
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/healthz` | 存活：进程在即 200，永远不鉴权 |
-| GET | `/readyz` | 就绪：必需 app 未全起时 503，列缺失 app |
+| GET | `/healthz` | 存活：进程在即 200，永远不鉴权，**drain 期间也是 200** |
+| GET | `/readyz` | 就绪：`draining`/`down` 时 503（`status` 为 drain 状态），否则按必需 app 判 200/503 |
 | GET | `/metrics` | Prometheus 文本（封闭 key 集合） |
 | GET | `/api/v1/status` | 节点、版本、分区、retention、集群、指标快照 |
+| GET | `/api/v1/node` | 节点视图（S12-A）：`state`、`ready`、连接数、本节点拥有分区——外部 LB 消费的契约 |
+| POST | `/api/v1/drain` | 摘流：挂起本节点全部 ranch listener，**不断开在用连接**（ADR-032 D2） |
+| POST | `/api/v1/undrain` | 恢复接收新连接 |
 | GET | `/api/v1/config` | 脱敏配置快照 + SHA-256 |
 | GET | `/api/v1/version` | release/OTP/数据格式/配置版本 |
 | GET | `/api/v1/backups` | 备份清单（名称、字节、mtime） |
 | POST | `/api/v1/backup` | 创建一次热备份 |
 | POST | `/api/v1/tls/reload` | 清 `ssl` PEM 缓存，轮换证书 |
 
-`/readyz` 检查的 app：`broker_storage`、`broker_router`、`broker_queue`、`broker_subscription`、`broker_event`、`broker_security`。`broker_metrics` 与 `broker_admin` 故意不在其中：指标/管理面故障不应把 broker 摘出负载均衡。
+`/readyz` 检查的 app：`broker_storage`、`broker_router`、`broker_queue`、`broker_subscription`、`broker_event`、`broker_security`。`broker_metrics` 与 `broker_admin` 故意不在其中：指标/管理面故障不应把 broker 摘出负载均衡。**判定口径是「已 started」而非「已 loaded」**：一个崩溃但未 unload 的 app 不会被算成就绪（S12-A 修复）。
+
+#### 摘流（drain）
+
+`POST /api/v1/drain` 把节点切到 `draining`：挂起本节点**全部 ranch listener**（停止 accept），在用连接保留到自然结束或宽限期到期。管理 API 自身不是 ranch listener，因此 drain 期间**仍可达**，`undrain` 随时可调。
+
+```bash
+# 用配置里的 drain_timeout_ms
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     http://127.0.0.1:8090/api/v1/drain
+# 或显式指定宽限期（毫秒；infinity 表示等到显式 undrain）
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"timeout_ms":30000}' \
+     http://127.0.0.1:8090/api/v1/drain
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     http://127.0.0.1:8090/api/v1/undrain
+```
+
+- 入参严格校验（R-LB8）：未知字段、类型错误、非法 JSON 一律 **400**，且**不会**改变状态。
+- 宽限期到期自动 `draining -> down`（`drain_timeout_ms`，默认 `infinity`）；到 `down` 后 `drain` 回 **409**，`undrain` 仍可恢复。
+- **任何路径都不主动断开在用连接**：`down` 只是「可以停进程了」的信号。
+- drain 状态是**节点本地**的，不进 ra：失去多数派时摘流仍然可用（ADR-032 D1）。
+- 排空顺序建议：`/readyz` 已 503 → 等 LB 摘除 → 观察 `/api/v1/node` 的 `connections.active` 归零 → 停进程。
 
 示例：
 
@@ -606,7 +631,8 @@ curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
 ### 3.1 健康与就绪
 
 - `/healthz` 200 且 `/readyz` 200：正常。
-- `/readyz` 503：响应体会列出缺失 app，先查该 app 的启动日志（`data/log/s1.log`）。
+- `/readyz` 503 且 `status` 为 `draining`/`down`：节点被显式摘流（见 §2 摘流一节），不是故障。
+- `/readyz` 503 且 `status` 为 `not_ready`：响应体的 `missing` 会列出缺失 app，先查该 app 的启动日志（`data/log/s1.log`）。
 - 进程在但 `/readyz` 一直 503：检查数据目录是否可写、分区是否已带外创建（见 §5）。
 
 ### 3.2 关键指标

@@ -139,4 +139,30 @@ D2 的前置修复已落地，**D2 原文不动**（冻结文本只追加本节�
   - **为什么不用一次性 app spec**：`{application, App, [{modules, []}, ...]}` 加载后 `application:get_application(App)` 回 `undefined`（实测），旧逻辑同样回 `false`，无法区分新旧实现——那样的负控是假的。
 - **未保留多余导出**：初版曾 `-export([started/1])` 供直接单测，但那样会让 `xref` 从 302 涨到 303（新增一条 unused-export）。改为走 HTTP 后撤销导出，`xref` 保持 **302**。
 - **验证**：admin 套件 **12/12**；全量 `rebar3 ct` **1374/1374**（基线 1373 + 1 新测试）；`dialyzer` 0 warning；`xref` 302 条全 unused-export（不变）。
-- **S12-A 仍未完成**：drain 状态机（`up|draining|down` + `/readyz` 503 一致）、节点视图真相落地、管理 API（R-LB8）、非回环 + 空 token 拒启。D2 的其余三条仍是待办。
+
+### S12-A 第二个代码交付：drain 状态机 + 管理 API + 启动校验（2026-11-17）
+
+D2 的其余三条已落地，**D2 冻结文本仍一字未改**。
+
+- **状态机**：新模块 `broker_drain`（`apps/broker_admin/src/broker_drain.erl`），`up | draining | down`，挂进 `broker_admin_sup`。状态镜像到 `persistent_term`（key `{broker_drain, state}`，默认 `up`），`/readyz` 热路径**不调用**该进程。
+- **「停止 accept」的实现**：`ranch:suspend_listener/1`。实测其源码语义（`ranch.erl:234-243`）是 `set_addr(Ref, {undefined,undefined})` + `supervisor:terminate_child(ListenerSup, ranch_acceptors_sup)`——**只终止 acceptor supervisor**，`ranch_conns_sup` 与全部在用连接存活（`ranch_listener_sup.erl:38-46` 的子进程表证实两者并列）。这正是 D2 的「不迁移连接、不断开在用连接」。
+  - **管理 API 自身不受影响**：`broker_admin_listener` 是手写 `gen_tcp` acceptor，不是 ranch child，所以 drain 期间 8090 仍可达，`undrain` 随时可调。
+  - **覆盖范围如实收窄**：drain 只覆盖 ranch TCP listener。QUIC（`mqtt_quic_listener`）与 CoAP（`coap_listener`）是自定义 `gen_udp`/`gen_server`，**不在挂起范围**。这是一条需要在 S12 后续阶段处理或明确接受的边界，此处如实记录。
+- **`/readyz` 对齐**：先看 drain 状态——`draining`/`down` 一律 **503** 且 `status` 直接是该状态；`up` 时维持原有的 `ready` / `not_ready` + `missing` 逻辑。`/healthz` 恒 200（draining 的节点是健康的，只是不接新流量）。
+- **管理 API（R-LB8）**：
+  - `POST /api/v1/drain`，body 可选：`{}` 或空 = 用配置的 `drain_timeout_ms`；`{"timeout_ms": N}`；`{"timeout_ms": "infinity"}`。
+  - **严格校验**：非法 JSON / 未知字段 / 类型错误 → **400**，且**不改变状态**（`drain_rejects_a_malformed_body` 断言拒绝后仍为 `up`）。未知字段回 `{"error":"unknown_field","field":"<名>"}` 而不是丢掉元组的裸串。
+  - `POST /api/v1/undrain`；`GET /api/v1/node` 给外部 LB 的契约（`state`、`ready`、`connections{active,total,max}`、本节点拥有的 `partitions`）。连接数直接聚合自 `ranch:info/1`，不是另立计数器；分区归属走 `broker_cluster:owner/1`（本地镜像，**不碰 ra**）。
+  - `down` 之后再 `drain` → **409**。`drain/1` 的宽限期上限 `16#FFFFFFFF`（与 `send_after` 同界）。
+- **`drain_timeout_ms` 有真实消费者（R-E6）**：`config/sys.config.src` 的 `broker_admin` 块新增该键，默认 `infinity`；到期 `draining -> down`。**到达 `down` 也不断开在用连接**——它只是「可以停进程了」的信号。
+- **启动校验（D2 末条）**：`broker_admin_sup:init/1` 在 `bind` 非回环且 `token` 为空时 `{stop, {insecure_bind, Bind, empty_token}}`，应用启动失败。`enabled => false` 不校验（没有 listener 就没有暴露）。这条此前只写在注释（`broker_admin_http.erl:19-22`）与文档（`docs/operations.md:9`）里。
+- **测试**（`broker_admin_SUITE`，共 **19** 例，新增 7 例）：
+  - 用**真实 ranch listener**（`broker_admin_drain_probe`，`port => 0`）证明：drain 后 `ranch:info(Ref).status` 为 `suspended`、新连接 `econnrefused`、**在用连接仍能收发**；undrain 后恢复。
+  - `timeout_ms => 0` 走异步 `send_after`，因此**轮询等状态**而不是假设回复即已迁移。
+  - bind/token 用例覆盖两侧：空 token + `{0,0,0,0}` 启动失败且 `broker_admin_listener:port() =:= undefined`；带 token 时同一 bind 可以起来。
+  - **七条都做过反证**（逐条临时改坏再跑）：drain 不挂起 → 3 例挂；drain 改成 `stop_listener`（真正断开连接）→ 5 例挂；`/readyz` 不看 drain → 2 例挂；校验放行宽 bind → 1 例挂。即这些测试不是空跑。
+- **顺带修掉的两个真实缺陷**（都由测试逼出来，不是重构）：
+  1. `json_safe/1` 没有布尔分支，`true`/`false` 被编码成字符串 `"true"`/`"false"`。`/api/v1/node` 的 `ready` 若回 `"false"`，按布尔比较的 LB 会读反。加了 `json_safe(true|false)` 分支（既有端点未用过布尔，故无行为变化）。
+  2. `broker_admin_listener` 未 `trap_exit`，supervisor 关停时 `terminate/2` 不执行，`persistent_term` 留下**过期端口**，`port/0` 会对已无人监听的端口作答。加 `process_flag(trap_exit, true)`。
+- **验证**：admin 套件 **19/19**；全量 `rebar3 ct` **1381/1381**（1374 + 7）；`dialyzer` 0 warning；`xref` **302** 条全 unused-export（不变，新模块的导出计入既有 unused-export 口径，未新增其他类别）。
+- **S12-A 仍未完成**：D1 的「节点视图唯一真相」在**成员/归属**侧的落地（`broker_meta` 的 `cluster_node`/`partition_meta` 退役为遗留形状）不在本次交付内；本次只落了**节点自身**的 drain 状态与对外视图。QUIC/CoAP 的摘流边界待定。

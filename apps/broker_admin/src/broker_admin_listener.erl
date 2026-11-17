@@ -22,6 +22,11 @@ port() ->
     persistent_term:get(?PT, undefined).
 
 init([]) ->
+    %% Trap exits so `terminate/2' runs on a supervisor shutdown and clears the
+    %% advertised port. Without this the process is killed outright (supervisors
+    %% send `exit(Pid, shutdown)'), `persistent_term' keeps the old port, and
+    %% `port/0' goes on answering with a port nobody is listening on.
+    process_flag(trap_exit, true),
     Bind = application:get_env(broker_admin, bind, {127, 0, 0, 1}),
     Port = application:get_env(broker_admin, port, 8090),
     Opts = [binary, {packet, http_bin}, {active, false},
@@ -188,6 +193,7 @@ reason(400) -> <<"Bad Request">>;
 reason(401) -> <<"Unauthorized">>;
 reason(404) -> <<"Not Found">>;
 reason(405) -> <<"Method Not Allowed">>;
+reason(409) -> <<"Conflict">>;
 reason(500) -> <<"Internal Server Error">>;
 reason(503) -> <<"Service Unavailable">>.
 
