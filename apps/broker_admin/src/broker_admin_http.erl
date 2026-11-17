@@ -133,11 +133,16 @@ missing_apps() ->
                 broker_subscription, broker_event, broker_security],
     [A || A <- Required, not started(A)].
 
+%% A required app counts as "ready" only when it has actually started,
+%% not merely when it has been loaded. `application:get_application/1'
+%% with an app name resolves to the module -> application mapping, which
+%% is populated as soon as `application:load/1' runs: an app that crashed
+%% without unloading still answers `{ok, App}', so gating on it would keep
+%% `/readyz' at 200 while the data plane is down (S12-A, ADR-032 D2).
+%% `which_applications/0' lists only started applications, which is the
+%% readiness question we are asking.
 started(App) ->
-    case application:get_application(App) of
-        {ok, _} -> true;
-        _ -> false
-    end orelse lists:keymember(App, 1, application:which_applications()).
+    lists:keymember(App, 1, application:which_applications()).
 
 %%%_* Prometheus text exposition -------------------------------------------
 

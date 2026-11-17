@@ -124,3 +124,19 @@ S12-0 为纯文档阶段，验证即**事实可核对性**：
   - S12-B：节点级计数闸门超限时**显式拒绝**（不是 acceptor 睡下）；`connections_current` 在 WS/NATS/AMQP/Kafka/Pulsar/CoAP/WebRTC 的连接生命周期上正确增减（负控：断开后归零）。
   - S12-C：扩 `broker_cluster_dist_SUITE`（现有 3 节点 `peer`，`broker_cluster_dist_SUITE.erl:19,141,170`）——节点加入/退出/故障下再平衡器**默认不动**、显式触发后一轮一迁移、旧 owner `{fenced,_}`、无双写、`cooldown_ms` 内不复迁；再平衡器崩溃不影响 `assign/4` 直连路径。
 - **能力矩阵**：4 仓全部 F- 条目（各单仓稿 §2.5）逐行留痕（R-N8）；本 ADR 的 9 项「S12 不交付」逐条列出（活进程迁移、handoff 版本号、指标键集扩展、`on_quorum_loss`、`broker_security` mnesia 接线、跨节点投递、全协议 epoch 校验、跨 group 自动均衡、Broker 内部排队）。
+
+## 落地偏差记录
+
+### S12-A 首个代码交付：`/readyz` 的 loaded→started 修复（2026-11-17）
+
+D2 的前置修复已落地，**D2 原文不动**（冻结文本只追加本节）。
+
+- **修法**：`started/1` 改为只判定 `lists:keymember(App, 1, application:which_applications())`。D2 列的候选里选了「只保留 `which_applications/0` 判定」——`application:get_application/1` 的模块形态同样受 loaded 语义影响，不能用来回答「started」。
+- **实证**（`application:load(broker_queue)` 后单行 `erl`）：`application:get_application(broker_queue) = {ok, broker_queue}`，而 `which_applications()` 不含它；旧 `started/1` 返回 `true`，新逻辑返回 `false`。用 `/readyz` 实际门控的六个 app 全量复核，旧逻辑对**全部六个**都答 `true`（即「missing 为空 → 200」），新逻辑对全部六个答 `false`（`missing` 为全集 → 503）。
+- **测试**：`broker_admin_SUITE:started_predicate_ignores_loaded_not_started_apps`——**走真实 `/readyz` 路由**，不导出私有谓词、不加 `ignore_xref`。做法：把六个必需 app 全部 `application:load/1`（**只 loaded、不 started**），断言 `/readyz` 回 **503** 且 `missing` 恰为「运行时确实未 started 的那一组」。期望集合**运行时推导**，因为 `broker_security` 会随 `broker_admin` 一起启动（我第一次写成硬编码全六个，实测失败在 `[broker_security]`，已改成推导）。
+  - **有效性已反证**：把 `started/1` 临时改回旧实现重跑，该用例**失败**（12 例中 1 例挂）；改回修复后 12/12。即这是真回归测试，不是空跑。
+  - **为什么不硬编码 `broker_router`**：CT 所有套件共用一个节点，`acp_agent_SUITE` 等会 `ensure_all_started(broker_router)` 且 `end_per_suite` 不停止它，硬编码就变成对「套件执行顺序」的依赖而非性质断言。
+  - **为什么不用一次性 app spec**：`{application, App, [{modules, []}, ...]}` 加载后 `application:get_application(App)` 回 `undefined`（实测），旧逻辑同样回 `false`，无法区分新旧实现——那样的负控是假的。
+- **未保留多余导出**：初版曾 `-export([started/1])` 供直接单测，但那样会让 `xref` 从 302 涨到 303（新增一条 unused-export）。改为走 HTTP 后撤销导出，`xref` 保持 **302**。
+- **验证**：admin 套件 **12/12**；全量 `rebar3 ct` **1374/1374**（基线 1373 + 1 新测试）；`dialyzer` 0 warning；`xref` 302 条全 unused-export（不变）。
+- **S12-A 仍未完成**：drain 状态机（`up|draining|down` + `/readyz` 503 一致）、节点视图真相落地、管理 API（R-LB8）、非回环 + 空 token 拒启。D2 的其余三条仍是待办。

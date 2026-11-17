@@ -14,6 +14,7 @@
 all() ->
     [healthy_and_ready,
      metrics_endpoint_lists_the_closed_key_set,
+     started_predicate_ignores_loaded_not_started_apps,
      status_reports_partitions,
      config_audit_hash_is_stable_and_redacts,
      version_reports_data_format,
@@ -75,6 +76,49 @@ healthy_and_ready(Config) ->
         #{<<"status">> := <<"not_ready">>, <<"missing">> := Missing} ->
             true = is_list(Missing)
     end,
+    ok.
+
+%% A required app that is loaded but not started must not count as ready.
+%% This is the S12-A / ADR-032 D2 regression: the old `started/1' keyed on
+%% `application:get_application/1', which answers `{ok, App}' the moment the
+%% app is *loaded* -- so a crashed-but-not-unloaded app kept `/readyz' at 200.
+started_predicate_ignores_loaded_not_started_apps(Config) ->
+    %% Drive the real endpoint, not a private predicate. Loading a required app
+    %% does *not* start it, and the old implementation ("loaded counts as
+    %% ready") answered 200 for exactly that state -- the bug ADR-032 D2 names.
+    Required = [broker_storage, broker_router, broker_queue,
+                broker_subscription, broker_event, broker_security],
+    ok = ensure_loaded(Required),
+    %% Expected set is derived at runtime: some required apps are started as a
+    %% side effect of this suite (`broker_security' comes in with broker_admin),
+    %% and other suites may leave some running. Deriving it keeps the assertion a
+    %% property rather than a dependency on suite ordering.
+    NotStarted = [A || A <- Required, not is_started(A)],
+    %% Without at least one loaded-but-not-started app there is nothing to
+    %% distinguish: old and new logic would agree.
+    true = NotStarted =/= [] orelse ct:fail(no_loaded_not_started_app),
+    {Status, Ready} = request(get, "/readyz", [], Config),
+    #{<<"status">> := <<"not_ready">>, <<"missing">> := Missing0} = Ready,
+    503 = Status,
+    Missing = lists:sort([binary_to_atom(M, utf8) || M <- Missing0]),
+    case Missing =:= lists:sort(NotStarted) of
+        true -> ok;
+        false -> ct:fail({missing_apps_mismatch, Missing, lists:sort(NotStarted)})
+    end,
+    %% Positive control: an app that really is started is never reported missing.
+    [false = lists:member(A, Missing) || A <- Required, is_started(A)],
+    ok.
+
+is_started(App) -> lists:keymember(App, 1, application:which_applications()).
+
+ensure_loaded(Apps) ->
+    lists:foreach(
+      fun(A) ->
+              case application:load(A) of
+                  ok -> ok;
+                  {error, {already_loaded, A}} -> ok
+              end
+      end, Apps),
     ok.
 
 metrics_endpoint_lists_the_closed_key_set(Config) ->
