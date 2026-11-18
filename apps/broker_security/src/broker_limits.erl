@@ -13,6 +13,8 @@
 %%   * `max_event_attributes'    -- CloudEvents core + extension attributes
 %%   * `max_extension_value_bytes' -- one CloudEvents extension value
 %%   * `max_json_depth'          -- nesting depth of a JSON `data' value
+%%   * `max_connections'         -- node-wide admitted connections, `infinity'
+%%     (default) leaves `broker_admission' disabled
 %%
 %% Why these live in `broker_security': the limits are a governance decision,
 %% and the function is pure so `broker_queue' and `broker_event' can call it
@@ -33,7 +35,13 @@
                     max_header_value_bytes => 8192,
                     max_event_attributes => 64,
                     max_extension_value_bytes => 4096,
-                    max_json_depth => 16}).
+                    max_json_depth => 16,
+                    %% S12-B (ADR-032 D7): the node-level admission gate. The
+                    %% default is `infinity' on purpose -- before S12-B the node
+                    %% had no node-wide cap (ranch's 1024 is per listener), so
+                    %% turning one on has to be an operator's decision, not an
+                    %% upgrade's side effect. See `broker_admission'.
+                    max_connections => infinity}).
 
 %% @doc The effective limits, defaults filled in. Exposed so the admin API can
 %% report exactly what is enforced (no "config says X, code does Y").
