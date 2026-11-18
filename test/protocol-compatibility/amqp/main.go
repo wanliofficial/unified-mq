@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"time"
 
@@ -53,6 +54,7 @@ func main() {
 		{"amqp-passive-missing", passiveMissing},
 		{"amqp-prefetch-qos", prefetchQos},
 		{"amqp-multi-channel", multiChannel},
+		{"amqp-backlog-before-consume", backlogBeforeConsume},
 	}
 	pass, fail := 0, 0
 	for _, c := range cases {
@@ -586,6 +588,60 @@ func multiChannel() (string, error) {
 		return "", fmt.Errorf("channel b: %v %q", err, m.Body)
 	}
 	return `{"channels":2,"isolated":true}`, nil
+}
+
+// RQ-01: messages published to a queue before any consumer joins stay
+// readable -- 100 published first, then one consumer must receive all 100 in
+// publish order.
+func backlogBeforeConsume() (string, error) {
+	return withConn(func(_ *amqp.Connection, ch *amqp.Channel) (string, error) {
+		const q = "compat.backlog"
+		if err := declareQueue(ch, q); err != nil {
+			return "", err
+		}
+		const n = 100
+		want := make([]string, 0, n)
+		for i := 1; i <= n; i++ {
+			b := fmt.Sprintf("backlog-%03d", i)
+			if err := publish(ch, "", q, b); err != nil {
+				return "", err
+			}
+			want = append(want, b)
+		}
+		msgs, err := ch.Consume(q, "late", false, false, false, false, nil)
+		if err != nil {
+			return "", err
+		}
+		got := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			m, err := recvOne(msgs, 5*time.Second)
+			if err != nil {
+				return "", err
+			}
+			got = append(got, string(m.Body))
+			if err := m.Ack(false); err != nil {
+				return "", err
+			}
+		}
+		if !reflect.DeepEqual(want, got) {
+			return "", fmt.Errorf("backlog mismatch: got %d messages, first divergence at %v",
+				len(got), firstDiff(want, got))
+		}
+		return `{"backlog":100,"in_order":true}`, nil
+	})
+}
+
+func firstDiff(want, got []string) int {
+	n := len(want)
+	if len(got) < n {
+		n = len(got)
+	}
+	for i := 0; i < n; i++ {
+		if want[i] != got[i] {
+			return i
+		}
+	}
+	return n
 }
 
 func keys(m map[string]int) []string {

@@ -30,13 +30,19 @@ S2-C 要补齐 QoS 2 / Retain / Will。ADR-012 已冻结 QoS 2 的承诺边界�
 | keepalive 超时（1.5×） | 是 |
 | 协议错误 / 解码失败 / 超限 PUBLISH | 是 |
 | `{append_failed, _}` 等内部错误 | 是 |
-| 会话接管（同 ClientID 新连接） | 是（§3.1.4 + §3.1.2.5 字面：旧连接未经 DISCONNECT 被关闭） |
+| 会话接管（同 ClientID 新连接） | **否（S2.5 起）**——§3.1.2.5 把「新 Network Connection」定为**取消** Will 的事件，而不是触发它。S2.5 之前的实现按 §3.1.4 的字面（旧连接未经 DISCONNECT 被关闭）发布，现已更正 |
 | broker 自身崩溃 / 重启 | 不适用（Will 未落盘，进程已死） |
 
 - **Will QoS/Retain**：`will_qos ∈ 0..2`（S2-C 起含 2，帧层同步放宽），`will_retain ∈ 0|1`。发布走与普通 PUBLISH 相同的路径：`broker_router:route/3` → `broker_queue:append/3`（qos>0 用 `fsync`，qos=0 不落 WAL）→ `broker_subscription:dispatch/2`；`will_retain=1` 时同时更新 retain 树（§18.2）。
 - **没有 ack**：Will 的发布者是正在死亡的连接，没有可回 PUBACK 的对象；`reliability` 仍按 QoS 映射（qos>0 → `fsync`），失败只记日志。
 - **为什么不做持久化**：持久化 Will 需要第四份与 `.subs`/`.cursors`/`.inflight` 对齐的会话真相，并引入「重启即 Will 风暴」的失败模式；mosquitto 默认同样不持久化。MQTT 5 的 Will Delay（S2.5）会重新讨论这个边界，届时用 ADR 修订处理。
 - **与 MQTT 5 的关系**：S2.5 引入 `session expiry` 后，「Will 在所有会话结束后才发布」需要新的状态机；本 ADR 只冻结 3.1.1 行为。
+
+> **【冻结后补充 S2.5，2026-11-17】Will Delay Interval 落地。** §3.1.3.2.2 的延迟部分由新模块 `mqtt_will_server` 承担：连接进程无法持有自己的定时器，所以带延迟的 Will 被**停靠**到该 gen_server，延迟取 `min(will_delay_interval, session_expiry)`；同 ClientID 的新连接在 CONNECT 时取消它。
+>
+> 停靠的 Will **仍是内存姿态**：与上表「broker 自身崩溃 / 重启」一行同类，重启即丢，不补发（`mqtt_will_server:terminate/2` 只清定时器）。这保留了上表「为什么不做持久化」的全部理由。
+>
+> 只有 `persist = true`（v5 `session_expiry > 0`，或 3.1.1 `clean_session = 0`）的会话才会停靠；会话随断开结束（expiry 0 / clean session）时按上表立即发布。不改变本节其余判定。
 
 ### 18.2 Retain：独立 app、独立文件、QoS>0 同步落盘（O6 定案）
 

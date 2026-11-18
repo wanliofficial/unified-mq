@@ -42,7 +42,7 @@
 
 -include_lib("broker_core/include/broker_message.hrl").
 
--export([subscribe/3, subscribe/4, join/5, join/6, unsubscribe/2, leave/2,
+-export([subscribe/3, subscribe/4, join/5, join/6, join/7, unsubscribe/2, leave/2,
          ack/4, claim/4, release/4, retry/4,
          inflight/2, attach/3, detach/2, dispatch/2]).
 -export([subscriptions/1, cursor/2, session/1, role/2]).
@@ -103,6 +103,25 @@ join(Kind, Group, ClientId, Filter, QoS) ->
           {ok, sub_ref()} | {error, term()}.
 join(Kind, Group, ClientId, Filter, QoS, Tenant) ->
     broker_subscription_worker:join(Kind, Group, ClientId, Filter, QoS, Tenant).
+
+%% @doc Group join with entity-creation options (RQ-01, 2026-11-17). The only
+%% option today is `anchor':
+%%
+%%   * `tail' (default) -- a freshly created group anchors its cursor at each
+%%     partition's live tail: members only see messages published from now on
+%%     (MQTT `$share', NATS queue groups).
+%%   * `earliest' -- a freshly created group anchors at 0, so messages that
+%%     were already in the log when the first consumer joined stay deliverable
+%%     (AMQP queues: queue state predates consumers; basic.get backlog reads).
+%%
+%% The anchor acts only at entity birth: joining an existing group never moves
+%% its cursors. The option rides `.subs' (`anchor' key) and the boot restore
+%% keeps the stored anchor for partitions born after the subscribe.
+-spec join(sub_kind(), binary(), binary(), binary(), 0..2, binary(), map()) ->
+          {ok, sub_ref()} | {error, term()}.
+join(Kind, Group, ClientId, Filter, QoS, Tenant, Opts) when is_map(Opts) ->
+    broker_subscription_worker:join(Kind, Group, ClientId, Filter, QoS,
+                                    Tenant, Opts).
 
 %% @doc Drop an **exclusive** subscription: unregister from the Router, delete
 %% the entity and its cursors, remove the files. Idempotent (MQTT §4.10:

@@ -175,6 +175,8 @@ handle_line(<<"HPUB ", Rest/binary>>, St) ->
 handle_line(<<>>, St) ->
     {noreply, St};
 handle_line(_Line, St) ->
+    logger:debug("NATS unknown protocol operation: ~ts",
+                 [binary:part(_Line, 0, min(40, byte_size(_Line)))]),
     err_close(<<"Unknown Protocol Operation">>, St).
 
 %%%_* CONNECT --------------------------------------------------------------
@@ -421,11 +423,22 @@ encode_header_block(Headers) ->
     iolist_to_binary([<<"NATS/1.0\r\n">>, Lines, <<"\r\n">>]).
 
 handle_pub(Subject, Reply, Headers, Payload, St) ->
-    case publish(Subject, Reply, Headers, Payload, St) of
-        ok ->
-            maybe_ok(St);
-        {error, Reason} ->
-            err_close(reason_bin(Reason), St)
+    %% JetStream managed subject (M3): the write goes into the stream's own
+    %% destination and the caller gets a PubAck on its reply inbox instead of
+    %% the generic route.
+    case nats_jetstream:managed(Subject) of
+        {ok, Stream} ->
+            case nats_jetstream:managed_publish(Stream, Subject, Reply,
+                                                Payload, St#st.tenant) of
+                ok -> maybe_ok(St);
+                {error, Reason} ->
+                    err_close(reason_bin(Reason), St)
+            end;
+        nomatch ->
+            case publish(Subject, Reply, Headers, Payload, St) of
+                ok -> maybe_ok(St);
+                {error, Reason} -> err_close(reason_bin(Reason), St)
+            end
     end.
 
 publish(Subject, Reply, Headers, Payload, St) ->
@@ -587,14 +600,18 @@ claim_and_pull(P, Ref, St) ->
             St
     end.
 
+%% Ascending offset order (see amqp_conn:read_offsets -- reversed folds
+%% delivered multi-message claim pages backwards).
 read_offsets(P, Offsets) ->
-    lists:foldl(
-      fun(O, {Acc, Missing}) ->
-              case (catch broker_queue:read_from(P, O, 1)) of
-                  {ok, [{O, Msg}], _Next} -> {[{O, Msg} | Acc], Missing};
-                  _ -> {Acc, [O | Missing]}
-              end
-      end, {[], []}, Offsets).
+    {Read, Missing} = lists:foldl(
+                        fun(O, {Acc, Miss}) ->
+                                case (catch broker_queue:read_from(P, O, 1)) of
+                                    {ok, [{O, Msg}], _Next} ->
+                                        {[{O, Msg} | Acc], Miss};
+                                    _ -> {Acc, [O | Miss]}
+                                end
+                        end, {[], []}, lists:sort(Offsets)),
+    {lists:reverse(Read), lists:reverse(Missing)}.
 
 deliver_shared(P, Ref, O, Msg, St) ->
     case should_echo(Msg, St) of

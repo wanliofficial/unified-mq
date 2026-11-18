@@ -5,6 +5,9 @@
 %% calling process; only `register/4' and `unregister/2' hand work to the single
 %% writer. That split is the frozen point 【F3】 of §10.1 -- routing must not
 %% serialize through one gen_server (README §7.2).
+%%
+%% The index itself is a trie (docs/design/router-read-path.md §3): matching
+%% walks the destination instead of scanning every registered filter.
 -module(broker_router_hash).
 
 -behaviour(broker_router).
@@ -12,12 +15,13 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include("broker_router.hrl").
 
--export([init/1, route/3, register/4, unregister/2, current_env/0]).
+-export([init/1, route/3, register/4, unregister/2, current_env/0, gen/0]).
 
 -type env() :: #{store := pid(),
                  tab := ets:tid(),
                  partitions := pos_integer(),
-                 hash := phash2}.
+                 hash := phash2,
+                 gen => atomics:atomics_ref()}.
 
 -export_type([env/0]).
 
@@ -33,12 +37,16 @@ init(Config) ->
     case parse_config(Config) of
         {ok, N, Hash} ->
             Name = maps:get(name, Config, broker_router_hash_store),
-            case broker_router_hash_store:start_link(Name) of
+            case broker_router_hash_store:start_link(Name, #{partitions => N, hash => Hash}) of
                 {ok, Pid} ->
-                    {ok, #{store => Pid,
-                           tab => broker_router_hash_store:table(Pid),
-                           partitions => N,
-                           hash => Hash}};
+                    %% The store publishes the *complete* env, partitions and hash
+                    %% included, so this return and `current_env/0' hand out one
+                    %% shape from one place. They used to differ: the store's map
+                    %% lacked the two config fields and each caller merged them in,
+                    %% which the design §2.4 cache rules would have read as two
+                    %% different maps.
+                    {ok, Published} = broker_router_hash_store:env(Name),
+                    {ok, Published#{store => Pid}};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -57,31 +65,68 @@ init(Config) ->
 %% tenant's subscriptions plus legacy entries registered as `<<"*">>' (the
 %% pre-S6 shape, kept so existing sessions keep working). This is the read-path
 %% half of tenant isolation; the write path is `broker_security:authorize/2'.
-route(Destination, Ctx, #{tab := Tab, partitions := N, hash := Hash} = Env) ->
-    Tenant = ctx_tenant(Ctx),
-    TopicLevels = levels(Destination),
-    Matches =
-        lists:flatmap(
-            fun({{EntryTenant, Filter}, Subs}) ->
-                case tenant_visible(EntryTenant, Tenant) of
-                    false -> [];
-                    true ->
-                        case match(TopicLevels, levels(Filter)) of
-                            true -> Subs;
-                            false -> []
-                        end
-                end
-            end,
-            ets:tab2list(Tab)),
-    _ = Env,
+%%
+%% S11x change 2 (docs/design/router-read-path.md §3): the index is a trie, so
+%% this walks the destination's levels (two ETS lookups per visited node) instead
+%% of copying every registered filter with `ets:tab2list/1'. The old shape made
+%% a publish cost O(total subscriptions) regardless of how many matched.
+route(Destination, Ctx, #{tab := Tab, partitions := N, hash := Hash}) ->
+    Topic = levels(Destination),
+    Matches = lists:append([walk(Tab, Root, [], Topic)
+                            || Root <- visible_roots(ctx_tenant(Ctx))]),
     {ok, [{partition(Destination, N, Hash), ordered_unique(lists:keysort(2, Matches))}]}.
+
+%% `<<"*">>' subscriptions are visible to every tenant, including the legacy
+%% tenant that reads them directly -- querying it twice would double every hit.
+visible_roots(<<"*">>) ->
+    [<<"*">>];
+visible_roots(Tenant) ->
+    [Tenant, <<"*">>].
+
+%% Topic exhausted: filters ending at this node are exact matches, and a `#'
+%% child also matches the parent itself (MQTT §4.7: "sport/#" matches "sport").
+walk(Tab, Tenant, Path, []) ->
+    {Children, Subs} = node(Tab, Tenant, Path),
+    case maps:is_key(<<"#">>, Children) of
+        true -> Subs ++ subs_at(Tab, Tenant, Path ++ [<<"#">>]);
+        false -> Subs
+    end;
+%% Otherwise three branches at most: the literal level, `+', and `#' (which
+%% ends that branch because it already covers every depth below).
+walk(Tab, Tenant, Path, [Level | Rest]) ->
+    {Children, _Subs} = node(Tab, Tenant, Path),
+    Exact =
+        case maps:is_key(Level, Children) of
+            true -> walk(Tab, Tenant, Path ++ [Level], Rest);
+            false -> []
+        end,
+    Plus =
+        case maps:is_key(<<"+">>, Children) of
+            true -> walk(Tab, Tenant, Path ++ [<<"+">>], Rest);
+            false -> []
+        end,
+    Hash =
+        case maps:is_key(<<"#">>, Children) of
+            true -> subs_at(Tab, Tenant, Path ++ [<<"#">>]);
+            false -> []
+        end,
+    Exact ++ Plus ++ Hash.
+
+subs_at(Tab, Tenant, Path) ->
+    {_Children, Subs} = node(Tab, Tenant, Path),
+    Subs.
+
+%% Row shape is owned by `broker_router_hash_store': `{{Tenant, Path},
+%% Children, Subs}'. A missing row is an empty node, not an error: the writer
+%% prunes rows as soon as they are empty.
+node(Tab, Tenant, Path) ->
+    case ets:lookup(Tab, {Tenant, Path}) of
+        [{{Tenant, Path}, {Children, Subs}}] -> {Children, Subs};
+        [] -> {#{}, []}
+    end.
 
 ctx_tenant(#route_ctx{tenant_id = T}) when is_binary(T), T =/= <<>> -> T;
 ctx_tenant(_) -> <<"default">>.
-
-tenant_visible(<<"*">>, _Tenant) -> true;
-tenant_visible(Tenant, Tenant) -> true;
-tenant_visible(_, _) -> false.
 
 -spec register(env(), binary(), broker_router:sub_ref(), map()) -> ok | {error, term()}.
 register(#{store := Store}, Filter, SubRef, SubOpts) ->
@@ -107,28 +152,38 @@ unregister(#{store := Store}, SubRef) ->
 %% the supervisor's registered child or leak an untracked process. Not a
 %% behavior callback -- ADR-010 is frozen; this is the assembly-time accessor
 %% the frozen signatures never had a story for (design §13 I12-class gap).
+%%
+%% S11x (docs/design/router-read-path.md §2): this used to end in
+%% `broker_router_hash_store:table/1', a `gen_server:call' -- so every publish
+%% in the node queued on the index writer to re-learn a table id that never
+%% changes. ADR-010 §10.1 only bites the *inside* of `route/3', but the metric
+%% that matters is "publish to `[{Partition, Refs}]'", and that path was
+%% serialized.
+%%
+%% It was not free after change 1 either: the store published only
+%% `#{store, tab, gen}', so this read the partition count from app env and merged
+%% it into a fresh map on *every* publish. `application:get_env/3' is an `ac_tab'
+%% lookup, measured at ~1.1 us (tools/bench/env_cost.erl) -- more than the
+%% persistent_term read it wrapped. The store now publishes the complete env at
+%% init, so this is a `persistent_term' read plus an aliveness check, and the
+%% partition count is validated at boot instead of on the first publish.
+%%
+%% Error precedence is unchanged: a missing store is `router_store_not_started',
+%% an assembly bug, and it outranks nothing else because the count can no longer
+%% be wrong by the time this runs.
 -spec current_env() -> {ok, env()} | {error, term()}.
 current_env() ->
-    Partitions = application:get_env(broker_router, partitions, undefined),
-    case {whereis(store_name()), partitions_ok(Partitions)} of
-        {undefined, _} ->
-            {error, router_store_not_started};
-        {_, false} ->
-            {error, {invalid_partitions, Partitions}};
-        %% Same guard as init/1: an out-of-range count would make modulo
-        %% arithmetic on the first publish crash, and here it is caught at boot
-        %% instead. The hash stays phash2 -- S1 offers no other, and the app env
-        %% has no `hash' key (init/1 took it from a Config map nobody builds at
-        %% boot; see design §6 'two partition keys').
-        {Pid, true} ->
-            {ok, #{store => Pid,
-                   tab => broker_router_hash_store:table(Pid),
-                   partitions => Partitions,
-                   hash => phash2}}
-    end.
+    broker_router_hash_store:env(store_name()).
 
-partitions_ok(N) ->
-    is_integer(N) andalso N > 0.
+%% @doc Monotonic write counter of the index behind the configured store.
+%%
+%% Exposed for the route-plan cache described in design §4, which is not
+%% implemented: a cache is only correct if it reads this *before* reading the
+%% index and tags the plan with the value it saw. Nothing on the current read
+%% path calls it, so it costs nothing today.
+-spec gen() -> non_neg_integer() | undefined.
+gen() ->
+    broker_router_hash_store:gen(store_name()).
 
 %% The registered name `broker_router_sup' gives the child, and the name init/1
 %% defaults to. One source so the supervisor's child and current_env/0 cannot
@@ -153,19 +208,6 @@ partition(Destination, N, phash2) ->
 
 levels(Topic) ->
     binary:split(Topic, <<"/">>, [global]).
-
-%% MQTT 3.1.1 §4.7: # stands for the parent level and any number below it, so
-%% "sport/#" matches "sport" as well as "sport/a/b".
-match(_TopicLevels, [<<"#">>]) ->
-    true;
-match([], []) ->
-    true;
-match([_ | Topic], [<<"+">> | Filter]) ->
-    match(Topic, Filter);
-match([Level | Topic], [Level | Filter]) ->
-    match(Topic, Filter);
-match(_Topic, _Filter) ->
-    false.
 
 %% A malformed filter would silently never match (or match the wrong thing), so
 %% it is rejected when it is registered instead of at publish time.
@@ -192,16 +234,17 @@ has_wildcard(Level) ->
     binary:match(Level, [<<"+">>, <<"#">>]) =/= nomatch.
 
 %% Input is sorted by registration sequence, so keeping the first occurrence of
-%% each SubRef preserves index order and drops the duplicates.
+%% each SubRef preserves index order and drops the duplicates. The seen-set is a
+%% map, not a list: with N subscriptions matching one topic, `lists:member/2'
+%% made this O(N^2) (design §0 P3).
 ordered_unique(Pairs) ->
-    ordered_unique(Pairs, [], []).
-
-ordered_unique([], _Seen, Acc) ->
-    lists:reverse(Acc);
-ordered_unique([{SubRef, _Seq} | Rest], Seen, Acc) ->
-    case lists:member(SubRef, Seen) of
-        true ->
-            ordered_unique(Rest, Seen, Acc);
-        false ->
-            ordered_unique(Rest, [SubRef | Seen], [SubRef | Acc])
-    end.
+    {Acc, _Seen} =
+        lists:foldl(fun({SubRef, _Seq}, {Acc, Seen}) ->
+                            case maps:is_key(SubRef, Seen) of
+                                true -> {Acc, Seen};
+                                false -> {[SubRef | Acc], Seen#{SubRef => true}}
+                            end
+                    end,
+                    {[], #{}},
+                    Pairs),
+    lists:reverse(Acc).

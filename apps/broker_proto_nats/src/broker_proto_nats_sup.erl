@@ -10,8 +10,15 @@ start_link() ->
 %% supervisor, so stopping the app stops accepting and ranch's conns sup shuts
 %% every live connection down with the listener.
 init([]) ->
-    Children = [listener_spec(S) || S <- listeners()],
+    %% JetStream (M3) sits before the listeners: its internal subscriptions
+    %% must exist before client publishes can hit managed subjects.
+    Children = [nats_jetstream_spec() | [listener_spec(S) || S <- listeners()]],
     {ok, {#{strategy => one_for_one, intensity => 1, period => 5}, Children}}.
+
+nats_jetstream_spec() ->
+    {nats_jetstream,
+     {nats_jetstream, start_link, []},
+     permanent, 5000, worker, [nats_jetstream]}.
 
 listeners() ->
     application:get_env(broker_proto_nats, listeners, []).

@@ -42,7 +42,7 @@
 %% implementation must grow a new export (design §13 I12-class gap).
 -spec env() -> {ok, router_env()} | {error, term()}.
 env() ->
-    Backend = application:get_env(broker_router, backend, broker_router_hash),
+    Backend = backend(),
     Backend:current_env().
 
 %% @doc Write-path facades for consumers that only have a SubRef and a Filter.
@@ -65,4 +65,14 @@ unregister(SubRef) ->
     end.
 
 backend() ->
-    application:get_env(broker_router, backend, broker_router_hash).
+    %% Cached at app start (broker_router_sup:init/1) instead of read from app env
+    %% on every publish: `application:get_env/3' is an `ac_tab' lookup measured at
+    %% ~1.1 us (tools/bench/env_cost.erl) and this runs twice per publish (once
+    %% here, once inside the backend). The fallback keeps unit tests that use the
+    %% backend without starting the app working, and it is the same value the
+    %% supervisor used to pick the child, so the two can no longer disagree after a
+    %% config change -- a boot-config value this system already treats as fixed.
+    case persistent_term:get({broker_router_sup, backend}, undefined) of
+        undefined -> application:get_env(broker_router, backend, broker_router_hash);
+        Backend -> Backend
+    end.

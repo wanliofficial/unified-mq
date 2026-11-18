@@ -308,6 +308,15 @@ key_specs() ->
      {wal_append_total, counter},
      {wal_sync_total, counter},
      {segment_bytes, gauge},
+     %% S11x (design/router-read-path.md §7.2 OQ-2): the router's trie index
+     %% row count, = ets:info(Tab, size), refreshed by the index writer on every
+     %% register/unregister. Exported as ROWS, not subscriptions, because the two
+     %% diverge by up to ~19x: the trie's rows are paths, and N subscribers on the
+     %% same path share one row (a 100k fanout is 4 rows). Memory tracks rows,
+     %% not subscribers, so capacity alarms must key on rows -- see
+     %% docs/benchmarks/2026-11-16-s11x-router-index-memory.md §0. One atom key,
+     %% no labels, same closed-set rule as everything above.
+     {router_index_rows, gauge},
      {recovery_time_us, histogram},
      {retention_deleted_bytes, counter},
      {retention_deleted_segments, counter},

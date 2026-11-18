@@ -38,7 +38,9 @@ HTTP 暴露 / Prometheus / OpenTelemetry 统一留到 **S6（运维化）**；�
 | 吞吐 | `publish_total`、`deliver_total`、`ack_total`、`bytes_in`、`bytes_out` | counter |
 | 延迟 | `publish_latency_us`、`deliver_latency_us`、`ack_latency_us`、`wal_sync_latency_us` | histogram（固定桶） |
 | 积压 | `queue_depth`、`subscription_backlog`、`cursor_lag`、`dlq_size`、`redelivery_total` | gauge / counter |
-| 存储 | `wal_append_total`、`wal_sync_total`、`segment_bytes`、`recovery_time_us`、`retention_deleted_bytes` | counter / gauge |
+| 存储 | `wal_append_total`、`wal_sync_total`、`segment_bytes`、`router_index_rows`、`recovery_time_us`、`retention_deleted_bytes` | counter / gauge |
+
+> **实施注记（S11x，2026-11-16）**：键集增补一个 gauge `router_index_rows` = `ets:info(Trie, size)`，由路由索引写者（`broker_router_hash_store`）在每次 register/unregister 后刷新（`broker_router` 现依赖 `broker_metrics`，故写者启动时指标服务已就绪）。按**行数**而非订阅数导出：trie 的行是路径、订阅共享路径，二者最多差约 19 倍，而内存正比于行数（见 [`2026-11-16-s11x-router-index-memory.md`](../benchmarks/2026-11-16-s11x-router-index-memory.md) §0）——容量告警必须按行数。单个原子键、无标签，仍是有限闭集；`keys_are_stable` 已同步。
 
 - **直方图用固定桶**（默认 `[100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000]` 微秒），不依赖外部库；`observe/2` 记录 `{Count, Sum, Buckets}`。
 - **禁止高基数标签**：不把 destination、client_id、message_id 作为键；需要按维度拆时用**预定义枚举**（如 `qos`、`kind`），由 `broker_metrics` 显式维护有限键集合。README §10.1 的"高基数指标爆炸"约束在此落地。

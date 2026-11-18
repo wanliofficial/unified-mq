@@ -33,6 +33,7 @@ all() ->
          deliver_latency_us, ack_latency_us, wal_sync_latency_us,
          queue_depth, subscription_backlog, cursor_lag, redelivery_total,
          dlq_size, wal_append_total, wal_sync_total, segment_bytes,
+         router_index_rows,
          recovery_time_us, retention_deleted_bytes,
          retention_deleted_segments, retention_blocked_by_slow_consumer,
          retention_blocked_by_committed, cloudevents_validate_ok,

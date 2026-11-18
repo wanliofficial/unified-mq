@@ -37,6 +37,8 @@ all() ->
      subscribe_mints_a_subref_the_route_can_see,
      resubscribe_updates_qos_without_touching_the_route,
      a_new_subscription_anchors_at_the_live_tail,
+     a_fresh_shared_group_with_anchor_earliest_reads_the_backlog,
+     anchor_earliest_survives_a_restart_when_cursors_are_lost,
      ack_moves_the_cursor_over_the_contiguous_prefix_only,
      an_ack_behind_the_cursor_is_a_noop,
      acking_a_dead_subscription_is_idempotent_ok,
@@ -268,6 +270,39 @@ a_new_subscription_anchors_at_the_live_tail(_Config) ->
     {ok, 3} = broker_subscription:cursor(SubRef, 0),
     {ok, 2} = broker_subscription:cursor(SubRef, 1),
     ok.
+
+%% RQ-01: `anchor => earliest' at group birth makes pre-existing log content
+%% claimable; the default (no opts / tail) still refuses to replay history.
+a_fresh_shared_group_with_anchor_earliest_reads_the_backlog(_Config) ->
+    ok = boot(),
+    {ok, _} = append(0, <<"s/a">>),
+    {ok, _} = append(0, <<"s/b">>),
+    {ok, _} = append(0, <<"s/c">>),
+    {ok, Earliest} = broker_subscription:join(shared, <<"q">>, <<"c1">>,
+                                              <<"s/#">>, 1, <<"*">>,
+                                              #{anchor => earliest}),
+    {ok, [1, 2, 3]} = broker_subscription:claim(Earliest, 0, 100, <<"c1">>),
+    %% The default join stays at the live tail: nothing new is claimable.
+    {ok, Tail} = broker_subscription:join(shared, <<"live">>, <<"c2">>,
+                                          <<"s/#">>, 1),
+    {ok, []} = broker_subscription:claim(Tail, 0, 100, <<"c2">>),
+    ok.
+
+%% The anchor rides `.subs' (`anchor' key + init_cursors 0), so a restart with
+%% lost `.cursors' restores the group at its origin, not at the live tail.
+anchor_earliest_survives_a_restart_when_cursors_are_lost(_Config) ->
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"q">>, <<"c1">>,
+                                            <<"s/#">>, 1, <<"*">>,
+                                            #{anchor => earliest}),
+    [_, _] = [element(2, append(0, <<"s/x">>)) || _ <- [1, 2]],
+    %% No acks -> no flushed `.cursors' file -> boot falls back to the `.subs'
+    %% init anchor (0 for the earliest group): the backlog stays claimable.
+    bounce_subscription_app(),
+    {ok, 1} = broker_subscription:cursor(SubRef, 0),
+    {ok, [1, 2]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    ok.
+
 
 %%%_* ack / cursor ------------------------------------------------------------
 

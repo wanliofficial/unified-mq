@@ -93,7 +93,7 @@ MQ-01、MQ-02、MQ-03 是「代码写了一半或字段被静默丢掉」。MQ-0
 
 | ID | 项 | 状态 |
 |---|---|---|
-| SN-01 | DTLS | 未做。1884 是明文 |
+| SN-01 | DTLS | 已落地（2026-11-17）：`transport => dtls` PSK-only listener，身份即认证；明文 UDP 保持默认，需显式配置 |
 | SN-02 | Forwarder Encapsulation（1.2 §5.5） | 未做。转发器后面的传感器网关拓扑覆盖不了 |
 | SN-03 | 串口桥、把 SN 再桥到外部 MQTT broker | 未做。这里是终结网关，不是桥 |
 | SN-04 | 第三方证据不完整 | `mqtt-sn-tools` 0.0.7 没有 QoS 2、没有 Will、PINGREQ 不带 client id。这三块只有仓内 `mqtt_sn_conn_SUITE`（23 例）。不能把 10/10 理解成工具覆盖了全部语义 |

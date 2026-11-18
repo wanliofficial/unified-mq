@@ -46,9 +46,10 @@
 
 -record(st, {
     listener :: pid(),
-    socket :: gen_udp:socket(),
+    socket :: gen_udp:socket() | undefined,
     endpoint :: {inet:ip_address(), inet:port_number()},
     cfg :: map(),
+    transport = udp :: udp | dtls,
     client_id :: binary() | undefined,
     tenant :: binary(),
     principal :: binary() | undefined,
@@ -130,7 +131,9 @@ init({Listener, Socket, Endpoint, Cfg}) ->
     %% Will.
     process_flag(trap_exit, true),
     {ok, #st{listener = Listener, socket = Socket, endpoint = Endpoint,
-             cfg = Cfg, tenant = broker_security:default_tenant()}}.
+             cfg = Cfg, transport = maps:get(transport, Cfg, udp),
+             tenant = maps:get(tenant_id, Cfg, broker_security:default_tenant()),
+             principal = maps:get(principal, Cfg, undefined)}}.
 
 terminate(Reason, #st{} = St) ->
     case abnormal(Reason) of
@@ -163,6 +166,8 @@ handle_cast(_Msg, St) ->
     {noreply, St}.
 
 handle_info({sn_packet, Packet}, St) ->
+    logger:log(warning, "DBG conn sn_packet type=~p client=~p",
+               [maps:get(type, Packet, unknown), St#st.client_id]),
     handle_packet(Packet, St);
 handle_info({broker_deliver, ClientId, MaxQoS, Refs, Delivery},
             #st{client_id = ClientId} = St) ->
@@ -177,6 +182,13 @@ handle_info({sn_endpoint, Endpoint}, St) ->
 handle_info({sn_takeover, _NewPid}, St) ->
     %% The client reconnected from elsewhere. Not a death: no Will.
     {stop, normal, St};
+handle_info({sn_socket_gone, _Endpoint}, St) ->
+    %% DTLS: the peer closed (or lost) its transport. Unlike UDP there IS a
+    %% connection here, and it broke -- that is an abnormal ending, so the
+    %% Will decision in `terminate/2' sees a real death.
+    logger:info("mqtt_sn dtls transport gone (client ~p)",
+                [St#st.client_id]),
+    {stop, socket_gone, St};
 handle_info({sn_sleep_granted, _Listener}, St) ->
     {noreply, enter_sleep(St)};
 handle_info({sn_sleep_denied, _Listener}, St) ->
@@ -255,6 +267,8 @@ handle_packet(Packet, St) ->
 
 on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
              clean_session := Clean, duration := Duration, will := Will}, St) ->
+    logger:log(warning, "DBG on_connect client=~p transport=~p principal=~p tenant=~p",
+               [ClientId, St#st.transport, St#st.principal, St#st.tenant]),
     case ProtocolId of
         1 ->
             MaxDuration = maps:get(max_duration_s, St#st.cfg),
@@ -1188,9 +1202,19 @@ take_msg_id(#st{next_id = Id} = St) ->
 
 %%%_* Wire ------------------------------------------------------------------
 
+%% One reply exit, two transports. UDP: any process may write the listener's
+%% socket, so the reply goes straight out. DTLS: only the listener owns the
+%% peer socket (`ssl:send` from a non-owner is an error), so the reply is a
+%% `{sn_send, ...}` cast to it -- the listener resolves the endpoint to the
+%% established DTLS socket and writes.
 reply(St, Packet) ->
     Data = mqtt_sn_codec:encode(Packet),
-    {IP, Port} = St#st.endpoint,
-    _ = gen_udp:send(St#st.socket, IP, Port, Data),
+    case St#st.transport of
+        udp ->
+            {IP, Port} = St#st.endpoint,
+            _ = gen_udp:send(St#st.socket, IP, Port, Data);
+        dtls ->
+            gen_server:cast(St#st.listener, {sn_send, St#st.endpoint, Data})
+    end,
     broker_metrics:inc(bytes_out, byte_size(Data)),
     St.

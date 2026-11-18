@@ -214,6 +214,7 @@ msg(ProtoMeta) ->
 start_queue(Config) ->
     _ = application:load(broker_storage),
     _ = application:load(broker_queue),
+    _ = application:load(broker_router),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
     ok = application:set_env(broker_storage, data_dir,
                              filename:join([?config(data_dir, Config),
@@ -221,6 +222,12 @@ start_queue(Config) ->
     ok = application:set_env(broker_storage, wal,
                              #{require_durable_fs => false}),
     ok = application:set_env(broker_queue, partitions, 1),
+    %% broker_queue depends on broker_router, so ensure_all_started/1 below
+    %% boots it too -- and broker_router_hash_store reads its ring size from
+    %% `broker_router, partitions' at start, failing the whole boot with
+    %% {invalid_partitions, undefined} when it is unset. Every other suite
+    %% that starts the router sets this; this one did not.
+    ok = application:set_env(broker_router, partitions, 1),
     {ok, _} = application:ensure_all_started(broker_storage),
     ok = broker_queue:create_partition(0),
     {ok, _} = application:ensure_all_started(broker_queue),

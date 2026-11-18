@@ -653,16 +653,25 @@ sub_topics_v5(Bin, Acc) ->
         too_short ->
             {error, {malformed_packet, subscribe_truncated}};
         {F, <<Opts, R/binary>>} ->
+            %% §3.8.3.1 byte layout: bits 0-1 QoS, bit 2 No Local, bit 3 Retain
+            %% As Published, bits 4-5 Retain Handling, bits 6-7 reserved. Every
+            %% field is kept and validated -- dropping one silently would make
+            %% the broker answer a subscription it understood differently.
             QoS = Opts band 2#11,
+            NoLocal = (Opts bsr 2) band 1,
+            Rap = (Opts bsr 3) band 1,
+            RH = (Opts bsr 4) band 2#11,
             Reserved = Opts band 2#11000000,
-            case {validate_filter_string(F), Reserved, QoS} of
-                {ok, 0, Q} when Q =< 2 ->
-                    sub_topics_v5(R, [{F, Q} | Acc]);
-                {ok, _, Q} when Q > 2 ->
+            case {validate_filter_string(F), Reserved, QoS, RH} of
+                {ok, 0, Q, H} when Q =< 2, H =< 2 ->
+                    sub_topics_v5(R, [{F, Q, NoLocal, Rap, H} | Acc]);
+                {ok, _, Q, _} when Q > 2 ->
                     {error, {malformed_packet, {bad_subscribe_qos, Q}}};
-                {ok, _, _} ->
+                {ok, _, _, _} ->
+                    %% Retain Handling 3 is a protocol error (§3.8.3.1), and the
+                    %% reserved bits stay malformed. Both disconnect the conn.
                     {error, {malformed_packet, {bad_subscribe_options, Opts}}};
-                {{error, Reason}, _, _} ->
+                {{error, Reason}, _, _, _} ->
                     {error, Reason}
             end;
         {F, <<>>} ->
@@ -715,6 +724,19 @@ parse_props(Bin, Acc) ->
                 {user_properties, _} ->
                     Prev = maps:get(user_properties, Acc, []),
                     parse_props(Rest, Acc#{user_properties => Prev ++ [Value]});
+                %% §3.3.2.3.4: Subscription Identifier is the one other
+                %% repeatable property -- a PUBLISH with several matching
+                %% subscriptions carries one 0x0B per identifier.
+                {subscription_identifier, false} ->
+                    parse_props(Rest, Acc#{subscription_identifier => Value});
+                {subscription_identifier, true} ->
+                    Prev = maps:get(subscription_identifier, Acc),
+                    PrevL = case Prev of
+                                L when is_list(L) -> L;
+                                I when is_integer(I) -> [I]
+                            end,
+                    parse_props(Rest,
+                                Acc#{subscription_identifier => PrevL ++ [Value]});
                 {_, true} ->
                     {error, {duplicate_property, Key}};
                 {_, false} ->
@@ -1081,8 +1103,7 @@ encode_v5(#subscribe{packet_id = Pid, topics = Topics, props = Props}) ->
     if
         is_integer(Pid), Pid >= 1, Pid =< 65535,
         is_list(Topics), Topics =/= [] ->
-            Body = list_to_binary(
-                     [<<(len16(T))/binary, T/binary, Q>> || {T, Q} <- Topics]),
+            Body = list_to_binary([sub_entry_bin(E) || E <- Topics]),
             fixed_header(8, 2, <<Pid:16, (props_bin(Props))/binary, Body/binary>>);
         true ->
             erlang:error({malformed_frame_out, subscribe})
@@ -1166,6 +1187,18 @@ ack_v5_out(Type, Pid, RC, Props)
 ack_v5_out(_Type, _Pid, _RC, _Props) ->
     erlang:error({malformed_frame_out, ack}).
 
+%% The outbound SUBSCRIBE byte from either topic-entry shape: a bare QoS
+%% (3.1.1-style construction) or the full §3.8.3.1 option set (v5 decode).
+sub_entry_bin(E) ->
+    F = element(1, E),
+    <<(len16(F))/binary, F/binary, (sub_opts_byte(E))>>.
+
+sub_opts_byte({T, Q}) when is_binary(T), is_integer(Q), Q >= 0, Q =< 2 ->
+    Q;
+sub_opts_byte({T, Q, NL, Rap, RH}) when is_binary(T), is_integer(Q),
+                                        Q >= 0, Q =< 2, RH >= 0, RH =< 2 ->
+    Q bor (NL bsl 2) bor (Rap bsl 3) bor (RH bsl 4).
+
 %% Deterministic order so a re-encode is byte-identical; unknown keys are a
 %% programming error, not something to drop silently.
 props_bin(Props) when is_map(Props) ->
@@ -1191,8 +1224,15 @@ prop_bin({response_topic, V}, Acc) ->
     <<Acc/binary, 16#08, (len16(V))/binary, V/binary>>;
 prop_bin({correlation_data, V}, Acc) ->
     <<Acc/binary, 16#09, (len16(V))/binary, V/binary>>;
-prop_bin({subscription_identifier, V}, Acc) ->
-    <<Acc/binary, 16#0B, (encode_remaining_length(V))/binary>>;
+%% §3.3.2.3.4: a PUBLISH may carry several Subscription Identifiers (one per
+%% matching subscription), so the value accepts either a single integer or a
+%% list of them; each is encoded as its own 0x0B property.
+prop_bin({subscription_identifier, Id}, Acc) when is_integer(Id) ->
+    <<Acc/binary, 16#0B, (encode_remaining_length(Id))/binary>>;
+prop_bin({subscription_identifier, Ids}, Acc) when is_list(Ids) ->
+    lists:foldl(fun(Id, A) when is_integer(Id) ->
+                        <<A/binary, 16#0B, (encode_remaining_length(Id))/binary>>
+                end, Acc, Ids);
 prop_bin({session_expiry_interval, V}, Acc) ->
     <<Acc/binary, 16#11, V:32>>;
 prop_bin({assigned_client_identifier, V}, Acc) ->
