@@ -3,7 +3,8 @@
 - **文档版本**：v0.1（底层调研立项稿，2026-11-11）
 - **对应 Roadmap**：[`docs/roadmap.md`](../roadmap.md) §14（S12 基础设施高可用与 TCP 集群负载均衡）
 - **前置**：S0–S8 已实现并验证（回归基线以当次 `rebar3 ct` 为准）；S9 / S10 / S11 的实时状态以 roadmap 对应章节为准（本文不写死其进度）
-- **状态**：**立项规划，未开工，无「已实测」数字，无新增 app / 端口 / 代码路径**。
+- **状态**：**立项规划，S12-0 已交付（2026-11-17，纯文档），S12-A/B/C 未开工**；无「已实测」数字，无新增 app / 端口 / 代码路径。
+- **S12-0 交付物**：[`s12-0-convergence-report.md`](s12-0-convergence-report.md)（OQ-1~OQ-10 逐条裁决）+ [`docs/adr/032-s12-node-view-drain-and-rebalance-boundary.md`](../adr/032-s12-node-view-drain-and-rebalance-boundary.md)（ADR-032 D1~D9 冻结）。**§4 的候选需求、§5.2 的子阶段粒度以 ADR-032 为准**；本文末尾的「修订记录」列出与原始假设冲突、已被收敛更正的五条事实。
 - **调研对象**：4 个 Erlang/OTP 基础设施仓库，按「底层调研」口径**全部深挖到源码级**（README + 全部核心源码逐行核对），无索引级稿：
   - [`developerworks/tcp_gen_server_cluster`](https://github.com/developerworks/tcp_gen_server_cluster) → [`s12-infra-gen-server-cluster.md`](s12-infra-gen-server-cluster.md)
   - [`mdaguete/tcpbalance`](https://github.com/mdaguete/tcpbalance) → [`s12-infra-tcpbalance.md`](s12-infra-tcpbalance.md)
@@ -44,7 +45,7 @@
 
 | 能力 | 落点 | 依据 |
 |---|---|---|
-| 控制面元数据 | `broker_meta`：Mnesia 11 张表（`cluster_node` / `partition_meta` / `config_version` / outbox 等），`reconcile/0` 周期对账 | [ADR-021](../adr/021-cluster-control-plane-raft-and-fencing.md) D1 |
+| 控制面元数据 | `broker_meta`：Mnesia **13 张表**（`cluster_node` / `partition_meta` / `config_version` / outbox 等；`agent_card` / `push_config` 为 S9 追加，ADR-026 §D3/§D6）。**注意**：`reconcile/0` 并不存在，真实的是 `broker_meta_config` 的 `config_version` 周期轮询（`reconcile_ms` 默认 5000），**只对账配置版本、不碰成员/归属**；`cluster_node` / `partition_meta` 生产无写入者，归属真相在 ra（见文末「修订记录」） | [ADR-021](../adr/021-cluster-control-plane-raft-and-fencing.md) D1；S12-0 收敛报告 §1.2 |
 | 分区归属与共识 | `broker_cluster`：`ra 3.2.0` Metadata Raft Group，`{broker_cluster_meta, node()}`，状态机 `#{partitions => #{Partition => #{owner, epoch, replicas, state}}}` | ADR-021 D2 |
 | Fencing | epoch 单调递增；`broker_cluster:authorize_append(Partition, Epoch)`；旧 owner 写被 `{fenced, _}` 拒绝 | ADR-021 D3 |
 | 复制与 ACK | `replicated_commit`：本地 fsync + `broker_cluster_rep` 复制，quorum 达成才 ACK | ADR-021 D5 |
@@ -262,5 +263,23 @@ S12 承接 S11（S9/S10/S11 均在交付或规划中，S12 **不阻塞**它们�
 | [`s12-infra-tcpbalance.md`](s12-infra-tcpbalance.md) | `mdaguete/tcpbalance` | 源码级深挖 |
 | [`s12-infra-gen-lb.md`](s12-infra-gen-lb.md) | `boundary/gen_lb` | 源码级深挖 |
 | [`s12-infra-nkdist.md`](s12-infra-nkdist.md) | `erlnets/nkdist` | 源码级深挖 |
+| [`s12-0-convergence-report.md`](s12-0-convergence-report.md) | **S12-0 收敛报告**（OQ-1~OQ-10 裁决、事实底座、入口条件） | 收敛 |
+| [`../adr/032-s12-node-view-drain-and-rebalance-boundary.md`](../adr/032-s12-node-view-drain-and-rebalance-boundary.md) | **ADR-032**（D1~D9 冻结） | ADR |
 
 全部登记在 [`docs/roadmap.md`](../roadmap.md) §15.2「文档产出物」。
+
+---
+
+## 7. 修订记录
+
+### S12-0 收敛更正（2026-11-17）
+
+以下五条是本文原始假设与仓库事实的冲突，**以 ADR-032 与 [`s12-0-convergence-report.md`](s12-0-convergence-report.md) §1.2 为准**：
+
+| # | 原文假设 | 事实 | 更正后口径 |
+|---|---|---|---|
+| 1 | §2「`broker_meta` 的 `reconcile/0` 周期对账」 | **不存在** `reconcile/0`；真实的是 `broker_meta_config` 的 `config_version` 轮询（`reconcile_ms` 默认 5000，`broker_meta_config.erl:50,112-120`），只对账配置版本 | R-CL3 的「复用 `reconcile/0`」改为「ra 状态机 + 本地 ETS 镜像，镜像对账已由 `snapshot_installed/5` 与每次 apply 写缓存覆盖」，无需新对账周期（ADR-032 D1） |
+| 2 | §2 / R-CL1「视图真相来自 `broker_cluster` 的 Raft 归属 / `cluster_node` 表」 | Mnesia `cluster_node` / `partition_meta` 与 ra **运行时 0 互相引用**，生产无写入者，`cluster_node.status` 硬编码 `up` | 退役为遗留视图；真相只有 ra（ADR-032 D1）。节点自身 `up / draining / down` 存**本地**、不进 ra（失去多数派仍可 drain） |
+| 3 | §2 表数写 11 张 | 实际 **13 张**（S9 追加 `agent_card` / `push_config`） | 13 张（ADR-032 后果） |
+| 4 | R-HA2/R-CL1 隐含「`/readyz` 反映真实健康」 | `/readyz` 的 `started/1` 用 `application:get_application/1` 传原子 = 查 **loaded** 非 started；已用 `application:load/1` 实测 | S12-A **必须先修**（ADR-032 D2）；修好前 R-HA2 的一致性承诺不成立 |
+| 5 | §1 / K1~K8 未列「跨节点投递」 | **不存在**（`pg`/`global`/`monitor_nodes` 0 处，投递一律本地 `Pid !`，副本刻意不通知本地订阅者） | **G2 达成口径收窄**为「多节点接入 + 分区归属可迁移 + 外部 LB 分发 + 会话粘性」，**不含跨节点消息路由**；后者单列 S12-D 且需新增 ADR（ADR-032 D9） |

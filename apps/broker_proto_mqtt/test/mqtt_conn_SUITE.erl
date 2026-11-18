@@ -130,7 +130,11 @@ all() ->
      a_hot_partition_does_not_block_the_others,
      %% README §10.2: W3C trace context over MQTT 5 user properties.
      v5_trace_context_roundtrips_through_user_properties,
-     v5_trace_context_is_stripped_when_propagation_is_off].
+     v5_trace_context_is_stripped_when_propagation_is_off,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_with_server_unavailable_3,
+     over_capacity_is_refused_with_v5_server_busy_89,
+     a_released_slot_is_usable_again].
 
 %%%_* Fixtures ----------------------------------------------------------------
 
@@ -171,6 +175,10 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 100),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 100),
     ok = application:set_env(broker_security, users, ?USERS),
+    %% S12-B: the admission gate's budget. Written in every case so a case that
+    %% pushed it down to one cannot starve the next one.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_proto_mqtt, pull_page_limit, 32),
     ok = application:set_env(broker_proto_mqtt, max_inflight, 64),
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 1000),
@@ -201,6 +209,11 @@ init_per_testcase(Case, Config) ->
     [{data_dir, DataDir} | Config].
 
 end_per_testcase(_Case, _Config) ->
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     %% The connections are `temporary' children, so stopping the application
     %% does NOT terminate them; kill them first or their sockets and their log
     %% noise outlive the case.
@@ -244,6 +257,17 @@ case_env(a_slow_consumer_stays_bounded) ->
 case_env(a_hot_partition_does_not_block_the_others) ->
     ok = application:set_env(broker_proto_mqtt, pull_page_limit, 4),
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100);
+%% S12-B: a budget of one slot makes the second connection the refused one, and
+%% the first is what proves the gate is not simply refusing everybody.
+case_env(over_capacity_is_refused_with_server_unavailable_3) ->
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => 1});
+case_env(over_capacity_is_refused_with_v5_server_busy_89) ->
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => 1});
+case_env(a_released_slot_is_usable_again) ->
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => 1});
 case_env(_) ->
     ok.
 
@@ -432,6 +456,63 @@ v5_trace_context_is_stripped_when_propagation_is_off(_Config) ->
     ?assertNot(lists:keymember(<<"traceparent">>, 1, Pairs)),
     ?assertNot(lists:keymember(<<"tracestate">>, 1, Pairs)),
     ok.
+
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% A budget of one slot, and the first connection holds it: the second must get
+%% a CONNACK that says the server cannot take it. The point of the case is the
+%% *code* -- before S12-B ranch parked the acceptor and the peer saw a TCP socket
+%% that never answered, which no client can tell from a hung broker.
+over_capacity_is_refused_with_server_unavailable_3(_Config) ->
+    ok = boot(),
+    {First, _} = open(<<"g1">>),
+    {Refused, #connack{return_code = 3}} = mqtt_open(#{client_id => <<"g2">>}),
+    %% The refused peer's process must be gone, not merely quiet: a connection
+    %% that stays alive without a CONNACK would still hold a session row.
+    {ok, _} = mqtt_close(Refused),
+    %% And the holder is still served -- a gate that refused everybody would pass
+    %% a weaker version of this case.
+    #ping{kind = resp} = mqtt_ping(First),
+    {ok, normal} = mqtt_close(First),
+    ok.
+
+%% The same refusal, framed the way a v5 client parses it: 0x89 "Server busy".
+%% Getting this wrong is not cosmetic -- a 3 here would be read as a reason code
+%% in a different table.
+over_capacity_is_refused_with_v5_server_busy_89(_Config) ->
+    ok = boot(),
+    {_First, _} = mqtt_open_v5(#{client_id => <<"g5a">>, props => #{}}),
+    {Refused, #connack{return_code = 16#89}} =
+        mqtt_open_v5(#{client_id => <<"g5b">>, props => #{}}),
+    {ok, _} = mqtt_close(Refused),
+    ok.
+
+%% The slot has to come back when the holder goes away, or a node would ratchet
+%% down to zero capacity over its lifetime.
+a_released_slot_is_usable_again(_Config) ->
+    ok = boot(),
+    {First, _} = open(<<"r1">>),
+    {Refused, #connack{return_code = 3}} = mqtt_open(#{client_id => <<"r2">>}),
+    {ok, _} = mqtt_close(Refused),
+    {ok, normal} = mqtt_close(First),
+    %% `terminate/3' runs on the conn process; wait for the slot rather than
+    %% sleeping a guess. The suite shares one node with every other suite, so
+    %% this waits for "at most what we expect", never for an absolute zero.
+    ok = wait_admission_released(),
+    {Conn, #connack{return_code = 0}} = mqtt_open(#{client_id => <<"r3">>}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+wait_admission_released() ->
+    wait_admission_released(100).
+
+wait_admission_released(0) ->
+    exit({admission_slot_leaked, broker_admission:snapshot()});
+wait_admission_released(Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        0 -> ok;
+        _ -> timer:sleep(20), wait_admission_released(Budget - 1)
+    end.
 
 publish_v5_trace(Parent, State) ->
     ok = boot(),

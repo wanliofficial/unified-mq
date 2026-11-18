@@ -50,7 +50,10 @@
     phase = awaiting_owner :: awaiting_owner | up,
     %% Live stream FSMs, keyed by the monitor reference so the `DOWN' message
     %% identifies them without a reverse lookup.
-    streams = #{} :: #{reference() => pid()}
+    streams = #{} :: #{reference() => pid()},
+    %% S12-B (ADR-032 D7): node-level admission lease, adopted onto this process
+    %% in `init/1' so that the gate's sweep can reclaim it if we are killed.
+    admission = undefined :: undefined | broker_admission:lease()
 }).
 
 %%%_* API ---------------------------------------------------------------------
@@ -65,9 +68,14 @@ start_link(Cfg) ->
 
 init(Cfg) ->
     process_flag(trap_exit, true),
-    {ok, #st{cfg = Cfg}}.
+    %% S12-B (ADR-032 D7): the lease was taken by the listener, because that is
+    %% the only place a refusal can still be answered to the peer. Re-home it to
+    %% this process, which owns the QUIC connection: a lease whose owner is this
+    %% process can be reclaimed by the gate's sweep if it is killed.
+    Admission = broker_admission:adopt(maps:get(admission, Cfg, undefined)),
+    {ok, #st{cfg = Cfg, admission = Admission}}.
 
-terminate(_Reason, #st{conn = Conn, streams = Streams}) ->
+terminate(_Reason, #st{conn = Conn, streams = Streams} = St) ->
     %% Closing the connection ends every stream it carries; stopping the FSMs
     %% first keeps the shutdown ordered (each one stops its own session and
     %% publishes its Will).
@@ -76,6 +84,11 @@ terminate(_Reason, #st{conn = Conn, streams = Streams}) ->
         undefined -> ok;
         _ -> _ = mqtt_quic_nif:close_connection(Conn)
     end,
+    %% S12-B (ADR-032 D7): the node-level lease was taken by the listener for
+    %% this QUIC connection and comes in through the config map. It is released
+    %% here, so every ending -- a clean close, a failed handshake, the listener
+    %% going down -- frees exactly one slot.
+    ok = broker_admission:release(maps:get(admission, St#st.cfg, undefined)),
     ok.
 
 %%%_* gen_server --------------------------------------------------------------

@@ -70,6 +70,12 @@
     will_stage = none :: none | want_topic | want_msg,
     asleep = false :: boolean(),
     counted = false :: boolean(),
+    %% S12-B (ADR-032 D7): the node-level admission lease. Held for the whole
+    %% life of the process -- including while the session sleeps, because a
+    %% sleeping MQTT-SN session still owns a timer, its subscriptions and its
+    %% heap. That is exactly where `connections_current' and this counter differ
+    %% (see `broker_admission').
+    admission = undefined :: undefined | broker_admission:lease(),
     sleep_timer :: reference() | undefined,
     keepalive_timer :: reference() | undefined
 }).
@@ -140,10 +146,12 @@ terminate(Reason, #st{} = St) ->
         true -> publish_will(St);
         false -> ok
     end,
-    case St#st.counted of
-        true -> _ = broker_metrics:gauge_add(connections_current, -1);
-        false -> ok
-    end,
+    ok = broker_metrics:connection_closed(St#st.counted),
+    %% S12-B (ADR-032 D7): the admission slot goes back here and only here. The
+    %% sleep path deliberately does NOT release it -- a sleeping session is still
+    %% this node's process -- so a session that sleeps and wakes must not take a
+    %% second slot on wake, and its death must free exactly one.
+    ok = broker_admission:release(St#st.admission),
     detach(St),
     ok.
 
@@ -271,49 +279,76 @@ on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
                [ClientId, St#st.transport, St#st.principal, St#st.tenant]),
     case ProtocolId of
         1 ->
-            MaxDuration = maps:get(max_duration_s, St#st.cfg),
-            Dur = min(Duration, MaxDuration),
-            Persist = not Clean,
-            %% `attach/3' answers the pid that was attached before us, if any
-            %% (takeover). Its contract has no error branch.
-            {ok, Prev} = broker_subscription:attach(ClientId, self(), Persist),
-            maybe_takeover(Prev),
-            %% §6.2: a clean session starts from zero. Dropping our local map
-            %% alone would leave the entities (and their cursors) attached to
-            %% this client id, so the next publish would still be routed here.
-            case Clean of
-                true -> clean_session_teardown(ClientId);
-                false -> ok
-            end,
-            Subs = case Persist of
-                       true -> session_subs(ClientId);
-                       false -> #{}
-                   end,
-            St1 = St#st{client_id = ClientId, clean = Clean, duration = Dur,
-                        subs = Subs,
-                        %% A fresh CONNECT clears the topic table: ids handed out
-                        %% in a previous session are not something a client may
-                        %% carry across a reconnect (it re-REGISTERs, which is
-                        %% the contract).
-                        topics = #{},
-                        counted = true},
-            _ = broker_metrics:gauge_add(connections_current, 1),
-            gen_server:cast(St#st.listener, {sn_bind, self(), ClientId}),
-            case Will of
-                true ->
-                    %% The Will exchange runs *before* CONNACK: a client must not
-                    %% consider itself connected until its Will is stored, or a
-                    %% death in between would lose it (§6.10).
-                    {noreply, reply(St1#st{will_stage = want_topic},
-                                    #{type => willtopicreq})};
-                false ->
-                    finish_connect(Dur, St1)
+            case admit(St) of
+                {ok, St0} ->
+                    on_connect_sn(ClientId, Clean, Duration, Will, St0);
+                {error, St0} ->
+                    %% §6.2: CONNACK's return code is the whole refusal vocabulary
+                    %% here, and 3 is "rejected: not supported" -- the closest
+                    %% thing the protocol has to "this server cannot take you".
+                    {stop, normal, reply(St0, #{type => connack,
+                                               return_code => ?RC_NOT_SUPPORTED})}
             end;
         _Other ->
             %% MQTT-SN 1.2 is protocol id 1. Anything else gets "not supported"
             %% rather than a guess.
             {stop, normal, reply(St, #{type => connack,
                                        return_code => ?RC_NOT_SUPPORTED})}
+    end.
+
+on_connect_sn(ClientId, Clean, Duration, Will, St) ->
+    MaxDuration = maps:get(max_duration_s, St#st.cfg),
+    Dur = min(Duration, MaxDuration),
+    Persist = not Clean,
+    %% `attach/3' answers the pid that was attached before us, if any
+    %% (takeover). Its contract has no error branch.
+    {ok, Prev} = broker_subscription:attach(ClientId, self(), Persist),
+    maybe_takeover(Prev),
+    %% §6.2: a clean session starts from zero. Dropping our local map
+    %% alone would leave the entities (and their cursors) attached to
+    %% this client id, so the next publish would still be routed here.
+    case Clean of
+        true -> clean_session_teardown(ClientId);
+        false -> ok
+    end,
+    Subs = case Persist of
+               true -> session_subs(ClientId);
+               false -> #{}
+           end,
+    Counted = broker_metrics:connection_opened(),
+    St1 = St#st{client_id = ClientId, clean = Clean, duration = Dur,
+                subs = Subs,
+                %% A fresh CONNECT clears the topic table: ids handed out
+                %% in a previous session are not something a client may
+                %% carry across a reconnect (it re-REGISTERs, which is
+                %% the contract).
+                topics = #{},
+                counted = Counted},
+    gen_server:cast(St#st.listener, {sn_bind, self(), ClientId}),
+    case Will of
+        true ->
+            %% The Will exchange runs *before* CONNACK: a client must not
+            %% consider itself connected until its Will is stored, or a
+            %% death in between would lose it (§6.10).
+            {noreply, reply(St1#st{will_stage = want_topic},
+                            #{type => willtopicreq})};
+        false ->
+            finish_connect(Dur, St1)
+    end.
+
+%% S12-B (ADR-032 D7): the node-level gate. Asked once per connection, after the
+%% protocol id proves this is a client we can even answer -- a refusal must be a
+%% CONNACK the peer understands, and pre-1.2 peers cannot be answered at all.
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("mqtt-sn: connection refused by admission gate: ~p",
+                           [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
     end.
 
 finish_connect(Duration, St) ->
@@ -656,11 +691,11 @@ wake_and_answer(#st{asleep = true} = St) ->
     St1 = cancel_sleep(St),
     gen_server:cast(St1#st.listener, {sn_wake, self()}),
     _ = broker_subscription:attach(St1#st.client_id, self(), not St1#st.clean),
-    _ = broker_metrics:gauge_add(connections_current, 1),
+    Counted = broker_metrics:connection_opened(),
     %% Wake means "I am back": replay what piled up while detached, then answer
     %% the ping. The client sees PINGRESP after its backlog, which is the order
     %% the sleep contract implies (the backlog is owed to it either way).
-    St2 = (St1#st{asleep = false, counted = true}),
+    St2 = (St1#st{asleep = false, counted = Counted}),
     case catch_up(St2) of
         {ok, St3} -> reply(arm_keepalive(St3#st.duration, St3), #{type => pingresp});
         {stop, _Reason, St3} -> St3
@@ -695,7 +730,7 @@ enter_sleep(St) ->
     %% by definition (it never entered storage), which the capability matrix
     %% states rather than hides.
     _ = broker_subscription:detach(St#st.client_id, self()),
-    _ = broker_metrics:gauge_add(connections_current, -1),
+    ok = broker_metrics:connection_closed(St#st.counted),
     TRef = erlang:start_timer(St#st.duration * 1000, self(), sleep_expired),
     cancel_keepalive(St#st{asleep = true, counted = false, sleep_timer = TRef}).
 

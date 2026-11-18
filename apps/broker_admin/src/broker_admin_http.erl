@@ -7,9 +7,12 @@
 %% Endpoints:
 %%
 %%   GET  /healthz             liveness  -- process alive, always 200
-%%   GET  /readyz              readiness -- required apps up, else 503
+%%   GET  /readyz              readiness -- drain state, then required apps
 %%   GET  /metrics             Prometheus text exposition (closed key set)
 %%   GET  /api/v1/status       node, partitions, cluster, retention
+%%   GET  /api/v1/node         node view for an external LB (state, weight, conns)
+%%   POST /api/v1/drain        stop accepting new connections (S12-A, ADR-032 D2)
+%%   POST /api/v1/undrain      resume accepting
 %%   GET  /api/v1/config       redacted config audit snapshot + sha256
 %%   GET  /api/v1/version      release / OTP / data-format versions
 %%   GET  /api/v1/backups      backup inventory
@@ -42,16 +45,36 @@ handle(Method, Path0, Headers, Body) ->
 %%%_* Routing --------------------------------------------------------------
 
 route(get, <<"/healthz">>, _H, _B) ->
+    %% Liveness: the process is alive. Drain does not change this -- a draining
+    %% node is still healthy, it is just not accepting new traffic (D2).
     json(200, #{status => ok});
 route(get, <<"/readyz">>, _H, _B) ->
-    case missing_apps() of
-        [] -> json(200, #{status => ready});
-        Missing -> json(503, #{status => not_ready, missing => Missing})
+    %% Readiness: may this node be handed traffic? Drain state first, then the
+    %% required apps. `draining'/`down' must be 503 so an LB retires the node
+    %% *before* connections start failing, which is the whole point of a
+    %% voluntary drain (R-HA1, D2).
+    case broker_drain:status() of
+        up ->
+            case missing_apps() of
+                [] -> json(200, #{status => ready});
+                Missing -> json(503, #{status => not_ready, missing => Missing})
+            end;
+        DrainState ->
+            json(503, #{status => DrainState})
     end;
 route(get, <<"/metrics">>, _H, _B) ->
     {200, <<"text/plain; version=0.0.4">>, metrics_text()};
 route(get, <<"/api/v1/status">>, _H, _B) ->
     json(200, status());
+route(get, <<"/api/v1/node">>, _H, _B) ->
+    json(200, node_view());
+route(post, <<"/api/v1/drain">>, _H, Body) ->
+    drain(Body);
+route(post, <<"/api/v1/undrain">>, _H, _B) ->
+    %% `undrain/0' only fails for an unsupported message, so it has no error
+    %% branch: the drain process always answers `{ok, up}'.
+    {ok, State} = broker_drain:undrain(),
+    json(200, node_view(State));
 route(get, <<"/api/v1/config">>, _H, _B) ->
     json(200, #{hash => broker_config_audit:hash(),
                 config => broker_config_audit:snapshot()});
@@ -133,11 +156,16 @@ missing_apps() ->
                 broker_subscription, broker_event, broker_security],
     [A || A <- Required, not started(A)].
 
+%% A required app counts as "ready" only when it has actually started,
+%% not merely when it has been loaded. `application:get_application/1'
+%% with an app name resolves to the module -> application mapping, which
+%% is populated as soon as `application:load/1' runs: an app that crashed
+%% without unloading still answers `{ok, App}', so gating on it would keep
+%% `/readyz' at 200 while the data plane is down (S12-A, ADR-032 D2).
+%% `which_applications/0' lists only started applications, which is the
+%% readiness question we are asking.
 started(App) ->
-    case application:get_application(App) of
-        {ok, _} -> true;
-        _ -> false
-    end orelse lists:keymember(App, 1, application:which_applications()).
+    lists:keymember(App, 1, application:which_applications()).
 
 %%%_* Prometheus text exposition -------------------------------------------
 
@@ -243,6 +271,112 @@ configured_token() ->
 header(Headers, Name) ->
     maps:get(Name, Headers, undefined).
 
+%%%_* Node view (D3: the contract an external LB consumes) ------------------
+
+%% Everything an operator or LB needs to decide whether, and how much, to send
+%% this node traffic. Deliberately limited to what exists today: weight and role
+%% arrive with S12-C's rebalancer, and inventing a constant here would be a lie
+%% the LB could act on.
+node_view() ->
+    node_view(broker_drain:status()).
+
+node_view(DrainState) ->
+    #{node => to_bin(atom_to_binary(node(), utf8)),
+      state => DrainState,
+      ready => DrainState =:= up,
+      uptime_seconds => uptime_seconds(),
+      connections => connections_view(),
+      partitions => partitions_view()}.
+
+%% Aggregate connection counts straight from ranch, so they describe the
+%% listeners that actually exist on this node rather than a counter maintained
+%% separately. A node with no ranch listeners (admin-only boot) reports zeros.
+connections_view() ->
+    Infos = [ranch_info(Ref) || Ref <- ranch_refs()],
+    #{active => sum_key(active_connections, Infos),
+      total => sum_key(all_connections, Infos),
+      max => sum_key(max_connections, Infos)}.
+
+sum_key(Key, Infos) ->
+    lists:sum([maps:get(Key, I, 0) || I <- Infos, is_map(I)]).
+
+ranch_refs() ->
+    case code:ensure_loaded(ranch) of
+        {module, ranch} ->
+            try maps:keys(ranch:info()) catch _:_ -> [] end;
+        _ ->
+            []
+    end.
+
+ranch_info(Ref) ->
+    try ranch:info(Ref) catch _:_ -> #{} end.
+
+%% Partitions this node currently owns, with their epochs. Read from the local
+%% mirror via `broker_cluster:owner/1' / `epoch/1' (D1): the node view must never
+%% block on ra, and every read here degrades to "not owned" when the cluster
+%% layer is absent.
+partitions_view() ->
+    Owned =
+        [ #{partition => P, epoch => safe_epoch(P)}
+          || P <- safe_partition_ids(),
+             safe_owner(P) =:= {ok, node()} ],
+    #{count => length(Owned), partitions => Owned}.
+
+safe_partition_ids() ->
+    try broker_queue:partition_ids() catch _:_ -> [] end.
+
+safe_owner(Partition) ->
+    try broker_cluster:owner(Partition) catch _:_ -> not_found end.
+
+safe_epoch(Partition) ->
+    try broker_cluster:epoch(Partition) of
+        {ok, E} -> E;
+        _ -> 0
+    catch
+        _:_ -> 0
+    end.
+
+%%%_* Drain ---------------------------------------------------------------
+
+%% R-LB8: strict input validation. The body is optional (`{}' or empty means
+%% "use the configured grace period"), but anything we do not understand is a
+%% 400 rather than a silently ignored typo.
+drain(Body) ->
+    case parse_drain_body(Body) of
+        {ok, Timeout} ->
+            case apply_drain(Timeout) of
+                {ok, State, Suspended} ->
+                    json(200, (node_view(State))#{suspended_listeners => Suspended});
+                {error, down} ->
+                    json(409, #{error => already_down, node => node_view()})
+            end;
+        {error, Error} ->
+            json(400, Error)
+    end.
+
+apply_drain(configured) -> broker_drain:drain();
+apply_drain(Timeout) -> broker_drain:drain(Timeout).
+
+parse_drain_body(<<>>) ->
+    {ok, configured};
+parse_drain_body(Body) ->
+    try json:decode(Body) of
+        #{} = Map ->
+            case maps:to_list(Map) of
+                [] -> {ok, configured};
+                [{<<"timeout_ms">>, infinity}] -> {ok, infinity};
+                [{<<"timeout_ms">>, T}] when is_integer(T), T >= 0 -> {ok, T};
+                [{<<"timeout_ms">>, _}] -> {error, #{error => invalid_timeout_ms}};
+                [{Other, _}] ->
+                    {error, #{error => unknown_field, field => Other}};
+                _ -> {error, #{error => unknown_fields}}
+            end;
+        _ ->
+            {error, #{error => body_must_be_object}}
+    catch
+        _:_ -> {error, #{error => invalid_json}}
+    end.
+
 %%%_* Utilities ------------------------------------------------------------
 
 strip_query(Path) ->
@@ -263,6 +397,11 @@ json_safe(L) when is_list(L) ->
     [json_safe(V) || V <- L];
 json_safe(T) when is_tuple(T) ->
     json_safe(tuple_to_list(T));
+%% Booleans are JSON literals, not strings. Without these clauses the generic
+%% atom clause below turns `true' into `"true"', which an LB comparing against a
+%% boolean would silently misread.
+json_safe(true) -> true;
+json_safe(false) -> false;
 json_safe(B) when is_binary(B) -> B;
 json_safe(A) when is_atom(A) -> atom_to_binary(A, utf8);
 json_safe(I) when is_integer(I) -> I;

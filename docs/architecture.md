@@ -78,7 +78,7 @@ apps/
 | `broker_event` | kernel, stdlib, sasl, broker_core, broker_metrics, broker_router, broker_queue | `broker_event_dedup`（去重窗口 gen_server + ETS） | `policy/0`、`policy_for/1`、`apply_policy/1,2`、`dedup_window/1`、`duplicate/1`、`quarantine/2`、`broker_event_codec`（CE 1.0 JSON / Binary）、`broker_event_binding`（MQTT Binding + 损失报告） | 去重 ETS（`{Tenant,Destination,source,id} → 过期时刻`，默认关闭） |
 | `broker_security` | kernel, stdlib, sasl, ssl, broker_core | 空 supervisor | `authenticate/2`、`authorize/2`、`tenant_id/1`（纯函数读 env） | 无（配置即状态） |
 | `broker_retain` | kernel, stdlib, sasl, broker_core, broker_metrics | `broker_retain`（gen_server） | `put/2`、`delete/2`、`lookup/1`、`entries/0`、`stats/0`、`flush/0` | 每 topic 一条 retained 消息（ETS/内存树）+ `retain/retain.v1` 快照 |
-| `broker_admin` | kernel, stdlib, sasl, crypto, broker_core, broker_metrics, broker_security | `broker_admin_listener`（HTTP accept） | `broker_admin_http:handle/4`、`metrics_text/0`、`broker_backup`、`broker_config_audit`、`broker_version:info/0` | 只读快照；备份清单文件 |
+| `broker_admin` | kernel, stdlib, sasl, crypto, broker_core, broker_metrics, broker_security | `broker_admin_listener`（HTTP accept）+ `broker_drain`（drain 状态机，S12-A） | `broker_admin_http:handle/4`、`metrics_text/0`、`broker_backup`、`broker_config_audit`、`broker_version:info/0`、`broker_drain`（`up|draining|down`） | 只读快照；备份清单文件；drain 状态（`persistent_term` 镜像，**节点本地、不进 ra**） |
 | `broker_proto_mqtt` | kernel, stdlib, sasl, ranch, broker_core, broker_metrics, broker_storage, broker_router, broker_queue, broker_subscription, broker_event, broker_security, broker_retain | `mqtt_conn_sup` + 每连接 `mqtt_conn_fsm` + 嵌入的 ranch listener | `mqtt_frame`（编解码）、`mqtt_filter`（Annex A 校验）、`mqtt_conn_fsm`、`mqtt_listener`、`mqtt_transport`（行为）与 `mqtt_transport_tcp`（TCP/TLS 实现） | 每连接内存视图（packet_id 分配器、in-flight 集合、keepalive 定时器）+ 传输 handle |
 | `broker_ws` | kernel, stdlib, crypto | **无进程、无配置** | `ws_frame`（RFC 6455 帧编解码）、`ws_handshake`（`accept/1,2` 握手 + 子协议协商）、`max_handshake/0` | 无（纯函数库） |
 | `broker_proto_ws` | kernel, stdlib, sasl, ranch, broker_ws, broker_core, broker_metrics + 内核 6 app | 每连接 `ws_conn` + ranch listener | `ws_conn`、`ws_listener`（帧编解码已委托给 `broker_ws` 的 `ws_frame`） | 每连接分片缓冲、订阅集合 |
@@ -172,7 +172,8 @@ broker_event_app ───────► broker_event_sup                      
 broker_security_app ────► broker_security_sup                       one_for_all（空）
 
 broker_admin_app ───────► broker_admin_sup                          one_for_one, 5/10s
-                          └── broker_admin_listener                 permanent
+                          ├── broker_drain                          permanent（drain 状态机，S12-A）
+                          └── broker_admin_listener                 permanent（`enabled => false` 时不建）
 
 broker_proto_mqtt_app ──► broker_proto_mqtt_sup                     one_for_all, 1/5s
                           ├── mqtt_conn_sup                         simple_one_for_one
@@ -768,7 +769,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 - 写入不经过进程、不分配键：键表在启动时固定，索引存 `persistent_term`；`snapshot/0` 按 `keys/0` 顺序读数组。
 - `enabled=false` 时写 API 仍是 `ok`（`gauge_add/2` 返回 0），`snapshot/0` 返回全零，键集合不变。
-- `connections_current`/`connections_peak` 是唯一需要读改写的地方：`gauge_add/2`（原子 `add_get`）维护当前数，只有更高时才 `gauge/2` 写峰值。
+- `connections_current`/`connections_peak` 是唯一需要读改写的地方：`gauge_add/2`（原子 `add_get`）维护当前数，只有更高时才 `gauge/2` 写峰值。**S12-B 起所有协议前端统一经 `connection_opened/0` / `connection_closed/1` 这一对**（ADR-032 D7）：前者返回 boolean 表示「这条连接是否真的被计入」，后者只在该值为 `true` 时减——metrics 关闭时 `gauge_add/2` 返回 `0` 而非 `ok`，所以这个布尔量是防止 gauge 被减成负数的唯一依据。`mqtt_ws` / `mqtt_quic` 不重复计数（其下即 `mqtt_conn_fsm`）；CoAP 只计 DTLS 会话。
 - `subscription_backlog`/`cursor_lag` 由 `broker_subscription_worker` 每次 cursor tick 采样（默认 100 ms）；`queue_depth`/`segment_bytes` 由分区 `wal_writer` 写，多分区共用一个键，最后写入者覆盖 ⇒ 视为近似全局值，分区精确值读 `broker_queue:watermarks/1`。
 - `redelivery_total`/`dlq_size`/`retention_*` 与 `cloudevents_*` 的埋点已分别随 S2-E / S2-F / S3 接入（键集合冻结不变）。
 

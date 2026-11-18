@@ -4,7 +4,7 @@
     {registered, [broker_proto_a2a_sup, a2a_task_registry]},
     {mod, {broker_proto_a2a_app, []}},
     {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
-                    broker_core, broker_security, broker_meta,
+                    broker_core, broker_security, broker_metrics, broker_meta,
                     broker_router, broker_queue, broker_proto_agent_rpc]},
     {env, [{listeners, []},
            {require_auth, true},

@@ -6,7 +6,7 @@
 - **告警规则**：[`config/alerts.yml`](../config/alerts.yml)
 - **相关**：`docs/storage-and-recovery.md`（WAL/会话恢复）、`docs/security.md`（TLS/ACL）
 
-本手册只描述已实现的管理面。命令示例以默认配置（admin `127.0.0.1:8090`，空 token）为准；生产环境必须设置 token 并限制 bind。
+本手册只描述已实现的管理面。命令示例以默认配置（admin `127.0.0.1:8090`，空 token）为准；生产环境必须设置 token 并限制 bind。**非回环 `bind` 配空 `token` 会在启动时直接失败**（`{insecure_bind, Bind, empty_token}`）——这条不变式由代码强制，不再是注释约定。
 
 ---
 
@@ -576,17 +576,43 @@ Authorization: Bearer <token>
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/healthz` | 存活：进程在即 200，永远不鉴权 |
-| GET | `/readyz` | 就绪：必需 app 未全起时 503，列缺失 app |
+| GET | `/healthz` | 存活：进程在即 200，永远不鉴权，**drain 期间也是 200** |
+| GET | `/readyz` | 就绪：`draining`/`down` 时 503（`status` 为 drain 状态），否则按必需 app 判 200/503 |
 | GET | `/metrics` | Prometheus 文本（封闭 key 集合） |
 | GET | `/api/v1/status` | 节点、版本、分区、retention、集群、指标快照 |
+| GET | `/api/v1/node` | 节点视图（S12-A）：`state`、`ready`、连接数、本节点拥有分区——外部 LB 消费的契约 |
+| POST | `/api/v1/drain` | 摘流：挂起本节点全部 ranch listener，**不断开在用连接**（ADR-032 D2） |
+| POST | `/api/v1/undrain` | 恢复接收新连接 |
 | GET | `/api/v1/config` | 脱敏配置快照 + SHA-256 |
 | GET | `/api/v1/version` | release/OTP/数据格式/配置版本 |
 | GET | `/api/v1/backups` | 备份清单（名称、字节、mtime） |
 | POST | `/api/v1/backup` | 创建一次热备份 |
 | POST | `/api/v1/tls/reload` | 清 `ssl` PEM 缓存，轮换证书 |
 
-`/readyz` 检查的 app：`broker_storage`、`broker_router`、`broker_queue`、`broker_subscription`、`broker_event`、`broker_security`。`broker_metrics` 与 `broker_admin` 故意不在其中：指标/管理面故障不应把 broker 摘出负载均衡。
+`/readyz` 检查的 app：`broker_storage`、`broker_router`、`broker_queue`、`broker_subscription`、`broker_event`、`broker_security`。`broker_metrics` 与 `broker_admin` 故意不在其中：指标/管理面故障不应把 broker 摘出负载均衡。**判定口径是「已 started」而非「已 loaded」**：一个崩溃但未 unload 的 app 不会被算成就绪（S12-A 修复）。
+
+#### 摘流（drain）
+
+`POST /api/v1/drain` 把节点切到 `draining`：挂起本节点**全部 ranch listener**（停止 accept），在用连接保留到自然结束或宽限期到期。管理 API 自身不是 ranch listener，因此 drain 期间**仍可达**，`undrain` 随时可调。
+
+```bash
+# 用配置里的 drain_timeout_ms
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     http://127.0.0.1:8090/api/v1/drain
+# 或显式指定宽限期（毫秒；infinity 表示等到显式 undrain）
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"timeout_ms":30000}' \
+     http://127.0.0.1:8090/api/v1/drain
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     http://127.0.0.1:8090/api/v1/undrain
+```
+
+- 入参严格校验（R-LB8）：未知字段、类型错误、非法 JSON 一律 **400**，且**不会**改变状态。
+- 宽限期到期自动 `draining -> down`（`drain_timeout_ms`，默认 `infinity`）；到 `down` 后 `drain` 回 **409**，`undrain` 仍可恢复。
+- **任何路径都不主动断开在用连接**：`down` 只是「可以停进程了」的信号。
+- **覆盖范围**：drain 挂起的是 ranch listener（TCP 系协议）。QUIC（`mqtt_quic_listener`）与 CoAP（`coap_listener`）是自定义 `gen_udp`/`gen_server`，**不在挂起范围**——这两个协议目前需要靠停进程来摘流。
+- drain 状态是**节点本地**的，不进 ra：失去多数派时摘流仍然可用（ADR-032 D1）。
+- 排空顺序建议：`/readyz` 已 503 → 等 LB 摘除 → 观察 `/api/v1/node` 的 `connections.active` 归零 → 停进程。
 
 示例：
 
@@ -606,7 +632,8 @@ curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
 ### 3.1 健康与就绪
 
 - `/healthz` 200 且 `/readyz` 200：正常。
-- `/readyz` 503：响应体会列出缺失 app，先查该 app 的启动日志（`data/log/s1.log`）。
+- `/readyz` 503 且 `status` 为 `draining`/`down`：节点被显式摘流（见 §2 摘流一节），不是故障。
+- `/readyz` 503 且 `status` 为 `not_ready`：响应体的 `missing` 会列出缺失 app，先查该 app 的启动日志（`data/log/s1.log`）。
 - 进程在但 `/readyz` 一直 503：检查数据目录是否可写、分区是否已带外创建（见 §5）。
 
 ### 3.2 关键指标
@@ -615,7 +642,8 @@ curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 | 指标 | 含义 | 关注点 |
 |---|---|---|
-| `connections_current` / `connections_peak` | 当前/峰值连接 | 突增或触顶 `max_connections` |
+| `connections_current` / `connections_peak` | 当前/峰值连接（**节点全部协议前端**，S12-B 起） | 突增或触顶 `max_connections` |
+| — | （上行的口径说明） | 计入：MQTT / MQTT-SN / MQTT over QUIC / MQTT over WS / WS / NATS / AMQP / Kafka / Pulsar / WebRTC 信令 / A2A / MCP，以及 **CoAP 的 DTLS 会话**（明文 UDP 无连接语义，不计）。S12-B 之前只有 MQTT 系在写，任何据此做的告警在旧版本上都是低估 |
 | `auth_failures` / `authz_failures` | 认证失败 / 授权失败 | 前者账号问题，后者 ACL/租户问题 |
 | `publish_total` / `deliver_total` / `ack_total` | 发布/投递/确认计数 | 三者比例失衡说明消费滞后 |
 | `publish_latency_us` / `deliver_latency_us` / `ack_latency_us` | 直方图 | p99 抬升先看 WAL |
@@ -800,6 +828,46 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 - 容量估算以「持久化 msg/s × 消息大小 ÷ 副本因子 × 安全系数」为起点，必须用目标硬件复测，不要直接外推本机数字。
 - **WebRTC 信令与 ICE 的容量基准**（不落盘路径，与上面持久化口径不可直接比较）：`docs/benchmarks/2026-11-14-s10-capacity.md`，复跑 `test/protocol-compatibility/s10/bench/run_bench.sh`（自带内存守卫与断点续跑，只绑回环临时端口）。快速结论：信令 32 连接并发 1498.7/s（p50 1.6 ms）、ICE allocation 顺序 p50 893 µs、relay 中继约 5.2k datagrams/s。**信令与 ICE 都不写 WAL**，它们的容量不受磁盘 fsync 约束，受 CPU/调度与 socket 缓冲约束；relay 在无上层流控的突发下会丢包（实测送达率 0.77），容量规划必须留余量。
 - **CoAP / coaps（DTLS-PSK）的容量基准**：`docs/benchmarks/2026-11-16-s11c-dtls-capacity.md`，复跑 `test/protocol-compatibility/s11c/bench/run_bench.sh`（只绑回环临时端口，会覆写 `results/dtls_capacity.json`，跑完 `git checkout --` 还原）。快速结论：**握手串行约 41/s**（p50 ~22 ms，冷启动大批设备须错峰 ≥150 ms）、**DTLS 单次往返 ≈ 明文 1.8×**、稳态单 listener **约 4.4k req/s 零错误**（单进程瓶颈）、冷启动风暴 32 并发仅 5 成功 vs 错峰 32/32。吞吐须「先顺序建会话、再并发打请求」，与持久化口径不可直接比较。
+
+### 9.1 节点级连接上限（`max_connections`，S12-B / ADR-032 D7）
+
+**语义**：`broker_security.limits.max_connections` 是**整节点**同时在线的连接数上限，跨全部协议前端，不是每 listener 的。各 listener spec 里那个同名的 `max_connections`（默认 1024）依旧只管自己，且 ranch 到限时**不拒绝连接**——它让 acceptor 睡下，对端 TCP 连上却永远收不到协议应答。节点级闸门就是为这个缺口加的。
+
+**默认 `infinity`（闸门关闭）**。升级不改变既有部署行为；要开启必须显式配置：
+
+```erlang
+{broker_security, [{limits, #{max_connections => 10000}}]}
+```
+
+**它数什么**：一个「名额」= 一条被准入的连接，从 `try_acquire` 成功到持有它的进程结束或显式释放。以下都算：MQTT / MQTT-over-WS / WS / WebRTC / NATS / AMQP / Kafka / Pulsar / A2A / MCP 的连接，**MQTT-SN 的 sleeping 会话**（timer、订阅、堆仍是本节点的资源，故意不释放），QUIC 连接，以及 **CoAP 只算 DTLS 会话**（明文 UDP 逐包无状态，不计）。
+
+**超限时对端看到什么**（各协议按自己的语法显式拒绝，不是静默挂起）：
+
+| 协议 | 拒绝帧 |
+|---|---|
+| MQTT 3.1.1 | CONNACK `rc=3`（Server unavailable） |
+| MQTT 5 | CONNACK `0x89`（Server busy） |
+| MQTT-SN | CONNACK `return_code=3`（congestion） |
+| WS / WebRTC / A2A / MCP | HTTP `503` + `Retry-After: 5`（在 101 之前） |
+| NATS | `-ERR 'Server is full'` |
+| Kafka | ApiVersions 响应 `error_code=56` + 说明文本 |
+| AMQP | `connection.close` reply-code `541` + 说明文本 |
+| Pulsar | `ERROR` 命令 `request_id=0`、`ERROR_UNKNOWN` + 说明文本 |
+| CoAP (DTLS) | 握手后直接关闭 socket（`{refuse, node_cap}`） |
+| QUIC | `{error, too_many_connections}`，连接关闭 |
+
+NATS / AMQP / Kafka / Pulsar 的拒绝帧只能在**收到首帧、协议版本确定后**发出，因此**可观测性弱于 MQTT**：连接已建立、只是首帧后立刻被拒。
+
+**被拒的连接只进 warning 日志**（`<proto>: connection refused by admission gate: over_capacity`）。`broker_metrics` 的键集封闭，没有「被拒连接数」计数（R-LB9 扩展项标「S12 不交付」）。要观察余量，读闸门自己的快照：
+
+```erlang
+broker_admission:snapshot().
+%% #{limit => 10000, in_use => 4213, state => up}
+```
+
+**`state`** 是 `up | draining | down`：drain 中的节点即使还有空位也拒绝新连接（否则它接纳的连接对正在进行的 drain 不可见）。`in_use` 是当前占用；若怀疑泄漏，注意实现会在**下一次拒绝时**清扫已死持有者的名额（例如被 `brutal_kill` 杀掉的连接，`terminate/2` 不会运行），因此一个刚被杀死的连接可能短时间仍计入，直到有人触发一次准入判定。
+
+**规划建议**：取值要低于「文件描述符上限 / 单连接内存 × 安全系数」，并与 MQTT-SN 的 sleeping 会话规模一起考虑——它们占名额但不占 fd。
 
 ---
 

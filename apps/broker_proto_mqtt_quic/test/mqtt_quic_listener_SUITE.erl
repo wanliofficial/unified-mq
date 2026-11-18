@@ -41,7 +41,11 @@ groups() ->
        a_client_with_another_alpn_is_refused,
        a_real_connect_gets_a_connack,
        a_pingreq_is_not_a_protocol_error,
-       a_new_stream_on_the_same_connection_is_a_new_session]}].
+       a_new_stream_on_the_same_connection_is_a_new_session,
+       %% S12-B (ADR-032 D7): the node-level admission gate, at the
+       %% `{new_conn, _}' seam where a refusal can still be answered.
+       a_connection_over_the_node_cap_is_refused,
+       a_released_node_slot_admits_the_next_connection]}].
 
 %%%_* Fixtures ----------------------------------------------------------------
 
@@ -66,7 +70,9 @@ init_per_testcase(Case, Config0) ->
                Case =:= a_client_with_another_alpn_is_refused;
                Case =:= a_real_connect_gets_a_connack;
                Case =:= a_pingreq_is_not_a_protocol_error;
-               Case =:= a_new_stream_on_the_same_connection_is_a_new_session ->
+               Case =:= a_new_stream_on_the_same_connection_is_a_new_session;
+               Case =:= a_connection_over_the_node_cap_is_refused;
+               Case =:= a_released_node_slot_admits_the_next_connection ->
             {Cert, Key} = self_signed(),
             [{certfile, Cert}, {keyfile, Key} | Config];
         _ ->
@@ -75,6 +81,11 @@ init_per_testcase(Case, Config0) ->
 
 end_per_testcase(_Case, Config) ->
     stop_broker(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     restore_tls(?config(saved_tls, Config)),
     ok.
 
@@ -167,6 +178,64 @@ a_client_with_another_alpn_is_refused(Config) ->
 %% The whole stack on one stream: real QUIC, the real `mqtt_conn_fsm', a real
 %% MQTT 3.1.1 CONNECT and a real CONNACK. If the handoff, the passive-to-active
 %% switch or the stream ownership were wrong, this is where it shows.
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% The per-listener cap in the listener spec is exactly per listener, so a node
+%% with several QUIC listeners had no node-wide bound. The gate is asked where a
+%% new connection object arrives, which is the last point a refusal can still be
+%% an answer to the peer rather than a silent drop.
+a_connection_over_the_node_cap_is_refused(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    boot_broker(Config),
+    {ok, Pid} = start_listener(Config),
+    Port = mqtt_quic_listener:port(Pid),
+    {ok, First} = quicer:connect("localhost", Port,
+                                 #{alpn => ["mqtt"], verify => none}, 5000),
+    ok = wait_admission(1),
+    %% The second connection cannot be admitted at the node level. Quicer reports
+    %% it as a failed connect/handshake, which is MQTT-over-QUIC's honest shape:
+    %% CONNECT has not been read, so there is no CONNACK to carry a reason code.
+    Refused = quicer:connect("localhost", Port,
+                             #{alpn => ["mqtt"], verify => none}, 2000),
+    ?assert(case Refused of
+                {ok, Second} ->
+                    %% It may connect and then be closed by the listener; either
+                    %% way it must not become a served MQTT connection.
+                    _ = quicer:close_connection(Second),
+                    false;
+                {error, _} -> true
+            end),
+    _ = quicer:close_connection(First),
+    gen_server:stop(Pid).
+
+a_released_node_slot_admits_the_next_connection(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    boot_broker(Config),
+    {ok, Pid} = start_listener(Config),
+    Port = mqtt_quic_listener:port(Pid),
+    {ok, First} = quicer:connect("localhost", Port,
+                                 #{alpn => ["mqtt"], verify => none}, 5000),
+    ok = wait_admission(1),
+    _ = quicer:close_connection(First),
+    %% The lease travels into `mqtt_quic_conn' as part of its config and is
+    %% released by its `terminate/2', so the slot returns when that process ends.
+    ok = wait_admission(0),
+    {ok, Second} = quicer:connect("localhost", Port,
+                                  #{alpn => ["mqtt"], verify => none}, 5000),
+    _ = quicer:close_connection(Second),
+    gen_server:stop(Pid).
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
+
 a_real_connect_gets_a_connack(Config) ->
     boot_broker(Config),
     {ok, Pid} = start_listener(Config),
@@ -369,6 +438,9 @@ boot_broker(Config) ->
     ok = application:set_env(broker_security, users, []),
     ok = application:set_env(broker_security, acl, allow),
     ok = application:set_env(broker_security, require_auth, []),
+    %% S12-B: the admission gate's budget, back to "off" for every case.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_proto_mqtt, pull_page_limit, 32),
     ok = application:set_env(broker_proto_mqtt, max_inflight, 64),
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 100),

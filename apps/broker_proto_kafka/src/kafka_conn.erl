@@ -72,7 +72,15 @@
     port = 0 :: inet:port_number(),
     groups = #{} :: #{binary() => binary()},   % group => member id
     pending_sync = #{} :: #{{binary(), binary()} => integer()},
-    producer_id = 1 :: integer()
+    producer_id = 1 :: integer(),
+    %% S12-B (ADR-032 D7): whether this connection holds a row in
+    %% `connections_current'. Metrics may be off, in which case nothing was
+    %% added and `connection_closed/1' must not subtract.
+    counted = false :: boolean(),
+    %% S12-B: node-level admission lease, taken on ApiVersions (the first request
+    %% a Kafka client sends, and so the first point a response frame is legal),
+    %% released in `terminate/2'.
+    admission = undefined :: undefined | broker_admission:lease()
 }).
 
 %%%_* Lifecycle ------------------------------------------------------------
@@ -81,9 +89,12 @@ start_link(Ref, Transport, Opts) ->
     gen_server:start_link(?MODULE, {Ref, Transport, Opts}, []).
 
 init({Ref, Transport, _Opts}) ->
-    {ok, #st{ref = Ref, transport = Transport, port = ranch:get_port(Ref)}}.
+    {ok, #st{ref = Ref, transport = Transport, port = ranch:get_port(Ref),
+             counted = broker_metrics:connection_opened()}}.
 
-terminate(_Reason, #st{groups = Groups}) ->
+terminate(_Reason, #st{groups = Groups, counted = Counted} = St) ->
+    ok = broker_metrics:connection_closed(Counted),
+    ok = broker_admission:release(St#st.admission),
     maps:foreach(fun(Group, MemberId) ->
                          _ = (catch kafka_group:close_member(Group, MemberId))
                  end, Groups),
@@ -288,6 +299,25 @@ anonymous() ->
 %%%_* ApiVersions ---------------------------------------------------------
 
 handle_api_versions(Version, Corr, Body, St) ->
+    %% S12-B (ADR-032 D7): ApiVersions is the first request a Kafka client sends
+    %% and the moment the version is known, so it is the first point a refusal
+    %% can be encoded as a response frame instead of a bare close. A client that
+    %% is refused here has sent exactly one request and gets one answer.
+    case admit(St) of
+        {ok, St0} -> do_api_versions(Version, Corr, Body, St0);
+        {error, St0} ->
+            %% error_code 56 = KAFKA_STORAGE_ERROR is the nearest "this broker
+            %% cannot serve you"; 51 (UNKNOWN_SERVER_ERROR) would be a lie about
+            %% the cause. The text carries the real reason for an operator.
+            Reply = <<(kafka_codec:int16(56))/binary,
+                      (kafka_codec:nullable_string(
+                         <<"broker is at connection capacity">>))/binary,
+                      (kafka_codec:int32(0))/binary>>,
+            {noreply, St1} = send_response(Corr, Reply, St0),
+            {stop, normal, St1}
+    end.
+
+do_api_versions(Version, Corr, Body, St) ->
     %% ApiVersions is the one API a client sends before any version
     %% negotiation, so the reply must match the request's encoding: v0-v2 are
     %% non-flexible, v3+ are flexible. The request body (software name and
@@ -928,6 +958,19 @@ send_response(Corr, Body, St) ->
     Frame = <<(byte_size(Payload)):32/signed, Payload/binary>>,
     _ = raw_send(Frame, St),
     {noreply, St}.
+
+%% S12-B (ADR-032 D7): the node-level gate, asked once per connection.
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("kafka: connection refused by admission gate: ~p",
+                           [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
+    end.
 
 send_noreply(Corr, Body, St) ->
     {noreply, St1} = send_response(Corr, Body, St),

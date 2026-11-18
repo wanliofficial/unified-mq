@@ -212,17 +212,37 @@ handle_call({new_conn, _Conn}, _From,
   when map_size(Conns) >= Max ->
     {reply, {error, too_many_connections}, St};
 handle_call({new_conn, _Conn}, _From, #st{conns = Conns, cfg = Cfg} = St) ->
-    case mqtt_quic_conn:start_link(Cfg) of
+    %% S12-B (ADR-032 D7): the per-listener cap above is exactly that --
+    %% per-listener. The node-level gate is asked here too, because this is the
+    %% same seam (a connection object exists, no service promised yet), and
+    %% because the QUIC front end has no other place where a refusal can still
+    %% be an answer to the peer instead of a silent drop.
+    %%
+    %% The lease travels into `mqtt_quic_conn' as part of its config and is
+    %% released by its `terminate/2', which is the one path every connection
+    %% (including a failed stream handoff) ends in.
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("quic: connection refused by admission gate: ~p", [Why]),
+            {reply, {error, too_many_connections}, St};
+        Lease ->
+            start_conn(Lease, Conns, Cfg, St)
+    end;
+handle_call(_Req, _From, St) ->
+    {reply, {error, unsupported}, St}.
+
+start_conn(Lease, Conns, Cfg, St) ->
+    case mqtt_quic_conn:start_link(Cfg#{admission => Lease}) of
         {ok, Pid} ->
             Ref = erlang:monitor(process, Pid),
             {reply, {ok, Pid}, St#st{conns = Conns#{Ref => Pid}}};
         {error, Reason} ->
             %% The acceptor closes the connection when this comes back as an
-            %% error; the listener itself stays up for the next peer.
+            %% error; the listener itself stays up for the next peer. The lease
+            %% was taken for a process that never started, so it goes back here.
+            ok = broker_admission:release(Lease),
             {reply, {error, Reason}, St}
-    end;
-handle_call(_Req, _From, St) ->
-    {reply, {error, unsupported}, St}.
+    end.
 
 handle_cast(_Msg, St) ->
     {noreply, St}.

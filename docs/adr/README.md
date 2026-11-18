@@ -63,7 +63,15 @@
 | [030](030-s11-protocol-pool-screening.md) | S11 候选池筛选：**仅 CoAP 进入实现评审**（S11-A/B/C），不写第二套内核；归并 lorawan-server（桥接后端 Connector）/ processone/stun（复用 S10 ICE）/ apns4erl（归并 S9 出站）；SIP 一组**并入 ADR-028 信令面**评估、不单独立项；发现面（mdns/dnssd/rbeacon/erldns + DHT 两仓）**保留为延迟候选**（不关闭不实现）；mtproto_proxy / dhtcrawler / yxa 明确不做；可靠性显式分档、不替代 S4 Membership、无外部守护进程、无 CloudEvents 逐字 Binding、不预承诺数字 | 14 仓三段式立项稿（9 深挖 + 5 索引级）；[`s11-protocol-candidates.md`](../design/s11-protocol-candidates.md) §1/§3/§4.4；RFC 7252/7641/6690（CoAP）、RFC 6763（DNS-SD）、SIP RFC 3261（部分）；ADR-001/007/009/013/016/021/027/028/029 |
 | [031](031-coap-frontend-boundary.md) | CoAP 前端边界：**不 vendor `gen_coap`**、自写 `coap_codec`（4 字节头 + option，规模对齐 `stun_codec`/`mqtt_sn_codec`）；Observe **归订阅层 + cursor**（ADR-013），不另立扇出；CON/ACK 是 **datagram 级确认**，NON=至多一次、CON 只保证报文到达 adapter，禁止等价 QoS 1；资源路径直接映射 `broker_router` destination、不新开 `$coap/` 命名空间；DTLS 凭据接 `broker_security`、默认不自签；出厂 `enabled => false` 零 socket；Block-wise 如实标注对齐 `draft-ietf-core-block-18`；`broker_metrics` 不扩容 | `gen_coap` @245e220 构建 spike（OTP 28 上 `http_uri`/`pg2` 均移除、无客户端 Observe）；RFC 7252/7641/6690；ADR-001/007/009/010/013/016/021/022/029/030 |
 
-> S10 决策只冻结抽象与边界，S10-0~S10-D 已交付（S10-D 于 2026-11-14 收口，`rebar3 ct` 1251/1251）；S11 决策只冻结候选池筛选结论，S11-0 无代码、S11-A/B/C 尚未开工（roadmap §13）。
+> S10 决策只冻结抽象与边界，S10-0~S10-D 已交付（S10-D 于 2026-11-14 收口，`rebar3 ct` 1251/1251）；S11 决策只冻结候选池筛选结论，S11-A/B/C 已全部交付（2026-11-16 收口，`rebar3 ct` 1373/1373、84 套件，含 libcoap v4.3.5 真实客户端证据）。
+
+### S12 决策（已采纳，2026-11-17 冻结）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [032](032-s12-node-view-drain-and-rebalance-boundary.md) | S12 节点视图真相 / drain / 再平衡边界：**ra 为唯一真相**（Mnesia `cluster_node`/`partition_meta` 退役为遗留视图）、节点自身 `up\|draining\|down` **存本地不进 ra**（失去多数派仍可 drain）、**外部 LB + 8090 供契约**不做四层代理/DNS-SD/客户端路由、再平衡器在 `broker_cluster` 内**默认关闭**且目标函数只含分区数（滞后+冷却双门限、一次一轮）、**只迁移分区归属不迁移活进程**、不引入一致性哈希且不改 `phash2` 编号、写可用性矩阵绑定 ADR-007 三档、不内部排队、指标不扩容只修 `connections_current` 记账、ADR-021 两项遗留不并入、**跨节点投递不在 S12 范围（单列 S12-D）** | 收敛报告 §1 的 9 条负向发现（`broker_meta:reconcile/0` 不存在、两份平行元数据、`/readyz` 查 loaded 非 started、跨节点投递不存在、无 drain/无节点级容量闸门/无节点视图）；ADR-001/002/007/008/010/011/013/015/016/019/021 |
+
+> S12 决策只冻结边界与形状，**不写代码、不开端口、不新增 app / 依赖**；S12-A/B/C 均未开工（roadmap §14）。跨节点投递（S12-D）需新增 ADR，不在本轮范围。
 
 ## Gate S0 验收清单（roadmap §2）
 

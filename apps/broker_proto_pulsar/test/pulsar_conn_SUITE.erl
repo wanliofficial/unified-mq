@@ -38,7 +38,11 @@ all() ->
      send_without_producer_errors,
      sasl_token_authenticates_against_the_shared_table,
      sasl_token_with_a_wrong_secret_is_refused,
-     sasl_plain_authenticates_against_the_shared_table].
+     sasl_plain_authenticates_against_the_shared_table,
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_with_an_error_command,
+     a_released_slot_is_usable_again].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -76,6 +80,10 @@ init_per_testcase(Case, Config) ->
                              [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}},
                               {<<"svc">>, #{token => <<"tok">>, tenant_id => <<"t2">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget. Written in every case so a case that
+    %% pushes it down to one cannot starve the next one.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_pulsar, advertised_host, <<"127.0.0.1">>),
     ok = application:set_env(broker_proto_pulsar, listeners,
@@ -88,6 +96,11 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     stop_all(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok.
 
 create_partitions() ->
@@ -116,6 +129,36 @@ stop_all() ->
     _ = application:stop(broker_router),
     _ = application:stop(broker_storage),
     ok.
+
+%% S12-B (ADR-032 D7): the negative control the ADR asks for. Before this, only
+%% the MQTT front ends wrote `connections_current', so the gauge did not describe
+%% the node. Measured as a delta against a baseline rather than an absolute
+%% number: other suites on the shared CT node may hold connections of their own,
+%% and an absolute assertion would make this case order-dependent.
+connections_current_tracks_the_connection_lifecycle(Config) ->
+    Base = current(),
+    C = connect(Config),
+    %% The count is written in the connection process's `init/1', which starts
+    %% after ranch accepts, so wait for it rather than assuming the accept has
+    %% already happened.
+    wait_until_current(Base + 1),
+    %% This suite has no `close/1' of its own: it closes by dropping the socket.
+    _ = gen_tcp:close(C#c.s),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(25), wait_until_current(Expected, Left - 25)
+    end.
 
 %%%_* Cases -----------------------------------------------------------------
 
@@ -355,6 +398,50 @@ connect_ok(C) ->
     send_simple(C, connect_fields()),
     #{type := connected} = recv(C),
     ok.
+
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% CONNECT is Pulsar's first frame, so it is the first point a refusal can be an
+%% ERROR command rather than a bare close. Pulsar's server error table has no
+%% capacity code, so the frame carries ERROR_UNKNOWN (0) and a message that says
+%% what happened -- inventing a code the official client cannot map would be
+%% worse than an honest 0.
+over_capacity_is_refused_with_an_error_command(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Holder = connect(Config),
+    ok = connect_ok(Holder),
+    Refused = connect(Config),
+    send_simple(Refused, connect_fields()),
+    #{type := error, request_id := 0, error := 0, message := Msg} = recv(Refused),
+    ?assertEqual(<<"broker is at connection capacity">>, Msg),
+    %% The holder is still served.
+    send_simple(Holder, command(18, 18, [])),
+    #{type := pong} = recv(Holder),
+    ok.
+
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Holder = connect(Config),
+    ok = connect_ok(Holder),
+    Refused = connect(Config),
+    send_simple(Refused, connect_fields()),
+    #{type := error} = recv(Refused),
+    gen_tcp:close(Holder#c.s),
+    ok = wait_admission_released(),
+    Again = connect(Config),
+    ok = connect_ok(Again),
+    ok.
+
+wait_admission_released() ->
+    wait_admission_released(200).
+
+wait_admission_released(0) ->
+    exit({admission_slot_leaked, broker_admission:snapshot()});
+wait_admission_released(Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        0 -> ok;
+        _ -> timer:sleep(20), wait_admission_released(Budget - 1)
+    end.
 
 recv(#c{s = S}) ->
     {ok, Frame} = gen_tcp:recv(S, 0, 10000),

@@ -43,7 +43,15 @@
     next_delivery = 1 :: pos_integer(),
     seen = #{} :: map(),
     frag = undefined :: undefined | {0..2, [binary()]},
-    closing = false :: boolean()
+    closing = false :: boolean(),
+    %% S12-B (ADR-032 D7): whether this connection holds a row in
+    %% `connections_current'. Metrics may be off, in which case nothing was
+    %% added and `connection_closed/1' must not subtract.
+    counted = false :: boolean(),
+    %% S12-B: the node-level admission lease, taken at the WebSocket upgrade
+    %% (the first moment this socket asks to be a *connection* rather than a
+    %% byte stream) and handed back in `terminate/2'.
+    admission = undefined :: undefined | broker_admission:lease()
 }).
 
 %%%_* Lifecycle ------------------------------------------------------------
@@ -52,9 +60,14 @@ start_link(Ref, Transport, Opts) ->
     gen_server:start_link(?MODULE, {Ref, Transport, Opts}, []).
 
 init({Ref, Transport, _Opts}) ->
-    {ok, #st{ref = Ref, transport = Transport}}.
+    {ok, #st{ref = Ref, transport = Transport,
+             counted = broker_metrics:connection_opened()}}.
 
-terminate(_Reason, #st{} = St) ->
+terminate(_Reason, #st{counted = Counted} = St) ->
+    ok = broker_metrics:connection_closed(Counted),
+    %% S12-B (ADR-032 D7): give the admission slot back. An upgrade that was
+    %% refused never took one, so the lease is `undefined' and this is a no-op.
+    ok = broker_admission:release(St#st.admission),
     cleanup(St),
     ok.
 
@@ -144,17 +157,48 @@ rearm(St) ->
 handshake(Buffer, St) ->
     case binary:split(Buffer, <<"\r\n\r\n">>) of
         [Head, Rest] ->
-            case ws_handshake:accept(Head) of
-                {ok, Response} ->
-                    _ = raw_send(Response, St),
-                    St1 = St#st{handshake = done, buffer = <<>>},
-                    parse_frames(Rest, St1);
-                {error, Status} ->
-                    _ = raw_send(Status, St),
-                    {stop, normal, St}
+            %% S12-B (ADR-032 D7): the upgrade is where a raw socket becomes a
+            %% WebSocket connection, so it is where the node-level gate is asked.
+            %% `ws_handshake:accept/1' is the only place that writes the 101, so
+            %% a refusal sent from here is guaranteed to precede it -- the client
+            %% sees a 503 instead of a stream it does not know how to parse.
+            case admit(St) of
+                {ok, St0} ->
+                    case ws_handshake:accept(Head) of
+                        {ok, Response} ->
+                            _ = raw_send(Response, St0),
+                            St1 = St0#st{handshake = done, buffer = <<>>},
+                            parse_frames(Rest, St1);
+                        {error, Status} ->
+                            _ = raw_send(Status, St0),
+                            {stop, normal, St0}
+                    end;
+                {error, St0} ->
+                    _ = raw_send(busy_response(), St0),
+                    {stop, normal, St0}
             end;
         _ ->
             {noreply, St#st{buffer = Buffer}}
+    end.
+
+%% S12-B: the gate's refusal, in HTTP's vocabulary. 503 is the honest answer --
+%% the server is up but not taking work -- and `Retry-After' keeps a client from
+%% spinning against a full node.
+busy_response() ->
+    <<"HTTP/1.1 503 Service Unavailable\r\n"
+      "Retry-After: 5\r\n"
+      "Content-Length: 0\r\n"
+      "Connection: close\r\n\r\n">>.
+
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("ws: connection refused by admission gate: ~p", [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
     end.
 
 %%%_* Frame loop -----------------------------------------------------------

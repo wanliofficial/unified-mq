@@ -33,7 +33,11 @@ all() ->
      correlation_id_is_echoed,
      sasl_plain_authenticates_against_the_shared_table,
      sasl_plain_with_a_wrong_password_is_refused,
-     sasl_plain_with_an_unknown_mechanism_is_refused].
+     sasl_plain_with_an_unknown_mechanism_is_refused,
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_in_the_api_versions_response,
+     a_released_slot_is_usable_again].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -70,6 +74,10 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_security, users,
                              [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget. Written in every case so a case that
+    %% pushes it down to one cannot starve the next one.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_kafka, listeners,
                              [#{port => 0, ref => ?REF,
@@ -81,6 +89,11 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     stop_all(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok.
 
 create_partitions() ->
@@ -109,6 +122,86 @@ stop_all() ->
     _ = application:stop(broker_router),
     _ = application:stop(broker_storage),
     ok.
+
+%% S12-B (ADR-032 D7): the negative control the ADR asks for. Before this, only
+%% the MQTT front ends wrote `connections_current', so the gauge did not describe
+%% the node. Measured as a delta against a baseline rather than an absolute
+%% number: other suites on the shared CT node may hold connections of their own,
+%% and an absolute assertion would make this case order-dependent.
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% Kafka answers every request with a correlation id, so a refusal has to be a
+%% response frame -- a bare close would leave the client retrying a socket that
+%% never explains itself. ApiVersions is where the gate is asked because it is the
+%% first request any client sends.
+over_capacity_is_refused_in_the_api_versions_response(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Holder = connect(Config),
+    _ = request(Holder, 18, 0, <<>>),
+    Refused = connect(Config),
+    Body = iolist_to_binary(
+             [kafka_codec:compact_string(<<"ct">>),
+              kafka_codec:compact_string(<<"1">>),
+              kafka_codec:tagged_fields(#{})]),
+    Resp = request(Refused, 18, 3, Body),
+    %% error_code 56 = KAFKA_STORAGE_ERROR, the nearest "this broker cannot serve
+    %% you"; the text says what actually happened.
+    {56, R1} = kafka_codec:get_int16(Resp),
+    {Text, _R2} = kafka_codec:get_nullable_string(R1),
+    ?assertEqual(<<"broker is at connection capacity">>, Text),
+    %% The holder is still served.
+    _ = request(Holder, 18, 0, <<>>),
+    ok.
+
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Holder = connect(Config),
+    _ = request(Holder, 18, 0, <<>>),
+    Refused = connect(Config),
+    {56, _} = kafka_codec:get_int16(
+                request(Refused, 18, 0, <<>>)),
+    gen_tcp:close(Holder#c.s),
+    ok = wait_admission_released(),
+    Again = connect(Config),
+    Resp = request(Again, 18, 0, <<>>),
+    {0, _} = kafka_codec:get_int16(Resp),
+    ok.
+
+wait_admission_released() ->
+    wait_admission_released(200).
+
+wait_admission_released(0) ->
+    exit({admission_slot_leaked, broker_admission:snapshot()});
+wait_admission_released(Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        0 -> ok;
+        _ -> timer:sleep(20), wait_admission_released(Budget - 1)
+    end.
+
+connections_current_tracks_the_connection_lifecycle(Config) ->
+    Base = current(),
+    C = connect(Config),
+    %% The count is written in the connection process's `init/1', which starts
+    %% after ranch accepts, so wait for it rather than assuming the accept has
+    %% already happened.
+    wait_until_current(Base + 1),
+    %% This suite has no `close/1' of its own: it closes by dropping the socket.
+    _ = gen_tcp:close(C#c.s),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(25), wait_until_current(Expected, Left - 25)
+    end.
 
 %%%_* Cases -----------------------------------------------------------------
 

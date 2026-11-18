@@ -53,7 +53,11 @@ all() ->
      connection_close_honored,
      health,
      anonymous_listener_on_loopback_is_allowed,
-     anonymous_listener_on_wide_bind_is_refused].
+     anonymous_listener_on_wide_bind_is_refused,
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_with_503,
+     a_released_slot_is_usable_again].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(broker_security),
@@ -113,6 +117,11 @@ end_per_testcase(_Case, _Config) ->
     ok = application:set_env(broker_proto_a2a, max_body_bytes, 1048576),
     ok = application:set_env(broker_proto_a2a, task_auto_complete, true),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok.
 
 %%%_* Task lifecycle --------------------------------------------------------
@@ -482,6 +491,91 @@ anonymous_listener_on_wide_bind_is_refused(_Config) ->
            {listeners, [#{port => 0, ref => {a2a, ct}, ip => {0, 0, 0, 0}}]}],
     ?assertMatch({error, {{insecure_listener, _, {0, 0, 0, 0}}, _}},
                  start_listener_raw(Env)).
+
+
+%% S12-B (ADR-032 D7): `connections_current' must describe the node. This front
+%% end is a request/response loop that owns the socket for as long as the client
+%% keeps it alive, so the row must appear when the socket is accepted and be
+%% settled when it closes -- including when the loop exits by exception, which is
+%% what the `try ... after' in `a2a_conn:start/3' is there for.
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% The gate is asked right after `ranch:handshake/1', before a request is read,
+%% so a refused peer must get a real HTTP answer. That is the whole difference
+%% from ranch's own behaviour at its per-listener cap: there the socket is
+%% established and then parked, which a client cannot tell from a hung broker.
+over_capacity_is_refused_with_503(_Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    {Port, _} = start_listener([]),
+    %% The holder is a bare socket: an admitted connection holds its slot for the
+    %% socket's lifetime, not for one request.
+    {ok, Holder} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                                   [binary, {active, false}], 5000),
+    ok = wait_admission(1),
+    {Status, Headers, Body} = request(Port, post_headers(?TOKEN),
+                                      rpc_body(<<"GetTask">>, #{}, 9)),
+    ?assertEqual(503, Status),
+    ?assertEqual(<<"5">>, header(<<"retry-after">>, Headers)),
+    ?assertEqual(<<"{\"error\":\"server_busy\"}">>, Body),
+    %% The holder itself is still served: the slot it got at accept time is
+    %% what the refusal above was about, and holding it must not cost service.
+    ok = gen_tcp:send(Holder, build_request(post_headers(?TOKEN),
+                                            rpc_body(<<"GetTask">>, #{}, 10))),
+    {200, _, _} = read_response(Holder),
+    ok = gen_tcp:close(Holder),
+    ok.
+
+a_released_slot_is_usable_again(_Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    {Port, _} = start_listener([]),
+    {ok, Holder} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                                   [binary, {active, false}], 5000),
+    ok = wait_admission(1),
+    {503, _, _} = request(Port, post_headers(?TOKEN), rpc_body(<<"GetTask">>, #{}, 11)),
+    ok = gen_tcp:close(Holder),
+    ok = wait_admission(0),
+    %% A served request is a 404 for an unknown task -- not a 503.
+    {404, #{<<"error">> := #{<<"code">> := -32001}}} =
+        rpc(Port, <<"GetTask">>, #{<<"id">> => <<"nope">>}, 12),
+    ok.
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
+
+connections_current_tracks_the_connection_lifecycle(_Config) ->
+    Base = current(),
+    {Port, _} = start_listener([]),
+    %% A bare accepted socket is enough: both front ends count the connection
+    %% right after `ranch:handshake/1', before any request is read, because the
+    %% row is about the socket's lifetime, not about a completed request. Sending
+    %% nothing also removes the race a full request/response would introduce --
+    %% `request/5' closes the socket itself, so a "+1" assertion after it would
+    %% be measuring the wrong instant.
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000),
+    wait_until_current(Base + 1),
+    ok = gen_tcp:close(S),
+    wait_until_current(Base).
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(50), wait_until_current(Expected, Left - 50)
+    end.
 
 %%%_* Helpers ---------------------------------------------------------------
 

@@ -23,7 +23,13 @@
 -define(VERSION, <<"2026-07-28">>).
 
 all() ->
-    [{group, discover}, {group, headers}, {group, call}, {group, stream}].
+    [{group, discover}, {group, headers}, {group, call}, {group, stream},
+     %% S12-B (ADR-032 D7): connection accounting and admission are orthogonal
+     %% to the MCP method groups, so they are plain cases rather than group
+     %% members.
+     connections_current_tracks_the_connection_lifecycle,
+     over_capacity_is_refused_with_503,
+     a_released_slot_is_usable_again].
 
 groups() ->
     [{discover, [sequence],
@@ -150,6 +156,11 @@ reset_env() ->
                 {sse_max_event_bytes, 1048576},
                 {stdio_enabled, false}],
     [ok = application:set_env(broker_proto_mcp, K, V) || {K, V} <- Defaults],
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok.
 
 %%%_* Discover --------------------------------------------------------------
@@ -585,6 +596,89 @@ subscription_id(_Frame) ->
     undefined.
 
 %%%_* Listener -------------------------------------------------------------
+
+
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% The gate is asked right after `ranch:handshake/1', so a refused peer gets a
+%% real HTTP response instead of the silent parking ranch does at its own cap.
+over_capacity_is_refused_with_503(_Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    {Port, _} = start_listener(),
+    {ok, Holder} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                                   [binary, {active, false}], 5000),
+    ok = wait_admission(1),
+    {Status, Headers, Body} = request(Port, headers(<<"server/discover">>, #{}),
+                                      body(<<"server/discover">>, #{}, 1)),
+    ?assertEqual(503, Status),
+    ?assertEqual(<<"5">>, header(<<"retry-after">>, Headers)),
+    ?assertEqual(<<"{\"error\":\"server_busy\"}">>, Body),
+    %% The holder itself is still served.
+    ok = gen_tcp:send(Holder, build_request("POST", "/",
+                                           headers(<<"server/discover">>, #{}),
+                                           body(<<"server/discover">>, #{}, 2))),
+    {Head, Rest} = read_head(Holder, <<>>),
+    {200, Hdrs} = parse_head(Head),
+    Length = case header(<<"content-length">>, Hdrs) of
+                 undefined -> 0;
+                 V -> binary_to_integer(V)
+             end,
+    _ = read_exact(Holder, Rest, Length),
+    ok = gen_tcp:close(Holder),
+    ok.
+
+a_released_slot_is_usable_again(_Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    {Port, _} = start_listener(),
+    {ok, Holder} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                                   [binary, {active, false}], 5000),
+    ok = wait_admission(1),
+    {503, _, _} = request(Port, headers(<<"server/discover">>, #{}),
+                          body(<<"server/discover">>, #{}, 1)),
+    ok = gen_tcp:close(Holder),
+    ok = wait_admission(0),
+    {200, _, _} = request(Port, headers(<<"server/discover">>, #{}),
+                          body(<<"server/discover">>, #{}, 2)),
+    ok.
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
+
+connections_current_tracks_the_connection_lifecycle(_Config) ->
+    Base = current(),
+    {Port, _} = start_listener(),
+    %% A bare accepted socket is enough: both front ends count the connection
+    %% right after `ranch:handshake/1', before any request is read, because the
+    %% row is about the socket's lifetime, not about a completed request. Sending
+    %% nothing also removes the race a full request/response would introduce --
+    %% `request/5' closes the socket itself, so a "+1" assertion after it would
+    %% be measuring the wrong instant.
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000),
+    wait_until_current(Base + 1),
+    ok = gen_tcp:close(S),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(50), wait_until_current(Expected, Left - 50)
+    end.
 
 start_listener() ->
     ok = application:set_env(broker_proto_mcp, listeners,

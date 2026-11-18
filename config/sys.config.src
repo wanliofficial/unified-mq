@@ -152,8 +152,16 @@
     {enabled, true},
     {bind, {127, 0, 0, 1}},
     {port, 8090},
-    %% Empty token = no authentication. Set it whenever `bind' is not loopback.
+    %% Empty token = no authentication. Set it whenever `bind' is not loopback:
+    %% the app refuses to start on a non-loopback bind with an empty token
+    %% (S12-A, ADR-032 D2).
     {token, <<>>},
+    %% Grace period for `POST /api/v1/drain', in ms. After it, the node moves to
+    %% `down' on its own; `infinity' keeps it `draining' until an explicit
+    %% `POST /api/v1/undrain'. Either way no in-use connection is disconnected
+    %% (ADR-032 D2), so this only decides when the node stops advertising that it
+    %% is still winding down.
+    {drain_timeout_ms, infinity},
     %% Absolute path outside the release tree, same discipline as data_dir.
     {backup_dir, "/home/wanli/workspace/unified-mq/backups"}
   ]},

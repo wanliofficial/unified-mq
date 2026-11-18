@@ -16,6 +16,8 @@ all() ->
      inc_accumulates,
      gauge_overwrites,
      gauge_add_accumulates,
+     connection_pair_tracks_current_and_peak,
+     connection_pair_never_decrements_what_it_did_not_count,
      observe_buckets,
      snapshot_is_pure_read,
      unknown_key_is_rejected,
@@ -171,6 +173,45 @@ wrong_kind_is_rejected(_Config) ->
     {error, {wrong_kind, publish_total, counter}} =
         broker_metrics:observe(publish_total, 1),
     {error, {invalid_increment, -1}} = broker_metrics:inc(publish_total, -1),
+    ok.
+
+%% S12-B (ADR-032 D7): every protocol frontend counts through this pair, so the
+%% two gauges describe the node rather than only the MQTT family. Current is a
+%% live count; peak is its high-water mark and must never come down.
+connection_pair_tracks_current_and_peak(_Config) ->
+    ok = broker_metrics:reset(),
+    true = broker_metrics:connection_opened(),
+    true = broker_metrics:connection_opened(),
+    true = broker_metrics:connection_opened(),
+    #{connections_current := 3, connections_peak := 3} = broker_metrics:snapshot(),
+    ok = broker_metrics:connection_closed(true),
+    %% Closing a connection lowers the live count but not the peak.
+    #{connections_current := 2, connections_peak := 3} = broker_metrics:snapshot(),
+    true = broker_metrics:connection_opened(),
+    #{connections_current := 3, connections_peak := 3} = broker_metrics:snapshot(),
+    ok = broker_metrics:connection_closed(true),
+    #{connections_current := 2, connections_peak := 3} = broker_metrics:snapshot(),
+    ok.
+
+%% The boolean from `connection_opened/0' is what makes the pair safe with
+%% metrics off: a connection that was never counted must not be subtracted, or
+%% the gauge would go negative over a restart or a disabled interval.
+connection_pair_never_decrements_what_it_did_not_count(_Config) ->
+    ok = broker_metrics:reset(),
+    %% Closing something that was never counted is a no-op, not -1.
+    ok = broker_metrics:connection_closed(false),
+    #{connections_current := 0, connections_peak := 0} = broker_metrics:snapshot(),
+    %% The disabled path answers `false' from `connection_opened/0' precisely so
+    %% no caller passes `true' to the close, which is what would push the gauge
+    %% negative across a disable/enable cycle.
+    ok = application:set_env(broker_metrics, enabled, false),
+    ok = broker_metrics:init(),
+    false = broker_metrics:connection_opened(),
+    ok = broker_metrics:connection_closed(false),
+    ok = application:set_env(broker_metrics, enabled, true),
+    ok = broker_metrics:init(),
+    #{connections_current := 0, connections_peak := 0} =
+        broker_metrics:snapshot(),
     ok.
 
 disabled_is_noop(_Config) ->

@@ -108,7 +108,11 @@
     %% threaded into the resource layer's Ctx so ACL and tenant isolation apply.
     idents = #{} :: map(),
     %% Principal -> number of live sessions, for `dtls_max_sessions_per_principal'.
-    principal_sessions = #{} :: map()
+    principal_sessions = #{} :: map(),
+    %% S12-B (ADR-032 D7): established DTLS socket -> its node-level admission
+    %% lease. Kept beside `peers' rather than inside it because `peers' is read
+    %% on the datagram path, where the lease is of no interest.
+    admissions = #{} :: map()
 }).
 
 start_link(Spec) ->
@@ -399,9 +403,15 @@ handle_info(_Info, St) ->
 terminate(_Reason, #st{transport = dtls} = St) ->
     %% Close the listen socket first so the acceptor stops accepting, then every
     %% established peer. Left to the runtime, a restarted listener could find the
-    %% port still held.
+    %% port still held. Each session closes here rather than through
+    %% `drop_session/2', so the gauge and the admission slot are settled in the
+    %% same place -- the listener going down must not leave leases behind.
     _ = (catch ssl:close(St#st.dtls_listen)),
-    [ _ = (catch ssl:close(S)) || S <- maps:keys(St#st.peers) ],
+    [begin
+         _ = (catch ssl:close(S)),
+         _ = broker_metrics:connection_closed(true),
+         ok = broker_admission:release(maps:get(S, St#st.admissions, undefined))
+     end || S <- maps:keys(St#st.peers)],
     ok;
 terminate(_Reason, _St) ->
     ok.
@@ -780,32 +790,58 @@ admit_session(Identity, Peer, Socket, #st{peers = Peers, cfg = Cfg} = St) ->
                         true ->
                             {refuse, principal_cap};
                         false ->
-                            {ok, record_session(Peer, Socket, Principal, St)}
+                            %% S12-B (ADR-032 D7): the node-level gate, last of
+                            %% the three because it is the only one whose refusal
+                            %% has nothing to do with this peer in particular.
+                            %% A session that is refused here was never recorded,
+                            %% so `drop_session/2' stays the only release point.
+                            case broker_admission:try_acquire() of
+                                {rejected, _Why} ->
+                                    {refuse, node_cap};
+                                Lease ->
+                                    {ok, record_session(Peer, Socket, Principal,
+                                                        Lease, St)}
+                            end
                     end
             end
     end.
 
-record_session({IP, Port} = Peer, Socket, Principal,
+%% S12-B (ADR-032 D7): a DTLS session is the only thing in this front end that
+%% is a connection -- plain UDP is stateless per datagram and has no lifecycle to
+%% count, which the capability matrix states rather than papers over. The count
+%% goes up here, at the one place a session is recorded, and down in
+%% `drop_session/2', its only removal path, so the two cannot drift.
+record_session({IP, Port} = Peer, Socket, Principal, Lease,
                #st{peers = Peers, socks = Socks, idents = Idents,
-                   principal_sessions = Counts} = St) ->
+                   principal_sessions = Counts, admissions = Admissions} = St) ->
+    _ = broker_metrics:connection_opened(),
     St#st{peers = maps:put(Socket, Peer, Peers),
           socks = maps:put({IP, Port}, Socket, Socks),
           idents = maps:put({IP, Port}, #{principal => Principal,
                                           tenant => broker_security:tenant_id(Principal)},
                             Idents),
           principal_sessions = maps:update_with(Principal, fun(N) -> N + 1 end, 1,
-                                                Counts)}.
+                                                Counts),
+          admissions = maps:put(Socket, Lease, Admissions)}.
 
 %% A DTLS peer disappeared. Unlike plain UDP -- where an endpoint just goes
 %% silent and its entries age out -- here the close is a positive fact, so every
 %% table gets cleaned at once. Skipping this would let dead endpoints hold
 %% buckets, dedup slots and observations until the timers eventually caught up.
-drop_session(Socket, #st{peers = Peers} = St) ->
+drop_session(Socket, #st{peers = Peers, admissions = Admissions} = St) ->
     case maps:take(Socket, Peers) of
         error ->
+            %% Never recorded, so never counted: `admit_session/4' answers
+            %% `refuse' without touching the gauge or the gate.
             St;
         {Peer, Peers1} ->
-            St1 = St#st{peers = Peers1},
+            _ = broker_metrics:connection_closed(true),
+            %% S12-B (ADR-032 D7): the admission slot goes back on the same path
+            %% the recorded session does, so a refused session never releases
+            %% somebody else's.
+            ok = broker_admission:release(maps:get(Socket, Admissions, undefined)),
+            St1 = St#st{peers = Peers1,
+                        admissions = maps:remove(Socket, Admissions)},
             forget_endpoint(Peer, remove_session(Peer, St1))
     end.
 
