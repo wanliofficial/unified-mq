@@ -58,6 +58,11 @@
              client_id = undefined,
              keepalive_ms = 0,
              attached = false,
+             %% S12-B (ADR-032 D7): this connection's node-level admission
+             %% lease. Held for the life of the connection and handed back in
+             %% `terminate/2'; `undefined' means nobody asked (a unit test that
+             %% drives the FSM directly), which is why the release is optional.
+             admission = undefined :: undefined | broker_admission:lease(),
              persist = false,              %% = not clean_session (§4.2)
              round_no = 0,
              next_pid = 1,
@@ -391,54 +396,86 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
                 session_expiry = maps:get(session_expiry_interval, Props, 0),
                 receive_maximum = maps:get(receive_maximum, Props, 65535),
                 max_packet_size = maps:get(maximum_packet_size, Props, undefined)},
-    case authenticate(C, D0a) of
-        {error, Code, D} ->
-            refuse(Code, D);
-        {ok, D1} ->
-            %% ADR-018 §18.1: the Will is connection state, held in memory only
-            %% (never persisted, never republished after a broker restart).
-            D1a = D1#st{will = will_of(C)},
-            Clean = C#connect.clean_session =:= 1,
-            %% S2.5: MQTT 5 separates "discard the old session now" (Clean
-            %% Start) from "keep the new one after disconnect" (Session Expiry
-            %% Interval). 3.1.1 ties both to clean_session.
-            Persist = case Level of
-                          5 -> maps:get(session_expiry_interval, Props, 0) > 0;
-                          _ -> not Clean
-                      end,
-            %% session_present describes the session the client is about to get
-            %% back, so it has to be read before the clean-session teardown.
-            SP = session_present(Clean, C#connect.client_id),
-            D2 = attach_session(C#connect.client_id, Clean, Persist, D1a),
-            D3 = case Clean of
-                     true -> clean_session_teardown(D2);
-                     false -> restore_blob(D2)
-                 end,
-            case subscribe_partitions(D3) of
-                {ok, D4} ->
-                    D5 = count_connection(D4),
-                    log(info, "session up: client_id=~p principal=~p "
-                              "level=~p clean=~p session_present=~p "
-                              "max_qos=~p keepalive_ms=~p",
-                        [C#connect.client_id, D5#st.principal, Level, Clean, SP,
-                         D5#st.max_qos, D5#st.keepalive_ms]),
-                    %% E7/R7: the connect-time round is what serves a
-                    %% reconnecting session its backlog and its DUP
-                    %% resends -- leaving it to the poll tick would make
-                    %% a catch-up arrive up to pull_poll_interval_ms late
-                    %% even though we know, right here, that the session
-                    %% may have unread state.
-                    %%
-                    %% ADR-012 §12.3 / ADR-018 §18.3 R3: a restored QoS 2
-                    %% entry that had already been PUBREC'd resumes with
-                    %% PUBREL and must NOT be re-PUBLISHed. Doing it before
-                    %% the round also keeps the two from racing for the same
-                    %% packet id.
-                    schedule_round(resend_released(
-                                     send_frame(connack_bin(SP, 0, D5), D5)));
-                {error, Reason} ->
-                    {stop, {partition_subscribe_failed, Reason}, D3}
-            end
+    %% S12-B (ADR-032 D7): the node-level admission gate, asked before any
+    %% per-connection work so an over-capacity CONNECT costs a CONNACK and
+    %% nothing else. It sits after `proto_level' is in state because the refusal
+    %% is framed for the client's version -- 3 "Server unavailable" in 3.1.1,
+    %% 0x89 "Server busy" in v5.
+    case admit(D0a) of
+        {ok, D0b} ->
+            case authenticate(C, D0b) of
+                {error, Code, D} -> refuse(Code, D);
+                {ok, D1} -> do_connect(C, Props, Level, D1)
+            end;
+        {error, Code, D0b} ->
+            refuse(Code, D0b)
+    end.
+
+%% S12-B (ADR-032 D7): ask the node-level gate and keep the lease in state.
+%%
+%% `{error, Code, D}' rather than a bare rejection, because the caller's refusal
+%% path (`refuse/2') already knows how to frame a CONNACK for the negotiated
+%% version. Code 3 is "Server unavailable" in 3.1.1 and maps to 0x89 "Server
+%% busy" for v5 -- the closest thing v5 has to "this server is at capacity",
+%% and the reason the gate must run *after* `proto_level' is in state.
+admit(#st{admission = Lease} = D) when Lease =/= undefined ->
+    %% A second CONNECT on a connection that already holds a slot must not take
+    %% a second one: the protocol forbids it (the state machine will not route a
+    %% CONNECT here again), but the guard makes the accounting local anyway.
+    {ok, D};
+admit(D) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            log(warning, "connection refused by admission gate: ~p", [Why]),
+            {error, 3, D};
+        Lease ->
+            {ok, D#st{admission = Lease}}
+    end.
+
+do_connect(C, Props, Level, D1) ->
+    %% ADR-018 §18.1: the Will is connection state, held in memory only
+    %% (never persisted, never republished after a broker restart).
+    D1a = D1#st{will = will_of(C)},
+    Clean = C#connect.clean_session =:= 1,
+    %% S2.5: MQTT 5 separates "discard the old session now" (Clean
+    %% Start) from "keep the new one after disconnect" (Session Expiry
+    %% Interval). 3.1.1 ties both to clean_session.
+    Persist = case Level of
+                  5 -> maps:get(session_expiry_interval, Props, 0) > 0;
+                  _ -> not Clean
+              end,
+    %% session_present describes the session the client is about to get
+    %% back, so it has to be read before the clean-session teardown.
+    SP = session_present(Clean, C#connect.client_id),
+    D2 = attach_session(C#connect.client_id, Clean, Persist, D1a),
+    D3 = case Clean of
+             true -> clean_session_teardown(D2);
+             false -> restore_blob(D2)
+         end,
+    case subscribe_partitions(D3) of
+        {ok, D4} ->
+            D5 = count_connection(D4),
+            log(info, "session up: client_id=~p principal=~p "
+                      "level=~p clean=~p session_present=~p "
+                      "max_qos=~p keepalive_ms=~p",
+                [C#connect.client_id, D5#st.principal, Level, Clean, SP,
+                 D5#st.max_qos, D5#st.keepalive_ms]),
+            %% E7/R7: the connect-time round is what serves a
+            %% reconnecting session its backlog and its DUP
+            %% resends -- leaving it to the poll tick would make
+            %% a catch-up arrive up to pull_poll_interval_ms late
+            %% even though we know, right here, that the session
+            %% may have unread state.
+            %%
+            %% ADR-012 §12.3 / ADR-018 §18.3 R3: a restored QoS 2
+            %% entry that had already been PUBREC'd resumes with
+            %% PUBREL and must NOT be re-PUBLISHed. Doing it before
+            %% the round also keeps the two from racing for the same
+            %% packet id.
+            schedule_round(resend_released(
+                             send_frame(connack_bin(SP, 0, D5), D5)));
+        {error, Reason} ->
+            {stop, {partition_subscribe_failed, Reason}, D3}
     end.
 
 %% ADR-018 §18.1: the CONNECT will fields, or `undefined' when there is no Will.
@@ -2226,11 +2263,12 @@ refuse_code(Code, #st{proto_level = 5}) -> v5_refuse(Code);
 refuse_code(Code, _) -> Code.
 
 %% Only the codes this build can actually refuse with are listed: dialyzer
-%% proves the caller set is exactly 1|2|4, so a wider table would be dead code
+%% proves the caller set is exactly 1|2|3|4, so a wider table would be dead code
 %% that never runs when a new refusal is added. Add the clause at the same time
 %% as the new `refuse/2' call.
 v5_refuse(1) -> 16#84;   %% Unsupported Protocol Version
 v5_refuse(2) -> 16#85;   %% Client Identifier not valid
+v5_refuse(3) -> 16#89;   %% Server busy (S12-B: node-level admission gate)
 v5_refuse(4) -> 16#86.   %% Bad User Name or Password
 
 %% The keepalive deadline measures the PEER's silence (§3.1.2.10: the server's
@@ -2267,6 +2305,10 @@ terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
     _ = report_gauge(conn_mailbox_len, -D#st.reported_mailbox),
     _ = report_gauge(conn_inflight, -D#st.reported_inflight),
     _ = uncount_connection(D),
+    %% S12-B (ADR-032 D7): the slot goes back on every ending, including the
+    %% refusal paths that took one and then failed to attach -- otherwise a
+    %% crashing CONNECT would leak capacity until the node restarted.
+    ok = broker_admission:release(D#st.admission),
     publish_will(Reason, D),
     Persisting = D#st.persist andalso Reason =/= takeover,
     %% S2.5 (ADR-017): a v5 session's expiry deadline starts at disconnect, so

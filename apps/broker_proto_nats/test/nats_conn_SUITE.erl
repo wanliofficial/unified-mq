@@ -39,7 +39,10 @@ all() ->
      a_wrong_credential_is_refused,
      require_auth_refuses_an_anonymous_connect,
      trace_context_roundtrips_through_hmsg,
-     connections_current_tracks_the_connection_lifecycle].
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_with_server_is_full,
+     a_released_slot_is_usable_again].
 
 suite() -> [{timetrap, {seconds, 60}}].
 
@@ -83,6 +86,10 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_security, users,
                              [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget. Written in every case so a case that
+    %% pushes it down to one cannot starve the next one.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_nats, listeners,
                              [#{port => 0, ref => ?REF,
@@ -97,6 +104,11 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     stop_all(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok.
 
 create_partitions() ->
@@ -131,6 +143,59 @@ stop_all() ->
 %% the node. Measured as a delta against a baseline rather than an absolute
 %% number: other suites on the shared CT node may hold connections of their own,
 %% and an absolute assertion would make this case order-dependent.
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% One slot, held by the first connection: the second must be told so. NATS has
+%% no "server busy" reply to CONNECT (CONNECT is answered by PONG, and PONG has no
+%% error form), so the refusal is the `-ERR` line the client library surfaces --
+%% this is the `-ERR 'Server is full'` that nats-server itself uses.
+over_capacity_is_refused_with_server_is_full(Config) ->
+    %% `limit/0' reads the config on every call, so this takes effect on the next
+    %% admission without restarting the listener.
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    First = open(Config),
+    %% The INFO line arrives before CONNECT is even parsed, so the gate cannot
+    %% refuse at accept time; a client that is over capacity learns it here.
+    Port = ?config(port, Config),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {nodelay, true}]),
+    C = #c{s = S},
+    {<<"INFO ">>, _, C1} = recv_prefixed(C, <<"INFO ">>),
+    C2 = connect_raw(C1, #{}),
+    {<<"-ERR 'Server is full'">>, _C3} = recv_line(C2),
+    %% The holder is still served, so the gate is not refusing everybody.
+    {<<"PONG">>, _} = ping(First),
+    close(First),
+    ok.
+
+%% The slot comes back with the connection, or a node would ratchet down to zero
+%% capacity over its lifetime.
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    First = open(Config),
+    Port = ?config(port, Config),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {nodelay, true}]),
+    {<<"INFO ">>, _, C1} = recv_prefixed(#c{s = S}, <<"INFO ">>),
+    {<<"-ERR 'Server is full'">>, _} = recv_line(connect_raw(C1, #{})),
+    close(First),
+    ok = wait_admission_released(),
+    Again = open(Config),
+    {<<"PONG">>, _} = ping(Again),
+    close(Again),
+    ok.
+
+wait_admission_released() ->
+    wait_admission_released(200).
+
+wait_admission_released(0) ->
+    exit({admission_slot_leaked, broker_admission:snapshot()});
+wait_admission_released(Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        0 -> ok;
+        _ -> timer:sleep(20), wait_admission_released(Budget - 1)
+    end.
+
 connections_current_tracks_the_connection_lifecycle(Config) ->
     Base = current(),
     C = open(Config),

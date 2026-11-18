@@ -35,7 +35,10 @@ all() ->
      a_valid_credential_is_accepted,
      a_wrong_credential_is_refused,
      require_auth_refuses_an_anonymous_connect,
-     connections_current_tracks_the_connection_lifecycle].
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_with_connection_close,
+     a_released_slot_is_usable_again].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -76,6 +79,10 @@ init_per_testcase(Case, Config) ->
                              [{<<"guest">>, #{password => <<"guest">>,
                                              tenant_id => <<"t0">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget. Written in every case so a case that
+    %% pushes it down to one cannot starve the next one.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_proto_amqp, listeners,
                              [#{port => 0, ref => ?REF,
                                 num_acceptors => 4, max_connections => 128}]),
@@ -87,6 +94,11 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     stop_all(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok.
 
 create_partitions() ->
@@ -121,6 +133,57 @@ stop_all() ->
 %% the node. Measured as a delta against a baseline rather than an absolute
 %% number: other suites on the shared CT node may hold connections of their own,
 %% and an absolute assertion would make this case order-dependent.
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+
+%% One slot, held by the first connection. AMQP 0-9-1 has no capacity reply code,
+%% so the refusal is a connection.close with 541 `internal-error` -- the code that
+%% says "do not retry this connection" -- and a text that names the real reason.
+%% The peer must get the frame, not a bare FIN: a client that sees a silent close
+%% cannot tell a full broker from a broken one.
+over_capacity_is_refused_with_connection_close(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    First = connect(Config),
+    Port = ?config(port, Config),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {nodelay, true}]),
+    C0 = #c{s = S},
+    ok = gen_tcp:send(S, <<"AMQP", 0, 0, 9, 1>>),
+    {0, 10, 50, Args, _C1} = recv_method(C0),
+    %% connection.close args: reply-code, reply-text, class-id, method-id.
+    <<541:16, Rest/binary>> = Args,
+    {Text, _Rest} = amqp_codec:get_shortstr(Rest),
+    ?assertEqual(<<"server is at connection capacity">>, Text),
+    %% The holder is still served -- a gate that refused everybody would pass a
+    %% weaker version of this case. Opening a channel is something only a
+    %% live, fully handshaken connection can do.
+    _ = open_channel(First, 1),
+    ok.
+
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    First = connect(Config),
+    Port = ?config(port, Config),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {nodelay, true}]),
+    ok = gen_tcp:send(S, <<"AMQP", 0, 0, 9, 1>>),
+    {0, 10, 50, _, _} = recv_method(#c{s = S}),
+    close(First),
+    ok = wait_admission_released(),
+    Second = connect(Config),
+    _ = open_channel(Second, 1),
+    ok.
+
+wait_admission_released() ->
+    wait_admission_released(200).
+
+wait_admission_released(0) ->
+    exit({admission_slot_leaked, broker_admission:snapshot()});
+wait_admission_released(Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        0 -> ok;
+        _ -> timer:sleep(20), wait_admission_released(Budget - 1)
+    end.
+
 connections_current_tracks_the_connection_lifecycle(Config) ->
     Base = current(),
     C = connect(Config),

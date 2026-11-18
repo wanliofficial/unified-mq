@@ -56,7 +56,11 @@
     %% S12-B (ADR-032 D7): whether this connection holds a row in
     %% `connections_current'. Metrics may be off, in which case nothing was
     %% added and `connection_closed/1' must not subtract.
-    counted = false :: boolean()
+    counted = false :: boolean(),
+    %% S12-B: node-level admission lease, taken once the AMQP protocol header
+    %% proves the peer speaks 0-9-1 (before that there is no frame we may send),
+    %% released in `terminate/2'.
+    admission = undefined :: undefined | broker_admission:lease()
 }).
 
 %%%_* Lifecycle ------------------------------------------------------------
@@ -70,6 +74,7 @@ init({Ref, Transport, _Opts}) ->
 
 terminate(_Reason, #st{counted = Counted} = St) ->
     ok = broker_metrics:connection_closed(Counted),
+    ok = broker_admission:release(St#st.admission),
     cleanup(St),
     ok.
 
@@ -125,9 +130,17 @@ rearm(St) ->
     end.
 
 parse(<<"AMQP", 0, 0, 9, 1, Rest/binary>>, #st{phase = start} = St) ->
-    %% Protocol header: answer with connection.start and move on.
-    {noreply, St1} = send_start(St),
-    parse(Rest, St1);
+    %% S12-B (ADR-032 D7): the protocol header is the first moment the peer's
+    %% version is known, and therefore the first moment a refusal frame is legal
+    %% -- connection.close with a 0-9-1 reply code the client can parse.
+    case admit(St) of
+        {ok, St0} ->
+            %% Protocol header: answer with connection.start and move on.
+            {noreply, St1} = send_start(St0),
+            parse(Rest, St1);
+        {error, St0} ->
+            refuse_full(St0)
+    end;
 parse(Buffer, St) ->
     case amqp_codec:decode_frame(Buffer) of
         more ->
@@ -697,6 +710,39 @@ ack_deliveries(Channel, Tag, Multiple, Mode, St) ->
     put_ch(Channel, Ch#ch{deliveries = Keep}, St).
 
 %%%_* Wire helpers ---------------------------------------------------------
+
+%% S12-B (ADR-032 D7): the node-level gate, asked once, and the refusal that
+%% follows it.
+%%
+%% AMQP 0-9-1 has no "server unavailable" reply code of its own; the closest
+%% honest one is 541 `internal-error` -- the connection-level close that says
+%% "do not retry this connection". The text says what actually happened, because
+%% that is the only place an operator can see a capacity refusal (D7 keeps
+%% rejected connections out of the metric set).
+refuse_full(St) ->
+    %% connection.close args are `reply-code:short, reply-text:shortstr,
+    %% class-id:short, method-id:short' -- not a pair of shortstrs. A client
+    %% decodes the first field as an integer, so getting this wrong would hand it
+    %% a reply code of 0x0E49 instead of 541. (The authentication-failure path in
+    %% `handle_method/5' predates this and is tracked separately as RQ-20.)
+    Args = iolist_to_binary(
+             [<<541:16>>,
+              amqp_codec:encode_shortstr(<<"server is at connection capacity">>),
+              <<0:16, 0:16>>]),
+    _ = send_method(0, 10, 50, Args, St#st{phase = start}),
+    {stop, normal, St#st{phase = start}}.
+
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("amqp: connection refused by admission gate: ~p",
+                           [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
+    end.
 
 send_tune(St) ->
     Args = <<2047:16, ?FRAME_MAX:32, 0:16>>,

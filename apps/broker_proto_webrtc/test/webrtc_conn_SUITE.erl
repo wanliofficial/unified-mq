@@ -29,7 +29,10 @@ all() ->
      {group, frames},
      {group, timeouts},
      {group, tls},
-     connections_current_tracks_the_connection_lifecycle].
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_before_the_upgrade,
+     a_released_slot_is_usable_again].
 
 groups() ->
     [{handshake, [sequence],
@@ -95,6 +98,9 @@ init_per_testcase(Case, Config0) ->
                              [{<<"alice">>, #{password => <<"s3cr3t!">>,
                                               tenant_id => <<"t0">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget, back to "off" for every case.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     %% ADR-028 §D5: this app's own switch. `broker_security.require_auth' is a
     %% list of protocol names and is deliberately left alone here.
     ok = application:set_env(broker_proto_webrtc, require_auth, true),
@@ -118,6 +124,11 @@ init_per_testcase(Case, Config0) ->
 
 end_per_testcase(_Case, Config) ->
     stop_app(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     restore_tls(?config(saved_tls, Config)),
     ok.
 
@@ -557,6 +568,44 @@ authed(Config) ->
 authenticate(User, Pass) ->
     json:encode(#{event => authenticate,
                   data => #{username => User, password => Pass}}).
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+%%
+%% The upgrade is the gate. `webrtc_conn:accept/3' refuses before the 101, so a
+%% full node answers 503 and the client never believes it has a media session --
+%% the only shape that makes sense here, because after the upgrade the only way to
+%% say "no" would be to close a session the client is already using.
+
+over_capacity_is_refused_before_the_upgrade(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    {ok, Holder, _Sub} = handshake(Config, [?SUBPROTOCOL]),
+    {error, Response} = raw_handshake(Config, [?SUBPROTOCOL]),
+    <<"HTTP/1.1 503", _/binary>> = Response,
+    ?assertNotEqual(nomatch,
+                    binary:match(string:lowercase(Response), <<"retry-after: 5">>)),
+    _ = gen_tcp:close(Holder),
+    ok.
+
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    {ok, Holder, _} = handshake(Config, [?SUBPROTOCOL]),
+    {error, <<"HTTP/1.1 503", _/binary>>} = raw_handshake(Config, [?SUBPROTOCOL]),
+    _ = gen_tcp:close(Holder),
+    ok = wait_admission(0),
+    {ok, Again, _} = handshake(Config, [?SUBPROTOCOL]),
+    _ = gen_tcp:close(Again),
+    ok.
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
+
 
 handshake(Config, Subprotocols) ->
     handshake(Config, Subprotocols, tcp).

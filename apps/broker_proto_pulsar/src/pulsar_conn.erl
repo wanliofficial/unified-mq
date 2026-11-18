@@ -50,7 +50,10 @@
              %% S12-B (ADR-032 D7): whether this connection holds a row in
              %% `connections_current'. Metrics may be off, in which case nothing was
              %% added and `connection_closed/1' must not subtract.
-             counted = false :: boolean()}).
+             counted = false :: boolean(),
+             %% S12-B: node-level admission lease, taken on the CONNECT command
+             %% (Pulsar's first frame) and released in `terminate/2'.
+             admission = undefined :: undefined | broker_admission:lease()}).
 
 %%%_* Lifecycle -----------------------------------------------------------
 
@@ -61,8 +64,9 @@ init({Ref, Transport, _Opts}) ->
     {ok, #st{ref = Ref, transport = Transport, port = ranch:get_port(Ref),
              counted = broker_metrics:connection_opened()}}.
 
-terminate(_Reason, #st{consumers = Consumers, counted = Counted}) ->
+terminate(_Reason, #st{consumers = Consumers, counted = Counted} = St) ->
     ok = broker_metrics:connection_closed(Counted),
+    ok = broker_admission:release(St#st.admission),
     maps:foreach(fun({Topic, Sub}, ConsumerId) ->
                          _ = (catch pulsar_subscriptions:close_consumer(Topic, Sub, ConsumerId))
                  end, Consumers),
@@ -138,19 +142,18 @@ set_active(#st{transport = T, socket = S}) ->
     T:setopts(S, [{active, once}]).
 
 dispatch(#{type := connect} = Cmd, _Tail, St) ->
-    %% The credential, when the client offered one, resolves against the
-    %% shared broker_security identity table (S7) -- the same table MQTT uses.
-    %% Pulsar's CONNECT carries `auth_method_name' plus an opaque `auth_data';
-    %% the `token' method is the bearer shape, and the PLAIN method carries
-    %% `\0user\0password' inside auth_data.
-    case authenticate(Cmd) of
-        {ok, Identity} ->
-            St1 = St#st{client_version = maps:get(client_version, Cmd, <<>>),
-                        tenant = maps:get(tenant_id, Identity),
-                        principal = maps:get(principal, Identity)},
-            send(pulsar_codec:encode_connected(?SERVER_VERSION, ?PROTOCOL_VERSION), St1);
-        {error, _} ->
-            {stop, {authentication_failed, unauthenticated}, St}
+    %% S12-B (ADR-032 D7): CONNECT is Pulsar's first frame, so it is the first
+    %% point a refusal can be encoded for a client that is listening for one.
+    case admit(St) of
+        {ok, St0} -> do_connect(Cmd, St0);
+        {error, St0} ->
+            %% `ERROR_UNKNOWN' with an explanatory message: Pulsar's server error
+            %% table has no "capacity" code, and inventing one would be a code the
+            %% official client cannot map.
+            {noreply, St1} = send_error(0, ?ERROR_UNKNOWN,
+                                        <<"broker is at connection capacity">>,
+                                        St0),
+            {stop, normal, St1}
     end;
 dispatch(#{type := partitioned_metadata} = Cmd, _Tail, St) ->
     Response = pulsar_codec:encode_partitioned_metadata_response(
@@ -257,6 +260,35 @@ dispatch(#{type := {unknown, Type}}, _Tail, St) ->
     {stop, {unsupported_command, Type}, St};
 dispatch(_Other, _Tail, St) ->
     {noreply, St}.
+
+%% S12-B (ADR-032 D7): the CONNECT itself. The credential, when the client
+%% offered one, resolves against the shared broker_security identity table (S7)
+%% -- the same table MQTT uses. Pulsar's CONNECT carries `auth_method_name' plus
+%% an opaque `auth_data'; the `token' method is the bearer shape, and the PLAIN
+%% method carries `\0user\0password' inside auth_data.
+do_connect(Cmd, St) ->
+    case authenticate(Cmd) of
+        {ok, Identity} ->
+            St1 = St#st{client_version = maps:get(client_version, Cmd, <<>>),
+                        tenant = maps:get(tenant_id, Identity),
+                        principal = maps:get(principal, Identity)},
+            send(pulsar_codec:encode_connected(?SERVER_VERSION, ?PROTOCOL_VERSION), St1);
+        {error, _} ->
+            {stop, {authentication_failed, unauthenticated}, St}
+    end.
+
+%% S12-B: the node-level gate, asked once per connection.
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("pulsar: connection refused by admission gate: ~p",
+                           [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
+    end.
 
 %%%_* Produce -------------------------------------------------------------
 

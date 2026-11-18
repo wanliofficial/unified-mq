@@ -25,16 +25,39 @@
 start(Ref, Transport, _Opts) ->
     case ranch:handshake(Ref) of
         {ok, Socket} ->
-            Counted = broker_metrics:connection_opened(),
-            try
-                loop(Socket, Transport, 0)
-            after
-                broker_metrics:connection_closed(Counted)
+            %% S12-B (ADR-032 D7): the node-level gate, asked after the ranch
+            %% handshake (so the socket is ours) and before the first request is
+            %% read. A refusal is a real HTTP response, which is what separates
+            %% this from ranch's own silent parking at its per-listener cap.
+            case broker_admission:try_acquire() of
+                {rejected, Why} ->
+                    logger:warning("mcp: connection refused by admission gate: ~p",
+                                   [Why]),
+                    _ = Transport:send(Socket, busy_response()),
+                    _ = Transport:close(Socket),
+                    ok;
+                Lease ->
+                    Counted = broker_metrics:connection_opened(),
+                    try
+                        loop(Socket, Transport, 0)
+                    after
+                        broker_metrics:connection_closed(Counted),
+                        ok = broker_admission:release(Lease)
+                    end
             end;
         {continue, _} ->
             _ = ranch:handshake_cancel(Ref),
             ok
     end.
+
+%% S12-B: 503 with `Retry-After', built through the shared response writer.
+busy_response() ->
+    agent_rpc_http:response(
+      503,
+      [{<<"content-type">>, <<"application/json">>},
+       {<<"retry-after">>, <<"5">>}],
+      <<"{\"error\":\"server_busy\"}">>,
+      #{keep_alive => false}).
 
 loop(Socket, Transport, Count) when Count < ?MAX_REQUESTS ->
     Limits = #{body_bytes => mcp_rpc:max_body_bytes(),

@@ -47,7 +47,10 @@ all() ->
      dtls_abandoned_releases_slot,
      dtls_close_cleans_up,
      plain_udp_unaffected,
-     connections_current_tracks_the_dtls_session_lifecycle].
+     connections_current_tracks_the_dtls_session_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     dtls_node_cap_refuses_but_keeps_the_holder,
+     a_released_node_slot_is_usable_again].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -81,7 +84,8 @@ init_per_testcase(Case, Config0) ->
               per_principal => env(broker_proto_coap,
                                    dtls_max_sessions_per_principal),
               max_observes => env(broker_proto_coap, max_observes),
-              ack_timeout => env(broker_proto_coap, observe_ack_timeout_ms)},
+              ack_timeout => env(broker_proto_coap, observe_ack_timeout_ms),
+              limits => env(broker_security, limits)},
     DataDir = filename:join([?config(priv_dir, Config0), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -105,6 +109,9 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_security, acl, allow),
     ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_security, coaps, #{realm => ?DEFAULT_REALM}),
+    %% S12-B: the admission gate's budget, back to "off" for every case.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_proto_coap, enabled, true),
     %% `transport => dtls' is the opt-in: no plain UDP socket is opened at all.
     %% The one case about the plain path overrides this (see `case_env/2').
@@ -137,6 +144,12 @@ case_env(dtls_session_cap, _Config) ->
     ok = application:set_env(broker_proto_coap, max_dtls_sessions, 1);
 %% The close case needs a short ACK timeout so it can prove no retransmit timer
 %% outlived the session.
+%% S12-B: one node-wide slot. The DTLS caps stay at their defaults, so the only
+%% thing that can refuse the second peer is the node gate.
+case_env(dtls_node_cap_refuses_but_keeps_the_holder, _Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1});
+case_env(a_released_node_slot_is_usable_again, _Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1});
 case_env(dtls_close_cleans_up, _Config) ->
     ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300);
 case_env(_Case, _Config) ->
@@ -147,7 +160,7 @@ env(App, Key) ->
 
 restore_env(#{acl := Acl, require_auth := Auth, users := Users, coaps := Coaps,
               max_sessions := MaxSessions, per_principal := PerPrincipal,
-              max_observes := MaxObs, ack_timeout := AckTO}) ->
+              max_observes := MaxObs, ack_timeout := AckTO, limits := Limits}) ->
     set_or_unset(broker_security, acl, Acl),
     set_or_unset(broker_security, require_auth, Auth),
     set_or_unset(broker_security, users, Users),
@@ -157,6 +170,7 @@ restore_env(#{acl := Acl, require_auth := Auth, users := Users, coaps := Coaps,
                  PerPrincipal),
     set_or_unset(broker_proto_coap, max_observes, MaxObs),
     set_or_unset(broker_proto_coap, observe_ack_timeout_ms, AckTO),
+    set_or_unset(broker_security, limits, Limits),
     ok.
 
 set_or_unset(_App, _Key, undefined) -> ok;
@@ -213,6 +227,59 @@ cleanup_writers() ->
 %% The upper bound is checked at exactly +1 rather than ">=": two clients already
 %% exist in other cases of this suite, so the absolute number is not the contract
 %% -- this one session's contribution is.
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+%%
+%% A DTLS session is the only thing in this front end that is a connection: plain
+%% UDP has no lifecycle to count, and the capability matrix says so rather than
+%% pretending otherwise. The gate is the third refusal the listener can give, after
+%% the table cap and the per-principal cap, and it is the only one whose reason has
+%% nothing to do with the peer.
+
+%% One slot, held by the first peer. The second peer's handshake may complete, but
+%% admission refuses it and the acceptor closes the socket -- the same observable
+%% shape as the table cap, on purpose: a client cannot be told more than "gone".
+dtls_node_cap_refuses_but_keeps_the_holder(Config) ->
+    Port = ?config(port, Config),
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 200, [{uri_path, <<"node">>}], <<"a">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    %% A different identity, so the per-principal cap cannot be the cause.
+    {ok, B} = connect(<<"device-02">>, <<"secret-02">>, Port),
+    ?assertEqual(closed, probe_closed(B)),
+    %% The holder is undisturbed: the gate must not have evicted it to make room.
+    send(A, request(con, get, 202, [{uri_path, <<"node">>}])),
+    #{code := ?CONTENT, payload := <<"a">>} = expect(A, ack, ?CONTENT),
+    close(A),
+    close(B).
+
+a_released_node_slot_is_usable_again(Config) ->
+    Port = ?config(port, Config),
+    {ok, A} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    send(A, request(con, put, 210, [{uri_path, <<"rel">>}], <<"a">>)),
+    #{code := ?OK} = expect(A, ack, ?OK),
+    {ok, Refused} = connect(<<"device-02">>, <<"secret-02">>, Port),
+    ?assertEqual(closed, probe_closed(Refused)),
+    close(A),
+    close(Refused),
+    %% `drop_session/2' is the only release point, so the slot comes back when the
+    %% listener observes the close -- wait for it, do not guess.
+    ok = wait_admission(0),
+    {ok, B} = connect(<<"device-02">>, <<"secret-02">>, Port),
+    send(B, request(con, get, 212, [{uri_path, <<"rel">>}])),
+    #{code := ?CONTENT, payload := <<"a">>} = expect(B, ack, ?CONTENT),
+    close(B).
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
+
 connections_current_tracks_the_dtls_session_lifecycle(Config) ->
     Base = current(),
     Port = ?config(port, Config),

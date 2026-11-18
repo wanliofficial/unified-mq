@@ -64,7 +64,10 @@
           %% S12-B (ADR-032 D7): whether this connection holds a row in
           %% `connections_current'. Metrics may be off, in which case nothing
           %% was added and `connection_closed/1' must not subtract.
-          counted = false :: boolean()
+          counted = false :: boolean(),
+          %% S12-B: node-level admission lease, taken at the upgrade and handed
+          %% back by `uncount/1' -- the one function every terminate path runs.
+          admission = undefined :: undefined | broker_admission:lease()
          }).
 
 %%%===================================================================
@@ -180,8 +183,12 @@ terminate(Reason, #st{room = Room, transport = T, socket = S} = St) ->
     log_disconnect(St, terminate_code(Reason)),
     uncount(St).
 
-uncount(#st{counted = Counted}) ->
+uncount(#st{counted = Counted} = St) ->
     ok = broker_metrics:connection_closed(Counted),
+    %% S12-B (ADR-032 D7): every terminate clause funnels through here, so the
+    %% admission slot is released exactly once per connection whatever path
+    %% ended it.
+    ok = broker_admission:release(St#st.admission),
     ok.
 
 %% Map a gen_server terminate reason to the WebSocket close code an operator
@@ -240,24 +247,48 @@ do_handshake(Bin, St) ->
     end.
 
 accept(Bin, Room, St) ->
-    case ws_handshake:accept(Bin, #{supported_subprotocols => subprotocols()}) of
-        {ok, Resp, Sub} ->
-            _ = send(St, iolist_to_binary(Resp)),
-            St1 = St#st{buffer = <<>>, subprotocol = Sub, room = Room},
-            case require_auth() of
-                true ->
-                    %% R-C1: the auth window is armed the moment the upgrade
-                    %% completes, so an idle unauthenticated socket cannot sit
-                    %% there forever.
-                    arm_auth(St1#st{phase = authenticating});
-                false ->
-                    %% ADR-028 §D5 / broker_proto_webrtc_app:validate/0: only a
-                    %% loopback bind may reach this branch.
-                    go_active(anonymous(), St1)
+    %% S12-B (ADR-032 D7): the upgrade is the gate. Refusing here, before the
+    %% 101, means a full node answers 503 rather than completing a handshake it
+    %% cannot serve.
+    case admit(St) of
+        {ok, St0} ->
+            case ws_handshake:accept(Bin, #{supported_subprotocols => subprotocols()}) of
+                {ok, Resp, Sub} ->
+                    _ = send(St0, iolist_to_binary(Resp)),
+                    St1 = St0#st{buffer = <<>>, subprotocol = Sub, room = Room},
+                    case require_auth() of
+                        true ->
+                            %% R-C1: the auth window is armed the moment the
+                            %% upgrade completes, so an idle unauthenticated
+                            %% socket cannot sit there forever.
+                            arm_auth(St1#st{phase = authenticating});
+                        false ->
+                            %% ADR-028 §D5 / broker_proto_webrtc_app:validate/0:
+                            %% only a loopback bind may reach this branch.
+                            go_active(anonymous(), St1)
+                    end;
+                {error, Resp} ->
+                    _ = send(St0, Resp),
+                    stop_now(St0)
             end;
-        {error, Resp} ->
-            _ = send(St, Resp),
-            stop_now(St)
+        {error, St0} ->
+            _ = send(St0, <<"HTTP/1.1 503 Service Unavailable\r\n"
+                            "Retry-After: 5\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n\r\n">>),
+            stop_now(St0)
+    end.
+
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            ?LOG_WARNING("webrtc: connection refused by admission gate: ~p",
+                         [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
     end.
 
 %% `/websocket/<room>' is the one documented shape (R-T1). Anything else is

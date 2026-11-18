@@ -63,7 +63,11 @@
     %% S12-B (ADR-032 D7): whether this connection holds a row in
     %% `connections_current'. Metrics may be off, in which case nothing was
     %% added and `connection_closed/1' must not subtract.
-    counted = false :: boolean()
+    counted = false :: boolean(),
+    %% S12-B: node-level admission lease. Taken when the CONNECT frame proves
+    %% this is a NATS 1.0 client (before that there is no frame we may send),
+    %% released in `terminate/2'.
+    admission = undefined :: undefined | broker_admission:lease()
 }).
 
 %%%_* Lifecycle ------------------------------------------------------------
@@ -77,6 +81,7 @@ init({Ref, Transport, _Opts}) ->
 
 terminate(_Reason, #st{counted = Counted} = St) ->
     ok = broker_metrics:connection_closed(Counted),
+    ok = broker_admission:release(St#st.admission),
     cleanup(St),
     ok.
 
@@ -189,6 +194,16 @@ handle_connect(Json, #st{client_id = Existing} = St) when Existing =/= undefined
     _ = Json,
     err_close(<<"Protocol Violation">>, St);
 handle_connect(Json, St) ->
+    %% S12-B (ADR-032 D7): the gate is asked once the client's first frame has
+    %% proved this is NATS 1.0. Before that a `-ERR' would be a frame the peer has
+    %% no reason to parse, so a node that is full at accept time is closed there
+    %% instead -- the honest limit documented in the capability matrix.
+    case admit(St) of
+        {ok, St0} -> do_connect(Json, St0);
+        {error, St0} -> err_close(<<"Server is full">>, St0)
+    end.
+
+do_connect(Json, St) ->
     try json:decode(Json) of
         Map when is_map(Map) ->
             case check_auth(Map) of
@@ -742,6 +757,19 @@ send_raw(IoData, #st{transport = T, socket = S} = St) ->
 
 set_active(#st{transport = T, socket = S}) ->
     T:setopts(S, [{active, once}]).
+
+%% S12-B (ADR-032 D7): the node-level gate, asked exactly once per connection.
+admit(#st{admission = Lease} = St) when Lease =/= undefined ->
+    {ok, St};
+admit(St) ->
+    case broker_admission:try_acquire() of
+        {rejected, Why} ->
+            logger:warning("nats: connection refused by admission gate: ~p",
+                           [Why]),
+            {error, St};
+        Lease ->
+            {ok, St#st{admission = Lease}}
+    end.
 
 %%%_* Subjects -------------------------------------------------------------
 

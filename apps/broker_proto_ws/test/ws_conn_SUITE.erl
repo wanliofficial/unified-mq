@@ -45,7 +45,10 @@ all() ->
      trace_context_is_stripped_when_propagation_is_off,
      a_malformed_traceparent_is_not_propagated,
      wss_is_served_when_tls_is_enabled,
-     connections_current_tracks_the_connection_lifecycle].
+     connections_current_tracks_the_connection_lifecycle,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_before_the_upgrade,
+     a_released_slot_is_usable_again].
 
 %% S12-B (ADR-032 D7): before this, only the MQTT front ends wrote
 %% `connections_current', so the gauge did not describe the node. This is the
@@ -113,6 +116,9 @@ init_per_testcase(Case, Config0) ->
                              [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}},
                               {<<"bob">>, #{password => <<"pw">>, tenant_id => <<"t2">>}}]),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget, back to "off" for every case.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_ws, listeners,
                              [#{port => 0, num_acceptors => 4, max_connections => 128}]),
@@ -130,6 +136,11 @@ init_per_testcase(Case, Config0) ->
 
 end_per_testcase(_Case, Config) ->
     stop_all(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     restore_tls(?config(saved_tls, Config)),
     ok.
 
@@ -492,6 +503,71 @@ wss_is_served_when_tls_is_enabled(Config) ->
         tls_request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"wss1">>}),
     ok = ssl:close(S),
     ok.
+
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+%%
+%% The gate runs inside `handshake/2', before the 101. That ordering is the point:
+%% a WebSocket client correlates the upgrade with its socket, so refusing after a
+%% 101 would look like a protocol failure inside MQTT rather than "this node is
+%% full". 503 with `Retry-After` is the answer an HTTP client already knows how to
+%% act on.
+
+over_capacity_is_refused_before_the_upgrade(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Holder = open(Config),
+    %% A raw upgrade attempt: the refusal has to arrive instead of a 101.
+    Port = ?config(port, Config),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {nodelay, true}]),
+    Key = base64:encode(crypto:strong_rand_bytes(16)),
+    ok = gen_tcp:send(S, [<<"GET /ws HTTP/1.1\r\nHost: localhost\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: ">>, Key, <<"\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n">>]),
+    {ok, Response} = recv_until(S, <<"\r\n\r\n">>, <<>>),
+    <<"HTTP/1.1 503", _/binary>> = Response,
+    %% Header names are case-insensitive on the wire; the front end writes the
+    %% conventional capitalisation, so compare on a lowered copy.
+    ?assertNotEqual(nomatch,
+                    binary:match(string:lowercase(Response), <<"retry-after: 5">>)),
+    gen_tcp:close(S),
+    %% The holder is still a working MQTT session, not merely an open socket.
+    #{<<"op">> := <<"connack">>} =
+        request(Holder, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"g1">>}),
+    close(Holder),
+    ok.
+
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Holder = open(Config),
+    Port = ?config(port, Config),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {nodelay, true}]),
+    Key = base64:encode(crypto:strong_rand_bytes(16)),
+    ok = gen_tcp:send(S, [<<"GET /ws HTTP/1.1\r\nHost: localhost\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: ">>, Key, <<"\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n">>]),
+    {ok, <<"HTTP/1.1 503", _/binary>>} = recv_until(S, <<"\r\n\r\n">>, <<>>),
+    gen_tcp:close(S),
+    close(Holder),
+    ok = wait_admission(0),
+    Again = open(Config),
+    #{<<"op">> := <<"connack">>} =
+        request(Again, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"g2">>}),
+    close(Again),
+    ok.
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
 
 %%%_* Wire client -----------------------------------------------------------
 

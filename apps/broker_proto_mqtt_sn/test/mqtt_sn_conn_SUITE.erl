@@ -52,7 +52,10 @@ all() ->
      advertise_is_broadcast_on_the_configured_interval,
      unknown_client_pingreq_gets_disconnect,
      malformed_datagram_is_dropped,
-     require_auth_refuses_to_start].
+     require_auth_refuses_to_start,
+     %% S12-B (ADR-032 D7): the node-level admission gate.
+     over_capacity_is_refused_with_return_code_3,
+     a_released_slot_is_usable_again].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -91,6 +94,9 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 20),
     ok = application:set_env(broker_security, users, []),
     ok = application:set_env(broker_security, acl, allow),
+    %% S12-B: the admission gate's budget, back to "off" for every case.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     ok = application:set_env(broker_security, require_auth, []),
     ok = application:set_env(broker_proto_mqtt_sn, listeners,
                              [#{port => 0}]),
@@ -122,6 +128,11 @@ init_per_testcase(Case, Config0) ->
 
 end_per_testcase(_Case, Config) ->
     stop_all(),
+    %% S12-B: the admission budget is node state, not case state. A case that
+    %% pushed it down to one must hand it back, or every later suite in this
+    %% shared CT node inherits "capacity 1" and its second connection is refused.
+    ok = application:set_env(broker_security, limits,
+                             #{max_connections => infinity}),
     case ?config(advertise_socket, Config) of
         undefined -> ok;
         Socket -> _ = gen_udp:close(Socket), ok
@@ -639,6 +650,67 @@ require_auth_refuses_to_start(_Config) ->
     ?assertMatch({error, _}, Result),
     ?assert(contains({require_auth_unsupported, mqtt_sn}, Result)),
     ?assertEqual(undefined, whereis(broker_proto_mqtt_sn_sup)).
+
+%%%_* S12-B: the node-level admission gate (ADR-032 D7) -----------------------
+%%
+%% MQTT-SN has a return code for exactly this: 3 `congestion'. Using it (rather
+%% than silence) matters more here than in MQTT over TCP, because a UDP client
+%% has no socket close to infer anything from -- without a CONNACK it would just
+%% keep retransmitting CONNECT into a node that will never answer.
+%%
+%% A sleeping session deliberately keeps its slot: the timer, the subscriptions
+%% and the heap are still this node's resources. That is why the release happens
+%% in `terminate/2' only.
+
+over_capacity_is_refused_with_return_code_3(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Port = ?config(port, Config),
+    Holder = open(),
+    connect(Holder, Port, <<"sn-g1">>),
+    Refused = open(),
+    send(Refused, Port, #{type => connect, protocol_id => 1,
+                          clean_session => false, duration => 60,
+                          client_id => <<"sn-g2">>}),
+    #{type := connack, return_code := 3} = expect(Refused, connack),
+    %% The holder is still served.
+    #{type := pingresp} = begin
+                               send(Holder, Port, #{type => pingreq,
+                                                    client_id => <<"sn-g1">>}),
+                               expect(Holder, pingresp)
+                           end,
+    close(Holder),
+    close(Refused).
+
+a_released_slot_is_usable_again(Config) ->
+    ok = application:set_env(broker_security, limits, #{max_connections => 1}),
+    Port = ?config(port, Config),
+    Holder = open(),
+    connect(Holder, Port, <<"sn-r1">>),
+    Refused = open(),
+    send(Refused, Port, #{type => connect, protocol_id => 1,
+                          clean_session => false, duration => 60,
+                          client_id => <<"sn-r2">>}),
+    #{type := connack, return_code := 3} = expect(Refused, connack),
+    %% A clean DISCONNECT ends the session, so `terminate/2' runs and the slot
+    %% comes back.
+    send(Holder, Port, #{type => disconnect}),
+    ok = wait_admission(0),
+    Again = open(),
+    connect(Again, Port, <<"sn-r3">>),
+    close(Again),
+    close(Holder),
+    close(Refused).
+
+wait_admission(Expected) ->
+    wait_admission(Expected, 200).
+
+wait_admission(_Expected, 0) ->
+    exit({admission_did_not_settle, broker_admission:snapshot()});
+wait_admission(Expected, Budget) ->
+    case maps:get(in_use, broker_admission:snapshot()) of
+        Expected -> ok;
+        _ -> timer:sleep(20), wait_admission(Expected, Budget - 1)
+    end.
 
 %%%_* Helpers ---------------------------------------------------------------
 
