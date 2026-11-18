@@ -109,6 +109,11 @@ end_per_testcase(_Case, _Config) ->
     %% shared CT node inherits "capacity 1" and its second connection is refused.
     ok = application:set_env(broker_security, limits,
                              #{max_connections => infinity}),
+    %% Same class of leak: init_per_testcase pins `max_payload' to 64 for this
+    %% suite's small frames. Left behind, it makes every later suite on this
+    %% node (alphabetically: nats_jetstream) publish past the limit and get
+    %% its connection closed with "Maximum Payload Violation".
+    ok = application:set_env(broker_proto_nats, max_payload, 1048576),
     ok.
 
 create_partitions() ->
