@@ -40,7 +40,8 @@
 all() ->
     [the_dispatcher_routes_only_to_ready_nodes,
      a_draining_node_keeps_its_connections_but_gets_no_new_ones,
-     undrain_returns_a_node_to_rotation].
+     undrain_returns_a_node_to_rotation,
+     no_ready_node_is_refused_not_queued].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -146,6 +147,31 @@ undrain_returns_a_node_to_rotation(Config) ->
     assert_live_mqtt(Conn),
     close_all(WhileDraining ++ [{BackPeer, Conn}]).
 
+%% ADR-032 D7 puts R-LB6's behaviour *outside* the broker -- "no available node"
+%% and "node recovery" are absorbed by the LB and the client's retry, not by
+%% internal queueing. The case that belongs here is therefore about the dispatcher:
+%% with no ready node it must refuse immediately rather than hold the connection,
+%% and once a node recovers the next attempt is a brand-new connection, not a
+%% replay of a queued one.
+no_ready_node_is_refused_not_queued(Config) ->
+    Peers = peers(Config),
+    ok = form_cluster(Config),
+    [?assertEqual(<<"draining">>, drain_peer(P)) || P <- Peers],
+    ?assertEqual(no_available_node, dispatch_or_refuse(Peers)),
+    %% Nothing is waiting: bring both nodes back, give any notional queue time to
+    %% drain, and neither node may have acquired a connection on its own.
+    Rebound = [begin
+                   ?assertEqual(<<"up">>, undrain_peer(P)),
+                   refresh_mqtt_port(P)
+               end || P <- Peers],
+    timer:sleep(200),
+    [?assertEqual(0, active_connections(P)) || P <- Rebound],
+    %% A fresh attempt succeeds -- and it is a new connection, since there was no
+    %% queued one to replay.
+    {Peer, Conn} = dispatch(Rebound),
+    assert_live_mqtt(Conn),
+    close_all([{Peer, Conn}]).
+
 %%%_* The equivalent dispatcher ---------------------------------------------
 %%
 %% This is the "external LB or equivalent simulator" of R-E3, kept as small as
@@ -155,11 +181,21 @@ undrain_returns_a_node_to_rotation(Config) ->
 
 %% Dispatch one connection across the candidate set, honouring the view.
 dispatch(Candidates) ->
-    Ready = [P || P <- Candidates, node_ready(P)],
-    ?assertNotEqual([], Ready),
-    Picked = pick_next(Ready),
-    Conn = open_mqtt(Picked),
-    {Picked, Conn}.
+    case dispatch_or_refuse(Candidates) of
+        no_available_node -> ct:fail({expected_a_ready_node, Candidates});
+        Routed -> Routed
+    end.
+
+%% The LB's own behaviour when nothing is ready: a synchronous refusal. There is
+%% no queue anywhere in the broker (ADR-032 D7), so there is nothing to wait on.
+dispatch_or_refuse(Candidates) ->
+    case [P || P <- Candidates, node_ready(P)] of
+        [] ->
+            no_available_node;
+        Ready ->
+            Picked = pick_next(Ready),
+            {Picked, open_mqtt(Picked)}
+    end.
 
 %% Deterministic stand-in for round robin: the caller drives the rotation by
 %% re-reading the view each time, so a simple counter on the process dictionary

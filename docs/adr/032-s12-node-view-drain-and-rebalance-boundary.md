@@ -222,3 +222,12 @@ spike 的七条结论已按 §7 实现并接入全部前端。落地时有三处
 - **QUIC 的 lease 要换主。**闸门在 `mqtt_quic_listener` 的 `{new_conn, _}` 处问（那是唯一还能回 `{error, too_many_connections}` 的点），但连接活在其后创建的 `mqtt_quic_conn` 里。故新增 `adopt/1` 把台账行改写到真正持有资源的进程，配额随连接进程死亡被清扫回收。
 
 其余按 spike 执行：落点 conn/FSM 层、计数不复用 `connections_current`、`persistent_term` + `atomics` 无进程、预算默认 `infinity`、drain 读镜像、不做排队、不新增 metrics 键（被拒只进 warning 日志）。`broker_metrics` 键集未变，R-LB9 扩展项仍为「S12 不交付」。
+
+### S12-B 第三项：R-LB2 / R-LB6 的落点（2026-11-18）
+
+需求稿把 R-LB2（节点选择做成可插拔策略）与 R-LB6（无可用节点 / 节点恢复竞态）都排给 S12-B。D3 把 LB 形态冻结为「外部 LB + Broker 供给视图」之后，这两条的宾语不再落在 Broker 里，记录于此以免被当作漏做：
+
+- **R-LB2 的「策略」不在 Broker。**D3 让 Broker 只承诺**一份诚实的节点视图**（`ready`/`state`/连接数），选谁、怎么排是外部 LB 的事。在 Broker 内再实现一套「可插拔选择策略」会与外部 LB 抢同一个决定权，等于把 D3 撤销。因此本仓的交付物是「视图足以支撑选择」的可验收证据（`broker_lb_dispatch_dist_SUITE` 的等价分发器），**不是**一个策略接口。策略接口若将来需要，应在 LB 侧而非本仓定义。
+- **R-LB6 的「行为」不在 Broker，但用例在这里。**D7 写明「无可用节点与节点恢复竞态由外部 LB + 客户端重试消化，不在 Broker 内排队」。于是本仓能证明的是分发方在该契约下的行为：无 `ready` 节点时**同步拒绝**（不持有连接、不排队），节点恢复后下一次分发是**全新连接**而非重放（因为根本没有队列可重放）。这条由 `no_ready_node_is_refused_not_queued` 钉住。Broker 侧对应的承诺是「连接级等待队列长度恒为 0」——本仓没有队列，所以它不是「实现了有界队列」，而是「没有队列可溢出」。
+
+两条都不改 ADR 正文的裁决，只是把「由谁实现」写清楚。

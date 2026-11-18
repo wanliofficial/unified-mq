@@ -289,11 +289,12 @@ QUIC 的两条用例在本机**不执行**：`mqtt_quic_nif:available()` 为 `fa
 
 ### 9.2 连接分发证据（R-E3）
 
-R-E3 要求「外部 LB 或等价模拟器的连接分发证据落盘」。S12 刻意不做四层代理（ADR-032 D3），所以这里能证明的不是「Broker 会均衡流量」——那是运维 LB 的职责——而是**一份诚实的节点视图足以让一个外部消费方做出正确的分发决定**。证据在 `apps/broker_admin/test/broker_lb_dispatch_dist_SUITE`（2 peer、真实 MQTT listener、真实 `/api/v1/node`、真实 CONNECT/PINGREQ 往返）：
+R-E3 要求「外部 LB 或等价模拟器的连接分发证据落盘」。S12 刻意不做四层代理（ADR-032 D3），所以这里能证明的不是「Broker 会均衡流量」——那是运维 LB 的职责——而是**一份诚实的节点视图足以让一个外部消费方做出正确的分发决定**。证据在 `apps/broker_admin/test/broker_lb_dispatch_dist_SUITE`（4 例；2 peer、真实 MQTT listener、真实 `/api/v1/node`、真实 CONNECT/PINGREQ 往返）：
 
 - **正向**：一个只读 `ready` 字段、做轮转的等价分发器，把 4 条真实 MQTT 连接分到两个 `up` 节点上（两节点都分到，且每条都能完成 CONNECT 并答 PINGRESP）。这同时否证了「视图撒谎也能工作」——若 `ready` 与真实可用性不符，CONNACK 就不会来。
 - **drain 的两面**：drain 一个节点后，`ready` 变 false、`/api/v1/node` 的 `state` 变 `draining`；**已建立的连接继续服务**（`connections.active` 仍为 1，PING 仍通），而**后续 3 次分发全部落到另一个节点**。这就是 drain 存在的意义：停止接新活，不动在用的。
 - **undrain 复位**：undrain 后该节点重新进入轮转，能被再次分到。
+- **无可用节点（R-LB6）**：两个节点都 drain 后，分发器**同步拒绝**（`no_available_node`），不持有连接；随后 undrain、等待 200 ms，两节点的 `connections.active` 仍为 0，证明没有任何请求被排队后偷偷放行；再分发一次拿到的是**全新连接**（没有队列可重放）。
 
 **两条反证都精确命中**：让分发器忽略 `ready`（`Ready = Candidates`）→ 恰好只有两条 drain 相关用例失败，纯分发用例仍通过（两节点都 ready 时忽略标记没有差别）；让分发器不做轮转（总取 `hd`）→ 恰好只有「两节点都分到」那条失败。
 
