@@ -175,6 +175,8 @@ handle_line(<<"HPUB ", Rest/binary>>, St) ->
 handle_line(<<>>, St) ->
     {noreply, St};
 handle_line(_Line, St) ->
+    logger:debug("NATS unknown protocol operation: ~ts",
+                 [binary:part(_Line, 0, min(40, byte_size(_Line)))]),
     err_close(<<"Unknown Protocol Operation">>, St).
 
 %%%_* CONNECT --------------------------------------------------------------
@@ -421,11 +423,22 @@ encode_header_block(Headers) ->
     iolist_to_binary([<<"NATS/1.0\r\n">>, Lines, <<"\r\n">>]).
 
 handle_pub(Subject, Reply, Headers, Payload, St) ->
-    case publish(Subject, Reply, Headers, Payload, St) of
-        ok ->
-            maybe_ok(St);
-        {error, Reason} ->
-            err_close(reason_bin(Reason), St)
+    %% JetStream managed subject (M3): the write goes into the stream's own
+    %% destination and the caller gets a PubAck on its reply inbox instead of
+    %% the generic route.
+    case nats_jetstream:managed(Subject) of
+        {ok, Stream} ->
+            case nats_jetstream:managed_publish(Stream, Subject, Reply,
+                                                Payload, St#st.tenant) of
+                ok -> maybe_ok(St);
+                {error, Reason} ->
+                    err_close(reason_bin(Reason), St)
+            end;
+        nomatch ->
+            case publish(Subject, Reply, Headers, Payload, St) of
+                ok -> maybe_ok(St);
+                {error, Reason} -> err_close(reason_bin(Reason), St)
+            end
     end.
 
 publish(Subject, Reply, Headers, Payload, St) ->

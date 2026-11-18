@@ -52,6 +52,9 @@ func main() {
 		{"nats-echo-false", echoFalse},
 		{"nats-ping-flush", pingFlush},
 		{"nats-auth-failure", authFailure},
+		{"nats-js-stream-publish", jsStreamPublish},
+		{"nats-js-pull-ack", jsPullAck},
+		{"nats-js-redelivery", jsRedelivery},
 	}
 	pass, fail := 0, 0
 	for _, c := range cases {
@@ -75,6 +78,14 @@ func main() {
 }
 
 func url() string { return "nats://" + *addr }
+
+
+// resetStream drops the stream so cases are idempotent across runs: the
+// broker's data dir persists between runs and seq assertions below assume a
+// fresh stream.
+func resetStream(js nats.JetStreamContext, name string) {
+	_ = js.DeleteStream(name)
+}
 
 func connect(opts ...nats.Option) (*nats.Conn, error) {
 	base := []nats.Option{
@@ -444,6 +455,122 @@ func authFailure() (string, error) {
 		return "", fmt.Errorf("unexpected error %v", err)
 	}
 	return `{"auth":"refused"}`, nil
+}
+
+// --- JetStream MVP (NATS-JS-001..003 minimal slice) ------------------------
+
+// Stream create + managed publish with PubAck + seq monotonicity.
+func jsStreamPublish() (string, error) {
+	return withConn(func(nc *nats.Conn) (string, error) {
+		js, err := nc.JetStream()
+		if err != nil {
+			return "", fmt.Errorf("jetstream: %w", err)
+		}
+		resetStream(js, "compat")
+		if _, err = js.AddStream(&nats.StreamConfig{
+			Name:     "compat",
+			Subjects: []string{"jscompat.>"},
+		}); err != nil {
+			return "", fmt.Errorf("add stream: %w", err)
+		}
+		if pa, err := js.Publish("jscompat.a", []byte("hello-js")); err != nil {
+			return "", fmt.Errorf("publish: %w", err)
+		} else if pa.Stream != "compat" || pa.Sequence != 1 {
+			return "", fmt.Errorf("puback: %+v", pa)
+		}
+		if pa, err := js.Publish("jscompat.b", []byte("hello-js-2")); err != nil {
+			return "", fmt.Errorf("publish2: %w", err)
+		} else if pa.Sequence != 2 {
+			return "", fmt.Errorf("puback2: %+v", pa)
+		}
+		return `{"managed_publish":true,"seq":2}`, nil
+	})
+}
+
+// Durable pull consumer: fetch, ack, and a second fetch finds nothing new.
+func jsPullAck() (string, error) {
+	return withConn(func(nc *nats.Conn) (string, error) {
+		js, err := nc.JetStream()
+		if err != nil {
+			return "", fmt.Errorf("jetstream: %w", err)
+		}
+		resetStream(js, "compatpull")
+		if _, err = js.AddStream(&nats.StreamConfig{
+			Name:     "compatpull",
+			Subjects: []string{"compatpull.>"},
+		}); err != nil {
+			return "", fmt.Errorf("add stream: %w", err)
+		}
+		if pa, err := js.Publish("compatpull.a", []byte("pull-me")); err != nil {
+			return "", fmt.Errorf("publish: %w", err)
+		} else if pa.Sequence != 1 {
+			return "", fmt.Errorf("puback: %+v", pa)
+		}
+		sub, err := js.PullSubscribe("compatpull.a", "durable-pull")
+		if err != nil {
+			return "", fmt.Errorf("pull subscribe: %w", err)
+		}
+		msgs, err := sub.Fetch(1, nats.MaxWait(3*time.Second))
+		if err != nil || len(msgs) == 0 {
+			return "", fmt.Errorf("fetch: %w", err)
+		}
+		if string(msgs[0].Data) != "pull-me" {
+			return "", fmt.Errorf("payload %q", msgs[0].Data)
+		}
+		if err = msgs[0].Ack(); err != nil {
+			return "", fmt.Errorf("ack: %w", err)
+		}
+		// Acked: the next fetch finds nothing new.
+		msgs2, err := sub.Fetch(1, nats.MaxWait(500*time.Millisecond))
+		if err != nil && len(msgs2) != 0 {
+			return "", fmt.Errorf("post-ack fetch: %w", err)
+		}
+		return `{"pulled":true,"acked":true}`, nil
+	})
+}
+
+// Unacked deliveries are redelivered (NAK / ack-wait machinery).
+func jsRedelivery() (string, error) {
+	return withConn(func(nc *nats.Conn) (string, error) {
+		js, err := nc.JetStream()
+		if err != nil {
+			return "", fmt.Errorf("jetstream: %w", err)
+		}
+		resetStream(js, "compatredel")
+		_ = nc.FlushTimeout(2 * time.Second)
+		if _, err = js.AddStream(&nats.StreamConfig{
+			Name:     "compatredel",
+			Subjects: []string{"compatredel.>"},
+		}); err != nil {
+			return "", fmt.Errorf("add stream: %w", err)
+		}
+		if _, err = js.Publish("compatredel.a", []byte("again")); err != nil {
+			return "", fmt.Errorf("publish: %w", err)
+		}
+		sub, err := js.PullSubscribe("compatredel.a", "durable-redel")
+		if err != nil {
+			return "", fmt.Errorf("pull subscribe: %w", err)
+		}
+		msgs, err := sub.Fetch(1, nats.MaxWait(3*time.Second))
+		if err != nil || len(msgs) == 0 {
+			return "", fmt.Errorf("fetch1: %w", err)
+		}
+		// NAK: come back immediately.
+		if err = msgs[0].Nak(); err != nil {
+			return "", fmt.Errorf("nak: %w", err)
+		}
+		msgs2, err := sub.Fetch(1, nats.MaxWait(3*time.Second))
+		if err != nil || len(msgs2) == 0 {
+			return "", fmt.Errorf("redelivery fetch: %w", err)
+		}
+		if string(msgs2[0].Data) != "again" {
+			return "", fmt.Errorf("redelivery payload %q", msgs2[0].Data)
+		}
+		if err = msgs2[0].Ack(); err != nil {
+			return "", fmt.Errorf("ack2: %w", err)
+		}
+		return `{"redelivered":true}`, nil
+	})
 }
 
 func keys(m map[string]int) []string {
