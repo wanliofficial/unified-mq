@@ -46,7 +46,11 @@
              principal = undefined :: binary() | undefined,
              producers = #{} :: #{integer() => binary()},
              consumers = #{} :: #{{integer(), integer()} => binary()},
-             port = 0 :: inet:port_number()}).
+             port = 0 :: inet:port_number(),
+             %% S12-B (ADR-032 D7): whether this connection holds a row in
+             %% `connections_current'. Metrics may be off, in which case nothing was
+             %% added and `connection_closed/1' must not subtract.
+             counted = false :: boolean()}).
 
 %%%_* Lifecycle -----------------------------------------------------------
 
@@ -54,9 +58,11 @@ start_link(Ref, Transport, Opts) ->
     gen_server:start_link(?MODULE, {Ref, Transport, Opts}, []).
 
 init({Ref, Transport, _Opts}) ->
-    {ok, #st{ref = Ref, transport = Transport, port = ranch:get_port(Ref)}}.
+    {ok, #st{ref = Ref, transport = Transport, port = ranch:get_port(Ref),
+             counted = broker_metrics:connection_opened()}}.
 
-terminate(_Reason, #st{consumers = Consumers}) ->
+terminate(_Reason, #st{consumers = Consumers, counted = Counted}) ->
+    ok = broker_metrics:connection_closed(Counted),
     maps:foreach(fun({Topic, Sub}, ConsumerId) ->
                          _ = (catch pulsar_subscriptions:close_consumer(Topic, Sub, ConsumerId))
                  end, Consumers),

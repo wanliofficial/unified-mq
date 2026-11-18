@@ -14,10 +14,20 @@
 -define(MAX_REQUESTS, 1000).
 
 -spec start(ranch:ref(), module(), map()) -> ok.
+%% S12-B (ADR-032 D7): count the connection for the whole time it owns the
+%% socket. This is a plain loop rather than a gen_server, so `try ... after'
+%% is what makes the decrement unconditional -- an exception in the dispatcher
+%% must not leak a row in `connections_current'. The boolean records whether the
+%% gauge was actually written; `connection_closed/1' only subtracts when it was.
 start(Ref, Transport, _Opts) ->
     case ranch:handshake(Ref) of
         {ok, Socket} ->
-            loop(Socket, Transport, 0);
+            Counted = broker_metrics:connection_opened(),
+            try
+                loop(Socket, Transport, 0)
+            after
+                broker_metrics:connection_closed(Counted)
+            end;
         {continue, _} ->
             %% `ranch_tcp' and `ranch_ssl' never return `{continue, _}' (only the
             %% PROXY-protocol handshake does), but the type allows it. Cancel

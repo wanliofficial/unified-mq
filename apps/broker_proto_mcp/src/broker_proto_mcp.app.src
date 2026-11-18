@@ -4,7 +4,7 @@
     {registered, [broker_proto_mcp_sup]},
     {mod, {broker_proto_mcp_app, []}},
     {applications, [kernel, stdlib, sasl, ssl, ranch, crypto,
-                    broker_core, broker_security, broker_meta,
+                    broker_core, broker_security, broker_metrics, broker_meta,
                     broker_router, broker_queue, broker_proto_agent_rpc]},
     {env, [
         %% S9-D (ADR-027): empty by default. An operator release ships the app

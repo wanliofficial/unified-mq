@@ -44,7 +44,25 @@ all() ->
      trace_context_roundtrips_through_a_delivery,
      trace_context_is_stripped_when_propagation_is_off,
      a_malformed_traceparent_is_not_propagated,
-     wss_is_served_when_tls_is_enabled].
+     wss_is_served_when_tls_is_enabled,
+     connections_current_tracks_the_connection_lifecycle].
+
+%% S12-B (ADR-032 D7): before this, only the MQTT front ends wrote
+%% `connections_current', so the gauge did not describe the node. This is the
+%% negative control ADR-032 asks for -- the count must go up for a live
+%% connection and back down when it closes, not merely "not crash".
+%%
+%% Measured as a delta against a baseline rather than against zero: other suites
+%% on the shared CT node may hold connections of their own, and asserting an
+%% absolute number would make this case order-dependent.
+connections_current_tracks_the_connection_lifecycle(Config) ->
+    Base = current(),
+    S = open(Config),
+    connack(S, <<"counted1">>),
+    ?assertEqual(Base + 1, current()),
+    close(S),
+    wait_until(fun() -> current() =:= Base end),
+    ok.
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -579,6 +597,9 @@ close(S) ->
     catch gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true)),
     catch gen_tcp:close(S),
     ok.
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
 
 tls_open(Config) ->
     {ok, S} = ssl:connect("localhost", ?config(port, Config),

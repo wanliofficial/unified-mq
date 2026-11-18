@@ -23,7 +23,10 @@
 -define(VERSION, <<"2026-07-28">>).
 
 all() ->
-    [{group, discover}, {group, headers}, {group, call}, {group, stream}].
+    [{group, discover}, {group, headers}, {group, call}, {group, stream},
+     %% S12-B (ADR-032 D7): connection accounting is orthogonal to the MCP
+     %% method groups, so it is a plain case rather than a group member.
+     connections_current_tracks_the_connection_lifecycle].
 
 groups() ->
     [{discover, [sequence],
@@ -585,6 +588,35 @@ subscription_id(_Frame) ->
     undefined.
 
 %%%_* Listener -------------------------------------------------------------
+
+
+connections_current_tracks_the_connection_lifecycle(_Config) ->
+    Base = current(),
+    {Port, _} = start_listener(),
+    %% A bare accepted socket is enough: both front ends count the connection
+    %% right after `ranch:handshake/1', before any request is read, because the
+    %% row is about the socket's lifetime, not about a completed request. Sending
+    %% nothing also removes the race a full request/response would introduce --
+    %% `request/5' closes the socket itself, so a "+1" assertion after it would
+    %% be measuring the wrong instant.
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000),
+    wait_until_current(Base + 1),
+    ok = gen_tcp:close(S),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(50), wait_until_current(Expected, Left - 50)
+    end.
 
 start_listener() ->
     ok = application:set_env(broker_proto_mcp, listeners,

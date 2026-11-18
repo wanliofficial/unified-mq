@@ -642,7 +642,8 @@ curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 | 指标 | 含义 | 关注点 |
 |---|---|---|
-| `connections_current` / `connections_peak` | 当前/峰值连接 | 突增或触顶 `max_connections` |
+| `connections_current` / `connections_peak` | 当前/峰值连接（**节点全部协议前端**，S12-B 起） | 突增或触顶 `max_connections` |
+| — | （上行的口径说明） | 计入：MQTT / MQTT-SN / MQTT over QUIC / MQTT over WS / WS / NATS / AMQP / Kafka / Pulsar / WebRTC 信令 / A2A / MCP，以及 **CoAP 的 DTLS 会话**（明文 UDP 无连接语义，不计）。S12-B 之前只有 MQTT 系在写，任何据此做的告警在旧版本上都是低估 |
 | `auth_failures` / `authz_failures` | 认证失败 / 授权失败 | 前者账号问题，后者 ACL/租户问题 |
 | `publish_total` / `deliver_total` / `ack_total` | 发布/投递/确认计数 | 三者比例失衡说明消费滞后 |
 | `publish_latency_us` / `deliver_latency_us` / `ack_latency_us` | 直方图 | p99 抬升先看 WAL |

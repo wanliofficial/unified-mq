@@ -399,9 +399,13 @@ handle_info(_Info, St) ->
 terminate(_Reason, #st{transport = dtls} = St) ->
     %% Close the listen socket first so the acceptor stops accepting, then every
     %% established peer. Left to the runtime, a restarted listener could find the
-    %% port still held.
+    %% port still held. Each session closes here rather than through
+    %% `drop_session/2', so the gauge is settled in the same place.
     _ = (catch ssl:close(St#st.dtls_listen)),
-    [ _ = (catch ssl:close(S)) || S <- maps:keys(St#st.peers) ],
+    [begin
+         _ = (catch ssl:close(S)),
+         _ = broker_metrics:connection_closed(true)
+     end || S <- maps:keys(St#st.peers)],
     ok;
 terminate(_Reason, _St) ->
     ok.
@@ -785,9 +789,15 @@ admit_session(Identity, Peer, Socket, #st{peers = Peers, cfg = Cfg} = St) ->
             end
     end.
 
+%% S12-B (ADR-032 D7): a DTLS session is the only thing in this front end that
+%% is a connection -- plain UDP is stateless per datagram and has no lifecycle to
+%% count, which the capability matrix states rather than papers over. The count
+%% goes up here, at the one place a session is recorded, and down in
+%% `drop_session/2', its only removal path, so the two cannot drift.
 record_session({IP, Port} = Peer, Socket, Principal,
                #st{peers = Peers, socks = Socks, idents = Idents,
                    principal_sessions = Counts} = St) ->
+    _ = broker_metrics:connection_opened(),
     St#st{peers = maps:put(Socket, Peer, Peers),
           socks = maps:put({IP, Port}, Socket, Socks),
           idents = maps:put({IP, Port}, #{principal => Principal,
@@ -803,8 +813,11 @@ record_session({IP, Port} = Peer, Socket, Principal,
 drop_session(Socket, #st{peers = Peers} = St) ->
     case maps:take(Socket, Peers) of
         error ->
+            %% Never recorded, so never counted: `admit_session/4' answers
+            %% `refuse' without touching the gauge.
             St;
         {Peer, Peers1} ->
+            _ = broker_metrics:connection_closed(true),
             St1 = St#st{peers = Peers1},
             forget_endpoint(Peer, remove_session(Peer, St1))
     end.

@@ -46,7 +46,8 @@ all() ->
      dtls_per_principal_cap,
      dtls_abandoned_releases_slot,
      dtls_close_cleans_up,
-     plain_udp_unaffected].
+     plain_udp_unaffected,
+     connections_current_tracks_the_dtls_session_lifecycle].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -201,6 +202,37 @@ cleanup_writers() ->
                       _ = supervisor:terminate_child(broker_storage_wal_sup, Id),
                       ok = supervisor:delete_child(broker_storage_wal_sup, Id)
               end, supervisor:which_children(broker_storage_wal_sup))
+    end.
+
+
+%% S12-B (ADR-032 D7): in this front end only a DTLS session is a connection --
+%% plain UDP is stateless per datagram and has no lifecycle to count, which the
+%% capability matrix states rather than papers over. The pair goes up when the
+%% session is recorded and back down when it drops.
+%%
+%% The upper bound is checked at exactly +1 rather than ">=": two clients already
+%% exist in other cases of this suite, so the absolute number is not the contract
+%% -- this one session's contribution is.
+connections_current_tracks_the_dtls_session_lifecycle(Config) ->
+    Base = current(),
+    Port = ?config(port, Config),
+    {ok, S} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    wait_until_current(Base + 1),
+    close(S),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(50), wait_until_current(Expected, Left - 50)
     end.
 
 %%%_* DTLS client -----------------------------------------------------------

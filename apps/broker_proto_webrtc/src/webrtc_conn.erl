@@ -60,7 +60,11 @@
           username :: binary() | undefined,
           peer_id :: binary() | undefined,
           auth_timer :: reference() | undefined,
-          idle_timer :: reference() | undefined
+          idle_timer :: reference() | undefined,
+          %% S12-B (ADR-032 D7): whether this connection holds a row in
+          %% `connections_current'. Metrics may be off, in which case nothing
+          %% was added and `connection_closed/1' must not subtract.
+          counted = false :: boolean()
          }).
 
 %%%===================================================================
@@ -76,7 +80,8 @@ start_link(Ref, Transport, Opts) ->
 
 init({_Ref, Transport, _Opts}) ->
     process_flag(trap_exit, true),
-    {ok, #st{transport = Transport}}.
+    {ok, #st{transport = Transport,
+             counted = broker_metrics:connection_opened()}}.
 
 handle_call(_Req, _From, St) ->
     {reply, {error, unsupported}, St}.
@@ -160,16 +165,23 @@ handle_info(_Info, St) ->
 %% R-C2: leaving is idempotent and total. A connection killed from outside
 %% never reaches here -- the registry's monitor covers that case -- but this is
 %% the normal path, and it is the one that must not raise.
-terminate(_Reason, #st{room = undefined}) ->
-    ok;
+%% All three clauses close the connection's row; each ends in a shared helper so
+%% the count cannot drift between the "never joined a room" and the socket-close
+%% paths.
+terminate(_Reason, #st{room = undefined} = St) ->
+    uncount(St);
 terminate(Reason, #st{room = Room, socket = undefined} = St) ->
     webrtc_room_registry:leave(Room, self()),
     log_disconnect(St, terminate_code(Reason)),
-    ok;
+    uncount(St);
 terminate(Reason, #st{room = Room, transport = T, socket = S} = St) ->
     webrtc_room_registry:leave(Room, self()),
     _ = T:close(S),
     log_disconnect(St, terminate_code(Reason)),
+    uncount(St).
+
+uncount(#st{counted = Counted}) ->
+    ok = broker_metrics:connection_closed(Counted),
     ok.
 
 %% Map a gen_server terminate reason to the WebSocket close code an operator

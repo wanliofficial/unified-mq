@@ -38,7 +38,8 @@ all() ->
      send_without_producer_errors,
      sasl_token_authenticates_against_the_shared_table,
      sasl_token_with_a_wrong_secret_is_refused,
-     sasl_plain_authenticates_against_the_shared_table].
+     sasl_plain_authenticates_against_the_shared_table,
+     connections_current_tracks_the_connection_lifecycle].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -116,6 +117,36 @@ stop_all() ->
     _ = application:stop(broker_router),
     _ = application:stop(broker_storage),
     ok.
+
+%% S12-B (ADR-032 D7): the negative control the ADR asks for. Before this, only
+%% the MQTT front ends wrote `connections_current', so the gauge did not describe
+%% the node. Measured as a delta against a baseline rather than an absolute
+%% number: other suites on the shared CT node may hold connections of their own,
+%% and an absolute assertion would make this case order-dependent.
+connections_current_tracks_the_connection_lifecycle(Config) ->
+    Base = current(),
+    C = connect(Config),
+    %% The count is written in the connection process's `init/1', which starts
+    %% after ranch accepts, so wait for it rather than assuming the accept has
+    %% already happened.
+    wait_until_current(Base + 1),
+    %% This suite has no `close/1' of its own: it closes by dropping the socket.
+    _ = gen_tcp:close(C#c.s),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(25), wait_until_current(Expected, Left - 25)
+    end.
 
 %%%_* Cases -----------------------------------------------------------------
 

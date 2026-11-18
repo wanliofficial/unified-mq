@@ -175,3 +175,28 @@ D2 的其余三条已落地，**D2 冻结文本仍一字未改**。
   - **drain 是节点本地的**：drain 一个节点后，该节点 `/readyz` 503 `draining`，其余节点的 `state` 仍是 `up`、`ready` 仍是 `true`、分区集不变、`/readyz` 也不出现 `draining`；`undrain` 同样不触碰其它节点。
   - **三条断言都做过反证**：去掉 owner 过滤（每个节点认领所有已分配分区）→ 一致性用例挂；`ready` 恒 `false` → 本地性用例挂；`/status` 分区集置空 → 端点一致断言挂。
 - **S12-A 已完成**；如实保留的边界：① 本次落的是**节点自身**的 drain 状态与对外视图，D1 里 `broker_meta` 的 `cluster_node`/`partition_meta`「退役为遗留形状」的清理未在本阶段删除（生产已无写入者，删除属独立重构）；② QUIC / CoAP 不归 ranch 管，**不在 drain 挂起范围**，仍需停进程摘流；③ `GET /api/v1/node` 的 `weight` / `role` 属 S12-C 的再平衡器，未提前造常量。
+
+### S12-B 第一项：修 `connections_current` 记账（2026-11-18）
+
+D7 把「这两个 gauge 只有 MQTT 系在写」列为**必须修**，并写死了修法：让没写的那些前端在连接生命周期上调用**既有** `gauge_add/2`，键不变、集合不变。落地如下。
+
+- **修的是记账，不是键集**：`broker_metrics` 新增一对共享辅助 `connection_opened/0 -> boolean()` 与 `connection_closed/1`，两者都只写 `connections_current` / `connections_peak`。没有新增键，`keys_are_stable` 未改。**不给十个前端各写一遍峰值逻辑**，是因为那段「读 current、比峰值、只在更高时写」的代码一旦抄十份，就会有一份漏掉比较或忘了 `-1`。
+- **boolean 返回值是这对辅助存在的理由**：`gauge_add/2` 在 metrics 关闭或未启动时返回 `0` 而不是 `ok`（ADR-016 S2-A 注记），所以「加没加上」必须被记录下来。`connection_closed(false)` 是 no-op —— 否则一次 disable/enable 周期会把 gauge 推成负数，而那是一个只有重启才看得出来的坏数。
+- **接入的前端（9 个）**：D7 正文列的「一次都不写」名单有 **10 个** app，D7 验证清单只点了其中 7 个（WS / NATS / AMQP / Kafka / Pulsar / CoAP / WebRTC）——少了 `a2a` 与 `mcp`，两者同样是 ranch 前端且同样从不写该 gauge，所以按正文的完整性口径一并接入；名单里的第 10 个 `mqtt_ws` **不计**，理由见下条。
+  - 每个连接一个 `gen_server` 且生命周期清晰的：`ws_conn`、`nats_conn`、`amqp_conn`、`kafka_conn`、`pulsar_conn`、`webrtc_conn`（`init/1` 计、`terminate/2` 结）。`webrtc_conn` 有**三个** `terminate/2` 子句（未入房 / 无 socket / 正常），三个都结算，否则「握手完成但从未 authenticate」的路径会漏一行；共用 `uncount/1` 以免三处漂移。
+  - **CoAP 只计 DTLS 会话**：明文 UDP 是无状态数据报，没有生命周期可计，这一点**如实写进能力矩阵**而不是拿 socket 数充数。计数点在 `record_session/4`（唯一记录处）与 `drop_session/2`（唯一移除路径），`terminate/2` 里逐个 session 结算，避免 listener 停止时留下残余。
+  - **`a2a_conn` / `mcp_conn` 是常函数循环**，没有 `terminate/2`：用 `try ... after` 保证结算，异常也不会漏。它们在 `ranch:handshake/1` 成功后立刻计数 —— 那个 socket 的整个存活期就是这一段循环。
+- **两个 app 补了 `broker_metrics` 依赖声明**（`broker_proto_a2a` / `broker_proto_mcp`）：**不是新增运行时依赖**，两者本来就经 `broker_queue` 传递依赖 `broker_metrics`，启动顺序早已在它之后；此前只是没写进自己的 `applications`，而代码现在直接调用它，不声明就是靠运气。
+- **`mqtt_ws_conn` 与 `mqtt_quic_conn` 明确不计**：它们底下跑的就是 `mqtt_conn_fsm`（S8 的复用，见两个模块自己的文档头），在那里再加一次就是**双计**。D7 的验证清单里也没有它们，与本结论一致。
+- **测试**：每个接入的前端各加**一条负控用例** `connections_current_tracks_the_connection_lifecycle`（CoAP 的是 `..._the_dtls_session_lifecycle`），形态统一：
+  - 量**相对基线的增量**，不断言绝对值 —— CT 共用单节点，别的套件可能还握着连接，绝对数会让用例变成顺序依赖；
+  - **上下都等**（`wait_until_current/2` 轮询），因为计数写在连接进程的 `init/1` 里、在 ranch 接受之后才执行，连上就断言 +1 会输给调度；
+  - 结束时回到基线，这正是 D7 要的「负控：断开后归零」。
+  - `broker_metrics_SUITE` 另有 2 例直接钉这对辅助：current 与 peak 的语义、以及「未计数的连接不得被减」。
+- **反证（逐条改坏再跑）**：
+  - `ws_conn:terminate/2` 不结算 → ws 用例挂；
+  - `coap_listener:drop_session/2` 不结算 → CoAP 用例挂；
+  - `a2a_conn` / `mcp_conn` 去掉 `try ... after` → 两个用例分别挂。
+  四条都是「恰好且仅有对应用例失败」，不是整片红，说明断言指向的是真实现象。
+- **验证**：全量 `rebar3 ct` **1395/1395、86 套件**（1384 + 11：`broker_metrics` 2 例 + 9 个前端各 1 例）；`dialyzer` 0 warning；`xref` **302** 全 unused-export（两个新导出均被调用，未增计数）。
+- **仍未做（如实留痕）**：① **节点级准入闸门**（D7 要求「S12-B spike 定落地位置」）尚未写 spike，也未实现 —— 今天超限仍是 ranch 的 acceptor 睡下，而非显式拒绝；② R-LB9 的扩展项（被拒连接数、节点上下线次数、迁移次数、等待队列长度）按 D7 标「S12 不交付」，一条未加；③ CoAP 明文 UDP 不在计数口径内（无连接语义），能力矩阵须照此写明。

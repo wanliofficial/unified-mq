@@ -28,7 +28,8 @@ all() ->
      {group, auth},
      {group, frames},
      {group, timeouts},
-     {group, tls}].
+     {group, tls},
+     connections_current_tracks_the_connection_lifecycle].
 
 groups() ->
     [{handshake, [sequence],
@@ -515,6 +516,32 @@ a_wss_connection_authenticates_the_same_way(Config) ->
     ?assertEqual(<<"pong">>, P2),
     _ = ssl:close(S),
     ok.
+
+
+%% S12-B (ADR-032 D7): `connections_current' must describe the node, not just the
+%% MQTT front ends. The negative control the ADR asks for -- the count goes up for
+%% a live connection and back to the baseline when it closes. A delta against a
+%% baseline, because other suites on the shared CT node may hold connections.
+connections_current_tracks_the_connection_lifecycle(Config) ->
+    Base = current(),
+    {ok, S, ?SUBPROTOCOL} = handshake(Config, [?SUBPROTOCOL]),
+    wait_until_current(Base + 1),
+    close(S),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(25), wait_until_current(Expected, Left - 25)
+    end.
 
 %%%_* Helpers: client -------------------------------------------------------
 

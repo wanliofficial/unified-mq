@@ -769,7 +769,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 
 - 写入不经过进程、不分配键：键表在启动时固定，索引存 `persistent_term`；`snapshot/0` 按 `keys/0` 顺序读数组。
 - `enabled=false` 时写 API 仍是 `ok`（`gauge_add/2` 返回 0），`snapshot/0` 返回全零，键集合不变。
-- `connections_current`/`connections_peak` 是唯一需要读改写的地方：`gauge_add/2`（原子 `add_get`）维护当前数，只有更高时才 `gauge/2` 写峰值。
+- `connections_current`/`connections_peak` 是唯一需要读改写的地方：`gauge_add/2`（原子 `add_get`）维护当前数，只有更高时才 `gauge/2` 写峰值。**S12-B 起所有协议前端统一经 `connection_opened/0` / `connection_closed/1` 这一对**（ADR-032 D7）：前者返回 boolean 表示「这条连接是否真的被计入」，后者只在该值为 `true` 时减——metrics 关闭时 `gauge_add/2` 返回 `0` 而非 `ok`，所以这个布尔量是防止 gauge 被减成负数的唯一依据。`mqtt_ws` / `mqtt_quic` 不重复计数（其下即 `mqtt_conn_fsm`）；CoAP 只计 DTLS 会话。
 - `subscription_backlog`/`cursor_lag` 由 `broker_subscription_worker` 每次 cursor tick 采样（默认 100 ms）；`queue_depth`/`segment_bytes` 由分区 `wal_writer` 写，多分区共用一个键，最后写入者覆盖 ⇒ 视为近似全局值，分区精确值读 `broker_queue:watermarks/1`。
 - `redelivery_total`/`dlq_size`/`retention_*` 与 `cloudevents_*` 的埋点已分别随 S2-E / S2-F / S3 接入（键集合冻结不变）。
 

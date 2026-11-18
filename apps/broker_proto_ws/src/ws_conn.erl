@@ -43,7 +43,11 @@
     next_delivery = 1 :: pos_integer(),
     seen = #{} :: map(),
     frag = undefined :: undefined | {0..2, [binary()]},
-    closing = false :: boolean()
+    closing = false :: boolean(),
+    %% S12-B (ADR-032 D7): whether this connection holds a row in
+    %% `connections_current'. Metrics may be off, in which case nothing was
+    %% added and `connection_closed/1' must not subtract.
+    counted = false :: boolean()
 }).
 
 %%%_* Lifecycle ------------------------------------------------------------
@@ -52,9 +56,11 @@ start_link(Ref, Transport, Opts) ->
     gen_server:start_link(?MODULE, {Ref, Transport, Opts}, []).
 
 init({Ref, Transport, _Opts}) ->
-    {ok, #st{ref = Ref, transport = Transport}}.
+    {ok, #st{ref = Ref, transport = Transport,
+             counted = broker_metrics:connection_opened()}}.
 
-terminate(_Reason, #st{} = St) ->
+terminate(_Reason, #st{counted = Counted} = St) ->
+    ok = broker_metrics:connection_closed(Counted),
     cleanup(St),
     ok.
 

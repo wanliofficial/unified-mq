@@ -38,7 +38,8 @@ all() ->
      a_valid_credential_is_accepted,
      a_wrong_credential_is_refused,
      require_auth_refuses_an_anonymous_connect,
-     trace_context_roundtrips_through_hmsg].
+     trace_context_roundtrips_through_hmsg,
+     connections_current_tracks_the_connection_lifecycle].
 
 suite() -> [{timetrap, {seconds, 60}}].
 
@@ -124,6 +125,35 @@ stop_all() ->
     _ = application:stop(broker_router),
     _ = application:stop(broker_storage),
     ok.
+
+%% S12-B (ADR-032 D7): the negative control the ADR asks for. Before this, only
+%% the MQTT front ends wrote `connections_current', so the gauge did not describe
+%% the node. Measured as a delta against a baseline rather than an absolute
+%% number: other suites on the shared CT node may hold connections of their own,
+%% and an absolute assertion would make this case order-dependent.
+connections_current_tracks_the_connection_lifecycle(Config) ->
+    Base = current(),
+    C = open(Config),
+    %% The count is written in the connection process's `init/1', which starts
+    %% after ranch accepts, so wait for it rather than assuming the accept has
+    %% already happened.
+    wait_until_current(Base + 1),
+    close(C),
+    wait_until_current(Base).
+
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(25), wait_until_current(Expected, Left - 25)
+    end.
 
 %%%_* Cases -----------------------------------------------------------------
 

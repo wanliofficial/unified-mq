@@ -520,7 +520,7 @@ S7 有两项交付：
 |---|---|---|---|
 | S12-0 不确定性收敛 | ✅ **已交付（2026-11-17）** | 收敛报告 [`design/s12-0-convergence-report.md`](design/s12-0-convergence-report.md) + **ADR-032**（LB 形态、节点视图唯一真相、再平衡触发者与稳定条件、迁移契约、依赖边界）；OQ-1~OQ-10 全部收敛 | 纯文档：**未新增 app / 端口 / 代码路径 / 依赖**；`rebar3 ct` 基线不变（1373/1373、84 套件） |
 | S12-A 节点视图与健康契约 | ✅ **已交付（2026-11-17）** | 统一节点视图（`GET /api/v1/node`）+ 主动健康上报（`up/draining/down`，`broker_drain`）+ drain 优雅摘流（挂起全部 ranch listener，**不断开在用连接**）+ `/readyz` 对齐 + 管理 API 严格校验（R-LB8）+ 非回环 bind 配空 token 拒启 | `broker_admin_dist_SUITE`（3 peer 多节点视图一致性：各节点只报自己拥有的分区、并集完整、无重复归属、`/status` 与 `/node` 一致、drain 不泄漏到其它节点）；drain 期间在用连接不中断（真实 ranch listener + 真实 MQTT listener 双证据）；既有零回归 |
-| S12-B 连接容量与选择策略 | ⬜ 未开工 | 可插拔节点选择策略 + 连接上限 / pending-active 计数 + 排队上限与超时 + 无可用节点 / 恢复竞态 + 指标 | 外部 LB 或等价模拟器分发证据；背压与拒绝专项用例；能力矩阵 |
+| S12-B 连接容量与选择策略 | 🟡 **部分交付（2026-11-18）**：连接计数记账已修 | 已完成：`connections_current` / `connections_peak` 记账修复（9 个前端接入共享辅助 `connection_opened/0` + `connection_closed/1`，**键集不变**）；未完成：节点级准入闸门（ADR-032 D7 要求先写 spike 定落地位置）、LB 分发证据、能力矩阵 | 已完成项的证据：`broker_metrics_SUITE` 2 例钉辅助语义（含「未计数不得减」）+ 9 个前端各一条负控用例（WS / NATS / AMQP / Kafka / Pulsar / WebRTC / CoAP-DTLS / A2A / MCP；共 +11 例，全量 1395/1395、86 套件），逐条反证过（去掉 `terminate`/`drop_session`/`try-after` 结算各自恰好打挂对应用例）；未完成项仍无「已实测」数字 |
 | S12-C 自动再平衡与迁移 | ⬜ 未开工 | 再平衡触发者 + ADR-021 两阶段迁移 + 有状态进程迁移契约 + 状态持久化 + 故障注入 + 文档同步 + ADR 定稿 | 扩 `broker_cluster_dist_SUITE`（3 节点 peer）：节点加入/退出/故障、旧 owner `{fenced,_}`、无双写、崩溃恢复；全量 CT + dialyzer/xref + 容量报告 |
 
 > 子阶段命名与粒度是**建议**；实际以 S12-0 评审后冻结的 ADR 为准（同 S8 / S9 / S10 / S11 设计稿的落地偏差处理方式）。

@@ -53,7 +53,8 @@ all() ->
      connection_close_honored,
      health,
      anonymous_listener_on_loopback_is_allowed,
-     anonymous_listener_on_wide_bind_is_refused].
+     anonymous_listener_on_wide_bind_is_refused,
+     connections_current_tracks_the_connection_lifecycle].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(broker_security),
@@ -482,6 +483,39 @@ anonymous_listener_on_wide_bind_is_refused(_Config) ->
            {listeners, [#{port => 0, ref => {a2a, ct}, ip => {0, 0, 0, 0}}]}],
     ?assertMatch({error, {{insecure_listener, _, {0, 0, 0, 0}}, _}},
                  start_listener_raw(Env)).
+
+
+%% S12-B (ADR-032 D7): `connections_current' must describe the node. This front
+%% end is a request/response loop that owns the socket for as long as the client
+%% keeps it alive, so the row must appear when the socket is accepted and be
+%% settled when it closes -- including when the loop exits by exception, which is
+%% what the `try ... after' in `a2a_conn:start/3' is there for.
+connections_current_tracks_the_connection_lifecycle(_Config) ->
+    Base = current(),
+    {Port, _} = start_listener([]),
+    %% A bare accepted socket is enough: both front ends count the connection
+    %% right after `ranch:handshake/1', before any request is read, because the
+    %% row is about the socket's lifetime, not about a completed request. Sending
+    %% nothing also removes the race a full request/response would introduce --
+    %% `request/5' closes the socket itself, so a "+1" assertion after it would
+    %% be measuring the wrong instant.
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000),
+    wait_until_current(Base + 1),
+    ok = gen_tcp:close(S),
+    wait_until_current(Base).
+current() ->
+    maps:get(connections_current, broker_metrics:snapshot()).
+
+wait_until_current(Expected) ->
+    wait_until_current(Expected, 5000).
+
+wait_until_current(Expected, Left) when Left =< 0 ->
+    ?assertEqual(Expected, current());
+wait_until_current(Expected, Left) ->
+    case current() of
+        Expected -> ok;
+        _ -> timer:sleep(50), wait_until_current(Expected, Left - 50)
+    end.
 
 %%%_* Helpers ---------------------------------------------------------------
 
