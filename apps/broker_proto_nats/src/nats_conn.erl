@@ -156,7 +156,6 @@ parse(Buffer, #st{pending_pub = {Subject, Reply, Size, HeaderSize}} = St) ->
             {noreply, St#st{buffer = Buffer}}
     end;
 parse(Buffer, St) when byte_size(Buffer) > ?MAX_LINE ->
-    _ = Buffer,
     err_close(<<"Maximum Payload Violation">>, St);
 parse(Buffer, St) ->
     case binary:split(Buffer, <<"\r\n">>) of
