@@ -212,3 +212,13 @@ D7 要求「TCP 侧在 ranch `max_connections` 之上补一个节点级计数闸
 - **MQTT-SN sleeping 会话计入预算**：它占的是节点资源（进程、订阅、timer），不是 TCP fd；D7 防的是节点被压垮。真正的解法是给 MQTT-SN 一个独立 session 上限（今天没有，实测无 `max_session*`），但那属于协议容量策略，**S12-B 不引入**。
 - **各协议的显式拒绝**：MQTT 3.1.1 → CONNACK `rc=3`；MQTT 5 → `0x89`（复用 `refuse/2` 的两套码表）；MQTT-SN → CONNACK `return_code=3`（码表即 `<<?CONNACK, RC:8>>`，无需扩展）；WS/WebRTC/MQTT-over-WS → upgrade 阶段回 HTTP 503（尚未发 101，`ws_handshake.erl:84` 是唯一发 101 处）；A2A/MCP → 503；CoAP DTLS → 既有 `{refuse, session_cap}` 路径；CoAP 明文 UDP → 不适用（无连接语义）；QUIC → 既有 `{error, too_many_connections}`。**NATS/AMQP/Kafka/Pulsar 必须如实留痕**：连接刚建立时版本尚未协商，错误帧的合法性取决于客户端第一包，只能在「收到首帧、版本确定后」拒绝；做不到就是 close + 服务端 warning，**能力矩阵须写明这四个协议给不出与 MQTT 同等的可观测性**。
 - **不做排队**（D7 明令）：`compare_exchange` 一次尝试，失败即拒，无 retry、无 sleep、等待队列恒为 0。**不新增 metrics 键**：被拒只进 log（warning），这是今天唯一不扩容键集的观测手段；R-LB9 的扩展项仍标「S12 不交付」。
+
+### S12-B 第二项落地：闸门实现（2026-11-18）
+
+spike 的七条结论已按 §7 实现并接入全部前端。落地时有三处必须改写的结论，记在这里，`docs/design/s12b-admission-gate-spike.md` 已同步：
+
+- **契约从 `ok | {error, _}` 改为返回 lease。**spike §7 第 1 条写的 `try_acquire/0 -> ok | {error, over_capacity | draining}` 无法表达「闸门关闭」：`infinity` 时不能假装占了一个名额，否则 `release/0` 会去减一个从未加过的计数、偷走别人的名额。落地为四种形态 `{leased, Key} | unlimited | {rejected, Why} | undefined`，**必须原样回传 `release/1`**；`undefined` 让每个前端只用一条 `terminate`/`after` 就能无条件释放。`release/1` 幂等。
+- **只有计数器不够：`terminate/2` 不是可靠释放点。**spike 假设「进程结束就释放」，但 MQTT 连接是 `supervisor` 的 `temporary, brutal_kill` 子进程——被 kill 时 `terminate/3` **不执行**，只靠计数器会让节点缓慢泄漏到「永远满」，比没有闸门更糟（`mqtt_conn_SUITE` 的 `a_released_slot_is_usable_again` 在实现初期就是这样失败的）。因此 `atomics` 之外加一张 `public` ETS 台账（lease key → 持有进程），**仅在拒绝时**清扫已死持有者后再试一次：快速路径仍是一次 `compare_exchange`，O(n) 只出现在「准确性真的可疑」的时刻。`a_killed_owner_does_not_leak_its_slot` 钉死此行为，`a_live_owner_is_not_reclaimed` 钉死另一面（沉默但活着的 MQTT-SN 会话不得被清扫）。
+- **QUIC 的 lease 要换主。**闸门在 `mqtt_quic_listener` 的 `{new_conn, _}` 处问（那是唯一还能回 `{error, too_many_connections}` 的点），但连接活在其后创建的 `mqtt_quic_conn` 里。故新增 `adopt/1` 把台账行改写到真正持有资源的进程，配额随连接进程死亡被清扫回收。
+
+其余按 spike 执行：落点 conn/FSM 层、计数不复用 `connections_current`、`persistent_term` + `atomics` 无进程、预算默认 `infinity`、drain 读镜像、不做排队、不新增 metrics 键（被拒只进 warning 日志）。`broker_metrics` 键集未变，R-LB9 扩展项仍为「S12 不交付」。

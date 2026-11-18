@@ -158,6 +158,13 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 | `max_event_attributes` | 64 | `broker_event_codec:validate/1`（核心 + 扩展） |
 | `max_extension_value_bytes` | 4096 | 同上 |
 | `max_json_depth` | 16 | 同上（`data` 的嵌套深度） |
+| `max_connections` | `infinity`（闸门关闭） | `broker_admission:try_acquire/0`，节点级准入（S12-B / ADR-032 D7） |
+
+**`max_connections` 是节点级的，不是每 listener 的。**架构里每个协议前端的 ranch listener 还有一个自己的 `max_connections`（默认 1024），但它**只在 listener 范围内**生效，且 ranch 到限时并不拒绝连接——它让 acceptor 睡下，对端 TCP 连上却永远收不到任何协议应答。`broker_security.limits.max_connections` 补上的是**跨 listener 的节点级预算**：超限时各前端按自己的协议显式拒绝（MQTT `rc=3` / MQTT 5 `0x89` / MQTT-SN `3` / HTTP 类 503 + `Retry-After` / NATS `-ERR` / Kafka `56` / AMQP `541` / Pulsar `ERROR_UNKNOWN` / QUIC `{error, too_many_connections}`）。详见 `docs/design/s12b-admission-gate-spike.md`。
+
+默认 `infinity` 是刻意的：升级不该把一台原本没有节点级上限的机器变成会上限拒绝的机器。**被拒绝的连接只写 warning 日志，不新增 metrics 键**（`broker_metrics` 键集封闭，R-LB9 的扩展项标「S12 不交付」），排障要靠 `max_connections` 的当前值与日志。
+
+证据：`broker_admission_SUITE`（14 例：并发不超发、死持有者名额回收、活持有者不被回收、lease 换主、drain 优先、`infinity` 不计），以及 12 个前端各自的负控（第二条连接必须拿到**可观测的拒绝帧**）与正控（释放后可再进）。
 
 所有协议都经 `broker_queue:append/3`，因此消息级上限对六个协议一致生效；事件级上限只在 CloudEvents 解码路径生效。超限返回 `{error, {limit_exceeded, Which, Actual, Max}}`，由调用者拒绝（MQTT 不 ACK）。
 

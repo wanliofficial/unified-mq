@@ -239,11 +239,13 @@ ranch_refs() ->
 
 ## 7. 落地清单（实现时照此执行，不在本 spike 内）
 
-1. **新增 `apps/broker_security/src/broker_admission.erl`**：`persistent_term` 持有 `atomics`，导出 `try_acquire/0`（`ok | {error, over_capacity | draining}`）、`release/0`、`snapshot/0`（给测试与 `/api/v1/node` 读）。无进程、无 supervisor 子项。
-2. **配置**：`broker_security.limits` 增加 `max_connections`（默认沿用 1024，与现有 per-listener 默认一致），由 `broker_limits:limits/0` 的 merge 机制提供；默认 `infinity` 时闸门恒放行（保持既有部署行为不变）。
+1. **新增 `apps/broker_security/src/broker_admission.erl`**：`persistent_term` 持有 `atomics` 计数与一张 ETS 台账，导出 `try_acquire/0`（返回 lease，见下）、`release/1`、`snapshot/0`（给测试与 `/api/v1/node` 读）。无进程、无 supervisor 子项。
+   - **本 spike 原文写的 `try_acquire/0 -> ok | {error, _}` 已过时**：落地改为返回 *lease*，四种形态 `{leased, Key} | unlimited | {rejected, Why} | undefined`，必须原样回传 `release/1`。原因是 `unlimited`（闸门关闭）不能折叠成编号 lease，否则一次释放会偷走别人的名额；`undefined` 让单个 `terminate`/`after` 可以无条件释放。
+   - **台账不是冗余**：`terminate/2` 不是可靠释放点。MQTT 连接是 `temporary, brutal_kill` 子 supervisor，被 kill 时 `terminate` 根本不跑，只靠计数器会让节点缓慢泄漏到「永远满」。ETS 台账按 lease key 记录持有进程；**仅在拒绝时**清扫已死持有者（O(n) 只在准确性问题真的成立时发生）。
+2. **配置**：`broker_security.limits` 增加 `max_connections`，经 `broker_limits:limits/0` 的 merge-default 提供，**默认 `infinity`（闸门关闭）**。默认开启会改变既有部署的行为——今天是每个 listener 各 1024，节点级 1024 可能在原先能接受的场景下拒绝，所以默认不介入，由运维显式开启。这样「实现了闸门」本身不等于「行为变了」。
 3. **12 个前端逐点接入**（§3 的表）。13 个接受连接的 app 里，`mqtt_ws` 不单独接（其下就是 `mqtt_conn_fsm`）；`mqtt_quic` 要接 —— 它既有的 `{new_conn, _}` 检查是 **per-listener** 的（`map_size(Conns) >= Max`），不是节点级，两者并存不冲突。CoAP 明文 UDP 不接。
 4. **drain 联动**：`broker_admission` 读 `{broker_drain, state}` 的 `persistent_term` 镜像，`draining | down` 拒绝。
-5. **测试**：每个前端一条负控（把预算压到 1，第二条连接必须拿到**可观测的拒绝帧**，而不是静默挂起）+ 一条正控（释放后能再进）+ `broker_admission_SUITE` 单独钉「并发 `try_acquire` 不超发」与「release 幂等」。每条都做反证（去掉闸门调用，对应用例必须挂）。
+5. **测试**：每个前端一条负控（把预算压到 1，第二条连接必须拿到**可观测的拒绝帧**，而不是静默挂起）+ 一条正控（释放后能再进）+ `broker_admission_SUITE` 单独钉「并发 `try_acquire` 不超发」「release 幂等」「死持有者的名额能被回收」。每条都做反证（去掉闸门调用/去掉并发保护/关掉清扫，对应用例必须挂）。
 6. **能力矩阵**：逐协议写明拒绝方式，以及 NATS/AMQP/Kafka/Pulsar 的「版本确定前无法给错误帧」这一真实限制。
 7. **文档**：ADR-032 追加「S12-B 第二项」落地偏差节；`docs/operations.md` 写明 `max_connections` 的节点级语义与被拒只进日志。
 
@@ -252,3 +254,35 @@ ranch_refs() ->
 ## 8. 一句话总结
 
 **闸门放在 conn/FSM 层（协议握手尚未承诺服务的那一刻），用一个独立于 `broker_metrics` 的原子计数（因为它必须在 metrics 关闭、sleep 会话、并发涌入三种情况下都准确），超限时按各协议自己的「服务不可用」语义显式拒绝，并顺带补上 drain 对非 ranch 前端（QUIC / CoAP）的空操作缺口。**
+
+---
+
+## 9. 能力矩阵（落地后）
+
+接入点与 §3 的预测一致，全部 12 处已接上。下表是**实现后实测**的拒绝方式，以及「对端能看见什么」：
+
+| 前端 | 闸门调用点 | 拒绝帧 | 对端可观测性 |
+|---|---|---|---|
+| `mqtt_conn_fsm` | `admit/1`，`do_connect/4` 之前 | v3.1.1 CONNACK `rc=3`；v5 `0x89` | **强**：在 CONNACK 内，客户端可直接读原因 |
+| `mqtt_sn_conn` | `admit/1`，`on_connect_sn/5` 之前 | CONNACK `return_code=3` | **强**：UDP 客户端没有 socket 关闭可推断，所以必须有帧 |
+| `ws_conn` | `handshake/2` 内，发 101 之前 | `503` + `Retry-After: 5` | **强**：upgrade 未完成，客户端按 HTTP 语义重试 |
+| `webrtc_conn` | `accept/3` 内，发 101 之前 | 同上 | **强**：同上 |
+| `a2a_conn` / `mcp_conn` | `ranch:handshake/1` 之后、读请求前 | `503` + `Retry-After: 5` + JSON 体 | **强**：纯 HTTP 前端 |
+| `nats_conn` | `admit/1`，CONNECT 时 | `-ERR 'Server is full'` | **中**：INFO 已发出，CONNECT 后才拒 |
+| `kafka_conn` | `admit/1`，ApiVersions 时 | ApiVersions `error_code=56` + 文本 | **中**：有 correlation id，但只有 ApiVersions 一个请求 |
+| `amqp_conn` | `admit/1`，协议头 `AMQP\0\0\9\1` 后 | `connection.close` `541` + 文本 | **中**：协议头已收，close 帧合法 |
+| `pulsar_conn` | `admit/1`，CONNECT 命令时 | `ERROR` 命令 `ERROR_UNKNOWN` + 文本 | **中**：CONNECT 无 request_id，用 0 |
+| `coap_listener` | `admit_session/4`，第三级检查 | DTLS socket 直接关闭 | **弱**：DTLS 握手已完成，只能靠连接断开 |
+| `mqtt_quic_listener` | `handle_call({new_conn,_})` | `{error, too_many_connections}`，连接关闭 | **弱**：CONNECT 未读，无 CONNACK 可承载 |
+
+**为什么 NATS/AMQP/Kafka/Pulsar 只能是「中」**：连接刚建立时协议版本尚未协商，错误帧的合法性取决于客户端第一包。只能在「收到首帧、版本确定后」拒绝；更早只能 close，那对客户端等同于网络故障。这一点必须在能力矩阵里如实写明，不能假装与 MQTT 同等。
+
+**CoAP 明文 UDP 不计连接**（逐包无状态、无生命周期），只有 DTLS 会话计入。**`mqtt_ws_conn` 不单独接入**——其下层就是 `mqtt_conn_fsm`。
+
+### 9.1 每条接入的验收证据
+
+每个前端两条用例：**负控**（预算压到 1，第二条连接必须拿到上表那个**可观测的拒绝帧**）+ **正控**（释放后可再进）。闸门自身另有 `broker_admission_SUITE` 14 例。
+
+三条反证都做过，均精确命中：把 `reserve/2` 换成「读-判断-sleep-写」→ 只有 `concurrent_acquires_never_exceed_the_limit` 失败；让清扫永远返回 0 → 只有 `a_killed_owner_does_not_leak_its_slot` 与 `adopt_moves_the_slot_to_the_owning_process` 失败。
+
+QUIC 的两条用例在本机**不执行**：`mqtt_quic_nif:available()` 为 `false`，该组整体不跑（与既有 6 条 QUIC 用例同一处境）。这一点在交付说明里标明，不算已验证。

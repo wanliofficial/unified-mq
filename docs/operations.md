@@ -829,6 +829,46 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 - **WebRTC 信令与 ICE 的容量基准**（不落盘路径，与上面持久化口径不可直接比较）：`docs/benchmarks/2026-11-14-s10-capacity.md`，复跑 `test/protocol-compatibility/s10/bench/run_bench.sh`（自带内存守卫与断点续跑，只绑回环临时端口）。快速结论：信令 32 连接并发 1498.7/s（p50 1.6 ms）、ICE allocation 顺序 p50 893 µs、relay 中继约 5.2k datagrams/s。**信令与 ICE 都不写 WAL**，它们的容量不受磁盘 fsync 约束，受 CPU/调度与 socket 缓冲约束；relay 在无上层流控的突发下会丢包（实测送达率 0.77），容量规划必须留余量。
 - **CoAP / coaps（DTLS-PSK）的容量基准**：`docs/benchmarks/2026-11-16-s11c-dtls-capacity.md`，复跑 `test/protocol-compatibility/s11c/bench/run_bench.sh`（只绑回环临时端口，会覆写 `results/dtls_capacity.json`，跑完 `git checkout --` 还原）。快速结论：**握手串行约 41/s**（p50 ~22 ms，冷启动大批设备须错峰 ≥150 ms）、**DTLS 单次往返 ≈ 明文 1.8×**、稳态单 listener **约 4.4k req/s 零错误**（单进程瓶颈）、冷启动风暴 32 并发仅 5 成功 vs 错峰 32/32。吞吐须「先顺序建会话、再并发打请求」，与持久化口径不可直接比较。
 
+### 9.1 节点级连接上限（`max_connections`，S12-B / ADR-032 D7）
+
+**语义**：`broker_security.limits.max_connections` 是**整节点**同时在线的连接数上限，跨全部协议前端，不是每 listener 的。各 listener spec 里那个同名的 `max_connections`（默认 1024）依旧只管自己，且 ranch 到限时**不拒绝连接**——它让 acceptor 睡下，对端 TCP 连上却永远收不到协议应答。节点级闸门就是为这个缺口加的。
+
+**默认 `infinity`（闸门关闭）**。升级不改变既有部署行为；要开启必须显式配置：
+
+```erlang
+{broker_security, [{limits, #{max_connections => 10000}}]}
+```
+
+**它数什么**：一个「名额」= 一条被准入的连接，从 `try_acquire` 成功到持有它的进程结束或显式释放。以下都算：MQTT / MQTT-over-WS / WS / WebRTC / NATS / AMQP / Kafka / Pulsar / A2A / MCP 的连接，**MQTT-SN 的 sleeping 会话**（timer、订阅、堆仍是本节点的资源，故意不释放），QUIC 连接，以及 **CoAP 只算 DTLS 会话**（明文 UDP 逐包无状态，不计）。
+
+**超限时对端看到什么**（各协议按自己的语法显式拒绝，不是静默挂起）：
+
+| 协议 | 拒绝帧 |
+|---|---|
+| MQTT 3.1.1 | CONNACK `rc=3`（Server unavailable） |
+| MQTT 5 | CONNACK `0x89`（Server busy） |
+| MQTT-SN | CONNACK `return_code=3`（congestion） |
+| WS / WebRTC / A2A / MCP | HTTP `503` + `Retry-After: 5`（在 101 之前） |
+| NATS | `-ERR 'Server is full'` |
+| Kafka | ApiVersions 响应 `error_code=56` + 说明文本 |
+| AMQP | `connection.close` reply-code `541` + 说明文本 |
+| Pulsar | `ERROR` 命令 `request_id=0`、`ERROR_UNKNOWN` + 说明文本 |
+| CoAP (DTLS) | 握手后直接关闭 socket（`{refuse, node_cap}`） |
+| QUIC | `{error, too_many_connections}`，连接关闭 |
+
+NATS / AMQP / Kafka / Pulsar 的拒绝帧只能在**收到首帧、协议版本确定后**发出，因此**可观测性弱于 MQTT**：连接已建立、只是首帧后立刻被拒。
+
+**被拒的连接只进 warning 日志**（`<proto>: connection refused by admission gate: over_capacity`）。`broker_metrics` 的键集封闭，没有「被拒连接数」计数（R-LB9 扩展项标「S12 不交付」）。要观察余量，读闸门自己的快照：
+
+```erlang
+broker_admission:snapshot().
+%% #{limit => 10000, in_use => 4213, state => up}
+```
+
+**`state`** 是 `up | draining | down`：drain 中的节点即使还有空位也拒绝新连接（否则它接纳的连接对正在进行的 drain 不可见）。`in_use` 是当前占用；若怀疑泄漏，注意实现会在**下一次拒绝时**清扫已死持有者的名额（例如被 `brutal_kill` 杀掉的连接，`terminate/2` 不会运行），因此一个刚被杀死的连接可能短时间仍计入，直到有人触发一次准入判定。
+
+**规划建议**：取值要低于「文件描述符上限 / 单连接内存 × 安全系数」，并与 MQTT-SN 的 sleeping 会话规模一起考虑——它们占名额但不占 fd。
+
 ---
 
 ## 10. 故障排查速查
