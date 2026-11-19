@@ -15,6 +15,7 @@
 -compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("broker_core/include/broker_message.hrl").
 
 -define(CLUSTER, broker_cluster_meta).
 
@@ -23,7 +24,8 @@ all() ->
      leader_failover_keeps_committing,
      losing_the_majority_rejects_metadata_writes,
      old_owner_is_fenced_after_migration,
-     a_crashed_node_rejoins_and_catches_up].
+     a_crashed_node_rejoins_and_catches_up,
+     a_stale_session_writer_is_fenced_by_the_guard_hook].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -180,6 +182,71 @@ a_crashed_node_rejoins_and_catches_up(Config) ->
     %% And the survivors did not have to be touched: the group still commits.
     {ok, 1} = rpc(N1, broker_cluster, assign, [1, N1, Members, 1]),
     ok.
+
+%% Session affinity (R-CL2 / Gate S12's 会话粘性) at the layer the protocol
+%% adapters actually reach. A connection is pinned to one access node for its
+%% whole lifetime; that node stamps the epoch it saw into `proto_meta' when it
+%% hands a message to the queue (`mqtt_conn_fsm:annotate_epoch/1', the
+%% `{broker_cluster, epoch}' hook). The queue runs this guard *before* it
+%% consumes an offset, so a `{fenced, _}' answer is a refusal, not a retry --
+%% the "no double write" half of the Gate, and why the adapter never re-sends
+%% a fenced message to a different node.
+%%
+%% What this proves beyond `old_owner_is_fenced_after_migration': that the
+%% *adapter-facing* entry point -- `guard_append/3', the persistent_term the
+%% queue installs -- enforces affinity by reading `proto_meta', not just the
+%% bare `authorize_append/2' epoch API; and that the no-epoch fallback
+%% (`owner_check') also fences a node that no longer owns the partition, which
+%% is the single-node / pre-cluster default path an adapter hits when it has
+%% nothing to stamp.
+a_stale_session_writer_is_fenced_by_the_guard_hook(Config) ->
+    Members = members(Config),
+    [N1, N2, N3] = Members,
+    ok = form_cluster(Config),
+    %% Partition 0 owned by N1 at epoch 1. Every node's cache now agrees.
+    {ok, 1} = rpc(N1, broker_cluster, assign, [0, N1, Members, 1]),
+    %% A publisher pinned to N1 stamps the epoch it saw (annotate_epoch/1).
+    Stamped1 = stamped(0, 1),
+    %% While N1 owns it, the guard lets the stamped write through.
+    ok = rpc(N1, broker_cluster, guard_append, [0, Stamped1, replicated_commit]),
+    %% ...and a message with no epoch falls back to the owner check, which N1
+    %% passes because it still owns the partition.
+    ok = rpc(N1, broker_cluster, guard_append, [0, unstamped(0), replicated_commit]),
+    %% Ownership moves N1 -> N2 (two phases), epoch ends at 3, active.
+    {ok, 2} = rpc(N1, broker_cluster, migrate, [0, N1, N2, 2]),
+    {ok, 3} = rpc(N1, broker_cluster, finish_migration, [0, 3]),
+    %% The connection is still pinned to N1 and still carries the epoch it saw
+    %% before the move (cluster_epoch => 1). The guard on N1 must refuse it --
+    %% a stale writer, fenced before an offset is consumed.
+    {error, {fenced, Fenced}} =
+        rpc(N1, broker_cluster, guard_append, [0, Stamped1, replicated_commit]),
+    0 = maps:get(partition, Fenced),
+    1 = maps:get(actual_epoch, Fenced),
+    3 = maps:get(expected_epoch, Fenced),
+    %% The no-epoch fallback also fences N1 now: it is not the owner any more.
+    {error, {fenced, _}} =
+        rpc(N1, broker_cluster, guard_append, [0, unstamped(0), replicated_commit]),
+    %% Even carrying the *current* epoch, N1 is refused -- it is not the owner;
+    %% epoch alone does not grant the write, ownership does.
+    {error, {fenced, _}} =
+        rpc(N1, broker_cluster, guard_append, [0, stamped(0, 3), replicated_commit]),
+    %% The new owner, N2, accepts its own stamped epoch.
+    ok = rpc(N2, broker_cluster, guard_append, [0, stamped(0, 3), replicated_commit]),
+    %% ...but a stale epoch against N2's current view is fenced too.
+    {error, {fenced, _}} =
+        rpc(N2, broker_cluster, guard_append, [0, stamped(0, 2), replicated_commit]),
+    _ = N3,
+    ok.
+
+%% A message as an adapter would hand it to the queue: partition + the epoch
+%% the access node stamped into `proto_meta'.
+stamped(Partition, Epoch) ->
+    #broker_message{partition_id = Partition,
+                   proto_meta = #{cluster_epoch => Epoch}}.
+
+%% A message with nothing to stamp (single-node / pre-cluster adapter).
+unstamped(Partition) ->
+    #broker_message{partition_id = Partition, proto_meta = #{}}.
 
 %%%_* Peers ---------------------------------------------------------------
 

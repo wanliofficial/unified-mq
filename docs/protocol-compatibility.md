@@ -2069,6 +2069,59 @@ ADR-031 §D7 把「与 libcoap 的分块往返」留给真实第三方证据裁�
 
 修复后实测（真实 libcoap，1000 B body，SZX 256/512/1024）：分块 PUT 后 GET **逐字节一致**。同时确认第三条是**已声明的限制而非缺陷**：服务端不做 Block2，libcoap 默认接收 PDU 1500 B，任何 >约 1.1 KB 的响应被客户端丢弃——2 KB payload 能写不能读（§4.24.4 已据此改写误导性的「65535 上限」措辞）。
 
+## 4.25 S12-C 追加（2026-11-19）：4 仓 `F-` 裁剪项逐行留痕（R-N8）
+
+需求稿 §3.3 的 R-N8 与 Gate S12 要求「4 仓全部裁剪项（各单仓稿 §2.5 的 `F-` 条目）在能力矩阵中逐行留痕」，与 S8/S10 对每个协议「每裁剪一项留一行」的做法同构（§4.11–§4.13、§4.23.5）。**本表 42 行覆盖 4 份单仓稿 `F-` 条目的全部**（`gen_server_cluster` 10 条、`tcpbalance` 12 条、`gen_lb` 10 条、`nkdist` 10 条），每条给出**事实**与 **S12 的处置**——处置只有三种：`禁止引入`、`不借鉴 / 不做`、`已按……覆盖`。
+
+**总口径**：4 仓**全部只作设计参考**，S12 不引入任何一仓的代码或依赖（净新增运行时依赖 0）；归属唯一真相仍是 ra 提交的 `owner/epoch`（ADR-032 D1），接入层仍是 ranch + 外部 LB（D3），再平衡器默认关闭且只搬元数据（D4/D5）。
+
+| # | 仓库 / F-id | 事实（单仓稿 §2.5 原文口径） | S12 的处置 |
+|---|---|---|---|
+| 1 | `gen_server_cluster` F-1 | 仓库名含 `tcp`，源码无一处 `gen_tcp` / listener，实为 `gen_server` 集群框架 | **不**把本仓列为 TCP 集群 / 负载均衡实现（R-N2）；S12 的接入层是 ranch 前端，不是本仓模型 |
+| 2 | `gen_server_cluster` F-2 | 所有客户端请求只发给 `{global, Name}` 主，备份不接客 | 只借鉴「主备」直觉；S12 的连接分摊靠外部 LB + 节点视图，不靠本仓 |
+| 3 | `gen_server_cluster` F-3 | 无 epoch / 无 quorum / 无 Fencing，`global:register_name` 竞争，选举自述「不确定」 | **禁止引入**（R-N1）；成员与归属唯一真相仍是 ra 提交的 `owner/epoch`（ADR-032 D1） |
+| 4 | `gen_server_cluster` F-4 | 状态更新靠 `cast` 广播闭包、无确认，闭包副作用在每个副本各执行一次 | S12 零借鉴：再平衡只搬 `(owner, epoch)` 元数据，不广播闭包、不复制状态（ADR-032 D5） |
+| 5 | `gen_server_cluster` F-5 | `code_change/3` 明确未实现 | 不声称热升级；S12 未引入本仓，`broker_cluster` 自身的 `code_change` 不受影响 |
+| 6 | `gen_server_cluster` F-6 | `random:uniform/1`（旧模块）、`lager` parse_transform | 禁止照搬；OTP 28.3.1 无 `random`，S12 未引入 |
+| 7 | `gen_server_cluster` F-7 | 依赖 `git://…lager.git` `branch master`，无固定 ref | 不可复现构建（ADR-003），**禁止引用**（R-N3）；S12 净新增运行时依赖 0 |
+| 8 | `gen_server_cluster` F-8 | `src/shandong.conf` 是无关 nginx 配置，`sup` 为空 | 证据判定为文章示例代码；不作为生产方案来源 |
+| 9 | `gen_server_cluster` F-9 | README 自承「不依赖位置的服务器才适用」 | 适用范围边界已写入本节：S12 的迁移只涉及元数据，不声称「任意有状态进程可迁移」 |
+| 10 | `gen_server_cluster` F-10 | 无持久化；自述依赖数据库恢复会让可靠性完全依赖数据库 | S12 的持久化仍是 WAL / `broker_storage`（ADR-011），不由本仓模型替代 |
+| 11 | `tcpbalance` F-1 | README 称「选最快空闲后端 / 感知多 CPU」，源码实为 first-fit + 手工 `maxconn` | 能力矩阵不写「最快 / 加权」（R-L4）；S12 的策略接口（R-LB2）不含隐藏打分 |
+| 12 | `tcpbalance` F-2 | 选择是**连接级一次性**的，无会话粘性概念 | **禁止照搬**为 Broker 前端；S12 的会话粘性由「连接生命周期钉在同一接入节点 + `proto_meta.cluster_epoch` 校验」保证（R-CL2，`broker_cluster_dist_SUITE` 新增用例） |
+| 13 | `tcpbalance` F-3 | 后端 `down` 是被动、永久的，无主动健康检查 / 自动恢复 | 项目已有 `/readyz` + `broker_drain`（S12-A）；S12 做**主动健康供给**，不做被动永久标记 |
+| 14 | `tcpbalance` F-4 | 全忙时 `wait_list` 无限排队 + 1s 超时清理；`get_be/1` 用 `infinity` 阻塞 | **不做内部排队**（ADR-032 D7）；超限一律显式拒绝（`broker_admission`，S12-B） |
+| 15 | `tcpbalance` F-5 | 任一端关闭即整体退出，不做半关闭；代理不解析协议 | 不能承载 MQTT session / WS 升级等有状态协议；S12 不做四层代理（ADR-032 D3） |
+| 16 | `tcpbalance` F-6 | 直接模式匹配 queue 内部 `{[], []}`，依赖 OTP 内部结构 | 禁止照搬；S12 未引入本仓代码 |
+| 17 | `tcpbalance` F-7 | `add_be` 校验自承可传 bogus record；`reset_host(up)` 用假 EXIT 消息 | 管理 API 已做严格校验与显式事件（R-LB8，S12-A `/api/v1/node`、`drain`、`undrain`），不用消息 hack |
+| 18 | `tcpbalance` F-8 | OTP R9B-0（2003）、`now()`、`error_logger`、`record/2` guard、`httpd/inets`、`.rel` 硬编码版本 | 与 OTP 28.3.1 不兼容，**禁止引入代码**，只借鉴状态机直觉 |
+| 19 | `tcpbalance` F-9 | `register(balance, self())` 单例，自承不能跑多实例 | 与多节点部署冲突；S12 的再平衡器**无进程**（ADR-032 D4），不存在单例注册 |
+| 20 | `tcpbalance` F-10 | `bal_sup` 的 `httpd` 子进程被注释，状态页实际可能不可用 | 不声称「自带 HTTP 运维界面」；S12 的运维面是 `broker_admin` 8090 |
+| 21 | `tcpbalance` F-11 | README 自承 bug：全部后端 `down` 时客户端连入、随后某后端置 `up` 会触发异常 | 需求须覆盖「无可用节点」与「节点恢复」竞态——已由 S12-B 的 `no_ready_node_is_refused_not_queued` 覆盖 |
+| 22 | `tcpbalance` F-12 | 2 Commits、2003 年代码、无测试套件 | 证据基线仅源码 + README；S12 全部结论由自建 CT 用例验证（`broker_lb_dispatch_dist_SUITE`、`broker_rebalance*_SUITE`） |
+| 23 | `gen_lb` F-1 | 分发的是 Erlang 消息 `{RemoteService, Node} ! …`，无 socket / listener / acceptor | **不当** TCP 连接分发方案（R-N3）；S12 的接入是 ranch listener |
+| 24 | `gen_lb` F-2 | `SelectNode` 是用户函数 + Context 可携带状态；内置仅 `round_robin/3` 且忽略 `Request` | **策略即函数**是有价值借鉴点；S12 的节点选择策略（R-LB2）按 ADR-032 D3 落在**外部 LB**，本仓只交付视图 |
+| 25 | `gen_lb` F-3 | 集群不可用时 `call` 排队、**`cast` 静默丢弃**（源码注释掉排队分支） | 降级语义必须显式，**禁止静默丢弃**（R-D1）；S12 无可用节点时同步拒绝而非排队 |
+| 26 | `gen_lb` F-4 | `verify_membership_loop` 退避 `2500 * 2^N` 无上限，`Times` 未使用 | 须有退避上限与最大重试（R-D4）；S12 的节点视图取自 ra，不做无上限验证循环 |
+| 27 | `gen_lb` F-5 | `random:uniform/1`、`now()`、`dict`、`sets`、`error_logger` 等旧/已移除 API | 与 OTP 28.3.1 不兼容，**禁止引入代码**（R-N1） |
+| 28 | `gen_lb` F-6 | `query_cluster` 依赖种子节点上名为 `admin` 的注册进程，本仓未提供 | 机制不完整；S12 的成员来自 `broker_cluster_meta`（启动配置），已如实留痕其限制 |
+| 29 | `gen_lb` F-7 | `meck` 依赖为 git `"master"` 字符串，无固定 ref | 不可复现构建（ADR-003）；**禁止引入**（R-N1） |
+| 30 | `gen_lb` F-8 | `.app.src` 描述写 "scylla instances"，仓库页写 "Erlang nodes" | 证据不一致，能力矩阵按源码行为描述，不按仓库描述 |
+| 31 | `gen_lb` F-9 | 无共识 / 无 epoch / 无 Fencing；`nodedown` 即从集合删除 | 与 ADR-021 冲突；**不得作为成员真相**（R-S4），S12 的成员/归属只来自 ra |
+| 32 | `gen_lb` F-10 | 空监督树、无可见测试源文件清单 | 证据基线限于 `gen_lb.erl` 与元数据；不作为实现来源 |
+| 33 | `nkdist` F-1 | 强依赖 `riak_core` + `nklib`（app.src + 十余处模块引用） | **禁止引入**（R-N1）：第二套共识 / ring 会破坏 ADR-021；S12 净新增运行时依赖 0 |
+| 34 | `nkdist` F-2 | **最终一致**系统，`join/2` 事后调和分裂状态 | 与 epoch Fencing + 多数派写入冲突；只借鉴语义不借鉴模型（R-N2） |
+| 35 | `nkdist` F-3 | 节点失败即丢该节点上全部进程状态，须外部持久化 | S12 **不迁移活进程**（ADR-032 D5），故本仓的「状态必丢」风险不进入 S12 的承诺；持久化仍是 WAL / `broker_storage` |
+| 36 | `nkdist` F-4 | `get_apl(DocIdx, 1, ?APP)` 只取 1 个 vnode，无副本 preference list | 无副本冗余，与 ADR-021 `replicas` / quorum ACK 不同；S12 沿用 ra 的副本模型 |
+| 37 | `nkdist` F-5 | `find_proc/2` 本地 ETS 缓存，miss 才走 vnode | 可借鉴「缓存归属映射」；S12 已用 `broker_cluster_cache` 镜像 + ra apply 对账（R-CL3），缓存不是第二份真相 |
+| 38 | `nkdist` F-6 | `start_and_join/2` 要求旧进程仍在运行、`join/2` 合并双份状态 | 是可迁移有状态进程的清晰契约（R-M1），但 **S12 不交付**（R-RB5 标「不交付」，ADR-032 D5） |
+| 39 | `nkdist` F-7 | README 写 `{nkcluster, …}`、源码注释写 `{nkdist_master, …}`，master 消息名不一致 | 证据不一致，能力矩阵按行为描述；S12 未引入 |
+| 40 | `nkdist` F-8 | `{vsn, "master"}` 无固定发布版本；handoff 编码用 `zlib:zip(term_to_binary(…))` | 版本基线须冻结；handoff 版本号（R-RB6 / R-M5）随活进程迁移一并 **S12 不交付**（ADR-032 D5） |
+| 41 | `nkdist` F-9 | 无 TCP / listener / 连接分发，是进程分布库 | **不得**列为 TCP 连接 LB 实现（R-N3） |
+| 42 | `nkdist` F-10 | `nkdist_admin.erl` 24 KB 管理模块、`nkdist_coverage` 10 s 超时查询 | 管理面体量大；S12 的运维面收敛在 `broker_admin` 8090，不引入第二套管理面 |
+
+**交叉引用**：本表与 §2 能力矩阵的 S12 相关行（节点视图 / 准入闸门 / LB 分发）互补——§2 描述「交付了什么」，本表描述「明确没做什么、以及为什么」。`docs/design/s12-infrastructure-ha-and-lb.md` §3.2 的 R-N1~R-N8 与 §4.5「明确不做」是同一份裁剪边界的需求侧表述，本表是其在交付侧的逐行落地。
+
 ---
 
 ## 5. 冻结契约一致性（T17 签认，2026-11-06）

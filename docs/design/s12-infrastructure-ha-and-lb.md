@@ -225,7 +225,7 @@ S12 承接 S11（S9/S10/S11 均在交付或规划中，S12 **不阻塞**它们�
 - [ ] 连接上限 / 排队上限 / 超时拒绝 / 全不可用与恢复竞态有专项用例
 - [ ] 有状态服务的状态持久化与崩溃恢复有测试证明，并绑定 ADR-007 显式可靠性等级
 - [ ] 外部 LB 或等价模拟器的真实分发证据落盘 `test/protocol-compatibility/`；能力矩阵与限制清单齐全
-- [ ] §4.5 非目标与各单仓稿的 F- 裁剪项在能力矩阵中逐行留痕
+- [x] §4.5 非目标与各单仓稿的 F- 裁剪项在能力矩阵中逐行留痕 —— `docs/protocol-compatibility.md` §4.25 表 42 行
 - [ ] 既有 `rebar3 ct` 零回归（基线以当次 `rebar3 ct` 为准）；dialyzer / xref 干净；`rebar3 release` 装配成功
 - [ ] 压测 / 容量 / 迁移耗时报告落盘，数字全部来自实测
 - [ ] S12 ADR 定稿；roadmap / architecture / operations / security / README / progress / protocol-compatibility 同步
