@@ -285,8 +285,7 @@ handle_api(Destination, Payload, Reply, St) ->
         [<<"$JS">>, <<"API">>, <<"STREAM">>, <<"INFO">>, Name] ->
             case stream_info_json(Name, St) of
                 {ok, Json} -> reply_json(Reply, Json, St), St;
-                {error, not_found} -> reply_stream_not_found(Reply, St), St;
-                {error, Code, Desc} -> reply_error(Reply, Code, err_code0(Code), Desc, St), St
+                {error, not_found} -> reply_stream_not_found(Reply, St), St
             end;
         [<<"$JS">>, <<"API">>, <<"STREAM">>, <<"DELETE">>, Name] ->
             api_stream_delete(Name, Reply, St);
@@ -300,8 +299,7 @@ handle_api(Destination, Payload, Reply, St) ->
         [<<"$JS">>, <<"API">>, <<"CONSUMER">>, <<"INFO">>, Stream, CName] ->
             case consumer_info_json(Stream, CName, St) of
                 {ok, Json} -> reply_json(Reply, Json, St), St;
-                {error, not_found} -> reply_consumer_not_found(Reply, St), St;
-                {error, Code, Desc} -> reply_error(Reply, Code, err_code0(Code), Desc, St), St
+                {error, not_found} -> reply_consumer_not_found(Reply, St), St
             end;
         [<<"$JS">>, <<"API">>, <<"CONSUMER">>, <<"DELETE">>, Stream, CName] ->
             api_consumer_delete(Stream, CName, Reply, St);
@@ -948,10 +946,6 @@ ack_tokens(Destination) ->
 
 subject_to_destination(Subject) ->
     binary:replace(Subject, <<".">>, <<"/">>, [global]).
-
-err_code0(not_found) -> 404;
-err_code0(Code) when is_integer(Code) -> Code;
-err_code0(_) -> 500.
 
 to_binary(B) when is_binary(B) -> B;
 to_binary(A) when is_atom(A) -> atom_to_binary(A, utf8);
