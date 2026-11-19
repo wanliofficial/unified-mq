@@ -70,8 +70,9 @@
 | ADR | 主题 | 关键依据 |
 |---|---|---|
 | [032](032-s12-node-view-drain-and-rebalance-boundary.md) | S12 节点视图真相 / drain / 再平衡边界：**ra 为唯一真相**（Mnesia `cluster_node`/`partition_meta` 退役为遗留视图）、节点自身 `up\|draining\|down` **存本地不进 ra**（失去多数派仍可 drain）、**外部 LB + 8090 供契约**不做四层代理/DNS-SD/客户端路由、再平衡器在 `broker_cluster` 内**默认关闭**且目标函数只含分区数（滞后+冷却双门限、一次一轮）、**只迁移分区归属不迁移活进程**、不引入一致性哈希且不改 `phash2` 编号、写可用性矩阵绑定 ADR-007 三档、不内部排队、指标不扩容只修 `connections_current` 记账、ADR-021 两项遗留不并入、**跨节点投递不在 S12 范围（单列 S12-D）** | 收敛报告 §1 的 9 条负向发现（`broker_meta:reconcile/0` 不存在、两份平行元数据、`/readyz` 查 loaded 非 started、跨节点投递不存在、无 drain/无节点级容量闸门/无节点视图）；ADR-001/002/007/008/010/011/013/015/016/019/021 |
+| [033](033-online-cluster-membership-change.md) | S12-D 前置·成员在线变更：**接线既有 `ra:add_member`/`remove_member`**（不新增共识/app/端口）、**admin 驱动显式 `join`/`leave` 同步 API 落在 8090 管理面**、再平衡成员取值点从启动配置改为 **`ra:members({local,_})`** 实时视图（落实 ADR-032 那条 TODO）、可用性绑定 ADR-007 三档且「join 成功 ≠ 新成员可用」（被公告成员抬高 quorum）、数据面两步（元数据变更 → 建分区 → `/readyz`+`/api/v1/node` 如实 not-ready 直到就绪）、**不做自动扩缩容/故障剔除**、不改分区数 G/`phash2`、不引入第二套共识 | vendored `ra.erl:582-635` 已提供 `add_member`/`remove_member`；`broker_cluster_meta` 0 处调用（接线缺口非共识缺陷）；ADR-032「成员集取自启动配置」TODO + 「单节点无法加入运行中的组」实测；ADR-007/010/011/019/021/032 |
 
-> S12 决策只冻结边界与形状，**不写代码、不开端口、不新增 app / 依赖**；S12-A/B/C 均未开工（roadmap §14）。跨节点投递（S12-D）需新增 ADR，不在本轮范围。
+> S12 决策只冻结边界与形状，**不写代码、不开端口、不新增 app / 依赖**；S12-A/B/C 均已交付（roadmap §14）。跨节点投递（S12-D）本体需新增 ADR、另见 [`s12d-cross-node-delivery-convergence.md`](../design/s12d-cross-node-delivery-convergence.md)，ADR-033 只交付其前置「成员在线变更」。
 
 ## Gate S0 验收清单（roadmap §2）
 

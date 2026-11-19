@@ -523,9 +523,9 @@ S7 有两项交付：
 | S12-B 连接容量与选择策略 | 🟡 **部分交付（2026-11-18）**：连接计数记账已修 + 准入闸门已实现并接入全部 12 个前端 | 已完成：① `connections_current` / `connections_peak` 记账修复（9 个前端接入共享辅助 `connection_opened/0` + `connection_closed/1`，**键集不变**）；② 节点级准入闸门的 **spike 结论**（`docs/design/s12b-admission-gate-spike.md`：落点 conn/FSM 层而非 listener 层、独立原子计数不复用 gauge、承载于 `broker_security` 纯函数模块、顺带发现 drain 对 QUIC/CoAP 是空操作这处既有缺口）；③ 闸门的**实现与接入**（`broker_admission`：`persistent_term` + `atomics` + ETS 台账，无进程、无 supervisor 子项；预算读 `broker_security.limits.max_connections`，默认 `infinity`；**12 个前端全部接上**，QUIC 经 `adopt/1` 换主）；④ 逐协议的**能力矩阵**（§9：拒绝帧与对端可观测性等级）；⑤ **连接分发证据**（`broker_lb_dispatch_dist_SUITE` 4 例：2 peer 真实 MQTT、等价分发器只按真实 `/api/v1/node` 的 `ready` 轮转，drain 后不再分到该节点但已建连接继续服务，undrain 复位，无 `ready` 节点时同步拒绝而非排队即 R-LB6；两条反证精确命中）；S12-B 至此收口（R-LB2 的「策略」与 R-LB6 的「行为」按 D3/D7 落在外部 LB，ADR 偏差节已写明） | 已完成的证据：`broker_admission_SUITE` 14 例（并发不超发 / 死持有者名额回收 / 活持有者不被回收 / lease 换主 / drain 优先 / `infinity` 不计）+ 9 个前端各一条负控用例（第二条连接必须拿到**可观测的拒绝帧**）与一条正控（释放后可再进），**全量 1436/1436、89 套件**（含新的 LB 分发证据 4 例），dialyzer 0 warning；三条反证均精确命中（`reserve/2` 换成读-判-sleep-写 → 仅并发不超发挂；清扫恒返回 0 → 仅两条清扫用例挂） |
 
 | S12-C 自动再平衡与迁移 | ✅ **已交付（2026-11-19）** | 再平衡触发者 `broker_rebalance`（无进程、默认关闭、按 owner 计数、hysteresis + cooldown 双门限、一轮一移、孤儿回收）+ ADR-021 两阶段迁移 + 只读视图 `partition_view/0`；**R-RB5 / R-RB6 按 ADR-032 D5 标「S12 不交付」**（不迁移活进程，故无三态契约与 handoff 版本号） | `broker_rebalance_SUITE`（单节点 10 例：默认关闭、双门限、一轮一移、孤儿回收、两阶段收尾）+ `broker_rebalance_dist_SUITE`（真实 3 peer 5 例：跨节点一致提交、`migrating` 期间源仍可读后被 fence、孤儿回收、失多数派 `{error, no_quorum}`、反复 step 收敛）；四条反证精确命中；既有零回归 |
-| S12-D 跨节点消息投递（一个逻辑 Broker） | 🟡 **立项调查已交付（2026-11-19），未开工** | 收敛调查报告 [`design/s12d-cross-node-delivery-convergence.md`](design/s12d-cross-node-delivery-convergence.md)：代码级钉死「跨节点投递不存在」缺四件（写入路由 / 订阅者节点索引 / 跨节点扇出+全局游标 / 迁移在途一致性），列 A~E 五条互斥路子与各自撞上的冻结契约（ADR-010 Router 不持有消费者状态、ADR-019 消费者本地 ETS、ADR-021 只承载元数据、ADR-011/007 可靠性三档）。**裁决留给新增的 S12-D ADR**，本文不预设 | 纯文档，无代码；待产品裁决「G2 终态是逻辑 Broker 还是分区 sharding」后再决定是否开工 + 立 ADR |
+| S12-D 跨节点消息投递（一个逻辑 Broker） | 🟡 **前置已交付（ADR-033，2026-11-19），本体未开工** | **前置·成员在线变更**：ADR-033 接线既有 `ra:add_member`/`remove_member`，admin 驱动显式 `join`/`leave`、成员取值点改实时 ra 视图（落实 ADR-032 那条 TODO）、可用性绑定 ADR-007 三档、数据面两步（元数据变更 → 建分区 → `/readyz` 如实 not-ready）；**本体·跨节点投递**收敛调查 [`design/s12d-cross-node-delivery-convergence.md`](design/s12d-cross-node-delivery-convergence.md) 已交付（缺四件 + A~E 路子 + ADR-010/019 冻结冲突），裁决留给 S12-D 本体 ADR | 纯文档（ADR-033 + 收敛调查），无代码；待立 S12-D 本体 ADR 后再开工实现 |
 
-> 子阶段命名与粒度是**建议**；实际以 S12-0 评审后冻结的 ADR 为准（同 S8 / S9 / S10 / S11 设计稿的落地偏差处理方式）。
+> 子阶段命名与粒度是**建议**；实际以 S12-0 评审后冻结的 ADR 为准（同 S8 / S9 / S10 / S11 设计稿的落地偏差处理方式）。S12-D 拆为「前置·成员在线变更（ADR-033）」与「本体·跨节点投递」两步，因前者是后者的必要前提且复杂度量级不同。
 
 ### 14.2 Gate S12（与需求文档 §5.3 同一份清单）
 
@@ -631,7 +631,8 @@ S7 有两项交付：
 | `docs/design/s12-infra-gen-lb.md` | S12（源码级立项稿；`gen_lb` 可插拔策略接口，P1 借鉴） | 5.3、6 |
 | `docs/design/s12-infra-nkdist.md` | S12（源码级立项稿；`nkdist` handoff 自动再平衡，**P0 重点架构参考**，命中 ADR-021 缺口） | 5.3、6、11.3 |
 | `docs/design/s12-0-convergence-report.md` | S12-0（收敛报告，2026-11-17；OQ-1~OQ-10 收敛 → ADR-032，D9 裁决 S12 不含跨节点投递、单列 S12-D） | 11.3 |
-| `docs/design/s12d-cross-node-delivery-convergence.md` | S12-D（立项 / 收敛调查，2026-11-19；跨节点投递缺四件 + A~E 路子 + ADR-010/019 冻结冲突，裁决留给 S12-D ADR） | 11.3 |
+| `docs/design/s12d-cross-node-delivery-convergence.md` | S12-D（立项 / 收敛调查，2026-11-19；跨节点投递缺四件 + A~E 路子 + ADR-010/019 冻结冲突，裁决留给 S12-D 本体 ADR） | 11.3 |
+| `docs/adr/033-online-cluster-membership-change.md` | S12-D 前置·成员在线变更（2026-11-19，已采纳；接线 `ra:add_member`/`remove_member`、admin 驱动 `join`/`leave`、成员取值改实时 ra 视图、可用性绑 ADR-007、数据面两步） | 11.3、14.1 |
 | `docs/cloudevents-mapping.md` | S3 | 3、4 |
 | `docs/protocol-compatibility.md` | S1 起持续更新 | 11.1 |
 | `docs/protocol-conformance-validation.md` | S6 之后（2026-11-10 起草；外部 conformance 资源接入规划，S8 三协议不在范围） | 11.1、11.2 |
