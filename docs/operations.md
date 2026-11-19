@@ -854,6 +854,49 @@ broker_rebalance:finish_pending().
 **搬迁有多快**：一次完整搬迁（`migrate` + `finish_migration`）在同主机 3 peer 下 p50 约 **2 ms**、p99 约 **4 ms**，决策 `evaluate/0` 约 0.2 ms——成本几乎全在 raft 多数派提交，不在搬迁逻辑。迁移期间源仍可读、旧 epoch 被 fence、不搬数据不搬连接，**对业务延迟贡献为零**。数字与方法见 [`docs/benchmarks/2026-11-19-s12c-rebalance.md`](benchmarks/2026-11-19-s12c-rebalance.md)（同主机下界，跨机需另测）。
 - 不感知**动态成员变更**。成员集取自节点启动时的 `broker_cluster.members`（本仓今天没有 `ra:add_member` 的调用路径）。改成员配置后请**重启该节点**，否则触发者仍在按旧成员集判断，会把新节点的分区当孤儿、把分区搬给已移除的节点（后者只会反复返回错误，不会损坏数据）。临时绕过：用 `broker_rebalance:evaluate/1` / `step/1` 显式传入成员列表。
 
+## 5.4 跨节点投递（`cross_node_delivery`，S12-D / ADR-034）
+
+**默认关闭，没有新进程、新端口、新应用。**关着的时候路由钩子根本不安装（`{broker_queue, router}` / `{broker_subscription, owner}` / `{broker_subscription, qos0_fanout}` 都不存在），`broker_queue` / `broker_subscription` 的每条路径与 S1~S4 **逐字节相同**——非 owner 的 append 仍被 fencing guard 拒成 `{error, {fenced, _}}`。这是 ADR-034 D8 的裁决，也是它敢默认关的前提。
+
+```erlang
+%% 打开（默认两者分别是 false / 2000）
+{broker_cluster, [{cross_node_delivery, true},
+                  {cross_node_timeout_ms, 2000}]}  %% 一次转发的 rpc 预算
+```
+
+钩子在 `broker_cluster` 应用启动时装（`install_hooks/0`），**改配置要重启该节点**。运行期临时切换可用 `broker_cluster:reinstall_hooks(true | false)`（它会先卸干净再装，避免残留旧 router）——这是运维/测试辅助函数，不是热配置。
+
+**它做什么**：一个分区**只有 owner 的一份权威日志**。非 owner 节点上的 publish 被转发到 owner 写，非 owner 节点上的订阅从 owner 拉——所以**全仓仍然只有一份日志，没有本地双写**（ADR-034 D2）。转发到的调用走 `forwarded/3`，owner 上的 guard 照样执行，因此「路由视图滞后」不会写出一个 fencing 层本来会拒绝的记录。QoS0 例外：它不进日志，改为 `rpc:cast` 广播给成员、每个成员按**自己的**索引重路由（D4），是 L1 尽力而为——不可达的成员静默丢弃、不重试、不落盘、发布方不阻塞。
+
+**开之前必须满足的前提**（ADR-034 D7，代码会拒）：
+
+1. `replicated_commit` 已启用（`broker_cluster_rep` 的复制路径在）；
+2. 每个**可能成为 owner** 的节点都已持有该分区的副本。
+
+不满足时 `assign` / `migrate` 在进日志前就被拒：`{error, {cross_node_delivery_requires_replica, Partition, Target}}`。原因是 S12-D 不做字节 handoff（ADR-032 D5 不迁移活进程/队列内容），owner 换到一个没有副本的节点就等于丢历史。
+
+**报错速查**（都应当**不 ACK**，让客户端重试或换节点）：
+
+| 返回 | 含义 / 处置 |
+|---|---|
+| `{error, {cross_node_unreachable, Node, Reason}}` | 转发时 owner 不可达（`Reason` 是 `badrpc` 的原因）。发布方**没有**在本地写任何记录，可以安全重试。先查 owner 是否活着、`epmd`/分布端口是否通 |
+| `{error, {not_owner, Owner}}` | 你的路由视图和对方不一致：调用被转发到的节点已不是 owner。会累加 `cluster_fencing_rejected`。等 `broker_cluster_cache` 追上元数据后重试；持续出现说明成员/元数据视图滞后，查 `GET /api/v1/node` 与 `broker_cluster:partition_view/0` |
+| `{error, {fenced, #{...}}}` | 写入携带的 epoch 或本节点归属已过期（`expected_epoch` / `actual_epoch` / `owner` 都在里面）。同属正常拒绝，不丢数据 |
+| `{error, {cross_node_shared_unsupported, Partition}}` | 跨节点 **shared** 订阅被拒（ADR-034 D5）：`claim/4` 在每节点独立分发 offset，跨节点会**静默重复投递**。把该 shared 组消费者放到 owner 所在节点，或改用 exclusive/failover（这两类跨节点是正确的） |
+
+`committed` 在这种模式下是**各节点候选游标的最小值**（D6）：只要还有任一节点的消费者没读过去，owner 就不会 GC 那段。**只有显式离开的节点会退出聚合**——对它调 `broker_cluster:leave/1`（ADR-033 的成员变更路径）会清掉它在这个节点上的候选条目；**仅仅是不可达的节点会保留最后一次上报的值**，它只能把 floor 压住（保守：绝不抬高，因此绝不会提前删数据），但不能自行释放。所以硬故障节点想释放 GC 必须补一次 `leave`，否则那个分区的 committed 会停在它最后的位置——**这是「不丢数据」换来的空间占用，不是缺陷**；需要空间时按本文件 §5.3 的节点下线流程显式摘除。
+
+**有多快**：同主机 2 peer 下，跨节点 append p50 ≈ **3.0 ms**（本地 append 的 2.0 ms 落盘 + 约 1 ms 转发），跨节点 read p50 ≈ **1.4 ms**，QoS0 dispatch 发布方侧 ≈ **0.3 ms**。转发的 1 ms 是常数级路径开销，**写放大量不变**（只写 owner 一份）。数字与方法见 [`docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`](benchmarks/2026-11-19-s12d-cross-node-delivery.md)（同主机下界，跨机需另测）。
+
+**边界（别指望它）**：
+
+- **不保证跨节点 exactly-once**。QoS0 广播是尽力而为；跨节点重试语义仍由各协议的 QoS 决定，本仓不新增去重层。
+- **不交付跨节点 shared 组**。见上表最后一行，是显式拒绝，不是静默降级。
+- **owner 是读热点**。所有读汇聚到 owner，单次读便宜（~1.4 ms）但会随订阅者数量线性叠加——容量规划按 owner 侧 QPS 算，不要按「分摊到 N 节点」算。
+- **不搬活进程、不搬队列内容、不搬连接**。与 §5.3 同一限制（ADR-032 D5）。
+- **只有同主机证据**。跨机 / 跨 AZ 时转发 RPC 的 RTT 会成为主导项，本仓无跨机集群实测，不要把上面的毫秒数外推。
+- **关闭时不追求「灰度混跑」**。开关是节点级的，同一分区在「开」和「关」的节点之间会发生视图不一致的拒绝（`{not_owner, _}` / `{fenced, _}`），不会损坏数据，但会在滚动切换期间产生可见错误率。要开请**全组一起开**（滚动重启的窗口里如实计入错误率），不要长期半开半关。
+
 ---
 
 ## 6. 滚动升级与版本兼容

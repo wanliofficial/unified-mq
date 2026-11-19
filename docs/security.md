@@ -405,3 +405,12 @@ S11-C 交付了 CoAP over DTLS 1.2（PSK-only）：真实 PSK 客户端握手、
 7. **诚实的边界：密码与 PSK 不落日志，但没有专门的 PSK 审计事件**：`redacted_config/0` 不暴露口令/PSK；`broker_security:credential_capable/0` 含 `<<"coaps">>` 使安全审计面能识别「该协议可带凭据」。但**没有**「某身份在某时刻从某地址用 PSK 建了会话」的专用审计日志——运维只能靠 listener 进程状态与 `broker_metrics` 既有键（`bytes_in`/`frame_decode_errors`/`protocol_errors`，ADR-016 冻结键集，**未扩容**）间接推断。
 8. **诱饵密钥是缓解而非消除**：未知身份回诱饵 PSK（而非 alert）消除了「时延/错误形态可区分」这一枚举 oracle，使未知用户与错口令在客户端看来一致。但**这不是**恒定时间保证——派生本身是 SHA-256（快），真正的握手失败仍发生在 Finished 校验；对能观测网络层重传模式的主动攻击者，理论上仍有细微信号。这一条的定位是「把明显的 oracle 关掉」，不是「证明不可枚举」。
 9. **DTLS 只在 `coaps` listener 上；明文 listener 不会升级**：同进程可以同时有 `transport => udp` 与 `transport => dtls` 的 listener，但明文 listener 的 datagram 永远不带身份。**没有**「明文进来、按源地址升级到 DTLS」的机制，也**没有**自动重定向（HTTP 式的 301 到 coaps）——客户端必须自己选 `coaps`。
+
+### 12.7 S12-D 跨节点投递的安全边界（2026-11-19 立）
+
+S12-D（ADR-034）多加了一类**节点间**调用：非 owner 上的 publish/read/subscribe 经 `rpc:call` 交给 owner。它**不改变任何协议侧的身份/ACL 语义**（判定仍在前端、转发不携带也不提升 `principal`/`tenant`），但确实扩大了一条**既有**的信任面，因此单独留痕：
+
+1. **节点间 RPC 没有应用层鉴权，信任边界是 Erlang distribution。**任何能连上 distribution 的节点都可以调 `broker_queue:forwarded/3`、`broker_subscription:dispatch_qos0/1` 等导出函数；`forwarded/3` 里的 `'$broker_queue_forwarded'` 标志**只防转发回环**（两个节点缓存不一致时无限转发），不是权限位。开启 `cross_node_delivery` 前请确认 distribution 端口只在受信网络/防火墙内可达；跨节点/复制通道 TLS 仍是 §12 第 1 条（未实现），对它同样适用。关闭开关时这些钩子根本不安装，减少一个可调用面。
+2. **owner 不做第二次 ACL 判定，这是与单节点一致的既有分工。**`broker_queue` / `broker_subscription` 从来不做授权，授权在协议前端（§4）。转发调用因此不是「绕过 owner 的鉴权」——owner 本来就没有鉴权层；它也不是「借 owner 的身份」，因为 `rpc` 调用不传身份，消息里的 `tenant`/`principal` 仍是发布方前端写入的原值。要收紧这个模型就得让转发带上调用者身份并由 owner 复核，那是另一个 ADR 的事，不在 S12-D。
+3. **跨节点 shared 组拒绝是正确性边界，不是安全控制**（ADR-034 D5）：拒绝的理由是 `claim/4` 在每节点独立发号会重复投递，不是「shared 不安全」。exclusive / failover 跨节点是可用的。
+4. **异常探测靠指标而不是日志**：路由视图滞后/陈旧写入被拒时累加 `cluster_fencing_rejected`（键集 S4 就有，S12-D 未新增键）。这个计数在正常迁移窗口也会涨，**不能**单独当成入侵信号；持续高位应查成员视图与 `broker_cluster_cache` 是否停更。

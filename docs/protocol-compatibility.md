@@ -2124,6 +2124,31 @@ ADR-031 §D7 把「与 libcoap 的分块往返」留给真实第三方证据裁�
 
 ---
 
+## 4.26 S12-D 追加（2026-11-19）：跨节点投递对协议面的影响（ADR-034）
+
+ADR-034 的跨节点投递是**节点间的路由选择**，不是新的协议能力：`cross_node_delivery = false`（默认）时数据面与单节点逐字节相同；开启后，非 owner 节点上的 publish/read 被转发到 owner，**线上帧格式、QoS 握手、ACK/NACK 语义都不变**。对逐协议兼容性只有一处可见差异：
+
+### 4.26.1 唯一可见变化：跨节点 `shared` 订阅被拒（ADR-034 D5）
+
+`shared` 语义（多个消费者分摊同一个 offset 流）在 `broker_subscription:claim/4` 里由**节点本地 ETS 发号**。跨节点时两节点各自发号会**静默重复投递**同一 offset，且没有协议层能发现——所以开启跨节点投递后，**非 owner 节点上的 shared 订阅被显式拒绝**，各协议把自己的失败码映射出去：
+
+| 协议 | 触发面 | 客户端看到 |
+|---|---|---|
+| MQTT 3.1.1 / 5.0 | `$share/<group>/<filter>` SUBSCRIBE 落在非 owner 分区 | SUBACK 失败码 `0x80`（v5 是 reason code，3.1.1 是 failure）；连接保持 |
+| NATS | queue group（`SUB <subject> <queue>`）落在非 owner | `-ERR '{cross_node_shared_unsupported,Partition}'`，随后关闭连接（NATS 错误语义） |
+| AMQP 0-9-1 | `basic.consume` 到非 owner 队列 | channel error `406 PRECONDITION_FAILED`，text 为 `{cross_node_shared_unsupported,Partition}`；channel 被关闭，connection 仍在（queue 本身仍可声明/查询） |
+| 其余前端 | 不使用 `shared` 分发（Kafka/Pulsar 的 group offset 在各自 `kafka_group`/`pulsar_subscriptions`；CoAP/A2A/MCP/ACP/WebRTC 无此模型） | 不受影响 |
+
+**处置**：把该 shared 组的消费者放到 owner 所在节点，或改用 exclusive/failover（这两类跨节点是正确的：一个读者、游标本地）。这是 v1 的**显式边界**，不是降级成「静默允许然后重复投递」——后者才是兼容性事故。
+
+### 4.26.2 不受影响、也不承诺的面
+
+- **不改任何协议的 QoS 承诺**：QoS1/2 的 ACK 仍代表 owner 的 WAL 已持久化（`replicated_commit` 下仍是多数派）——转发失败时**不 ACK**，与单节点「写失败不 ACK」是同一条规则。
+- **QoS0 跨节点广播是尽力而为**：`rpc:cast` 不可达即丢弃、不重试、两端 WAL 都不增长。也就是说**跨节点不承诺 exactly-once**，QoS0 的「至多一次」语义不变。
+- **不新增线上能力**：没有新报文、新属性、新 capability 广告；`shared_subscription_available` 等既有能力位不因这个开关变化（是否可共享取决于订阅落在哪个节点，是部署事实，不是 broker 能力）。
+
+---
+
 ## 5. 冻结契约一致性（T17 签认，2026-11-06）
 
 > 本节是 **Gate S1 的签认记录**，不是 S5 的兼容性结论。它回答一个问题：上表 MQTT 行的语义边界，是否真的由三份冻结 ADR 决定，而不是由实现细节偶然决定。复核对象是 T2~T15 的最终代码（commit `a8608d9` 前的实现状态，文档改动不触及代码）。

@@ -194,3 +194,12 @@ dist 套件 `broker_cluster_cross_node_dist_SUITE`（2 peer，每 peer `port => 
   - **fencing 纵深**：非 owner 转发到「cache 已非 owner」的节点时，该节点 `route_op/3` 因进程字典 `'$broker_queue_forwarded'` 置位而回 `{error, {not_owner, Owner}}` 并计 `cluster_fencing_rejected`，不静默本地写。
   - **默认关闭零回归**：`cross_node_delivery = false` 时三个钩子（`append_router` / `read_router` 经 `route_op` / `qos0_fanout`）均不安装（D4 的 `qos0_fanout` 同样随开关缺省）；`broker_queue` / `broker_subscription` 全路径与实现前逐字相同。全量 `rebar3 ct` **1469/1469**（实现前基线 1460，ADR-034 D2/D3/D5/D6/D8 +8 例，D4 +1 例）；dialyzer 0 warning；xref 仅既有 unused-export 告警。
   - **`forwarded/3` 的参数不重名**：`forwarded_op/7` 对每个 Op 自行解构参数，避免 `append` 的 `[Msg, Mode]` 与 `read_from` 的 `[From, Limit]` 在同一子句里模式冲突。
+
+### S12-D 定稿说明（2026-11-19）
+
+ADR-034 于 2026-11-19 评审签认（四项待签认问题全部签认，见「已签认的四个问题」），裁决正文冻结。本说明是定稿批注，**冻结正文 D1~D9 一字未改**。落地状态：
+
+- **代码**：D2/D3/D4/D5/D6/D8 全部落地（默认关闭），提交链 `ff37a78`（D2/D3/D5/D6/D8）→ `84580f0`（D4）。新增 `broker_router:route/2` facade、`broker_subscription:dispatch_local/2` + `dispatch_qos0/1`、`broker_cluster` 的 `route_op/3` + `qos0_fanout/1` + `cluster_members/0` 与三个钩子的安装/卸载。未新增 app / 端口 / 依赖，`broker_metrics` 键集不变，`broker_security` 语义不变。
+- **验证**：dist 套件 `broker_cluster_cross_node_dist_SUITE` 共 10 例（语义 7 + 负载 2 + 容量 1），全量 `rebar3 ct` **1472/1472**、dialyzer 0 warning、xref 仅既有 unused-export、`rebar3 release` 装配成功。容量/延迟实测见 [`docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`](../benchmarks/2026-11-19-s12d-cross-node-delivery.md)（同主机下界：跨节点写 = 本地落盘 2 ms + 转发 1 ms）。
+- **文档同步**：`docs/adr/README.md`（S12-D 本体升「已接受」）、`docs/roadmap.md`（§S12 行 + Gate S12 状态口径）、`docs/design/s12d-cross-node-delivery-convergence.md` §6（前向指针改为指向已接受 ADR）、`README.md`（状态行补 S12-D 段）、`progress.md`、`docs/operations.md`（§5.4 跨节点投递运维）、`docs/architecture.md`（§9 延期表补 S12-D 行 + app/env 表）同步到 S12-D 收口状态。
+- **边界（与 ADR-032 D5 一致）**：S12-D 不迁移活进程；有状态服务的持久化绑定 ADR-007 三档的专项压测、以及活进程/队列内容的跨节点 handoff，均不在本期范围（roadmap Gate S12 相应项如实标未勾选）。
