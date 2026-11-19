@@ -30,6 +30,9 @@ all() ->
      drain_timeout_advances_state_to_down,
      redrain_replaces_the_earlier_grace_period,
      drain_rejects_a_malformed_body,
+     cluster_members_rejects_wrong_method,
+     cluster_members_validates_the_request,
+     cluster_members_without_cluster_app_returns_503,
      node_view_reports_state_and_connections,
      insecure_bind_with_empty_token_refuses_to_start].
 
@@ -475,6 +478,54 @@ drain_rejects_a_malformed_body(Config) ->
     after
         restore_state()
     end.
+
+%%%_* Online cluster membership change (ADR-033 D2) ----------------------
+
+%% The endpoint is token-protected like every other `/api/' route, so a GET is
+%% a method mismatch (405), not a bypass.
+cluster_members_rejects_wrong_method(Config) ->
+    {405, #{<<"error">> := <<"method_not_allowed">>}} =
+        request_raw(get, "/api/v1/cluster/members", [], <<>>, Config),
+    ok.
+
+%% Malformed requests are rejected before any ra call: bad JSON, missing fields,
+%% an unknown action, and an unknown node each get a precise 400. The node check
+%% uses `binary_to_existing_atom', so a name this node has never heard of cannot
+%% mint a new atom.
+cluster_members_validates_the_request(Config) ->
+    {400, #{<<"error">> := <<"invalid_json">>}} =
+        request_raw(post, "/api/v1/cluster/members", [], <<"{bad json">>, Config),
+    {400, #{<<"error">> := <<"body_required">>}} =
+        request_raw(post, "/api/v1/cluster/members", [], <<>>, Config),
+    {400, #{<<"error">> := <<"body_must_have_action_and_node">>}} =
+        request_raw(post, "/api/v1/cluster/members", [],
+                    <<"{\"action\":\"join\"}">>, Config),
+    {400, #{<<"error">> := <<"invalid_action">>}} =
+        request_raw(post, "/api/v1/cluster/members", [],
+                    <<"{\"action\":\"explode\",\"node\":\"n@h\"}">>, Config),
+    {400, #{<<"error">> := <<"invalid_node">>}} =
+        request_raw(post, "/api/v1/cluster/members", [],
+                    <<"{\"action\":\"join\",\"node\":42}">>, Config),
+    %% A well-formed node name this VM does not know is a 400, never a new atom.
+    {400, #{<<"error">> := <<"unknown_node">>}} =
+        request_raw(post, "/api/v1/cluster/members", [],
+                    <<"{\"action\":\"join\",\"node\":\"no_such_node@nowhere\"}">>,
+                    Config),
+    ok.
+
+%% With a well-formed request but no cluster running, the endpoint answers 503
+%% `cluster_not_running' rather than crashing the listener. The success path
+%% (a real join/leave against a live group) is exercised in `broker_cluster_dist_SUITE';
+%% here only the guard and the dispatch are pinned.
+cluster_members_without_cluster_app_returns_503(Config) ->
+    false = lists:keymember(broker_cluster, 1,
+                            application:which_applications()),
+    Self = atom_to_binary(node(), utf8),
+    {503, #{<<"error">> := <<"cluster_not_running">>,
+            <<"action">> := <<"join">>}} =
+        request_json(post, "/api/v1/cluster/members", [],
+                     #{<<"action">> => <<"join">>, <<"node">> => Self}, Config),
+    ok.
 
 node_view_reports_state_and_connections(Config) ->
     start_probe(Config),

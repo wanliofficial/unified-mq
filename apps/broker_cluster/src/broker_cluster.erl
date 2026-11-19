@@ -11,6 +11,7 @@
 
 -export([start/0, stop/0]).
 -export([assign/4, migrate/4, finish_migration/2, remove/1]).
+-export([join/1, join/2, leave/1, leave/2]).
 -export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
          partition_view/0]).
 -export([authorize_append/2, guard_append/3, token/1]).
@@ -44,6 +45,30 @@ remove(Partition) ->
                 not_found -> 1
             end,
     command({remove, Partition, Epoch}).
+
+%%%_* Online membership change (ADR-033) ----------------------------------
+%%
+%% The admin-driven join/leave the roadmap's S12-D names. Thin delegations to
+%% `broker_cluster_meta' so a caller (the 8090 management API, or an operator
+%% with `rebar3 rpc') changes the membership without owning the ra call. See
+%% `broker_cluster_meta:join/1' for the two-step sequence and the failure
+%% semantics.
+
+-spec join(node()) -> broker_cluster_meta:member_result().
+join(Node) when is_atom(Node) ->
+    broker_cluster_meta:join(Node).
+
+-spec join(node(), timeout()) -> broker_cluster_meta:member_result().
+join(Node, Timeout) when is_atom(Node) ->
+    broker_cluster_meta:join(Node, Timeout).
+
+-spec leave(node()) -> broker_cluster_meta:member_result().
+leave(Node) when is_atom(Node) ->
+    broker_cluster_meta:leave(Node).
+
+-spec leave(node(), timeout()) -> broker_cluster_meta:member_result().
+leave(Node, Timeout) when is_atom(Node) ->
+    broker_cluster_meta:leave(Node, Timeout).
 
 command(Command) ->
     case broker_cluster_meta:command(Command) of

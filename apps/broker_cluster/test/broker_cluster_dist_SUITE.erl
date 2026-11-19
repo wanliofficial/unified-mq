@@ -25,7 +25,11 @@ all() ->
      losing_the_majority_rejects_metadata_writes,
      old_owner_is_fenced_after_migration,
      a_crashed_node_rejoins_and_catches_up,
-     a_stale_session_writer_is_fenced_by_the_guard_hook].
+     a_stale_session_writer_is_fenced_by_the_guard_hook,
+     online_join_makes_the_new_node_a_voter,
+     online_join_is_visible_to_the_rebalance_view,
+     online_join_is_rejected_without_a_majority,
+     clean_leave_removes_the_node_from_the_group].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -59,9 +63,16 @@ end_per_suite(Config) ->
 
 init_per_testcase(Case, Config) ->
     Peers = start_peers(Case, Config),
-    [{peers, Peers} | Config].
+    [{peers, Peers}, {new_peer, undefined} | Config].
 
 end_per_testcase(_Case, Config) ->
+    %% `online_join_*' start a fourth peer and register it as `new_peer'; stop it
+    %% before the fixture peers so its teardown never races a peer the cluster
+    %% still references.
+    case ?config(new_peer, Config) of
+        #{pid := Pid} -> catch peer:stop(Pid);
+        undefined -> ok
+    end,
     stop_peers(?config(peers, Config)),
     ok.
 
@@ -248,6 +259,151 @@ stamped(Partition, Epoch) ->
 unstamped(Partition) ->
     #broker_message{partition_id = Partition, proto_meta = #{}}.
 
+%%%_* Online membership change (ADR-033) ----------------------------------
+%%
+%% The four cases below are ADR-033's "验证" list. They exercise the
+%% admin-driven `join/1' / `leave/1' on `broker_cluster_meta': a node joins a
+%% *running* group without restarting the survivors, the rebalance view sees it
+%% as a member (not an orphan), a join that cannot commit is refused with the
+%% view unchanged, and a clean leave removes the node. They are the
+%% counterpart to ADR-032's measured "single node cannot join a running group":
+%% `ra:add_member' replaces the static `initial_members' path for exactly this.
+
+%% ADR-033 (验证 1): an explicit join adds the node to the *committed* group,
+%% and the survivors never restart. After the join the leader's committed
+%% membership contains the new node and a metadata write still commits -- the
+%% group is healthy with four voters.
+online_join_makes_the_new_node_a_voter(Config) ->
+    Members = members(Config),
+    [N1, N2, N3] = Members,
+    ok = form_cluster(Config),
+    New = start_join_peer(Config),
+    ok = rpc(N1, broker_cluster, join, [New]),
+    wait_until(fun() -> ra_members_include(N1, New) end, 20000),
+    %% A voter must also catch up to the committed log, else the group's commit
+    %% index stalls behind the new member. `ra:add_member' only records the new
+    %% id in the leader's config; the new node starts its own ra server with an
+    %% existing member as seed (the README's documented second step), reaches the
+    %% leader as a follower, and replays the log up to the commit index.
+    ok = rpc(New, ra, start_server,
+             [default, ?CLUSTER, {?CLUSTER, New},
+              {module, broker_cluster_meta_machine, #{}},
+              [{?CLUSTER, N1}]]),
+    %% Prove the catch-up through our own cache: assign a fresh partition on the
+    %% leader, then wait for the new node's ra apply loop to mirror it. The cache
+    %% is written by the state machine on every member, so once the new node's
+    %% cache shows the owner it has applied the post-join entry -- caught up.
+    {ok, 2} = retry(fun() ->
+                            rpc(N1, broker_cluster, assign,
+                                [1, N1, Members ++ [New], 2])
+                    end, 20, 250),
+    wait_until(fun() ->
+                      rpc(New, broker_cluster_cache, owner, [1]) =:= {ok, N1}
+                end, 20000),
+    {ok, N1} = rpc(New, broker_cluster_cache, owner, [1]),
+    %% The survivors were never touched: their control process is still up.
+    true = is_pid(rpc(N2, erlang, whereis, [broker_cluster_meta_ctl])),
+    true = is_pid(rpc(N3, erlang, whereis, [broker_cluster_meta_ctl])),
+    %% The group still commits with the new voter present.
+    {ok, 3} = retry(fun() ->
+                            rpc(N1, broker_cluster, assign,
+                                [2, N1, Members ++ [New], 3])
+                    end, 20, 250),
+    ok.
+
+%% ADR-033 (验证 2): the rebalance view reads the *live* membership, not the
+%% startup config, so a joined node is a member -- `broker_rebalance:status()'
+%% lists it and does not report it orphaned. This is the concrete proof that
+%% the members source moved from `application:get_env' to the ra state machine.
+online_join_is_visible_to_the_rebalance_view(Config) ->
+    Members = members(Config),
+    [N1 | _] = Members,
+    ok = form_cluster(Config),
+    New = start_join_peer(Config),
+    %% The startup config on every peer names only the original three; New is
+    %% never in `application:get_env(broker_cluster, members)'. This is the
+    %% baseline 验证 5 reverses: if the rebalance view read the startup config,
+    %% New could not appear in it.
+    false = lists:member(New, Members),
+    ok = rpc(N1, broker_cluster, join, [New]),
+    ok = rpc(New, ra, start_server,
+             [default, ?CLUSTER, {?CLUSTER, New},
+              {module, broker_cluster_meta_machine, #{}},
+              [{?CLUSTER, N1}]]),
+    wait_until(fun() -> rebalance_members_include(N1, New) end, 20000),
+    Status = rpc(N1, broker_rebalance, status, []),
+    %% The live view (the ra state machine) lists New; the startup config does
+    %% not. That gap is the proof the members source moved off the config.
+    true = lists:member(New, maps:get(members, Status)),
+    false = lists:member(New, maps:get(orphaned, Status)),
+    ok.
+
+%% ADR-033 (验证 3): a clean leave removes the node from the group. Join N4,
+%% wait for it to be a committed voter, then leave it from the leader; the
+%% committed membership shrinks back to the original three and the group still
+%% commits.
+clean_leave_removes_the_node_from_the_group(Config) ->
+    Members = members(Config),
+    [N1 | _] = Members,
+    ok = form_cluster(Config),
+    New = start_join_peer(Config),
+    ok = rpc(N1, broker_cluster, join, [New]),
+    ok = rpc(New, ra, start_server,
+             [default, ?CLUSTER, {?CLUSTER, New},
+              {module, broker_cluster_meta_machine, #{}},
+              [{?CLUSTER, N1}]]),
+    wait_until(fun() -> ra_members_include(N1, New) end, 20000),
+    %% A clean leave: `remove_member' on the leader commits the membership
+    %% change and the group shrinks back to three. (Draining the node first is
+    %% an operational precondition -- ADR-032 D5 -- not part of the ra change;
+    %% it lives in `broker_admin' and is exercised there.)
+    %% Wait for the *live view* on N1 (what `leave/1' consults) to include the
+    %% new node, not just the leader-redirected read, so `leave' sees a member.
+    wait_until(fun() -> rebalance_members_include(N1, New) end, 20000),
+    ok = rpc(N1, broker_cluster, leave, [New]),
+    wait_until(fun() -> not ra_members_include(N1, New) end, 20000),
+    %% The node is gone from every survivor's live view and the group still
+    %% commits without it.
+    lists:foreach(
+      fun(N) -> wait_until(fun() -> not rebalance_members_include(N, New) end,
+                           20000) end,
+      Members),
+    {ok, 2} = retry(fun() ->
+                            rpc(N1, broker_cluster, assign,
+                                [1, N1, Members, 2])
+                    end, 20, 250),
+    ok.
+
+%% ADR-033 (验证 4): a join that cannot reach a quorum leaves the committed view
+%% unchanged. Stop two of the three nodes so the caller (N1) is a lone voter
+%% with no majority, then attempt a join.
+%%
+%% The probe is the *committed* membership read on N1 (`ra:members'). A lone
+%% voter CAN append the membership entry locally, so `join/1' legitimately
+%% returns `ok' (ra's `after_log_append' reply fires the moment the leader
+%% appends, and a one-node group is its own majority) -- the durable fact is
+%% what the committed view shows. Two things must hold: the new node never
+%% enters N1's committed membership, and a *fresh* command still cannot commit.
+online_join_is_rejected_without_a_majority(Config) ->
+    Members = members(Config),
+    [N1, N2, N3] = Members,
+    ok = form_cluster(Config),
+    NewName = join_peer_name(?config(name, Config)),
+    stop_peer(Config, N2),
+    stop_peer(Config, N3),
+    _ = rpc(N1, broker_cluster, join, [NewName]),
+    %% The new node never entered N1's committed membership: the lone voter
+    %% cannot learn a node it has never heard from. Read the on-disk directory
+    %% (the committed config) rather than the live server, which would answer
+    %% `{error, name_not_registered}' once its ra system is torn down.
+    Registered = rpc(N1, ra_directory, list_registered, [default]),
+    false = lists:member(NewName, Registered),
+    %% And a fresh command still cannot commit -- the group has no quorum to
+    %% append it, so the metadata write is refused.
+    {error, no_quorum} = rpc(N1, broker_cluster, assign,
+                             [1, N1, [N1], 2]),
+    ok.
+
 %%%_* Peers ---------------------------------------------------------------
 
 start_peers(Case, Config) ->
@@ -322,6 +478,49 @@ form_cluster(Config) ->
     ok = rpc(N2, start_meta, [members(Config)]),
     ok = rpc(N3, start_meta, [members(Config)]),
     ok.
+
+%% A fourth peer, started but *not* part of the initial group. ADR-033's join
+%% brings it in at runtime; until then it is an ordinary node with ra up but no
+%% metadata server of its own. Registered in `new_peer' so `end_per_testcase'
+%% tears it down first.
+start_join_peer(Config) ->
+    Name = join_peer_name(?config(name, Config)),
+    DataDir = filename:join([?config(priv_dir, Config),
+                             atom_to_list(Name), "ra"]),
+    {ok, Pid, Node} =
+        peer:start_link(#{name => Name,
+                          args => ["-pa" | code_paths()],
+                          wait_boot => 20000}),
+    ok = rpc(Node, prepare_peer, [[DataDir, []]]),
+    Peer = #{pid => Pid, node => Node, data_dir => DataDir},
+    put(new_peer, Peer),
+    Node.
+
+join_peer_name(Case) ->
+    list_to_atom("s4_" ++ sanitise(atom_to_list(Case)) ++ "_n4").
+
+code_paths() ->
+    SuiteDir = filename:dirname(code:which(?MODULE)),
+    lists:usort([SuiteDir | [D || D <- code:get_path(), is_code_dir(D)]]).
+
+%% Is `Node' among the leader's committed voters? Reads the ra membership
+%% directly (not our cache) so it reflects the committed configuration, the
+%% thing `join/1' changed.
+ra_members_include(Leader, Node) ->
+    case rpc(Leader, ra, members, [{?CLUSTER, Leader}, 10000]) of
+        {ok, Ids, _} ->
+            lists:member({?CLUSTER, Node}, Ids);
+        _ -> false
+    end.
+
+%% Does this node's *rebalance* view see `Node' as a member? That view is the
+%% live `broker_cluster_meta:members/0' answer, which is what ADR-033 moved
+%% from the startup config to the ra state machine.
+rebalance_members_include(Node, Member) ->
+    case rpc(Node, broker_cluster_meta, members, []) of
+        Members when is_list(Members) -> lists:member(Member, Members);
+        _ -> false
+    end.
 
 leader(Config) ->
     [N | _] = peer_nodes(Config),

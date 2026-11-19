@@ -73,7 +73,7 @@
                  | {cooldown, map()}
                  | {rebalance, map()}.
 evaluate() ->
-    evaluate(broker_cluster_meta:members()).
+    evaluate(members_view()).
 
 %% @doc The decision against an explicit membership. `Members' is the ra member
 %% list (what production passes); nothing here consults a second source.
@@ -105,7 +105,7 @@ evaluate(Members) when is_list(Members) ->
               | {reassigned, non_neg_integer(), node()}
               | {error, term()}.
 step() ->
-    step(broker_cluster_meta:members()).
+    step(members_view()).
 
 %% @doc Apply at most one move against an explicit membership (see `evaluate/1').
 -spec step([node()]) -> {disabled}
@@ -181,7 +181,8 @@ finish_pending() ->
 status() ->
     Cfg = config(),
     View = broker_cluster:partition_view(),
-    Members = broker_cluster_meta:members(),    Counts = count_by_owner(View, Members),
+    Members = members_view(),
+    Counts = count_by_owner(View, Members),
     #{enabled => maps:get(enabled, Cfg),
       hysteresis => maps:get(hysteresis, Cfg),
       cooldown_ms => maps:get(cooldown_ms, Cfg),
@@ -192,6 +193,19 @@ status() ->
       last_migration_ms => last_ms()}.
 
 %%%_* Internal -------------------------------------------------------------
+
+%% The live membership for the no-argument entry points. `broker_cluster_meta:
+%% members/0' returns `{error, no_quorum}' when the group cannot commit a
+%% membership read (a majority down, or this node not in the committed config);
+%% an empty list is the safe view there -- the same "cannot act, do nothing"
+%% answer a quorum loss already gives, and one that keeps `evaluate/0', `step/0'
+%% and `status/0' from crashing on the failure shape they would otherwise have
+%% to special-case. The explicit-`Members' functions are unchanged.
+members_view() ->
+    case broker_cluster_meta:members() of
+        {error, _} -> [];
+        Members when is_list(Members) -> Members
+    end.
 
 decide(View, Members, Cfg) ->
     Hyst = maps:get(hysteresis, Cfg),
