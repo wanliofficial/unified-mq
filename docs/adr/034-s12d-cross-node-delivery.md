@@ -157,6 +157,22 @@ ADR-032 D9 冻结了两件事：①跨节点 publish→subscribe 在本仓**不�
 9. **默认关闭零回归**：`cross_node_delivery = false` 时全量 `rebar3 ct`（基线 1460/1460）逐例不变；`cluster_fencing_rejected` 计数行为不变。
 10. **wake 不承担正确性**：人为丢弃所有 `{new_messages, ...}` 后，poll tick 仍能把消息送达（拉模型自证）。
 
+### 落地验证记录（2026-11-19）
+
+dist 套件 `broker_cluster_cross_node_dist_SUITE`（2 peer，每 peer `port => 0`，`epmd` 起分布式）已落地上述断言，共 **9 例**：
+
+1. `a_publish_on_a_non_owner_writes_only_on_the_owner` —— 验证 1（跨节点写只落 owner、非 owner 经 facade 能读到、本地无副本）。
+2. `a_forwarded_call_on_a_non_owner_is_refused_and_fenced` —— 验证 1 的 fencing 纵深（stale owner 回 `{not_owner,_}` 并计 `cluster_fencing_rejected`）。
+3. `a_cross_node_subscribe_wakes_a_remote_subscriber_whose_death_cleans_up` —— 验证 3（跨节点 wake + 死亡 DOWN 清理）。
+4. `a_shared_group_is_refused_across_nodes_while_an_exclusive_one_is_not` —— 验证 7（shared 拒绝 / exclusive 放行）。
+5. `committed_is_the_minimum_over_the_nodes_and_a_leave_releases_it` —— 验证 8（committed 取 min、leave 释放）。
+6. `a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member` —— 验证 4（单条 QoS0 跨成员投递，两侧 WAL 不增）。
+7. `a_qos0_burst_reaches_a_remote_subscriber_without_loss_or_duplication` —— 验证 4 的负载面：**300 条** QoS0 突发跨成员投递，计数精确（无丢失、无重复），发布者日志不增（同时是「cast 不阻塞发布者」L1 主张的证据：`publish_burst/2` 返回即代表 300 次 cast 已全部入队）。
+8. `a_cross_node_append_burst_lands_only_on_the_owner` —— 验证 1 的负载面：**300 条**跨节点 append 全部只落 owner，非 owner 零泄漏，facade 读回有序完整（路由热路径在量级下仍正确）。
+9. `with_routing_off_a_non_owner_write_is_refused_and_writes_nothing` —— 验证 9（关闭时 guard 拒绝、无本地写）。
+
+全量 `rebar3 ct` **1471/1471**（基线 1460 + ADR-034 D2/D3/D5/D6/D8 8 例 + D4 1 例 + 本轮压测 2 例）；dialyzer 0 warning；xref 仅既有 unused-export 告警。
+
 ## 已签认的四个问题（2026-11-19）
 
 本 ADR 的四点评审签认记录如下，签认后裁决正文冻结：

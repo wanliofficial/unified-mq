@@ -43,6 +43,8 @@ all() ->
      a_shared_group_is_refused_across_nodes_while_an_exclusive_one_is_not,
      committed_is_the_minimum_over_the_nodes_and_a_leave_releases_it,
      a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member,
+     a_qos0_burst_reaches_a_remote_subscriber_without_loss_or_duplication,
+     a_cross_node_append_burst_lands_only_on_the_owner,
      with_routing_off_a_non_owner_write_is_refused_and_writes_nothing].
 
 %%%_* Fixtures --------------------------------------------------------------
@@ -241,6 +243,46 @@ a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member(Config) ->
     true = rpc(N1, erlang, exit, [Sub, kill]),
     ok.
 
+%% D4 under load: a burst of QoS0 publishes on one member all reach a subscriber on
+%% another, with no loss and no duplication, while the publisher's own log stays
+%% empty. This drives the fan-out hot path (`rpc:cast' once per message), so it
+%% is also the evidence for the ADR-007 L1 claim that the cast never blocks the
+%% publisher -- `publish_burst/2' returns only after every cast is queued, and the
+%% counts still match exactly.
+a_qos0_burst_reaches_a_remote_subscriber_without_loss_or_duplication(Config) ->
+    N1 = ?config(non_owner, Config),
+    N2 = ?config(owner, Config),
+    Topic = <<"burst/sport">>,
+    Parent = self(),
+    Count = 300,
+    Sub = rpc(N1, erlang, spawn,
+              [?MODULE, counting_subscriber, [Topic, Parent, Count]]),
+    ?assertEqual({ready, Sub}, receive_frame(10000)),
+    ok = rpc(N2, ?MODULE, publish_burst, [Topic, Count]),
+    ?assertEqual({delivered, Count}, receive_frame(30000)),
+    %% The publisher's log never grew: QoS0 does not enter it, cross-node or not.
+    ?assertEqual({ok, 0, 1}, local_watermarks(N2, 0)),
+    true = rpc(N1, erlang, exit, [Sub, kill]),
+    ok.
+
+%% D2/D3 under load: a burst of cross-node appends from the non-owner all land on
+%% the owner and nowhere else. After the burst the non-owner's log is still empty
+%% (no per-message leak) and reading through the facade on the non-owner returns
+%% every record, in order -- the routing hot path stays correct at volume.
+a_cross_node_append_burst_lands_only_on_the_owner(Config) ->
+    N1 = ?config(non_owner, Config),
+    N2 = ?config(owner, Config),
+    Count = 300,
+    [{ok, _Off} = rpc(N1, broker_queue, append, [0, msg(0, integer_to_binary(I)), fsync])
+     || I <- lists:seq(1, Count)],
+    %% The owner advanced by exactly Count; the non-owner did not move at all.
+    ?assertEqual({ok, 0, Count + 1}, local_watermarks(N2, 0)),
+    ?assertEqual({ok, 0, 1}, local_watermarks(N1, 0)),
+    %% Reading through the facade on N1 reaches every record, in order, exactly once.
+    ?assertEqual([{I, integer_to_binary(I)} || I <- lists:seq(1, Count)],
+                 payloads(rpc(N1, broker_queue, read_from, [0, 1, Count + 10]))),
+    ok.
+
 %%%_* Peers ----------------------------------------------------------------
 
 start_peers(Case, Config) ->
@@ -370,6 +412,37 @@ qos0_subscriber(Topic, Parent) ->
         Parent ! {no_delivery, self()}
     end.
 
+%% @private Called on a peer (N1): like `qos0_subscriber/2' but counts the
+%% cross-node QoS0 pushes and reports the total once `Expected' have arrived (or
+%% when the window closes, reporting whatever came through). The count is what
+%% the burst case asserts: no loss, no duplication.
+counting_subscriber(Topic, Parent, Expected) ->
+    {ok, _SubRef} = broker_subscription:subscribe(<<"cB">>, Topic, 0),
+    {ok, _Prev} = broker_subscription:attach(<<"cB">>, self(), true),
+    Parent ! {ready, self()},
+    collect_count(Parent, Expected, 0).
+
+collect_count(Parent, Expected, Acc) when Acc >= Expected ->
+    Parent ! {delivered, Acc};
+collect_count(Parent, Expected, Acc) ->
+    receive
+        {broker_deliver, <<"cB">>, _QoS, _Refs, {undefined, undefined, _Msg}} ->
+            collect_count(Parent, Expected, Acc + 1);
+        Other ->
+            Parent ! {unexpected, self(), Other}
+    after 10000 ->
+        Parent ! {delivered, Acc}
+    end.
+
+%% @private Called on the peer that publishes (N2): fan `Count' QoS0 messages out
+%% through `dispatch/2'. Each call is one `rpc:cast' to the other member, so the
+%% return means every cast is queued -- the publisher is never blocked on delivery.
+publish_burst(Topic, Count) ->
+    Msg = qos0_msg(Topic),
+    [ok = broker_subscription:dispatch([], {undefined, undefined, Msg})
+     || _ <- lists:seq(1, Count)],
+    ok.
+
 %%%_* Owner-side introspection (runs on the peer) ---------------------------
 
 %% Read the partition's own storage, bypassing `broker_queue' so a routed read on
@@ -432,6 +505,20 @@ receive_attached(Timeout) ->
     receive
         {attached, P} -> {attached, P};
         Other -> {unexpected, Other}
+    after Timeout ->
+        timeout
+    end.
+
+%% Generic one-frame wait: the burst cases use a tagged {ready,...}/{delivered,...}
+%% Generic one-frame wait: the burst cases use a tagged {ready,...}/{delivered,...}
+%% handshake from their subscribers, so a single timed receive covers both.
+receive_frame(Timeout) ->
+    receive
+        {ready, P} -> {ready, P};
+        {delivered, P, N} -> {delivered, P, N};
+        {delivered, P} -> {delivered, P};
+        {unexpected, P, _} -> {unexpected, P};
+        Other -> {unexpected_frame, Other}
     after Timeout ->
         timeout
     end.
