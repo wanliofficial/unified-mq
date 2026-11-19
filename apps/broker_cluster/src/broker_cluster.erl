@@ -11,7 +11,8 @@
 
 -export([start/0, stop/0]).
 -export([assign/4, migrate/4, finish_migration/2, remove/1]).
--export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0]).
+-export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
+         partition_view/0]).
 -export([authorize_append/2, guard_append/3, token/1]).
 -export([replicate/2, install_hooks/0, uninstall_hooks/0]).
 
@@ -66,6 +67,11 @@ epoch_or_zero(Partition) ->
     end.
 
 snapshot() -> broker_cluster_cache:all().
+
+%% @doc The ownership view keyed by partition -- what a rebalancer needs, since
+%% a move must name its partition. `snapshot/0' stays as-is for the callers that
+%% only read the metas.
+partition_view() -> broker_cluster_cache:partition_view().
 
 %% @doc The token a producer should carry for this partition. The epoch is only
 %% meaningful together with the owner, so both travel.

@@ -12,5 +12,8 @@
     {env, [{data_dir, "data/ra"},
            {members, []},                  %% [] -> [node()]
            {quorum_timeout_ms, 5000},
-           {replicate_timeout_ms, 2000}]}
+           {replicate_timeout_ms, 2000},
+           %% Rebalance trigger (ADR-032 D4): default closed. An operator runs
+           %% `broker_rebalance:step/0' by hand; nothing auto-rebalances.
+           {rebalance, #{enabled => false, hysteresis => 1, cooldown_ms => 300000}}]}
 ]}.

@@ -231,3 +231,57 @@ spike 的七条结论已按 §7 实现并接入全部前端。落地时有三处
 - **R-LB6 的「行为」不在 Broker，但用例在这里。**D7 写明「无可用节点与节点恢复竞态由外部 LB + 客户端重试消化，不在 Broker 内排队」。于是本仓能证明的是分发方在该契约下的行为：无 `ready` 节点时**同步拒绝**（不持有连接、不排队），节点恢复后下一次分发是**全新连接**而非重放（因为根本没有队列可重放）。这条由 `no_ready_node_is_refused_not_queued` 钉住。Broker 侧对应的承诺是「连接级等待队列长度恒为 0」——本仓没有队列，所以它不是「实现了有界队列」，而是「没有队列可溢出」。
 
 两条都不改 ADR 正文的裁决，只是把「由谁实现」写清楚。
+
+### S12-C 落地：再平衡触发者（2026-11-19）
+
+D4/D5 的裁决没有变，落地时有三处需要说清楚，否则读代码的人会以为漏做了：
+
+- **触发器是一个模块，不是进程。**`broker_rebalance` 没有 `gen_server`、没有 supervisor 子项、不订阅任何事件。`evaluate/0` 与 `step/0` 都只在被调用时读一次本地缓存视图、算一次、必要时发一条 ra 命令，然后返回。D4 要的是「不新增控制面进程池」，最彻底的满足方式就是没有进程：没有 tick、没有自动触发，也就没有「后台循环和运维命令抢决定权」这个问题——D4 的「手动覆盖优先」因此不需要额外的 pin 状态，它是结构性的。代价是**没有任何东西会自动调用它**，这正是 D4 的默认姿态（`enabled => false`）。
+- **目标函数按 owner 计数，含 `migrating`。**D4 写的是 `count(partitions where owner = Node)`。ADR-021 D3 的 `migrate` 在把分区标成 `migrating` 的同时就把 owner 改成了目标，所以迁移中的分区**已经属于目标**，必须计在它名下。否则一次 `step/0` 只会让源减一而目标不变，spread 只降 1，收敛速度减半；更麻烦的是计数会与 `owner/1` 的回答不一致，同一份视图在「谁拥有这个分区」上给出两个答案。按 owner 计数使一次移动让 spread 减 2（源 −1、目标 +1）。
+- **孤儿回收不受 cooldown 约束。**owner 已不在成员集里的分区是「节点离开后遗留」的恢复问题，不是调优；把它压在 5 分钟冷却之外只会让数据无人负责。故 `assign` 回收孤儿时只受「有可去的最轻负载成员」约束。这与 D4 的双门限不冲突：双门限约束的是**均衡迁移**（`migrate`），孤儿回收是 `assign`。
+- **成员集只有一个来源。**`evaluate/1` / `step/1` 接受显式成员列表，生产路径传 `broker_cluster_meta:members()`（即 ra 的成员）；`evaluate/0` / `step/0` 只是这一条的便捷包装。触发者不缓存、不推导、不维护第二份成员集（R-LB3）。显式参数同时让决策可以在单节点上纯测——单成员 ra 组里 owner 可以是任意节点原子，所以不均衡视图可以在一台机器上造出来。
+- **新增只读视图 `broker_cluster:partition_view/0`（及其底层 `broker_cluster_cache:partition_view/0`）。**既有 `snapshot/0` 返回**不带分区号的 meta 列表**（它的调用者只要 meta），而移动必须点名分区。故新增一个按分区号键控的只读视图，`snapshot/0` 语义不变。
+- **R-RB5 / R-RB6 不交付（D5）。**不迁移任何活进程，因此没有「三态迁移契约」与「handoff 版本号」——没有 handoff 就没有格式可版本化。消费者重连后重建（ADR-019）是文档写明的限制，不是遗漏。这两条在 Gate 里按 D5 标「S12 不交付」。
+
+证据：`broker_rebalance_SUITE`（单节点 10 例：默认关闭、按 owner 计数、双门限、一轮一移、孤儿回收、两阶段收尾）与 `broker_rebalance_dist_SUITE`（真实 3 peer 5 例：跨节点一致提交、`migrating` 期间源仍可读而被 fence、孤儿回收、失多数派 `{error, no_quorum}`、反复 step 收敛）。两条反证精确命中：去掉 hysteresis / cooldown 门限各只挂一条用例；把计数改回只算 `active` 挂两条依赖「spread 减 2」的用例；把 `authorize_append` 改成恒 `ok` 只挂 fencing 用例。
+
+### S12-C 的迁移耗时实测（2026-11-19）
+
+Gate S12 要求「容量 / 迁移报告」。实测（同主机 3 peer、串行、冷路径已预热、
+`n = 200`）：**一次完整搬迁（`migrate` + `finish_migration` 两阶段）p50 约
+2.0 ms、p99 约 4.2 ms**；决策 `evaluate/1` p50 约 0.23 ms；单条 `assign/4`
+p50 约 1.1 ms。结论：搬迁成本几乎全在 raft 多数派提交，不在搬迁逻辑，且
+迁移期间源仍可读、旧 epoch 被 fence、无数据搬运——**对业务延迟贡献为零**。
+默认 `cooldown_ms = 300000` 远大于实测搬迁成本，是防振荡旋钮而非性能预算。
+数字、方法、口径限制（同主机下界、未测跨机/并发/追平）见
+[`docs/benchmarks/2026-11-19-s12c-rebalance.md`](benchmarks/2026-11-19-s12c-rebalance.md)。
+
+### S12-C 的一处已知限制：成员集取自启动配置（2026-11-19）
+
+`broker_rebalance:evaluate/0` 与 `step/0` 的成员列表来自 `broker_cluster_meta:members()`，而它返回的是**节点启动时读到的 `broker_cluster.members` 配置**，不是 ra 的实时成员。后果很具体：
+
+- **本仓今天没有动态成员变更路径。**`ra:add_member/2` / `remove_member/2` 在全仓 0 处调用，成员集由 `sys.config` 静态给出（roadmap §S12 背景「成员来自静态 env」）。所以「配置即成员」在当前实现里不是近似，是事实。
+- **但如果将来引入动态成员变更，这个取值点会变成 bug**：新加入的成员在触发者眼里不存在，它的分区会被当成孤儿回收走；已移除的成员仍被计入均衡目标，导致反复把分区搬给一个不在组的节点（`assign` 会失败，`step` 返回 `{error, ...}`，不会造成损坏，但永远收敛不了）。
+
+不在此处改成读 `ra:members/1` 的理由：那是**跨节点查询**，在选举窗口里会超时，而触发者必须能在没有 leader 时给出诚实的「我不知道」——今天的 `{error, no_quorum}` 来自写路径，读路径不该引入第二种失败模式。**引入动态成员变更时应一并改这里**（读 `ra:members({local, ...})` 拿本节点已知视图，并显式处理「视图可能过期」），这是一条留给那次变更的 TODO，不是 S12-C 的缺陷。
+
+在此之前，运维侧的口径是：**改 `broker_cluster.members` 后重启该节点**，让配置与 ra 成员重新对齐；临时想让触发者按别的成员集决策，用 `evaluate/1` / `step/1` 显式传入。
+
+### 落地偏差记录：崩溃恢复路径曾被 ra 的 `{already_started,_}` 破坏（2026-11-19）
+
+S12-C 新增的分布式用例 `broker_cluster_dist_SUITE:a_crashed_node_rejoins_and_catches_up` 要求一个节点崩溃后带**原成员表**自行重启、并从 leader 追平 epoch（不需要运维重启整个组）。第一次执行时这条路径是**坏的**，且不是 S12-C 引入的回归，是既有缺陷：
+
+- `broker_cluster_meta:ensure_group/2` 调 `ra:start_or_restart_cluster/5`。ra 的实现是**先本地重启首成员，再对其余成员逐个 rpc「重启」**（`ra.erl:328` 起的列表推导）。
+- 一个崩溃后重启的节点，其**对端从未宕机**：rpc「重启」它们得到 `{error, {already_started, Pid}}`，ra 的推导式在该返回值上 badmatch，进程以 `{stop, {{badmatch, ...}, ...}}` 退出。本地服务器其实已经重启成功、也能从 leader 追平，但节点起不来。
+- 后果：单节点崩溃后必须**重启整个组**才能恢复。这直接打穿了 S12 Gate「有状态服务崩溃与恢复」那一项。
+
+修复：`ensure_group/2` 捕获 `badmatch {error,{already_started,_}}`，并在 `broker_cluster_meta`（本节点 ra 服务器）已注册时视为成功、否则回 `{error, {restart_failed, already_started}}`。选择兜住而不是改成「先查后起」是因为 ra 的返回本身就是判定依据，避免 TOCTOU。回归用例断言：重入后 owner/epoch 追平到崩溃期间的新值（epoch 2，非崩溃前的旧值），重入节点以当前 owner 身份正确 `{fenced,_}`、真实 owner 接受当前 epoch，**且存活对端全程未被触碰**。
+
+### 一处实测到的成员变更限制（2026-11-19）
+
+用探针实测了「第 4 个节点加入运行中的 3 节点组」：
+
+- **单个新节点带新成员表启动**：`broker_cluster_meta:init` 回 `{error, {metadata_cluster_not_formed, cluster_not_formed}}`。ra 的 `initial_members` 只在**首次 bootstrap** 时被采纳；组已存在时新节点的本地服务器找不到与自己匹配的已有集群，无法加入。存活对端不受影响、组仍可提交。
+- **全组同时重启（含新成员）**：实测**成功**——ra 从磁盘上的集群状态恢复出 4 成员，分区归属与 epoch 完整存活，新节点立刻可见 owner。但存在一个**启动顺序竞态**：若首成员在其对端的服务器记录就绪之前就尝试 rpc「重启」它们，会命中 `{{badmatch,{error,name_not_registered}}, ...}`。重跑即恢复，说明是时序问题而非持久性故障。
+
+结论与上一条「成员集取自启动配置」的留痕一致：**本仓的成员变更是重启级别的运维动作**，且要按对端先就绪的顺序启动（实践中逐个启动比同时启动更稳）。在线动态成员变更（`ra:add_member/2` / `remove_member/2`）仍是未实现的独立能力，需要新 ADR，届时与再平衡器的成员取值点一并修改（见上文「S12-C 的一处已知限制」）。

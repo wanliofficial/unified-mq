@@ -100,7 +100,26 @@ ensure_group(Ids, Machine) ->
         Pid when is_pid(Pid) ->
             {ok, [], []};
         undefined ->
-            ra:start_or_restart_cluster(default, broker_cluster, Machine, Ids)
+            %% `ra:start_or_restart_cluster/5' is the bootstrap path: it restarts
+            %% the head server, then "restarts" every other member over rpc. On a
+            %% node coming back after a crash the peers never went down, so that
+            %% second phase gets `{error, {already_started, Pid}}' for each of them
+            %% and the list comprehension inside ra badmatches. The local server
+            %% *has* restarted by then and will catch up from the leader, so treat
+            %% that shape as success when the local server is registered -- a
+            %% rejoining node must not need the whole group restarted.
+            try ra:start_or_restart_cluster(default, broker_cluster, Machine, Ids) of
+                {ok, Started, NotStarted} ->
+                    {ok, Started, NotStarted};
+                {error, Reason} ->
+                    {error, Reason}
+            catch
+                error:{badmatch, {error, {already_started, _}}} ->
+                    case whereis(?SERVER) of
+                        Pid when is_pid(Pid) -> {ok, [], []};
+                        undefined -> {error, {restart_failed, already_started}}
+                    end
+            end
     end.
 
 local_first(Ids) ->

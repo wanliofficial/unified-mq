@@ -14,8 +14,8 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, put/2, get/1, all/0, clear/0, clear_partition/1,
-         owner/1, epoch/1, replicas/1]).
+-export([start_link/0, put/2, get/1, all/0, partition_view/0, clear/0,
+         clear_partition/1, owner/1, epoch/1, replicas/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -45,6 +45,14 @@ get(Partition) ->
 all() ->
     try [Meta || {_P, Meta} <- ets:tab2list(?TAB)]
     catch _:_ -> []
+    end.
+
+%% @doc The cache keyed by partition. `all/0' drops the key (its existing
+%% callers only want the metas), but a rebalancer has to name the partition it
+%% wants to move, so this keeps the pair.
+partition_view() ->
+    try maps:from_list(ets:tab2list(?TAB))
+    catch _:_ -> #{}
     end.
 
 clear() ->

@@ -773,6 +773,87 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | 投影与日志不一致的嫌疑 | `a2a_task_recovery` 的重放耗时异常增长 | 日志变大而 checkpoint 未做（S9-F）；短期靠增加 `task_shards` 分摊，长期等 checkpoint |
 | 状态机拒绝 | `a2a_state_violation` 语义的日志行（`illegal_transition`） | 客户端在终态上重发/重取消；属客户端错误，`-32002`/`-32004` 是正常答复，不是故障 |
 
+## 5.3 分区再平衡（`broker_rebalance`，S12-C / ADR-032 D4）
+
+**默认关闭，没有后台进程。**再平衡器是一个**模块**，不是 `gen_server`：`broker_cluster` 的监督树没有多出任何子项，也没有任何 tick 或定时器会调用它。节点加入/退出**不会自动触发**迁移——这正是 ADR-021「S4 不做自动再平衡」的延续，也是 ADR-032 D4 的裁决。要不要动，是运维按下回车的那一刻决定的。
+
+```erlang
+%% 打开（默认 enabled => false，即 evaluate/0 与 step/0 恒回 {disabled}）
+{broker_cluster, [{rebalance, #{enabled => true,
+                               hysteresis => 1,        %% 分区数极差容许值
+                               cooldown_ms => 300000}}]}  %% 两次迁移的最小间隔
+```
+
+**它搬什么**：只搬**分区归属元数据** `(owner, epoch)`，走 ADR-021 D3 的两阶段 `migrate` → `finish_migration`。**不搬任何活进程、不搬队列内容、不搬连接**。消费者重连后重建（ADR-019）——这是 ADR-032 D5 写明的限制，不是缺陷。
+
+**它怎么决定**：目标函数是 `count(partitions where owner = Node)`（**按 owner 计数**，含 `migrating` 阶段，因为 `migrate` 一提交目标就是 owner 了）。双门限同时成立才动手：
+
+1. 各节点分区数极差 > `hysteresis`（默认 1）；
+2. 距上次迁移 ≥ `cooldown_ms`（默认 300000）。
+
+一次 `step/0` 只发**一条**命令（一轮一移），因此把集群搬到均衡是「重复 step 直到 `{stable, _}`」。极差不超过阈值时答 `{stable, _}` 而非 `{cooldown, _}`——先判阈值再判冷却，稳定的视图不该报冷却。
+
+```erlang
+broker_rebalance:status().
+%% #{enabled => true, hysteresis => 1, cooldown_ms => 300000,
+%%   members => ['a@h','b@h','c@h'],
+%%   counts => #{'a@h' => 3, 'b@h' => 2, 'c@h' => 2},
+%%   spread => 1, orphaned => [], last_migration_ms => 1732...}
+
+broker_rebalance:evaluate().
+%% {stable, Summary} | {cooldown, Summary} | {rebalance, Plan} | {disabled}
+%% Plan 里带着 action / partition / from / to / epoch / command，可先看后做
+
+broker_rebalance:step().
+%% {migrated, P, From, To} | {reassigned, P, To} | {stable, _}
+%% | {cooldown, _} | {disabled} | {error, no_quorum}
+```
+
+**循环搬到均衡**：
+
+```erlang
+%% 控制台里手推，直到 stable。有 cooldown 时靠 sleep 跨过冷却窗口。
+lists:foldl(fun(_, _) ->
+                case broker_rebalance:step() of
+                    {migrated, _, _, _} -> timer:sleep(300000), again;
+                    {reassigned, _, _} -> again;
+                    {stable, _} = S -> S;
+                    Other -> Other
+                end
+            end, again, lists:seq(1, 64)).
+```
+
+**两阶段：`step` 只做前半段。**`migrate` 之后分区处于 `migrating`，源仍可读、`authorize_append` 已把旧 epoch 挡成 `{fenced, _}`。数据追上后调：
+
+```erlang
+broker_rebalance:finish_pending().
+%% {finished, [0, 3]}   -- 把当前所有 migrating 分区推回 active（epoch+1）
+```
+
+不调也不丢数据，但视图会一直停在 `migrating`；`/status` 的 `cluster` 段能看出还有几个。**建议每次搬完就 `finish_pending/0`**，或者至少在把节点交还业务前跑一次。
+
+**孤儿分区**：owner 已不在成员集里的分区（节点没 drain 就消失）优先回收，走 `assign` 落到最轻负载的成员，**不受 `cooldown` 约束**——那是恢复，不是调优。`status/0` 的 `orphaned` 列出它们。
+
+**失去多数派时**：`step/0` 返回 `{error, no_quorum}`，视图不变。这是诚实的答复（ADR-021 D4），不存在「本地搬了但集群没提交」这种状态。
+
+**推荐的节点下线流程**（顺序很重要）：
+
+1. `POST /api/v1/drain` 摘流，等 `/api/v1/node` 的 `connections.active` 归零；
+2. 确认 `broker_rebalance:status()` 的 `orphaned` 为空——若不为空，说明还有分区挂在这个节点上；
+3. 若要以「优雅退出」而非「故障」语义交接，先在**还活着的节点**上把它的分区 `step` 走（owner 换到别人），再停进程；
+4. 停进程。
+
+反过来（先停进程再 step）也能收敛，但中间会有一段时间分区 owner 指向一个不存在的节点，写入被 fence、消费者没人可连——这是故障恢复路径，不是推荐路径。
+
+**边界（别指望它）**：
+
+- 不迁移**活连接**。drain 只停 accept，在用连接留在原节点直到客户端重连或宽限期结束。
+- 不跨 group 均衡。单 group 内最小搬迁单位是 1 个分区；跨 group 的均衡要改配置（ADR-008 :15-19）。
+- 不按连接数/内存/CPU 加权。连接数只覆盖 MQTT 系（ADR-032 D7），内存 CPU 不在冻结指标集里——按假数据加权比不加权更糟。
+- 不自动运行。没有 watchdog、没有 cron、没有节点事件订阅。要自动化请在外层调度器里调 `step/0`。
+**搬迁有多快**：一次完整搬迁（`migrate` + `finish_migration`）在同主机 3 peer 下 p50 约 **2 ms**、p99 约 **4 ms**，决策 `evaluate/0` 约 0.2 ms——成本几乎全在 raft 多数派提交，不在搬迁逻辑。迁移期间源仍可读、旧 epoch 被 fence、不搬数据不搬连接，**对业务延迟贡献为零**。数字与方法见 [`docs/benchmarks/2026-11-19-s12c-rebalance.md`](benchmarks/2026-11-19-s12c-rebalance.md)（同主机下界，跨机需另测）。
+- 不感知**动态成员变更**。成员集取自节点启动时的 `broker_cluster.members`（本仓今天没有 `ra:add_member` 的调用路径）。改成员配置后请**重启该节点**，否则触发者仍在按旧成员集判断，会把新节点的分区当孤儿、把分区搬给已移除的节点（后者只会反复返回错误，不会损坏数据）。临时绕过：用 `broker_rebalance:evaluate/1` / `step/1` 显式传入成员列表。
+
 ---
 
 ## 6. 滚动升级与版本兼容

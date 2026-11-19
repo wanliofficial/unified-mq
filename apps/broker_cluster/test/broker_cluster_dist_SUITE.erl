@@ -22,7 +22,8 @@ all() ->
     [three_node_group_forms_and_replicates,
      leader_failover_keeps_committing,
      losing_the_majority_rejects_metadata_writes,
-     old_owner_is_fenced_after_migration].
+     old_owner_is_fenced_after_migration,
+     a_crashed_node_rejoins_and_catches_up].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -133,6 +134,51 @@ old_owner_is_fenced_after_migration(Config) ->
     2 = maps:get(expected_epoch, Fenced),
     %% N2, the current owner, accepts the new epoch.
     ok = rpc(N2, broker_cluster, authorize_append, [0, 2]),
+    ok.
+
+%% A node that crashed and booted again must come back on its own: its local ra
+%% server restarts and catches up from the leader, with no operator action and
+%% no restart of the surviving peers. This is the "stateful service crashes and
+%% recovers" half of the S12 gate, at the layer where the ownership truth lives.
+%%
+%% The case exists because the recovery path was broken: `ra' restarts the head
+%% server locally and then "restarts" every other member over rpc, which on a
+%% rejoining node answers `{error, {already_started, _}}' for peers that never
+%% went down -- and the list comprehension inside `ra' badmatches on it, so
+%% `broker_cluster_meta:init/1' returned `{stop, ...}' and the node never came
+%% back. A single node crashing was enough to require a full-group restart.
+a_crashed_node_rejoins_and_catches_up(Config) ->
+    Members = members(Config),
+    [N1, N2, N3] = Members,
+    ok = form_cluster(Config),
+    %% N1 owns partition 0 at epoch 1, and N3 has seen it.
+    {ok, 1} = rpc(N1, broker_cluster, assign, [0, N1, Members, 1]),
+    {ok, N1} = rpc(N3, broker_cluster, owner, [0]),
+    %% N3 crashes: its metadata server and ra system go away, its peers stay up.
+    ok = rpc(N3, crash_meta, []),
+    undefined = rpc(N3, whereis_meta, []),
+    %% The cluster moves on while N3 is down -- this is the state it must catch
+    %% up on, not merely "the same view it had before".
+    {ok, 2} = rpc(N2, broker_cluster, assign, [0, N2, Members, 2]),
+    %% N3 boots again with the same member list, exactly as a reboot would.
+    ok = rpc(N3, revive_cache, []),
+    ok = rpc(N3, start_meta, [Members]),
+    ok = wait_until(fun() ->
+                            rpc(N3, broker_cluster, owner, [0]) =:= {ok, N2}
+                    end, 20000),
+    %% It did not just come back: it caught up to epoch 2 and to the new owner.
+    {ok, 2} = rpc(N3, broker_cluster, epoch, [0]),
+    {ok, N2} = rpc(N3, broker_cluster, owner, [0]),
+    %% Being caught up also means fencing correctly: N3 is not the owner any
+    %% more, so it refuses the write at *any* epoch, while the real owner takes
+    %% the current one. (Before the crash N3 would have answered `ok' for
+    %% epoch 1 had it owned the partition; the point here is that its view is
+    %% current, not stale.)
+    {error, {fenced, #{partition := 0, expected_epoch := 2}}} =
+        rpc(N3, broker_cluster, authorize_append, [0, 2]),
+    ok = rpc(N2, broker_cluster, authorize_append, [0, 2]),
+    %% And the survivors did not have to be touched: the group still commits.
+    {ok, 1} = rpc(N1, broker_cluster, assign, [1, N1, Members, 1]),
     ok.
 
 %%%_* Peers ---------------------------------------------------------------
@@ -276,4 +322,23 @@ start_meta(Members) ->
     ok = application:set_env(broker_cluster, members, Members),
     {ok, Meta} = broker_cluster_meta:start_link(),
     unlink(Meta),
+    ok.
+
+%% Simulate a crash of everything this application owns on the peer. The ra
+%% system is stopped last: stopping the server first would leave the system up
+%% with a stale server id registered, which is not what a restart looks like.
+crash_meta() ->
+    catch gen_server:stop(broker_cluster_meta_ctl, kill, 1000),
+    catch ra:stop_server(default, {broker_cluster_meta, node()}),
+    catch ra_system:stop_default(),
+    catch gen_server:stop(broker_cluster_cache),
+    ok.
+
+whereis_meta() -> whereis(broker_cluster_meta).
+
+%% A reboot brings the application's supervision tree back in order: the cache
+%% first, then the metadata server attaches to the existing group.
+revive_cache() ->
+    {ok, Cache} = broker_cluster_cache:start_link(),
+    unlink(Cache),
     ok.
