@@ -44,7 +44,7 @@
 
 -export([subscribe/3, subscribe/4, join/5, join/6, unsubscribe/2, leave/2,
          ack/4, claim/4, release/4, retry/4,
-         inflight/2, attach/3, detach/2, dispatch/2]).
+         inflight/2, attach/3, detach/2, dispatch/2, dispatch_qos0/1]).
 -export([subscriptions/1, cursor/2, session/1, role/2]).
 
 -export_type([sub_ref/0, sub_kind/0, cursors/0, subscription/0]).
@@ -219,7 +219,16 @@ detach(ClientId, Pid) ->
 -spec dispatch([sub_ref()], {partition_id() | undefined,
                              offset() | undefined,
                              #broker_message{}}) -> ok.
-dispatch(SubRefs, {PartitionId, _Offset, _Msg} = Delivery) ->
+dispatch(SubRefs, {undefined, undefined, Msg} = Delivery) ->
+    ok = dispatch_local(SubRefs, Delivery),
+    maybe_fanout_qos0(Msg);
+dispatch(SubRefs, Delivery) ->
+    dispatch_local(SubRefs, Delivery).
+
+%% @private The push itself, without the cross-node step. Both `dispatch/2' and
+%% the remote `dispatch_qos0/1' land here, so a message that arrived over the
+%% distribution is delivered without re-broadcasting (no fan-out recursion).
+dispatch_local(SubRefs, {PartitionId, _Offset, _Msg} = Delivery) ->
     Positional = PartitionId =/= undefined,
     lists:foreach(
       fun({ClientId, {MaxQoS, Matched}}) ->
@@ -232,6 +241,37 @@ dispatch(SubRefs, {PartitionId, _Offset, _Msg} = Delivery) ->
       end,
       maps:to_list(group_by_consumer(SubRefs, Positional))),
     ok.
+
+%% @private ADR-034 D4: hand the QoS0 message to the other members. The hook is
+%% installed by `broker_cluster' only when cross-node delivery is on; with it
+%% absent (the default) this is a no-op and `dispatch/2' is exactly the local
+%% push. The hook is `rpc:cast' based, so an unreachable member is dropped
+%% silently and the publisher's path never blocks (ADR-007 L1).
+maybe_fanout_qos0(Msg) ->
+    case persistent_term:get({?MODULE, qos0_fanout}, undefined) of
+        Fanout when is_function(Fanout, 1) ->
+            _ = (catch Fanout(Msg)),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% @doc The remote entry point (ADR-034 D4): a node that received a QoS0 message
+%% over the distribution resolves its own subscribers for it and pushes. It goes
+%% straight to `dispatch_local/2' -- never `dispatch/2' -- so the broadcast does
+%% not echo back out.
+-spec dispatch_qos0(#broker_message{}) -> ok.
+dispatch_qos0(#broker_message{destination = Topic, tenant_id = Tenant} = Msg) ->
+    case broker_router:route(Topic, tenant_of(Tenant)) of
+        {ok, Routed} ->
+            Refs = lists:append([Refs || {_Partition, Refs} <- Routed]),
+            dispatch_local(Refs, {undefined, undefined, Msg});
+        {error, _Reason} ->
+            ok
+    end.
+
+tenant_of(Tenant) when is_binary(Tenant), Tenant =/= <<>> -> Tenant;
+tenant_of(_) -> <<"*">>.
 
 %%%_* Reads (caller process, no process hop) --------------------------------
 

@@ -18,7 +18,7 @@
 -export([replicate/2, install_hooks/0, uninstall_hooks/0]).
 %% S12-D (ADR-034): installed as `persistent_term' hooks, never called by
 %% adapters directly.
--export([route_op/3, partition_owner/1, reinstall_hooks/1]).
+-export([route_op/3, partition_owner/1, reinstall_hooks/1, qos0_fanout/1]).
 
 %%%_* Lifecycle -----------------------------------------------------------
 
@@ -196,9 +196,46 @@ install_cross_node_hooks() ->
                                                    cross_node_timeout_ms, 2000)),
             persistent_term:put({broker_subscription, owner},
                                 fun ?MODULE:partition_owner/1),
+            persistent_term:put({broker_subscription, qos0_fanout},
+                                fun ?MODULE:qos0_fanout/1),
             ok;
         _ ->
             ok
+    end.
+
+%% @doc ADR-034 D4: broadcast a QoS0 message to the other members. Each member
+%% re-routes it against its own index (`broker_subscription:dispatch_qos0/1'), so
+%% no node needs another node's subscriber list. `rpc:cast' is fire-and-forget:
+%% an unreachable member is dropped silently, the publisher's path never blocks,
+%% and nothing is stored or retried -- ADR-007 L1, exactly what QoS0 promises.
+qos0_fanout(Msg) ->
+    case cluster_members() of
+        {ok, Members} ->
+            lists:foreach(
+              fun(Node) when Node =/= node() ->
+                      _ = (catch rpc:cast(Node, broker_subscription,
+                                          dispatch_qos0, [Msg]));
+                 (_) ->
+                      ok
+              end, Members),
+            ok;
+        {error, _} ->
+            ok
+    end.
+
+%% The committed membership is the truth (ADR-033). When the control process is
+%% not running -- a single node, or a test that only set the env -- fall back to
+%% the configured list, which defaults to `[node()]' (no fan-out).
+cluster_members() ->
+    try broker_cluster_meta:members() of
+        Members when is_list(Members) -> {ok, Members};
+        _ -> {error, unavailable}
+    catch
+        _:_ ->
+            case application:get_env(broker_cluster, members, [node()]) of
+                Ms when is_list(Ms) -> {ok, Ms};
+                _ -> {error, unavailable}
+            end
     end.
 
 %% @private Test/ops helper (ADR-034 D8): tear every hook down and reinstall the
@@ -216,6 +253,7 @@ uninstall_hooks() ->
     _ = persistent_term:erase({broker_queue, router}),
     _ = persistent_term:erase({broker_queue, forward_timeout_ms}),
     _ = persistent_term:erase({broker_subscription, owner}),
+    _ = persistent_term:erase({broker_subscription, qos0_fanout}),
     _ = persistent_term:erase({broker_cluster, epoch}),
     ok.
 

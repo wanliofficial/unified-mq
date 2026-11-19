@@ -42,6 +42,7 @@ all() ->
      a_cross_node_subscribe_wakes_a_remote_subscriber_whose_death_cleans_up,
      a_shared_group_is_refused_across_nodes_while_an_exclusive_one_is_not,
      committed_is_the_minimum_over_the_nodes_and_a_leave_releases_it,
+     a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member,
      with_routing_off_a_non_owner_write_is_refused_and_writes_nothing].
 
 %%%_* Fixtures --------------------------------------------------------------
@@ -72,7 +73,12 @@ init_per_testcase(Case, Config) ->
     Peers = start_peers(Case, Config),
     Nodes = [maps:get(node, P) || P <- Peers],
     [N1, N2] = Nodes,
-    %% Both peers share one ownership view: `Owner' owns every partition.
+    %% Both peers share one ownership view: `Owner' owns every partition. They
+    %% also share a membership view for the QoS0 fan-out (D4): the env is the
+    %% fallback `broker_cluster_meta:members/0' uses when the control process is
+    %% not running, which is the case for these storage-only peers.
+    ok = rpc(N1, application, set_env, [broker_cluster, members, Nodes]),
+    ok = rpc(N2, application, set_env, [broker_cluster, members, Nodes]),
     ok = rpc(N1, ?MODULE, set_owner, [0, N2, Nodes]),
     ok = rpc(N2, ?MODULE, set_owner, [0, N2, Nodes]),
     [{peers, Peers}, {nodes, Nodes}, {owner, N2}, {non_owner, N1} | Config].
@@ -213,6 +219,28 @@ with_routing_off_a_non_owner_write_is_refused_and_writes_nothing(Config) ->
     ?assertEqual({ok, [], 1}, local_page(N1, 0, 1, 10)),
     ok.
 
+%% D4's whole point: a QoS0 publish on one node reaches a subscriber attached on
+%% another. QoS0 never enters the log, so there is no owner to pull it from -- the
+%% message is cast to every member and each re-routes it against its *own* index.
+%% The publisher's local push is empty here (the subscriber is not on N2), which
+%% is what makes the cross-node hop load-bearing rather than incidental. Neither
+%% side writes anything: QoS0 has no offset to consume.
+a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member(Config) ->
+    N1 = ?config(non_owner, Config),
+    N2 = ?config(owner, Config),
+    Topic = <<"sports/tennis/+">>,
+    Parent = self(),
+    Sub = rpc(N1, erlang, spawn, [?MODULE, qos0_subscriber, [Topic, Parent]]),
+    ?assertEqual({attached, Sub}, receive_attached(5000)),
+    ok = rpc(N2, broker_subscription, dispatch,
+             [[], {undefined, undefined, qos0_msg(Topic)}]),
+    ?assertEqual({delivered, Sub}, receive_d(5000)),
+    %% QoS0 never enters the log on either side: nothing to own, nothing to pull.
+    ?assertEqual({ok, 0, 1}, local_watermarks(N1, 0)),
+    ?assertEqual({ok, 0, 1}, local_watermarks(N2, 0)),
+    true = rpc(N1, erlang, exit, [Sub, kill]),
+    ok.
+
 %%%_* Peers ----------------------------------------------------------------
 
 start_peers(Case, Config) ->
@@ -325,6 +353,23 @@ subscriber(Partition, Parent) ->
         Parent ! {no_wake, self()}
     end.
 
+%% @private Called on a peer (N1): subscribe exclusively to `Topic', attach this
+%% process as the delivery target, then report that it is ready and wait for the
+%% cross-node QoS0 push. The `{broker_deliver, ...}' frame is what
+%% `dispatch_local/2' sends when `dispatch_qos0/1' re-routes the message here.
+qos0_subscriber(Topic, Parent) ->
+    {ok, _SubRef} = broker_subscription:subscribe(<<"cB">>, Topic, 0),
+    {ok, _Prev} = broker_subscription:attach(<<"cB">>, self(), true),
+    Parent ! {attached, self()},
+    receive
+        {broker_deliver, <<"cB">>, _QoS, _Refs, {undefined, undefined, _Msg}} ->
+            Parent ! {delivered, self()};
+        Other ->
+            Parent ! {unexpected, self(), Other}
+    after 5000 ->
+        Parent ! {no_delivery, self()}
+    end.
+
 %%%_* Owner-side introspection (runs on the peer) ---------------------------
 
 %% Read the partition's own storage, bypassing `broker_queue' so a routed read on
@@ -366,6 +411,40 @@ msg(PartitionId, Payload) ->
 
 payloads({ok, Page, _Next}) ->
     [{Off, M#broker_message.payload} || {Off, M} <- Page].
+
+%% A QoS0 message addressed to `Topic' -- the payload is irrelevant, only the
+%% routing keys (destination / tenant) that `dispatch_qos0/1' re-resolves matter.
+qos0_msg(Topic) ->
+    #broker_message{message_id = <<"q">>,
+                    tenant_id = <<"t">>,
+                    destination = Topic,
+                    partition_id = 0,
+                    payload = <<"qos0">>,
+                    payload_encoding = raw,
+                    headers = #{},
+                    proto_meta = #{},
+                    persistence = durable,
+                    reliability = best_effort,
+                    created_at = 1,
+                    expires_at = undefined}.
+
+receive_attached(Timeout) ->
+    receive
+        {attached, P} -> {attached, P};
+        Other -> {unexpected, Other}
+    after Timeout ->
+        timeout
+    end.
+
+receive_d(Timeout) ->
+    receive
+        {delivered, P} -> {delivered, P};
+        {no_delivery, P} -> {no_delivery, P};
+        {unexpected, P, _} -> {unexpected, P};
+        Other -> {unexpected_frame, Other}
+    after Timeout ->
+        timeout
+    end.
 
 receive_wake(Timeout) ->
     receive

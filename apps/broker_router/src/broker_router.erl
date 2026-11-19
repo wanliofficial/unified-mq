@@ -10,7 +10,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include("broker_router.hrl").
 
--export([env/0, register/3, unregister/1]).
+-export([env/0, register/3, unregister/1, route/2]).
 
 -export_type([router_env/0, sub_ref/0, route_ctx/0]).
 
@@ -61,6 +61,29 @@ register(Filter, SubRef, SubOpts) ->
 unregister(SubRef) ->
     case {env(), backend()} of
         {{ok, Env}, Backend} -> Backend:unregister(Env, SubRef);
+        {{error, Reason}, _} -> {error, Reason}
+    end.
+
+%% @doc Read-path facade for a caller that only has a destination and a tenant
+%% -- S12-D (ADR-034 D4) needs exactly this: a node re-routing a QoS0 message it
+%% received over the distribution must resolve its *own* subscribers without
+%% threading the publisher's full `route_ctx'. Additive to the frozen behavior
+%% (a plain function, not a callback, same precedent as `env/0'): it resolves the
+%% configured backend so the caller never hardcodes `broker_router_hash'.
+%%
+%% The `reliability' field is filled with `os_buffer' because the read path is
+%% durability-blind -- the hash backend's `route/3' only consults the tenant --
+%% and a QoS0 re-route has no `sync_mode' to carry. The publisher is `undefined'
+%% for the same reason.
+-spec route(binary(), binary() | route_ctx()) ->
+          {ok, [{partition_id(), [sub_ref()]}]} | {error, term()}.
+route(Destination, Tenant) when is_binary(Destination), is_binary(Tenant) ->
+    route(Destination, #route_ctx{tenant_id = Tenant,
+                                  publisher = undefined,
+                                  reliability = os_buffer});
+route(Destination, #route_ctx{} = Ctx) ->
+    case {env(), backend()} of
+        {{ok, Env}, Backend} -> Backend:route(Destination, Ctx, Env);
         {{error, Reason}, _} -> {error, Reason}
     end.
 
