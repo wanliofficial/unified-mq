@@ -170,8 +170,9 @@ dist 套件 `broker_cluster_cross_node_dist_SUITE`（2 peer，每 peer `port => 
 7. `a_qos0_burst_reaches_a_remote_subscriber_without_loss_or_duplication` —— 验证 4 的负载面：**300 条** QoS0 突发跨成员投递，计数精确（无丢失、无重复），发布者日志不增（同时是「cast 不阻塞发布者」L1 主张的证据：`publish_burst/2` 返回即代表 300 次 cast 已全部入队）。
 8. `a_cross_node_append_burst_lands_only_on_the_owner` —— 验证 1 的负载面：**300 条**跨节点 append 全部只落 owner，非 owner 零泄漏，facade 读回有序完整（路由热路径在量级下仍正确）。
 9. `with_routing_off_a_non_owner_write_is_refused_and_writes_nothing` —— 验证 9（关闭时 guard 拒绝、无本地写）。
+10. `cross_node_delivery_latency` —— Gate S12「容量与迁移报告」的跨节点投递证据：真实 dist fixture 上测 D0/D2/D3/D4 四条热路径的 p50/p95/p99/max，**不做延迟断言**（是可复跑的 benchmark，不是 perf gate），数字落盘 `bench_s12d.txt` 并见 [`docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`](../benchmarks/2026-11-19-s12d-cross-node-delivery.md)。
 
-全量 `rebar3 ct` **1471/1471**（基线 1460 + ADR-034 D2/D3/D5/D6/D8 8 例 + D4 1 例 + 本轮压测 2 例）；dialyzer 0 warning；xref 仅既有 unused-export 告警。
+全量 `rebar3 ct` **1472/1472**（基线 1460 + ADR-034 D2/D3/D5/D6/D8 8 例 + D4 1 例 + 压测 2 例 + 容量 1 例）；dialyzer 0 warning；xref 仅既有 unused-export 告警。
 
 ## 已签认的四个问题（2026-11-19）
 

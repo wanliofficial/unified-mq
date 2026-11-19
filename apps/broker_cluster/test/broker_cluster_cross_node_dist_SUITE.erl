@@ -45,6 +45,7 @@ all() ->
      a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member,
      a_qos0_burst_reaches_a_remote_subscriber_without_loss_or_duplication,
      a_cross_node_append_burst_lands_only_on_the_owner,
+     cross_node_delivery_latency,
      with_routing_off_a_non_owner_write_is_refused_and_writes_nothing].
 
 %%%_* Fixtures --------------------------------------------------------------
@@ -282,6 +283,64 @@ a_cross_node_append_burst_lands_only_on_the_owner(Config) ->
     ?assertEqual([{I, integer_to_binary(I)} || I <- lists:seq(1, Count)],
                  payloads(rpc(N1, broker_queue, read_from, [0, 1, Count + 10]))),
     ok.
+
+%% Capacity / latency evidence for ADR-034 (Gate S12「容量与迁移报告」). Times the three
+%% cross-node hot paths on the real dist fixture, against a local-append baseline that
+%% isolates the routing cost. It records p50/p95/p99/max to `bench_s12d.txt' in the
+%% case's priv dir and makes **no timing assertion** -- it is a repeatable benchmark,
+%% not a perf gate, so a slow machine cannot turn it red.
+cross_node_delivery_latency(Config) ->
+    N1 = ?config(non_owner, Config),
+    N2 = ?config(owner, Config),
+    Topic = <<"bench/sport">>,
+    N = 200,
+    %% Warmup: prime module loading, leader discovery, cache fill -- none of which is
+    %% in the steady-state path the report describes.
+    [{ok, _} = rpc(N2, broker_queue, append, [0, msg(0, integer_to_binary(I)), fsync])
+     || I <- lists:seq(1, 20)],
+    %% D0 baseline: append served locally on the owner (no forwarding) -- the floor.
+    D0 = measure(fun(I) -> {ok, _} = rpc(N2, broker_queue, append,
+                                          [0, msg(0, integer_to_binary(I)), fsync]) end, N),
+    %% D2: append from the non-owner, forwarded to the owner over the distribution.
+    D2 = measure(fun(I) -> {ok, _} = rpc(N1, broker_queue, append,
+                                          [0, msg(0, integer_to_binary(I)), fsync]) end, N),
+    %% D3: read_from from the non-owner, routed to the owner's log.
+    D3 = measure(fun(_I) -> {ok, _, _} = rpc(N1, broker_queue, read_from, [0, 1, 10]) end, N),
+    %% D4: a QoS0 dispatch on the owner that fans out via rpc:cast (publisher-side cost).
+    D4 = measure(fun(_I) -> ok = rpc(N2, broker_subscription, dispatch,
+                                      [[], {undefined, undefined, qos0_msg(Topic)}]) end, N),
+    Rows = [{"D0_local_append_owner", D0},
+            {"D2_append_cross_node", D2},
+            {"D3_read_cross_node", D3},
+            {"D4_qos0_dispatch", D4}],
+    Lines = [io_lib:format("~s p50=~.1f p95=~.1f p99=~.1f max=~.1f",
+                           [Name, us(pct(S, 50)), us(pct(S, 95)),
+                            us(pct(S, 99)), us(lists:max(S))])
+             || {Name, S} <- Rows],
+    Out = filename:join(?config(priv_dir, Config), "bench_s12d.txt"),
+    ok = file:write_file(Out, [L ++ "\n" || L <- Lines]),
+    ct:pal("ADR-034 cross-node latency (n=~p, same host):~n~s",
+           [N, [L ++ "\n" || L <- Lines]]),
+    %% Functional sanity, so the case still fails loudly if the path breaks (only the
+    %% timings are un-asserted). The owner saw the warmup + D0 (local) + D2 (cross-node)
+    %% appends; the non-owner wrote nothing itself.
+    ?assertEqual({ok, 0, 21 + 2 * N}, local_watermarks(N2, 0)),
+    ?assertEqual({ok, 0, 1}, local_watermarks(N1, 0)),
+    ok.
+
+measure(F, N) ->
+    [begin
+         T0 = erlang:monotonic_time(nanosecond),
+         F(I),
+         erlang:monotonic_time(nanosecond) - T0
+     end || I <- lists:seq(1, N)].
+
+pct(Samples, P) ->
+    Sorted = lists:sort(Samples),
+    Idx = max(1, round(P * length(Sorted) / 100)),
+    lists:nth(Idx, Sorted).
+
+us(Nanoseconds) -> Nanoseconds / 1000.
 
 %%%_* Peers ----------------------------------------------------------------
 
