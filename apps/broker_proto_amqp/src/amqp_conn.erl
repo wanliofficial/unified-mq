@@ -39,6 +39,9 @@
 -define(FRAME_MAX, 131072).
 -define(PAYLOAD_MAX, (?FRAME_MAX - 8)).
 -define(DEFAULT_TICK, 100).
+%% §4.2.7: the server's proposed heartbeat (seconds). Clients may lower it in
+%% tune-ok; a proposal of 0 from either side disables heartbeats entirely.
+-define(DEFAULT_HEARTBEAT, 60).
 
 -record(ch, {
     pending = undefined :: undefined | {binary(), binary(), 0 | 1,
@@ -67,6 +70,15 @@
     frame_max = ?FRAME_MAX :: pos_integer(),
     channels = #{} :: #{non_neg_integer() => #ch{}},
     tick :: reference() | undefined,
+    %% §4.2.7 heartbeat negotiation, in milliseconds (0 = disabled, which is
+    %% what a proposal of 0 from either side means). `hb_ref' is the watchdog
+    %% timer and `hb_misses' counts consecutive ticks with no inbound traffic:
+    %% two of them (2*Hb of silence) means the peer is dead and the connection
+    %% closes. The pull `tick' above is a different thing (the poll interval)
+    %% and must not be reused for this.
+    heartbeat = 0 :: non_neg_integer(),
+    hb_ref :: reference() | undefined,
+    hb_misses = 0 :: non_neg_integer(),
     %% {Partition, Offset} this connection released unacked (nack requeue,
     %% recover, consumer drop). The next delivery of the same position is
     %% redelivered=1 (RQ-11). Connection-local by design: a consumer on
@@ -128,6 +140,8 @@ handle_info({broker_deliver, ClientId, _MaxQoS, _Refs, {_P, _O, _Msg}},
     {noreply, arm_tick(pull_all(St))};
 handle_info(pull_tick, St) ->
     {noreply, arm_tick(pull_all(St#st{tick = undefined}))};
+handle_info(heartbeat_tick, St) ->
+    hb_tick(St);
 handle_info(_Other, St) ->
     {noreply, St}.
 
@@ -138,7 +152,10 @@ code_change(_OldVsn, St, _Extra) -> {ok, St}.
 on_data(Data, St) ->
     Result = parse(<<(St#st.buffer)/binary, Data/binary>>, St#st{buffer = <<>>}),
     case Result of
-        {noreply, St1} -> rearm(St1);
+        %% Any inbound bytes prove the peer is alive: restart the heartbeat
+        %% watchdog (§4.2.7). A heartbeat frame we receive counts too -- that is
+        %% exactly what keeps two peers that are otherwise idle from timing out.
+        {noreply, St1} -> rearm(arm_heartbeat(St1));
         Other -> Other
     end.
 
@@ -299,9 +316,20 @@ handle_method(0, 10, 11, Args, #st{phase = start} = St) ->
                              0, 0, St)
     end;
 handle_method(0, 10, 31, Args, #st{phase = tune} = St) ->
-    %% connection.tune-ok: channel-max, frame-max, heartbeat.
-    <<_ChannelMax:16, FrameMax:32, _Heartbeat:16>> = Args,
-    {noreply, St#st{phase = open, frame_max = min(?FRAME_MAX, max(4096, FrameMax))}};
+    %% connection.tune-ok: channel-max, frame-max, heartbeat. The client may
+    %% lower the heartbeat we proposed; 0 from either side disables it.
+    <<_ChannelMax:16, FrameMax:32, ClientHb:16>> = Args,
+    ServerHb = server_heartbeat(),
+    Negotiated = case min(ServerHb, ClientHb) of
+                     0 -> 0;
+                     Hb -> Hb
+                 end,
+    %% Stored in milliseconds for the watchdog timer; 0 stays 0 (disabled).
+    St1 = St#st{phase = open,
+                frame_max = min(?FRAME_MAX, max(4096, FrameMax)),
+                heartbeat = Negotiated * 1000},
+    %% The connection is established now: start the heartbeat watchdog.
+    {noreply, arm_heartbeat(St1)};
 handle_method(0, 10, 40, Args, #st{phase = open} = St) ->
     {_VHost, Rest1} = amqp_codec:get_shortstr(Args),
     {_Capabilities, _Rest2} = amqp_codec:get_shortstr(Rest1),
@@ -1069,8 +1097,13 @@ admit(St) ->
     end.
 
 send_tune(St) ->
-    Args = <<2047:16, ?FRAME_MAX:32, 0:16>>,
+    %% The third field is the heartbeat the server proposes (seconds). 0 means
+    %% "no heartbeat"; a client may lower it in tune-ok but not raise it.
+    Args = <<2047:16, ?FRAME_MAX:32, (server_heartbeat()):16>>,
     {noreply, send_method(0, 10, 30, Args, St)}.
+
+server_heartbeat() ->
+    application:get_env(broker_proto_amqp, heartbeat, ?DEFAULT_HEARTBEAT).
 
 send_method(Channel, Class, Method, Args, St) ->
     send_frame(?FRAME_METHOD, Channel, amqp_codec:encode_method(Class, Method, Args), St).
@@ -1169,6 +1202,7 @@ bitval(false) -> 0.
 
 cleanup(#st{} = St) ->
     cancel_tick(St),
+    _ = cancel_hb_timer(St),
     lists:foreach(
       fun({Channel, #ch{} = Ch}) ->
               lists:foreach(
@@ -1185,6 +1219,36 @@ cleanup(#st{} = St) ->
         undefined -> ok;
         ClientId -> _ = (catch broker_subscription:detach(ClientId, self())), ok
     end.
+
+arm_heartbeat(#st{heartbeat = 0} = St) ->
+    %% Heartbeats disabled: no watchdog, nothing to do on inbound data.
+    St;
+arm_heartbeat(#st{heartbeat = Hb} = St) ->
+    _ = cancel_hb_timer(St),
+    St#st{hb_ref = erlang:send_after(Hb, self(), heartbeat_tick),
+          hb_misses = 0}.
+
+%% §4.2.7 watchdog. The timer fires every `heartbeat' ms, but ONLY inbound
+%% traffic restarts it (see `on_data/2'). So a tick means "we have heard nothing
+%% from the peer for a full interval":
+%%   * first silent tick  -> answer with a heartbeat frame, remember the miss;
+%%   * second silent tick -> 2*Hb of silence: the peer is gone, stop normal.
+hb_tick(#st{heartbeat = _Hb, hb_misses = N} = St) when N >= 1 ->
+    {stop, normal, St};
+hb_tick(#st{heartbeat = _Hb, hb_misses = 0, socket = undefined} = St) ->
+    %% Socket already gone (the tcp_closed handler will reap); don't touch it.
+    {noreply, St};
+hb_tick(#st{heartbeat = Hb} = St) ->
+    %% First silent interval: send a heartbeat and re-arm WITHOUT clearing the
+    %% miss, so the next tick still has the evidence of this one.
+    _ = send_frame(?FRAME_HEARTBEAT, 0, <<>>, St),
+    {noreply, St#st{hb_ref = erlang:send_after(Hb, self(), heartbeat_tick),
+                    hb_misses = 1}}.
+
+%% Cancel the watchdog timer, returning the state untouched so callers can thread
+%% it (unlike a bare `cancel_timer/1', whose `ok' would poison a record update).
+cancel_hb_timer(#st{hb_ref = undefined}) -> ok;
+cancel_hb_timer(#st{hb_ref = Ref}) -> _ = erlang:cancel_timer(Ref), ok.
 
 cancel_tick(#st{tick = undefined}) -> ok;
 cancel_tick(#st{tick = Ref}) -> _ = erlang:cancel_timer(Ref), ok.

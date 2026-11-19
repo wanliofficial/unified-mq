@@ -31,6 +31,7 @@ all() ->
      multi_channel_isolation,
      connection_close_gets_close_ok,
      heartbeat_frame_is_accepted,
+     heartbeat_is_negotiated_and_enforced,
      bad_frame_end_stops_connection,
      a_valid_credential_is_accepted,
      a_wrong_credential_is_refused,
@@ -406,6 +407,28 @@ heartbeat_frame_is_accepted(Config) ->
     close(C2),
     ok.
 
+%% §4.2.7: the server proposes a heartbeat in `connection.tune', the client
+%% echoes a (possibly lower) value in tune-ok, and once negotiated the server
+%% emits heartbeat frames while the peer is idle and closes the connection if
+%% the peer stays silent for 2*Hb. With the broker configured to 1s, both are
+%% observable within a test's timetrap.
+heartbeat_is_negotiated_and_enforced(Config) ->
+    ok = application:set_env(broker_proto_amqp, heartbeat, 1),
+    try
+        {ServerHb, C0} = connect_with_heartbeat(Config, 1),
+        ?assertEqual(1, ServerHb),
+        C1 = open_channel(C0, 1),
+        %% Idle: a heartbeat frame (type 8, empty) must arrive within the
+        %% watchdog interval.
+        {8, 0, <<>>, C2} = recv_frame(C1, 5000),
+        %% Stay idle past 2*Hb: the watchdog decides the peer is gone and the
+        %% socket closes.
+        ?assertEqual({error, closed}, gen_tcp:recv(C2#c.s, 0, 5000)),
+        ok
+    after
+        ok = application:unset_env(broker_proto_amqp, heartbeat)
+    end.
+
 bad_frame_end_stops_connection(Config) ->
     C0 = connect(Config),
     %% A method frame whose terminator is not 0xCE.
@@ -737,6 +760,19 @@ connect(Config) ->
     C5 = send_method(C4, 0, 10, 40, Open),
     {0, 10, 41, _, C6} = recv_method(C5),
     C6.
+
+%% @doc The handshake that also ECHOES a heartbeat value in tune-ok, and
+%% reports the heartbeat the server proposed. `Hb' is the negotiated client
+%% side; the server's own proposal is returned so a test can assert it.
+connect_with_heartbeat(Config, Hb) ->
+    C2 = connect_with(Config, <<"guest">>, <<"guest">>),
+    {0, 10, 30, <<2047:16, 131072:32, ServerHb:16>>, C3} = recv_method(C2),
+    C4 = send_method(C3, 0, 10, 31, <<2047:16, 131072:32, Hb:16>>),
+    Open = <<(amqp_codec:encode_shortstr(<<"/">>))/binary,
+             (amqp_codec:encode_shortstr(<<>>))/binary, 0:8>>,
+    C5 = send_method(C4, 0, 10, 40, Open),
+    {0, 10, 41, _, C6} = recv_method(C5),
+    {ServerHb, C6}.
 
 %% @doc The AMQP handshake up to `connection.tune', with the given PLAIN
 %% credentials.  The caller finishes the handshake (tune-ok, open).
