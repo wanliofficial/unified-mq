@@ -1,6 +1,6 @@
 # ADR-034：S12-D 本体——跨节点消息投递——owner 权威日志 + 跨节点读写路由（默认关闭）
 
-- **状态**：提案（待评审签认，2026-11-19）——**尚未签认**，本文件不构成冻结裁决
+- **状态**：已接受（2026-11-19 评审签认）——四项待签认问题见文末，全部签认；裁决正文自本日起构成冻结裁决
 - **日期**：2026-11-19
 - **关联**：ADR-032 D9（跨节点投递不在 S12，单列 S12-D 且须新增 ADR）、ADR-033（S12-D 前置·成员在线变更，已交付）、ADR-010（`broker_router` 行为——**本 ADR 不修订其冻结正文**）、ADR-011（`broker_storage` 行为——读/写入口不变）、ADR-013（订阅类型与 cursor 归属——**不变**）、ADR-014（retention「永不删过 `committed`」——**规则不变**，D6 只定义跨节点下 `committed` 的取法）、ADR-016（可观测最小集，冻结键集——不扩容）、ADR-019（Shared 原子 claim 与会话本地——**shared 跨节点不交付**，正文不修订）、ADR-021（集群控制面、Metadata Raft 与 Fencing——复用，不新增共识）、ADR-007（显式可靠性三档——可用性与丢失边界绑定它）、ADR-009（`broker_message` 记录——不变）
 - **关联文档**：[`docs/design/s12d-cross-node-delivery-convergence.md`](../design/s12d-cross-node-delivery-convergence.md)（缺四件、A~E 五条互斥路子、ADR-010/019/021 冻结冲突）、[`docs/design/s12-infrastructure-ha-and-lb.md`](../design/s12-infrastructure-ha-and-lb.md)（§4 R-*、§5.3 Gate）、[`docs/roadmap.md`](../roadmap.md) §14
@@ -157,19 +157,19 @@ ADR-032 D9 冻结了两件事：①跨节点 publish→subscribe 在本仓**不�
 9. **默认关闭零回归**：`cross_node_delivery = false` 时全量 `rebar3 ct`（基线 1460/1460）逐例不变；`cluster_fencing_rejected` 计数行为不变。
 10. **wake 不承担正确性**：人为丢弃所有 `{new_messages, ...}` 后，poll tick 仍能把消息送达（拉模型自证）。
 
-## 待评审签认的四个问题
+## 已签认的四个问题（2026-11-19）
 
-本 ADR 是**提案**，以下四点需要评审明确签认后才能冻结：
+本 ADR 的四点评审签认记录如下，签认后裁决正文冻结：
 
-1. 是否接受 **shared 组跨节点不交付**（显式拒绝）作为 v1 边界？
-2. 是否接受 **`replicated_commit` + 副本集覆盖可能 owner** 作为跨节点投递的**启动前提**（不满足即拒绝启动 / 拒绝迁移）？
-3. 是否接受 **owner 读热点**这一代价（相对 B 路线用写放大换读分散）？
-4. 是否确认 `cross_node_delivery` **默认 `false`**，且本期不追求跨节点 exactly-once？
+1. **shared 组跨节点不交付（显式拒绝）作为 v1 边界**——已签认。`reply_new_subscribe2` 对跨节点 shared join 显式拒绝（`{cross_node_shared_unsupported, Partition}`），exclusive/failover 跨节点正常交付。代价：v1 不支持跨节点的 shared 消费组横向扩展，留待后续版本。
+2. **`replicated_commit` + 副本集覆盖可能 owner 作为跨节点投递的启动前提**——已签认。不满足即拒绝启动 / 拒绝迁移（`assign`/`migrate` 做副本集校验）。代价：owner 必须落在 `replicas` 覆盖范围内，否则跨节点投递无从谈起。
+3. **owner 读热点**——已签认。选 D′（owner 权威日志 + 跨节点读写路由）而非 B 路线（写放大换读分散），读侧集中到 owner 是已知代价，本期接受。
+4. **`cross_node_delivery` 默认 `false`，且不追求跨节点 exactly-once**——已签认。默认关闭时单节点行为字节级不变；跨节点投递为 L1 尽力而为（cast 不阻塞、不可达静默丢弃），不承诺 exactly-once。
 
 ## 落地偏差记录
 
-- **2026-11-19 立项（提案，未签认）**：本 ADR 依据 ADR-032 D9「S12-D 须新增 ADR」与 ADR-033 立项记录「产品侧确认 G2 终态 = 一个逻辑 Broker」起草。裁决形状 D′（owner 权威日志 + 跨节点读写路由），不新增 app / 端口 / 依赖 / 指标键，不改 ADR-010 / ADR-019 冻结正文，不迁移活进程。实现尚未开工；落地偏差、实测数字与任何形状调整将在实现提交后追加到本节，**正文不改**。
-- **2026-11-19 实现落地（提案实现先行，仍未签认）**：按 D2 / D3 / D5 / D6 / D8 实现并交付 dist CT。**与正文的偏差如实记录**：
+- **2026-11-19 评审签认**：上述四项待签认问题全部签认（详见「已签认的四个问题」），ADR 状态由「提案」改为「已接受」，裁决正文自本日起冻结。
+- **2026-11-19 实现落地（D2/D3/D5/D6/D8 + D4，已签认）**：按 D2 / D3 / D4 / D5 / D6 / D8 实现并交付 dist CT。**与正文的偏差如实记录**：
   - **D4（QoS0 跨节点广播）已实现（2026-11-19 补交）**：`broker_subscription:dispatch/2` 拆出 `dispatch_local/2`，非位置型 `{undefined,undefined,Msg}` 分支在投递本地后调 `maybe_fanout_qos0/1`——读 `broker_cluster` 安装的 `{broker_subscription, qos0_fanout}` 钩子（`cross_node_delivery=true` 时装；缺省 no-op），把消息 `rpc:cast` 广播给 `cluster_members/0` 里的其他成员（成员集优先 `broker_cluster_meta:members/0`，未运行时回退 `application:get_env(broker_cluster, members, [node()])`）。每成员走新增的 `dispatch_qos0/1`：用新 facade `broker_router:route(Topic, Tenant)`（additive plain function，解析配置的 backend，不硬编码 `broker_router_hash`）按**自身** Router 索引重路由，再 `dispatch_local/2`——**不经 `dispatch/2`**，避免回声递归。QoS0 不进日志、无 owner 可 pull，故 L1 尽力而为：cast 不阻塞、不可达成员静默丢弃、两侧 WAL 均不增长。`route_ctx` 仅带 tenant + `os_buffer`（读路径 durability-blind，哈希后端只读 tenant）。dist 套件新增例 `a_qos0_publish_on_a_non_owner_reaches_a_subscriber_on_another_member` 验证跨成员投递；全量 `rebar3 ct` **1469/1469**（在 1468 基础上 +1）。
   - **D6 的保守口径**：`committed` 取「各节点上报候选的最小值」，但**聚合入口只在 owner 上对「自身以外的候选」做 min 时，自身候选也必须一并纳入**（`route_op/3` 的 `local_or_floor` 对 `advance_committed` 一律先 `report_committed(本节点)` 再取 min）。实现里 `report_committed/3` 对表缺失容错（返回 `undefined` ⇒ 退化为「仅自身候选」＝单节点规则），成员 `leave` 通过 `forget_committed/1` 清条目。跨节点订阅存在时 `committed` 可能被最慢节点长期 pin 住，WAL 段不回收——这是 D6 明示的代价，非偏差。
   - **D5 的 shared 拒绝落在 `reply_new_subscribe2`**：拒绝点选在「Router 注册之后、建 cursor 之前」，失败路径复用既有 `broker_router:unregister/1` 回滚（K8 orphan 容忍只服务崩溃，不服务可预见的拒绝）。`not_found`（无 owner 元数据）按单节点默认放行，与 `route_op/3` 的 `not_found → local` 一致。
