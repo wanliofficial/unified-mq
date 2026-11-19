@@ -46,7 +46,9 @@ all() ->
      a_crashed_storage_writer_is_reattached_and_the_log_continues,
      advance_committed_reaches_the_watermark_and_refuses_to_run_ahead,
      an_unsupported_sync_mode_is_refused_without_consuming_an_offset,
-     the_memory_backend_works_through_the_same_queue_api].
+     the_memory_backend_works_through_the_same_queue_api,
+     a_router_forward_writes_no_local_copy_when_the_owner_is_unreachable,
+     the_router_can_lower_the_committed_candidate_and_refuse_an_op].
 
 %%%_* Fixtures ------------------------------------------------------------
 
@@ -92,6 +94,11 @@ stop_all() ->
     _ = application:stop(broker_queue),
     _ = application:stop(broker_router),
     _ = application:stop(broker_storage),
+    %% A leftover routing hook would decide every later case's path, and CT runs
+    %% the whole suite in one node.
+    _ = persistent_term:erase({broker_queue, router}),
+    _ = persistent_term:erase({broker_queue, forward_timeout_ms}),
+    _ = persistent_term:erase({broker_subscription, owner}),
     cleanup_writers(),
     ok = application:set_env(broker_storage, backend, broker_storage_wal).
 
@@ -354,6 +361,55 @@ advance_committed_reaches_the_watermark_and_refuses_to_run_ahead(_Config) ->
     {error, _} = broker_queue:advance_committed(0, 99),
     {error, _} = broker_queue:advance_committed(0, 0),
     {error, {unknown_partition, ?BAD_ID}} = broker_queue:advance_committed(?BAD_ID, 1),
+    ok.
+
+%% S12-D (ADR-034 D2): `{forward, Node}' means the owner answers. With nobody
+%% listening on that node the honest failure is what shows up -- no offset
+%% consumed, nothing written locally, nothing queued. The hook is erased in the
+%% `after' so the next case sees the plain single-node path again.
+a_router_forward_writes_no_local_copy_when_the_owner_is_unreachable(_Config) ->
+    ok = start_with_partitions(),
+    Owner = 's12d_owner@nowhere',
+    persistent_term:put({broker_queue, router},
+                        fun(append, 0, [_Msg, _Mode]) -> {forward, Owner};
+                           (_Op, _Partition, _Args) -> local
+                        end),
+    try
+        {error, {cross_node_unreachable, Owner, _}} =
+            broker_queue:append(0, msg(0, <<"remote">>), fsync),
+        %% No offset was consumed and nothing was written: the offset sequence
+        %% is intact, which is what "no local double-write" means.
+        _ = persistent_term:erase({broker_queue, router}),
+        {ok, [], 1} = broker_queue:read_from(0, 1, 10),
+        {ok, 0, 1} = broker_queue:watermarks(0),
+        %% With the hook gone the same call is served locally and takes offset 1.
+        {ok, 1} = broker_queue:append(0, msg(0, <<"local">>), fsync)
+    after
+        _ = persistent_term:erase({broker_queue, router})
+    end,
+    ok.
+
+%% S12-D (ADR-034 D2/D6): the hook is allowed to answer `{local, Floor}' -- the
+%% committed floor is a minimum over every node's cursor -- and to refuse an op
+%% outright. Both are the routing contract; neither writes to a second place.
+the_router_can_lower_the_committed_candidate_and_refuse_an_op(_Config) ->
+    ok = start_with_partitions(),
+    [{ok, _} = broker_queue:append(0, msg(0, Payload), fsync)
+     || Payload <- [<<"a">>, <<"b">>, <<"c">>]],
+    persistent_term:put({broker_queue, router},
+                        fun(advance_committed, 0, [_Candidate]) -> {local, 1};
+                           (capability, 0, []) -> {error, {owner_unavailable, 'n2@h'}};
+                           (_Op, _Partition, _Args) -> local
+                        end),
+    try
+        %% The candidate is lowered to 1 before it reaches this log.
+        ok = broker_queue:advance_committed(0, 3),
+        {ok, 1, 4} = broker_queue:watermarks(0),
+        %% An outright refusal is surfaced as-is, not flattened.
+        {error, {owner_unavailable, 'n2@h'}} = broker_queue:capability(0)
+    after
+        _ = persistent_term:erase({broker_queue, router})
+    end,
     ok.
 
 %%%_* Backend interchange -------------------------------------------------

@@ -169,3 +169,11 @@ ADR-032 D9 冻结了两件事：①跨节点 publish→subscribe 在本仓**不�
 ## 落地偏差记录
 
 - **2026-11-19 立项（提案，未签认）**：本 ADR 依据 ADR-032 D9「S12-D 须新增 ADR」与 ADR-033 立项记录「产品侧确认 G2 终态 = 一个逻辑 Broker」起草。裁决形状 D′（owner 权威日志 + 跨节点读写路由），不新增 app / 端口 / 依赖 / 指标键，不改 ADR-010 / ADR-019 冻结正文，不迁移活进程。实现尚未开工；落地偏差、实测数字与任何形状调整将在实现提交后追加到本节，**正文不改**。
+- **2026-11-19 实现落地（提案实现先行，仍未签认）**：按 D2 / D3 / D5 / D6 / D8 实现并交付 dist CT。**与正文的偏差如实记录**：
+  - **D4（QoS0 跨节点广播）未实现**：`broker_subscription:dispatch/2` 未接线 `qos0_fanout` 钩子。理由：QoS0 不进日志、owner 无日志可 pull，其跨节点语义（各节点本地 route + dispatch、成员集广播、retain 仍本地）需要改动扇出热路径与成员集读取，风险高于本阶段其余各项；其余各项（D2 / D3 / D5 / D6 / D8）已可独立交付且可测。D4 留作后续单独提交，**不影响 D2 / D3 / D5 / D6 / D8 的落地与验证**。
+  - **D6 的保守口径**：`committed` 取「各节点上报候选的最小值」，但**聚合入口只在 owner 上对「自身以外的候选」做 min 时，自身候选也必须一并纳入**（`route_op/3` 的 `local_or_floor` 对 `advance_committed` 一律先 `report_committed(本节点)` 再取 min）。实现里 `report_committed/3` 对表缺失容错（返回 `undefined` ⇒ 退化为「仅自身候选」＝单节点规则），成员 `leave` 通过 `forget_committed/1` 清条目。跨节点订阅存在时 `committed` 可能被最慢节点长期 pin 住，WAL 段不回收——这是 D6 明示的代价，非偏差。
+  - **D5 的 shared 拒绝落在 `reply_new_subscribe2`**：拒绝点选在「Router 注册之后、建 cursor 之前」，失败路径复用既有 `broker_router:unregister/1` 回滚（K8 orphan 容忍只服务崩溃，不服务可预见的拒绝）。`not_found`（无 owner 元数据）按单节点默认放行，与 `route_op/3` 的 `not_found → local` 一致。
+  - **D2 的 `{forward, _}` 不本地写**：`append/3` 的 `{forward, _}` 分支直接返回 rpc 结果，不调用 `append_local/3`，因此不消费 offset、不写 WAL、不 notify——「无双写」是结构保证，非约定。
+  - **fencing 纵深**：非 owner 转发到「cache 已非 owner」的节点时，该节点 `route_op/3` 因进程字典 `'$broker_queue_forwarded'` 置位而回 `{error, {not_owner, Owner}}` 并计 `cluster_fencing_rejected`，不静默本地写。
+  - **默认关闭零回归**：`cross_node_delivery = false` 时三个钩子（`append_router` / `read_router` 经 `route_op` / `qos0_fanout`）均不安装（D4 未接线则本就不安装）；`broker_queue` / `broker_subscription` 全路径与实现前逐字相同。全量 `rebar3 ct` **1468/1468**（实现前基线 1460，新增 8 例：单节点转发/无本地写 2 例 + 跨节点 dist 套件 6 例）；dialyzer 0 warning；xref 仅既有 unused-export 告警。
+  - **`forwarded/3` 的参数不重名**：`forwarded_op/7` 对每个 Op 自行解构参数，避免 `append` 的 `[Msg, Mode]` 与 `read_from` 的 `[From, Limit]` 在同一子句里模式冲突。

@@ -15,5 +15,16 @@
            {replicate_timeout_ms, 2000},
            %% Rebalance trigger (ADR-032 D4): default closed. An operator runs
            %% `broker_rebalance:step/0' by hand; nothing auto-rebalances.
-           {rebalance, #{enabled => false, hysteresis => 1, cooldown_ms => 300000}}]}
+           {rebalance, #{enabled => false, hysteresis => 1, cooldown_ms => 300000}},
+           %% S12-D (ADR-034 D8): default closed. Off means the routing hooks
+           %% (`{broker_queue, router}', `{broker_subscription, owner}') are not
+           %% installed at all, so a single node behaves byte for byte as before
+           %% and a non-owner append is still refused by the fencing guard.
+           %% Turning it on requires a replica set that covers every possible
+           %% owner plus `replicated_commit' (ADR-034 D7), otherwise assign /
+           %% migrate are refused before they reach the log.
+           {cross_node_delivery, false},
+           %% One hop budget for a forwarded call; the caller's protocol
+           %% adapter already has its own timeout, so this only bounds the rpc.
+           {cross_node_timeout_ms, 2000}]}
 ]}.

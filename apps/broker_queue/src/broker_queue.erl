@@ -27,6 +27,10 @@
 -export([append/3, append_replica/3, reliability/0, read_from/3,
          advance_committed/2, capability/1, watermarks/1]).
 -export([subscribe/2, unsubscribe/2]).
+%% S12-D (ADR-034): the single remote entry point for a node that owns the
+%% partition. It is reached only through the `router' hook's `{forward, Node}'
+%% answer, never by callers directly.
+-export([forwarded/3]).
 %% ADR-014 §14.5: operator/test view of what retention could not delete.
 -export([retention_status/0]).
 
@@ -118,6 +122,12 @@ retention_status() ->
 %%     consensus commit); replication is the extra step that turns "my disk has
 %%     it" into "a majority has it". Without a replicator the mode stays
 %%     unsupported, exactly as ADR-011 froze it.
+%%
+%% S12-D (ADR-034) adds a `router' hook in front of both: on a node that does
+%% not own the partition it answers `{forward, Owner}', and the call is answered
+%% by the owner's `forwarded/3' instead of the local log. With no router
+%% installed (the default: `cross_node_delivery = false') every path below is
+%% byte-for-byte the S1~S4 behaviour again.
 -spec append(partition_id(), #broker_message{}, sync_mode()) ->
     {ok, offset()} | {error, term()}.
 append(PartitionId, Msg, Mode) ->
@@ -127,12 +137,22 @@ append(PartitionId, Msg, Mode) ->
     %% their existing "do not ack" behaviour instead of growing a second one.
     case broker_limits:check_message(Msg) of
         ok ->
-            case append_guard(PartitionId, Msg, Mode) of
-                ok -> append_checked(PartitionId, Msg, Mode);
+            case route(append, PartitionId, [Msg, Mode]) of
+                local -> append_local(PartitionId, Msg, Mode);
+                {forward, Node} -> forward(Node, append, PartitionId, [Msg, Mode]);
                 {error, _Reason} = Error -> Error
             end;
         {error, _Reason} = Error ->
             Error
+    end.
+
+%% The guard stays here, after routing: a forwarded write runs this same guard
+%% on the owner, so a router whose ownership view lagged cannot produce a write
+%% the fencing layer would have refused.
+append_local(PartitionId, Msg, Mode) ->
+    case append_guard(PartitionId, Msg, Mode) of
+        ok -> append_checked(PartitionId, Msg, Mode);
+        {error, _Reason} = Error -> Error
     end.
 
 %% @doc Follower-side append (ADR-021 §D5). No guard -- only the owner decides
@@ -213,6 +233,13 @@ notify_range(PartitionId, Offset) ->
 -spec read_from(partition_id(), offset(), pos_integer()) ->
     {ok, [{offset(), #broker_message{}}], offset()} | {error, term()}.
 read_from(PartitionId, From, Limit) ->
+    case route(read_from, PartitionId, [From, Limit]) of
+        local -> read_from_local(PartitionId, From, Limit);
+        {forward, Node} -> forward(Node, read_from, PartitionId, [From, Limit]);
+        {error, _Reason} = Error -> Error
+    end.
+
+read_from_local(PartitionId, From, Limit) ->
     with_partition(PartitionId,
                    fun(#{backend := Backend, handle := Hd, worker := Worker}) ->
                            try Backend:read_from(Hd, From, Limit) of
@@ -226,6 +253,19 @@ read_from(PartitionId, From, Limit) ->
 
 -spec advance_committed(partition_id(), offset()) -> ok | {error, term()}.
 advance_committed(PartitionId, Offset) ->
+    case route(advance_committed, PartitionId, [Offset]) of
+        local -> advance_committed_local(PartitionId, Offset);
+        %% The hook may lower the candidate before it reaches this node's log:
+        %% with cross-node delivery on, `committed' is a minimum over every
+        %% node's cursor, not just this node's (ADR-034 D6).
+        {local, Effective} when is_integer(Effective) ->
+            advance_committed_local(PartitionId, Effective);
+        {forward, Node} ->
+            forward(Node, advance_committed, PartitionId, [Offset, node()]);
+        {error, _Reason} = Error -> Error
+    end.
+
+advance_committed_local(PartitionId, Offset) ->
     with_partition(PartitionId,
                    fun(#{backend := Backend, handle := Hd, worker := Worker}) ->
                            try Backend:advance_committed(Hd, Offset) of
@@ -255,6 +295,13 @@ reliability() ->
 
 -spec capability(partition_id()) -> [sync_mode()] | {error, term()}.
 capability(PartitionId) ->
+    case route(capability, PartitionId, []) of
+        local -> capability_local(PartitionId);
+        {forward, Node} -> forward(Node, capability, PartitionId, []);
+        {error, _Reason} = Error -> Error
+    end.
+
+capability_local(PartitionId) ->
     with_partition(PartitionId,
                    fun(#{backend := Backend, handle := Hd}) -> Backend:capability(Hd) end).
 
@@ -268,6 +315,13 @@ capability(PartitionId) ->
 %% subscribing right after a writer crash gets a repaired registry, not `badarg'.
 -spec watermarks(partition_id()) -> {ok, offset(), offset()} | {error, term()}.
 watermarks(PartitionId) ->
+    case route(watermarks, PartitionId, []) of
+        local -> watermarks_local(PartitionId);
+        {forward, Node} -> forward(Node, watermarks, PartitionId, []);
+        {error, _Reason} = Error -> Error
+    end.
+
+watermarks_local(PartitionId) ->
     with_partition(PartitionId,
                    fun(#{backend := Backend, handle := Hd, worker := Worker}) ->
                            try Backend:watermarks(Hd) of
@@ -287,11 +341,88 @@ watermarks(PartitionId) ->
 %% reads from its own cursor (§5.3) rather than trusting the range.
 -spec subscribe(partition_id(), pid()) -> ok | {error, term()}.
 subscribe(PartitionId, Pid) ->
+    case route(subscribe, PartitionId, [Pid]) of
+        local -> subscribe_local(PartitionId, Pid);
+        {forward, Node} -> forward(Node, subscribe, PartitionId, [Pid]);
+        {error, _Reason} = Error -> Error
+    end.
+
+subscribe_local(PartitionId, Pid) ->
     with_worker(PartitionId, fun(Worker) -> call(Worker, {subscribe, Pid}) end).
 
 -spec unsubscribe(partition_id(), pid()) -> ok | {error, term()}.
 unsubscribe(PartitionId, Pid) ->
+    case route(unsubscribe, PartitionId, [Pid]) of
+        local -> unsubscribe_local(PartitionId, Pid);
+        {forward, Node} -> forward(Node, unsubscribe, PartitionId, [Pid]);
+        {error, _Reason} = Error -> Error
+    end.
+
+unsubscribe_local(PartitionId, Pid) ->
     with_worker(PartitionId, fun(Worker) -> call(Worker, {unsubscribe, Pid}) end).
+
+%%%_* Cross-node routing (ADR-034) -----------------------------------------
+
+%% The hook's answer is the whole contract:
+%%   `local'           -- this node owns the partition; run the local body.
+%%   `{local, Arg}'    -- ditto, with an Effective argument substituted (only
+%%                        `advance_committed' uses it: the committed floor is a
+%%                        minimum over every node's cursor).
+%%   `{forward, Node}' -- `Node' owns it; `forwarded/3' answers instead.
+%%   `{error, _}'      -- no owner is known and the call must fail honestly.
+%%
+%% No hook (the default) means `local', so single-node behaviour is unchanged.
+route(Op, PartitionId, Args) ->
+    case persistent_term:get({?MODULE, router}, undefined) of
+        undefined ->
+            local;
+        Router when is_function(Router, 3) ->
+            try Router(Op, PartitionId, Args) of
+                local -> local;
+                {local, _} = Local -> Local;
+                {forward, Node} = Forward when is_atom(Node) -> Forward;
+                {error, _Reason} = Error -> Error;
+                Other -> {error, {bad_router_answer, Other}}
+            catch
+                Class:Reason ->
+                    {error, {router_failed, Class, Reason}}
+            end
+    end.
+
+%% A forwarded call runs on the owner. The flag tells the router hook that it
+%% must not forward again (that would be an infinite loop between two nodes
+%% whose caches disagree); a stale owner answers `{not_owner, Owner}' instead.
+forward(Node, Op, PartitionId, Args) ->
+    Timeout = persistent_term:get({?MODULE, forward_timeout_ms}, 2000),
+    try rpc:call(Node, ?MODULE, forwarded, [Op, PartitionId, Args], Timeout) of
+        {badrpc, Reason} -> {error, {cross_node_unreachable, Node, Reason}};
+        Reply -> Reply
+    catch
+        Class:Reason -> {error, {cross_node_unreachable, Node, {Class, Reason}}}
+    end.
+
+%% @private The owner-side entry point. Reached only from `forward/4'.
+-spec forwarded(atom(), partition_id(), list()) -> term().
+forwarded(Op, PartitionId, Args) ->
+    put('$broker_queue_forwarded', true),
+    try forwarded_op(Op, PartitionId, Args)
+    after
+        erase('$broker_queue_forwarded'),
+        erase('$broker_queue_origin')
+    end.
+
+forwarded_op(append, P, [Msg, Mode]) -> append(P, Msg, Mode);
+forwarded_op(read_from, P, [From, Limit]) -> read_from(P, From, Limit);
+forwarded_op(watermarks, P, []) -> watermarks(P);
+forwarded_op(advance_committed, P, [Candidate, Origin]) ->
+    %% The origin travels with the call so the hook can fold this node's
+    %% candidate into the committed floor (ADR-034 D6).
+    put('$broker_queue_origin', Origin),
+    advance_committed(P, Candidate);
+forwarded_op(capability, P, []) -> capability(P);
+forwarded_op(subscribe, P, [Pid]) -> subscribe(P, Pid);
+forwarded_op(unsubscribe, P, [Pid]) -> unsubscribe(P, Pid);
+forwarded_op(Op, _P, _Args) -> {error, {unknown_forwarded_op, Op}}.
 
 %%%_* Internal ------------------------------------------------------------
 
