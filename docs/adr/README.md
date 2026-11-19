@@ -74,6 +74,14 @@
 
 > S12 决策只冻结边界与形状，**不写代码、不开端口、不新增 app / 依赖**；S12-A/B/C 均已交付（roadmap §14）。跨节点投递（S12-D）本体需新增 ADR、另见 [`s12d-cross-node-delivery-convergence.md`](../design/s12d-cross-node-delivery-convergence.md)，ADR-033 只交付其前置「成员在线变更」。
 
+### S12-D 本体（**提案，待评审签认**，2026-11-19）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [034](034-s12d-cross-node-delivery.md) | S12-D 本体·跨节点消息投递：**owner 权威日志 + 跨节点读写路由（D′）**——一个分区只有 owner 的一份权威日志，publish 路由到 owner 写、订阅者所在节点从 owner **pull** 读；**不做全量复制 / 不做 owner 侧代理 / 不建订阅者节点索引**（因此 **ADR-010 / ADR-019 冻结正文不改**）；写侧在 `broker_queue:append/3` 单点转发、失败一律不 ACK 且**无本地双写**；读侧 `read_from`/`watermarks`/`advance_committed`/`capability`/`subscribe`/`unsubscribe` 路由到 owner，wake 靠跨节点 pid 直投 + 既有 monitor；QoS0 广播到成员、各节点本地 `route`+`dispatch`（ADR-007 L1）；**shared 组跨节点不交付**（显式拒绝，不静默重复）；`committed` 由 owner 对「各节点候选」取最小（ADR-014「永不删过 committed」不变）；迁移继承 S12-C「无字节 handoff」，故前置 **副本集覆盖可能 owner + `replicated_commit`**；**默认关闭**，关闭时单节点行为字节级不变；不新增 app / 端口 / 依赖 / 指标键 | 收敛调查 §2 缺四件与 §3 A~E 路子；代码事实：`broker_queue.erl:123,193,215,270,289`、`broker_cluster.erl:113,135,164`、`broker_cluster_rep.erl:21,28,59`、`broker_queue_partition.erl:66-89`、`broker_subscription.erl:157,222`、`broker_cluster_meta_machine.erl:35-37`、`wal_gc.erl:14-16`、`mqtt_conn_fsm.erl:752,821,833,964`；ADR-007/010/011/013/014/016/019/021/032/033 |
+
+> ADR-034 **尚未签认**，不构成冻结裁决；四个待签认问题（shared 跨节点不交付、副本前提、owner 读热点、默认关闭且不追求 exactly-once）见文末。
+
 ## Gate S0 验收清单（roadmap §2）
 
 - [x] S0.1（ra 评估）与 S0.3（WAL）产出明确结论（采用 ra / 采用方案 A 自研 WAL）
