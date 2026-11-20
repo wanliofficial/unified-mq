@@ -59,3 +59,13 @@ mTLS 之上的第二因子。OTP 默认仍检查 cookie，去掉它需要额外�
 ## 落地验证记录
 
 见 `docs/superpowers/plans/2026-11-20-cluster-distribution-tls.md` 的 Task 6~9 与全量 CT 记录。
+
+### 定稿说明（2026-11-20）：OTP 29.1.2 复验
+
+`main` 在合并本 ADR 的实现后随即升到 **OTP 29.1.2**（`ca04f24`、`d26bb00`）。原本的 29 例只在 OTP 28.3.1 上跑过，因此在新版本上重跑了一遍，**裁决与边界结论一字未改**：
+
+- **结果**：`broker_cluster_dist_tls_SUITE` **29/29 全绿**，0 failed、0 skipped（`=== TEST COMPLETE, 29 ok, 0 failed of 29 test cases`）。
+- **运行时证据**（取自 CT 的 `suite.log` 头部，不是推断）：`=otp_release 29`、`=emulator_vsn 17.1.1`；树上 `broker_cluster_dist_tls.beam` 的 `compile_info` 编译器版本 `10.0.7`（OTP 29 的编译器）。
+- **真实分布式用例确实跑了**（耗时说明没有被短路）：`a_two_node_ra_group_forms_over_tls_distribution` 0.200 s、`a_write_commits_and_the_remote_node_sees_the_owner` 0.232 s；两个负向用例 `a_node_signed_by_another_ca_cannot_join` 1.825 s、`tls_nodes_without_certificates_cannot_reach_each_other` 1.412 s（等握手失败的自然超时）。
+- **因此 D2 的两条实测边界在 29 上原样成立**：`-proto_dist inet_tls` 仍在 boot 期生效、`ssl_dist_opts` 仍可回读、mTLS 双向验证、跨 CA 拒绝、无证书 fail-closed 全部一致；**拨出方向按 SAN 绑定对端、拨入方向不校验客户端 SAN** 的不对称也没有回退。
+- **未复验的部分**：本 ADR 的验证只覆盖分布通道本身。OTP 29 迁移的其余影响（`catch Expr` 退役等）由 `ca04f24`/`d26bb00` 单独承担，不在本 ADR 的记录范围内。
