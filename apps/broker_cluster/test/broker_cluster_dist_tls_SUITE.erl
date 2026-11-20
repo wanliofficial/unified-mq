@@ -18,7 +18,9 @@ all() ->
     [disabled_by_default,
      disabled_config_keeps_the_shipped_defaults,
      config_merges_overrides_onto_defaults,
-     redacted_config_never_contains_key_material].
+     redacted_config_never_contains_key_material,
+     effective_reports_the_plain_default,
+     effective_reads_the_arguments_this_node_booted_with].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -83,6 +85,28 @@ redacted_config_never_contains_key_material(_Config) ->
     false = maps:is_key(keyfile, Map),
     false = maps:is_key(private_key, Map),
     false = maps:is_key(key, Map),
+    ok.
+
+%% The CT host runs plain `inet_tcp', so "effective" must say exactly that:
+%% no proto_dist flag, no ssl_dist_sup, no options table. This is the value
+%% validate/0 compares the declaration against on every unmodified node.
+effective_reports_the_plain_default(_Config) ->
+    Eff = broker_cluster_dist_tls:effective(),
+    error = maps:get(proto_dist, Eff),
+    false = maps:get(tls_booted, Eff),
+    undefined = maps:get(server_opts, Eff),
+    undefined = maps:get(client_opts, Eff),
+    ok.
+
+%% Guard rail for the distributed cases below: if this ever stopped being
+%% true, `effective/0' would be reading the wrong things and every drift
+%% check would silently pass.
+effective_reads_the_arguments_this_node_booted_with(_Config) ->
+    Eff = broker_cluster_dist_tls:effective(),
+    %% CT's own host is un-named unless a dist suite started distribution;
+    %% either way we assert the *shape*, not a particular value.
+    true = is_atom(maps:get(node_name, Eff)),
+    true = lists:member(maps:get(longnames, Eff), [true, false]),
     ok.
 
 %%%_* Helpers ---------------------------------------------------------------

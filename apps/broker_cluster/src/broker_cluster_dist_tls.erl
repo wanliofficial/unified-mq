@@ -16,7 +16,7 @@
 %% 这是「默认逐字节不变」的守门。
 -module(broker_cluster_dist_tls).
 
--export([enabled/0, config/0, redacted_config/0]).
+-export([enabled/0, config/0, effective/0, redacted_config/0]).
 
 -export_type([config/0]).
 
@@ -63,3 +63,41 @@ redacted_config() ->
 
 basename_or_undefined(undefined) -> undefined;
 basename_or_undefined(Path) -> unicode:characters_to_binary(filename:basename(Path)).
+
+%% @doc What this node *actually* booted with, as opposed to what the env
+%% declares. Every field here was measured on OTP 28.3.1 (spec §1.1):
+%%
+%%   * `proto_dist'      -- `init:get_argument(proto_dist)'; `error' means the
+%%                          default `inet_tcp'. Present only when `-proto_dist'
+%%                          was given at boot.
+%%   * `tls_booted'      -- `ssl_dist_sup' is started by `inet_tls_dist' and by
+%%                          nothing else, so its existence is proof that this
+%%                          node's distribution terminates TLS.
+%%   * `optfile'         -- `init:get_argument(ssl_dist_optfile)'.
+%%   * `inline_opt'      -- `init:get_argument(ssl_dist_opt)' was used. That
+%%                          form works but does NOT populate `ssl_dist_opts',
+%%                          so its contents cannot be checked -- which is why
+%%                          validate/0 refuses it.
+%%   * `server_opts' / `client_opts' -- the options `inet_tls_dist' will really
+%%                          hand to `ssl'; `undefined' when there is no table.
+-spec effective() -> map().
+effective() ->
+    #{node_name => node(),
+      longnames => net_kernel:longnames() =:= true,
+      proto_dist => init:get_argument(proto_dist),
+      optfile => init:get_argument(ssl_dist_optfile),
+      inline_opt => init:get_argument(ssl_dist_opt),
+      tls_booted => whereis(ssl_dist_sup) =/= undefined,
+      server_opts => dist_opts(server),
+      client_opts => dist_opts(client)}.
+
+%% The table exists only in the optfile path (spec §1.1 finding 3), and only
+%% once `ssl_dist_sup' has run. Absent means "no readable options", which is
+%% not the same as "no options" -- hence `undefined' rather than `[]'.
+dist_opts(Type) ->
+    try ets:lookup(ssl_dist_opts, Type) of
+        [{Type, Opts}] -> Opts;
+        [] -> undefined
+    catch
+        error:badarg -> undefined
+    end.
