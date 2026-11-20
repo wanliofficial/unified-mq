@@ -174,8 +174,6 @@ handle_cast(_Msg, St) ->
     {noreply, St}.
 
 handle_info({sn_packet, Packet}, St) ->
-    logger:log(warning, "DBG conn sn_packet type=~p client=~p",
-               [maps:get(type, Packet, unknown), St#st.client_id]),
     handle_packet(Packet, St);
 handle_info({broker_deliver, ClientId, MaxQoS, Refs, Delivery},
             #st{client_id = ClientId} = St) ->
@@ -275,8 +273,6 @@ handle_packet(Packet, St) ->
 
 on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
              clean_session := Clean, duration := Duration, will := Will}, St) ->
-    logger:log(warning, "DBG on_connect client=~p transport=~p principal=~p tenant=~p",
-               [ClientId, St#st.transport, St#st.principal, St#st.tenant]),
     case ProtocolId of
         1 ->
             case admit(St) of

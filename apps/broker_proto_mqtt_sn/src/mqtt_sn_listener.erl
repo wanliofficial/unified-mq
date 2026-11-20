@@ -312,8 +312,6 @@ handle_info({dtls_owned, Socket}, #st{peers = Peers} = St) ->
 handle_info({dtls_abandoned, Socket}, St) ->
     {noreply, drop_session(Socket, St)};
 handle_info({ssl, Socket, Bin}, #st{peers = Peers} = St) ->
-    logger:log(warning, "DBG ssl data ~p bytes hex=~w peers=~p",
-               [byte_size(Bin), Bin, maps:size(Peers)]),
     case maps:find(Socket, Peers) of
         {ok, {IP, Port}} ->
             {noreply, on_datagram(IP, Port, Bin, St)};
@@ -437,7 +435,6 @@ route_by_client(Endpoint, ClientId, Packet, St) ->
     end.
 
 start_session(Endpoint, Packet, St) ->
-    logger:log(warning, "DBG start_session endpoint=~p", [Endpoint]),
     %% DTLS: the handshake-proven identity rides the session config, so
     %% CONNECT cannot claim a principal the socket did not prove (MQTTSN-003).
     Cfg = case St#st.transport of

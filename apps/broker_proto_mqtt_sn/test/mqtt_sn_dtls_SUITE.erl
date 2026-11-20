@@ -231,8 +231,14 @@ unknown_identity_is_indistinguishable(Config) ->
                       ?HANDSHAKE_MS),
     WrongPw = connect(<<"device-01">>, <<"wrong-password">>, Port,
                       ?HANDSHAKE_MS),
-    ?assertEqual({error, timeout}, Unknown),
-    ?assertEqual({error, timeout}, WrongPw),
+    %% OTP 28 left both handshakes hanging until the client timed out
+    %% (`{error, timeout}'); OTP 29 refuses both up front with a fatal
+    %% `{tls_alert, {handshake_failure, _}}'. Either way the two peers are
+    %% indistinguishable, so the reason is normalised to its class before
+    %% comparing (the CoAP twin does the same).
+    ?assertEqual(refusal_class(Unknown), refusal_class(WrongPw)),
+    ?assert(lists:member(refusal_class(Unknown),
+                         [timeout, {tls_alert, handshake_failure}])),
     %% The listener is unharmed: a good identity still gets in.
     {ok, Good} = connect(<<"device-01">>, <<"secret-01">>, Port),
     ok = ssl:close(Good),
@@ -294,6 +300,17 @@ probe_plain(S, [Port | Rest]) ->
 %% password. Pinned here because it IS the wire contract.
 psk(Identity, Password) ->
     crypto:hash(sha256, [?PSK_LABEL, 0, Identity, 0, ?REALM, 0, Password]).
+
+%% OTP 28 reported a refused PSK handshake as the bare atom `timeout'; OTP 29
+%% reports it as a fatal `{tls_alert, {handshake_failure, _}}'. The two peers
+%% under test (unknown identity vs. wrong secret) must stay indistinguishable,
+%% so collapse either shape to its class before comparing.
+refusal_class(timeout) ->
+    timeout;
+refusal_class({error, {tls_alert, {Alert, _Desc}}}) ->
+    {tls_alert, Alert};
+refusal_class(Other) ->
+    Other.
 
 connect(Identity, Password, Port) ->
     connect(Identity, Password, Port, ?HANDSHAKE_MS).
