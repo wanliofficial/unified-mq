@@ -547,6 +547,8 @@ S7 有两项交付：
 
 `docs/security.md` §12 第 1 条的未实现项已关闭（ADR-035）：`broker_cluster.dist_tls` + OTP `-proto_dist inet_tls` + mTLS，默认关闭、boot 期双向漂移校验、optfile 由模块渲染。验收：全量 `rebar3 ct` 零回归（既有 1472 全绿；本次全量实测 1501 通过，唯一失败是主仓库既有的 `turn_allocation_SUITE:a_full_relay_pool_is_a_508`，与本次改动无关）+ 新套件 `broker_cluster_dist_tls_SUITE` 29 例全绿 + `broker_admin_SUITE` 新例全绿；负向用例证明跨 CA 节点被拒、无证书的 TLS 节点 fail-closed。运维面见 `docs/operations.md` §5.5，边界见 ADR-035 §D2/§后果。
 
+**OTP 29.1.2 复验（2026-11-20 追加）**：`main` 在本项落地后随即升到 OTP 29.1.2（`ca04f24`/`d26bb00`），故在新版本上重跑 `broker_cluster_dist_tls_SUITE`：**29/29 全绿**（0 failed / 0 skipped），CT `suite.log` 头部为 `=otp_release 29`、`=emulator_vsn 17.1.1`。真实分布式与两个负向用例均实跑（0.200 s / 0.232 s / 1.825 s / 1.412 s），D2 的「拨出按 SAN 绑定、拨入不校验」不对称在 29 上原样成立。详见 ADR-035「落地验证记录」的定稿说明。
+
 ---
 
 ## 15. 附录
