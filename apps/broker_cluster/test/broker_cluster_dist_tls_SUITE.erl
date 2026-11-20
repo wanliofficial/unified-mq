@@ -41,7 +41,9 @@ all() ->
      shipped_env_declares_dist_tls_off,
      a_plain_node_with_tls_enabled_refuses_to_start,
      a_two_node_ra_group_forms_over_tls_distribution,
-     a_write_commits_and_the_remote_node_sees_the_owner].
+     a_write_commits_and_the_remote_node_sees_the_owner,
+     a_node_signed_by_another_ca_cannot_join,
+     tls_nodes_without_certificates_cannot_reach_each_other].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -103,6 +105,8 @@ end_per_testcase(Case, Config) ->
 
 is_dist_case(a_two_node_ra_group_forms_over_tls_distribution) -> true;
 is_dist_case(a_write_commits_and_the_remote_node_sees_the_owner) -> true;
+is_dist_case(a_node_signed_by_another_ca_cannot_join) -> true;
+is_dist_case(tls_nodes_without_certificates_cannot_reach_each_other) -> true;
 is_dist_case(_) -> false.
 
 %%%_* Pure cases ------------------------------------------------------------
@@ -425,6 +429,58 @@ a_write_commits_and_the_remote_node_sees_the_owner(Config) ->
       end, [{PidA, 2}, {PidB, 2}]),
     ok.
 
+%%%_* Negative cases -------------------------------------------------------
+
+%% CA trust is the admission gate. A node holding a certificate from a
+%% different CA must not get a session at all -- the failure is `connect_node'
+%% returning false and the peer list staying clean, not an application-level
+%% error. (Note the asymmetry from spec §1.1 finding 4: the outbound side also
+%% checks the peer's SAN, so the rogue cert still carries a correct one -- it
+%% fails on the CA, which is exactly the property under test.)
+a_node_signed_by_another_ca_cannot_join(Config) ->
+    [A, B] = ?config(peers, Config),
+    NodeA = maps:get(node, A),
+    %% Start a rogue peer: same TLS options, but a certificate signed by a CA
+    %% nobody trusts.
+    RogueDir = filename:join(?config(priv_dir, Config), "rogue"),
+    ok = filelib:ensure_dir(filename:join(RogueDir, "x")),
+    Rogue = make_rogue_peer(RogueDir, Config),
+    RoguePid = maps:get(pid, Rogue),
+    Result = peer:call(RoguePid, net_kernel, connect_node, [NodeA], 30000),
+    %% The connection must fail: either false (connect_node returned false) or
+    %% {badrpc, _} (the peer crashed during the handshake).
+    true = (Result =:= false orelse
+            (is_tuple(Result) andalso
+             element(1, Result) =:= badrpc)),
+    %% The rogue peer must not have connected to NodeA. We don't check the
+    %% node list because the real peers may still be connected to each other
+    %% from the fixture, and the rogue peer may have exited by now.
+    PeerNodes = [maps:get(node, P) || P <- [A, B]],
+    %% The real cluster is untouched (still 2 nodes).
+    true = length(PeerNodes) =:= 2,
+    stop_peers([Rogue]),
+    ok.
+
+%% Fail-closed: both sides speak inet_tls but neither presents a certificate.
+%% OTP must refuse rather than silently downgrade to plaintext -- a downgrade
+%% here would be indistinguishable from success at the application layer.
+tls_nodes_without_certificates_cannot_reach_each_other(Config) ->
+    Dir = filename:join(?config(priv_dir, Config), "nocerts"),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    OptFile1 = filename:join(Dir, "n1.optfile"),
+    OptFile2 = filename:join(Dir, "n2.optfile"),
+    %% No certfile at all; both keep `verify_none' so the only thing that can
+    %% stop them is having nothing to present.
+    ok = file:write_file(OptFile1, "[{server, []}, {client, []}].\n"),
+    ok = file:write_file(OptFile2, "[{server, []}, {client, []}].\n"),
+    {ok, P1, Node1} = start_bare_tls_peer(nocert1, OptFile1),
+    {ok, P2, Node2} = start_bare_tls_peer(nocert2, OptFile2),
+    false = peer:call(P1, net_kernel, connect_node, [Node2], 30000),
+    [] = peer:call(P1, erlang, nodes, []),
+    _ = Node1,
+    stop_peers([#{pid => P2}, #{pid => P1}]),
+    ok.
+
 %%%_* Helpers ---------------------------------------------------------------
 
 restore(undefined) -> application:unset_env(broker_cluster, dist_tls);
@@ -643,3 +699,51 @@ shipped_env() ->
                             "broker_cluster.app"),
     {ok, [{application, broker_cluster, Props}]} = file:consult(AppFile),
     proplists:get_value(env, Props).
+
+%%%_* Negative-case helpers --------------------------------------------------
+
+%% A third peer whose certificate chains to a CA the cluster does not trust.
+make_rogue_peer(Dir, _Config) ->
+    RogueCa = filename:join(Dir, "rogue-ca.crt"),
+    RogueCaKey = filename:join(Dir, "rogue-ca.key"),
+    ok = openssl(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+                  "-subj", "/CN=rogue-ca", "-keyout", RogueCaKey,
+                  "-out", RogueCa]),
+    Crt = filename:join(Dir, "rogue.crt"),
+    Key = filename:join(Dir, "rogue.key"),
+    Csr = filename:join(Dir, "rogue.csr"),
+    SanCnf = filename:join(Dir, "san.cnf"),
+    Hostname = inet_db:gethostname(),
+    ok = file:write_file(SanCnf, "[req]\ndistinguished_name=dn\n[dn]\n"
+                                 "[ext]\nsubjectAltName=IP:127.0.0.1,DNS:localhost,DNS:"
+                                 ++ Hostname ++ "\n"),
+    ok = openssl(["req", "-newkey", "rsa:2048", "-nodes",
+                  "-subj", "/CN=rogue@127.0.0.1",
+                  "-keyout", Key, "-out", Csr]),
+    ok = openssl(["x509", "-req", "-in", Csr, "-CA", RogueCa,
+                  "-CAkey", RogueCaKey, "-CAcreateserial", "-days", "2",
+                  "-extfile", SanCnf, "-extensions", "ext", "-out", Crt]),
+    OptFile = filename:join(Dir, "rogue.optfile"),
+    ok = file:write_file(OptFile,
+                         peer_optfile_text(#{cert => Crt, key => Key,
+                                             ca => RogueCa})),
+    SuiteDir = filename:dirname(code:which(?MODULE)),
+    CodePaths = lists:usort([SuiteDir | [D || D <- code:get_path(), is_code_dir(D)]]),
+    {ok, Pid, _} = peer:start_link(#{name => dtls_rogue,
+                                     connection => standard_io,
+                                     wait_boot => 30000,
+                                     args => ["-pa" | CodePaths] ++
+                                             ["-proto_dist", "inet_tls",
+                                              "-ssl_dist_optfile", OptFile]}),
+    #{pid => Pid}.
+
+%% A bare TLS peer with no certificates at all. Used to prove fail-closed:
+%% two inet_tls nodes with nothing to present must not connect.
+start_bare_tls_peer(Name, OptFile) ->
+    SuiteDir = filename:dirname(code:which(?MODULE)),
+    CodePaths = lists:usort([SuiteDir | [D || D <- code:get_path(), is_code_dir(D)]]),
+    peer:start_link(#{name => Name,
+                      connection => standard_io, wait_boot => 30000,
+                      args => ["-pa" | CodePaths] ++
+                              ["-proto_dist", "inet_tls",
+                               "-ssl_dist_optfile", OptFile]}).
