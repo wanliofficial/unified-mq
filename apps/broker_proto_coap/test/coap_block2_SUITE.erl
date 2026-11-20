@@ -195,8 +195,25 @@ block2_streams_a_single_block_when_body_fits(_Config) ->
 block2_is_not_used_without_the_option(_Config) ->
     ok.
 
-block2_combines_with_observe_zero(_Config) ->
-    ok.
+%% A GET with Observe=0 AND block2 registers the relationship and answers the
+%% initial 2.05 carrying BOTH the `observe' sequence option AND a `block2'
+%% option (RFC 7641 §4.5 lets the initial response negotiate the block size).
+%% The first block is the only one that fits in the initial response.
+block2_combines_with_observe_zero(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    Body = binary:copy(<<"0123456789">>, 200),   %% 2000 bytes
+    send(S, Port, request(con, put, 1, [{uri_path, <<"obs">>}], Body)),
+    #{code := {response, 2, 4}} = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2,
+                          [{uri_path, <<"obs">>}, {observe, 0},
+                           {block2, {0, true, 1024}}])),
+    Init = expect(S, ack, {response, 2, 5}),
+    %% Both options are present on the initial response.
+    ?assertMatch({0, true, 1024}, coap_codec:block(block2, Init)),
+    ?assertEqual(1024, byte_size(coap_codec:payload(Init))),
+    ?assert(is_integer(coap_codec:option(observe, Init))),
+    close(S).
 
 block2_on_missing_resource_is_still_404(_Config) ->
     ok.

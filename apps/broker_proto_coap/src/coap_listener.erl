@@ -602,7 +602,7 @@ reply_observe(IP, Port, Req, Cfg, St) ->
                                           [], <<>>), St2};
                         {St2, Rel} ->
                             Opts = [{observe, coap_observe:seq(Rel)} | Options],
-                            {encode_reply(Req, reply_type(Req), Code, Opts,
+                            {block2_slice(Req, reply_type(Req), Code, Opts,
                                           Payload), St2}
                     end;
                 _ ->
