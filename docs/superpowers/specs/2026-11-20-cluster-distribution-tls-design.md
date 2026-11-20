@@ -28,7 +28,7 @@ distribution 通道上，而这条通道今天只有 **magic cookie** 这一层�
 | 1 | **`-ssl_dist_opt server certfile X` 这种写法是错的**。`inet_tls_dist:ssl_options/4` 只认下划线拼接的键名（`server_certfile`、`client_keyfile`），写成 `server` + `certfile` 两段会在连**出**时 `function_clause` 崩溃（`inet_tls_dist.erl:867`）。 | 初稿的 vm.args 块**不可用**。改用 **`-ssl_dist_optfile <File>`**：文件是普通 Erlang term（`[{server,[...]},{client,[...]}]`），由 `ssl_dist_sup:consult/1` 用 `erl_scan` 解析，无键名拼接问题、可写 `%` 注释。 |
 | 2 | `-ssl_dist_optfile` 路径写错 → **节点直接起不来**（`net_sup` 的 `start_error`，`{bad_ssl_dist_optfile, Path}`）。 | 少了「配了 TLS 却静默明文」的失败模式；渲染器仍应输出绝对路径（相对路径按节点 CWD 解析）。 |
 | 3 | `-proto_dist inet_tls` **可被应用回读**：`init:get_argument(proto_dist)` 返回 `{ok,[["inet_tls"]]}`；进程 `ssl_dist_sup` 存在 ⟺ 本次 boot 真的用了 TLS 分布；用 `-ssl_dist_optfile` 时还能从 `ssl_dist_opts` ETS 表读到实际生效的 server/client 选项（内联 `-ssl_dist_opt` 则**该表不存在** ⇒ 选项无从回读）。 | 初稿「vm.args 无法回读、只能靠 fail-loud 兜住」**过于悲观**。`validate/0` 可以做**双向一致性校验**：env 声明 vs 实际 boot 协议 vs 实际选项。前提是**强制用 optfile**——因此 validate 对「用了内联 `-ssl_dist_opt`」直接报错并指向 renderer，而不是容忍一个无法校验的载体。 |
-| 4 | 默认**不做**主机名 / SAN 校验：CA 签发但 SAN 写成 `IP:10.99.99.99` 的证书，连 `127.0.0.1` 的节点**照样握手成功**；完全没有 SAN 的证书也一样。SAN 只有在两个条件**同时**满足时才被校验：① 选项里带 `{verify_fun,{fun inet_tls_dist:verify_client/3,_}}` 这个 marker；② `net_kernel` 的 allowed 列表**非空**（实测必须用 `net_kernel:allow/1` 在连接前设，`-kernel net_kernel allowed [...]` 这个启动标志**不生效**，`net_kernel:allowed/0` 仍是 `[]`）。满足后 `allowed_nodes/4` 按 peer IP 与 allowed host 校验 SAN，错配报 `{bad_cert, cert_no_hostname_nor_ip_match}` 并拒绝。 | **CA 信任就是准入闸门，SAN 默认不参与判定**。这必须写进安全文档而不是假装有主机名校验；可选加固的具体前置条件也一并写明（否则运维以为配上就生效）。 |
+| 4 | **主机名 / SAN 校验是双向不对称的**（2026-11-20 复测推翻初版结论，见下方补记）：① **拨出（client）方向默认校验对端 SAN**——`inet_tls_dist` 在 client 选项里**恒注入** `{server_name_indication, Host}`（`inet_tls_dist.erl:657`），`ssl` 用它做标准 hostname 校验。因此 `verify_peer` 下，对端证书 SAN 写成 `IP:10.99.99.99` 而本端拨 `127.0.0.1`，握手**失败**（`{bad_cert,{hostname_check_failed,{requested,"127.0.0.1"},{received,[{iPAddress,<<10,99,99,99>>}]}}}`）；完全没有 SAN 的证书一样被拒。② **拨入（server）方向默认不校验对端 SAN**——除非选项带 `{verify_fun,{fun inet_tls_dist:verify_client/3,_}}` 这个 marker **且** `net_kernel` allowed 列表**非空**（实测须用 `net_kernel:allow/1` 在连接前设；`-kernel net_kernel allowed [...]` 启动标志**不生效**，`net_kernel:allowed/0` 仍是 `[]`）。仅带 marker 但 allowed 为空时 `verify_client(_, {valid_peer, {[],_}=S}, _) -> {valid,S}`——**放行所有主机**；allowed 非空后 `allowed_nodes/4` 按 peer IP 与 allowed host 校验，错配报 `{bad_cert, cert_no_hostname_nor_ip_match}` 拒绝。 | 初版「SAN 默认不校验」**是错的**，已作废。修正后的真实边界：**CA 信任是双向准入闸门（跨 CA 一律 `Unknown CA` 失败），拨出方向额外按 SAN 绑定对端身份（默认 fail-closed），拨入方向不绑定客户端身份**（一个受信 CA、SAN 写错的节点仍可拨进来）。这比初版更强，且是硬要求：**开启 mTLS 后节点证书的 SAN 必须匹配对端拨它的地址（`@IP:...` → `IP:` SAN；`@hostname` → `DNS:` SAN），否则跨节点连接握手即失败**。必须写进安全文档与运维 runbook，而不是假装有或没有。 |
 
 另两条已验证的正向事实：mTLS（`verify_peer` + `fail_if_no_peer_cert`）在 dist 上按预期
 工作；跨 CA 的节点握手失败为 `Fatal - Unknown CA`、`connect_node` 返回 `false`、
@@ -46,7 +46,7 @@ distribution 通道上，而这条通道今天只有 **magic cookie** 这一层�
 | 实现机制 | OTP 原生 `-proto_dist inet_tls`（`inet_tls_dist`），不自造分布模块 |
 | 选项载体 | **`-ssl_dist_optfile <File>`**（唯一支持的载体）。内联 `-ssl_dist_opt` 下划线键名虽能被 OTP 解析，但**不创建 `ssl_dist_opts` ETS 表**，实际选项无从回读 ⇒ 无法校验，`validate/0` 直接拒绝（见 §1.1 第 1、3 条） |
 | 鉴权 | **mTLS**：`verify_peer` + `fail_if_no_peer_cert`，节点互验证书；**CA 信任是成员准入闸门** |
-| 主机名校验 | **默认不做**（OTP 默认行为），文档如实写明；需要时 = `verify_fun` marker **且** 运行期 `net_kernel:allow/1` 非空（`-kernel allowed` 启动标志实测不生效），列为可选加固，不在本期实现 |
+| 主机名校验 | **双向不对称**（2026-11-20 实测）：拨出方向 OTP **默认**按 SAN 绑定对端身份（`inet_tls_dist` 恒注入 `server_name_indication`，fail-closed，无法关）；拨入方向默认不绑定客户端身份。本期不额外实现拨入 SAN 校验，只把这一边界写进安全文档与 runbook。详见 §1.1 第 4 行 |
 | 证书来源 | 独立 `broker_cluster.dist_tls` 块，与面向客户端的 `broker_security.tls` 分开 |
 | 默认 | **`enabled => false`**：默认仍是明文 `inet_tcp` + cookie，与现状逐字节相同 |
 | Cookie | **保留** mTLS 之上的 cookie 作为第二因子（OTP 默认仍检查） |
@@ -196,8 +196,9 @@ optfile 避免手抄漂移**。
   同协议才成立。这是本套件最主要的写法差异，实现时必须显式处理。
 
 epmd 仍需运行。**证书在 suite 内用 `openssl` 现生成**（与 `broker_security_tls_SUITE`
-同一先例；仓库不提交任何 PEM）；需生成：CA、2 张受信节点证书（SAN 含 `IP:127.0.0.1`，
-虽然默认不校验，但保留以免将来加校验时证书全废）、1 张**另一 CA**签发的恶意证书。
+同一先例；仓库不提交任何 PEM）；需生成：CA、2 张受信节点证书（**SAN 必须是 `IP:127.0.0.1`**——
+拨出方向按 SAN 校验对端身份（§1.1 第 4 行），SAN 写错则握手 `hostname_check_failed`）、
+1 张**另一 CA**签发的恶意证书。
 
 - **happy path**：2 peer 组 2 节点 ra 集群（`peer:call` 驱动），断言：组形成、
   `broker_cluster:assign` 提交、两节点缓存一致（即把 S12-D 的跨节点 happy path 跑在
@@ -221,11 +222,13 @@ epmd 仍需运行。**证书在 suite 内用 `openssl` 现生成**（与 `broker
 
 - **新 ADR-035「集群跨节点 / 复制通道 TLS」**：决策 OTP inet_tls + mTLS + **optfile 载体**
   + 默认关闭 + 双向漂移校验；**把「boot 期约束 ⇒ 非运行时可切换」与「`-ssl_dist_opt`
-  内联写法不可用（§1.1）」写进裁决理由**；记录保留 cookie 的理由；记录 **CA 即闸门、
-  SAN 默认不校验**这一诚实边界；冻结正文不回填历史（照既有 ADR 追加式）。
-- 更新：`operations.md`（开启步骤 / optfile / 证书供给 / 轮换）、
+  内联写法不可用（§1.1）」写进裁决理由**；记录保留 cookie 的理由；记录 **CA 即双向准入闸门、
+  拨出方向按 SAN 绑定对端身份、拨入方向不绑定客户端身份（§1.1 第 4 行）** 这一诚实边界；
+  冻结正文不回填历史（照既有 ADR 追加式）。
+- 更新：`operations.md`（开启步骤 / optfile / 证书供给 / 轮换 / **证书 SAN 必须匹配对端拨入地址**）、
   `architecture.md`（env 表 + `broker_cluster` 行）、`security.md`（§12 第 1 条标已实现 +
-  §12.7 更新「分布现在可 TLS」，并写明 SAN 不校验、cookie 仍在）、`roadmap`、`progress.md`。
+  §12.7 更新「分布现在可 TLS」，并写明拨出按 SAN 校验 / 拨入不校验、cookie 仍在）、
+  `roadmap`、`progress.md`。
 - `protocol-compatibility.md` 无需改：分布在所有协议之下，无新线上帧。
 
 ## 8. 范围边界（明确不做）
@@ -236,8 +239,10 @@ epmd 仍需运行。**证书在 suite 内用 `openssl` 现生成**（与 `broker
 - 不移除 cookie。
 - 不加 `broker_metrics` 键、不加管理端口、不新增第三方依赖 / 应用（唯一新增的
   `applications` 项是 OTP 自带的 `public_key`，用于本地 PEM 校验）。
-- 不默认做主机名/SAN 校验（OTP 默认行为）；需要 SAN 校验时的两个前置条件（`verify_fun`
-  marker + 运行期 `net_kernel:allow/1`）只作为文档化的可选加固，不在本期实现。
+- 不「移除」主机名/SAN 校验——恰恰相反：拨出方向 OTP **默认就**按 SAN 绑定对端身份
+  （§1.1 第 4 行），这是 fail-closed 的硬行为，无法关闭（除非本端用 `verify_none`）。
+  本期**不额外实现**拨入方向的 SAN 校验（`verify_fun` marker + 运行期 `net_kernel:allow/1`），
+  即接受「拨入不绑定客户端身份」这一 OTP 默认边界，只把它写进安全文档。
 - 不做证书自动签发 / ACME / 轮转编排（轮换仍走「换 PEM + 重启节点」，文档说明）。
 
 ## 9. 验收
