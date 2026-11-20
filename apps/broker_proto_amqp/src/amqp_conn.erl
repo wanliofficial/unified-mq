@@ -348,8 +348,12 @@ handle_method(Channel, 20, 10, _Args, #st{phase = ready} = St) ->
     {noreply, send_method(Channel, 20, 11, amqp_codec:encode_longstr(<<>>),
                           St#st{channels = (St#st.channels)#{Channel => Ch}})};
 handle_method(Channel, 20, 40, _Args, St) ->
-    %% channel.close from the client -> close-ok.
-    {noreply, send_method(Channel, 20, 41, <<>>, drop_channel(Channel, St))};
+    %% channel.close from the client -> close-ok. §1.5.2.5: an unacked delivery
+    %% belongs to its channel, so closing it hands every in-flight message back
+    %% (requeued, redelivered=1 on the next delivery) before the consumer
+    %% registrations go. Without this the claims stayed with a tag nothing would
+    %% ever ack and `low' pinned until the whole connection died.
+    {noreply, send_method(Channel, 20, 41, <<>>, close_channel(Channel, St))};
 handle_method(_Channel, 20, 41, _Args, St) ->
     %% channel.close-ok (our answer to a server-side channel error).
     {noreply, St};
@@ -502,8 +506,18 @@ handle_channel_method(Channel, 60, 30, Args, St) ->
     {[NoWait], _} = amqp_codec:get_bits(Rest1, 1),
     Ch = ch(Channel, St),
     case maps:take(Tag, Ch#ch.consumers) of
-        {#{ref := Ref}, Consumers} ->
-            _ = (catch broker_subscription:leave(Ref, St#st.client_id)),
+        {#{ref := _Ref}, Consumers} ->
+            %% §1.8.3.2: cancelling a consumer stops new deliveries only. The
+            %% messages it already has in flight are still the client's to ack
+            %% or reject, so the deliveries map and the cursor claims must be
+            %% left alone; a rejected one is requeued with redelivered=1.
+            %%
+            %% This must NOT call `broker_subscription:leave/2': the group is
+            %% keyed by (queue, client), so every consumer tag on the queue --
+            %% including ones on other channels of this connection -- shares
+            %% that SubRef. Leaving would hand back *their* unacked claims too,
+            %% redelivering messages nobody cancelled, and the later ack would
+            %% come back `unowned' and be dropped.
             St1 = put_ch(Channel, Ch#ch{consumers = Consumers}, St),
             {noreply, reply_ok(Channel, 60, 31, NoWait, amqp_codec:encode_shortstr(Tag), St1)};
         error ->
@@ -972,7 +986,6 @@ get_scan(Channel, Ref, Queue, NoAck, [P | Ps], St0) ->
 get_deliver(Channel, Ref, Queue, NoAck, P, O, Msg, St0) ->
     Ch = ch(Channel, St0),
     Tag = Ch#ch.next_tag,
-    logger:log(warning, "DBG get_deliver tag=~p off=~p q=~p", [Tag, O, Queue]),
     #{<<"amqp">> := #{<<"exchange">> := Exchange,
                       <<"routing_key">> := RK}} = Msg#broker_message.proto_meta,
     Redelivered = maps:is_key({P, O}, St0#st.redelivered),
@@ -1164,6 +1177,31 @@ put_ch(Channel, Ch, St) ->
 
 drop_channel(Channel, St) ->
     St#st{channels = maps:remove(Channel, St#st.channels)}.
+
+%% @doc Retire one channel: return the messages it never acked to the pool, then
+%% forget its consumer registrations. A channel nobody will ack is a dead
+%% lease, and leaving the claims behind would pin the group's `low' and make
+%% every other member of the queue redeliver nothing.
+close_channel(Channel, St) ->
+    case maps:find(Channel, St#st.channels) of
+        {ok, #ch{deliveries = Deliveries, consumers = Consumers}} ->
+            St1 = maps:fold(
+                    fun(_T, {Ref, P, O}, Acc) ->
+                            _ = (catch broker_subscription:release(
+                                           Ref, P, [O], Acc#st.client_id)),
+                            %% Same bookkeeping as a nack-with-requeue: the next
+                            %% delivery of this position on this connection is
+                            %% redelivered=1 (RQ-11).
+                            mark_redelivered(P, O, Acc)
+                    end, St, Deliveries),
+            lists:foreach(
+              fun({_T, #{ref := Ref}}) ->
+                      _ = (catch broker_subscription:leave(Ref, St1#st.client_id))
+              end, maps:to_list(Consumers)),
+            drop_channel(Channel, St1);
+        error ->
+            St
+    end.
 
 consumer_count(Queue, St) ->
     length([1 || {_, #ch{consumers = Cs}} <- maps:to_list(St#st.channels),

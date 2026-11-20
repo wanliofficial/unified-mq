@@ -53,6 +53,9 @@ all() ->
      unknown_method_is_refused_540,
      ack_unknown_delivery_tag_is_406,
      cancel_unknown_consumer_tag_is_404,
+     cancel_keeps_inflight_deliveries_ackable,
+     cancel_does_not_steal_another_channels_claims,
+     channel_close_requeues_unacked_deliveries,
      table_types_roundtrip,
      unknown_table_type_closes_with_503,
      basic_get_reads_the_backlog_and_then_answers_empty,
@@ -680,6 +683,83 @@ cancel_unknown_consumer_tag_is_404(Config) ->
     close(C3),
     ok.
 
+%% §1.8.3.2: basic.cancel stops new deliveries but does not repudiate the ones
+%% already in flight -- they are still the client's to ack. The old build called
+%% `broker_subscription:leave/2', which released every claim the connection held
+%% on that queue: the unacked message was handed back to the cursor, and the
+%% client's later ack came back `unowned' and was silently dropped.
+cancel_keeps_inflight_deliveries_ackable(Config) ->
+    C0 = open_channel(connect(Config), 1),
+    {_, C1} = declare_queue(C0, 1, <<"ct.cancel.keep">>),
+    {_, C2} = consume(C1, 1, <<"ct.cancel.keep">>, <<"k">>, false),
+    C3 = publish(C2, 1, <<>>, <<"ct.cancel.keep">>, <<"in-flight">>),
+    {D1, C4} = recv_deliver(C3),
+    C5 = cancel(C4, 1, <<"k">>),
+    %% The claim must NOT have been released: nothing is redelivered, because
+    %% this is still an open delivery the client has not answered.
+    ?assertEqual(timeout, recv_frame(C5, 700)),
+    %% And the ack for it is accepted (a genuine ack, not an `unowned' no-op):
+    %% a fresh consumer re-reads nothing, proving the offset moved forward.
+    C6 = ack(C5, 1, maps:get(delivery_tag, D1)),
+    {_, C7} = consume(C6, 1, <<"ct.cancel.keep">>, <<"k2">>, false),
+    ?assertEqual(timeout, recv_frame(C7, 700)),
+    close(C7),
+    ok.
+
+%% The queue's cursor group is keyed by (queue, client), so two consumer tags on
+%% two channels of one connection share a SubRef. Cancelling on channel 1 must
+%% not touch channel 2's in-flight delivery: leaving the shared group would
+%% release *its* claim and requeue a message nobody cancelled.
+cancel_does_not_steal_another_channels_claims(Config) ->
+    C0 = open_channel(connect(Config), 1),
+    C1 = open_channel(C0, 2),
+    {_, C2} = declare_queue(C1, 1, <<"ct.cancel.cross">>),
+    {_, C3} = consume(C2, 1, <<"ct.cancel.cross">>, <<"one">>, false),
+    {_, C4} = consume(C3, 2, <<"ct.cancel.cross">>, <<"two">>, false),
+    C5 = publish(C4, 1, <<>>, <<"ct.cancel.cross">>, <<"a">>),
+    C6 = publish(C5, 1, <<>>, <<"ct.cancel.cross">>, <<"b">>),
+    {D1, C7} = recv_deliver(C6),
+    {D2, C8} = recv_deliver(C7),
+    %% Both are unacked, one per channel. Cancel channel 1's consumer and ack
+    %% the delivery that belongs to channel 2: if cancel had stolen the claim the
+    %% ack would be dropped and the offset would sit unacked forever.
+    C9 = cancel(C8, 1, <<"one">>),
+    ?assertEqual(timeout, recv_frame(C9, 700)),
+    %% Ack the delivery that belongs to channel 2, on channel 2. Delivery tags
+    %% are per channel, so acking on the wrong one would be a 406 -- and if
+    %% cancel had stolen the claim the ack would be dropped instead.
+    Ch2 = maps:get(channel, D2),
+    C10 = ack(C9, Ch2, maps:get(delivery_tag, D2)),
+    ?assertEqual(timeout, recv_frame(C10, 500)),
+    %% Prove the ack moved the offset: a fresh scan finds nothing left.
+    {_, C11} = consume(C10, 1, <<"ct.cancel.cross">>, <<"one-b">>, false),
+    ?assertEqual(timeout, recv_frame(C11, 700)),
+    _ = D1,
+    close(C11),
+    ok.
+
+%% §1.5.2.5: closing a channel requeues its unacked deliveries. The old build
+%% just forgot the channel map, leaving the claims with a tag nothing could ever
+%% ack and pinning the group's `low' until the whole connection died.
+channel_close_requeues_unacked_deliveries(Config) ->
+    C0 = open_channel(connect(Config), 1),
+    {_, C1} = declare_queue(C0, 1, <<"ct.chanclose">>),
+    {_, C2} = consume(C1, 1, <<"ct.chanclose">>, <<"c">>, false),
+    C3 = publish(C2, 1, <<>>, <<"ct.chanclose">>, <<"orphan">>),
+    {D1, C4} = recv_deliver(C3),
+    ?assertEqual(<<"orphan">>, maps:get(body, D1)),
+    %% Close the channel without acking, then re-open and consume again.
+    C5 = send_method(C4, 1, 20, 40, <<200:16, 0:16, 0:16>>),
+    {1, 20, 41, _, C6} = recv_method(C5),
+    C7 = open_channel(C6, 1),
+    {_, C8} = consume(C7, 1, <<"ct.chanclose">>, <<"c2">>, false),
+    {D2, C9} = recv_deliver(C8),
+    ?assertEqual(<<"orphan">>, maps:get(body, D2)),
+    ?assertEqual(true, maps:get(redelivered, D2)),
+    C10 = ack(C9, 1, maps:get(delivery_tag, D2)),
+    close(C10),
+    ok.
+
 %% RQ-04: the field-table types a Java client sends survive the round trip.
 table_types_roundtrip(Config) ->
     C0 = open_channel(connect(Config), 1),
@@ -929,6 +1009,14 @@ nack(C, Ch, Tag, Multiple, Requeue) ->
     send_method(C, Ch, 60, 120,
                 <<Tag:64, (amqp_codec:encode_bits([Multiple, Requeue]))/binary>>).
 
+cancel(C, Ch, ConsumerTag) ->
+    C1 = send_method(C, Ch, 60, 30,
+                     <<(amqp_codec:encode_shortstr(ConsumerTag))/binary,
+                       (amqp_codec:encode_bits([false]))/binary>>),
+    {Ch, 60, 31, Reply, C2} = recv_method(C1),
+    {ConsumerTag, _} = amqp_codec:get_shortstr(Reply),
+    C2.
+
 recv_deliver(C) ->
     {Ch, 60, 60, Args, C1} = recv_method(C),
     {CTag, R1} = amqp_codec:get_shortstr(Args),
@@ -938,7 +1026,7 @@ recv_deliver(C) ->
     {2, Ch, Header, C2} = recv_frame(C1),
     {60, _Weight, BodySize, _Props} = amqp_codec:decode_content_header(Header),
     {Body, C3} = recv_body(C2, Ch, BodySize),
-    {#{consumer_tag => CTag, delivery_tag => DTag,
+    {#{consumer_tag => CTag, delivery_tag => DTag, channel => Ch,
        redelivered => Redelivered =/= 0,
        exchange => Exchange, routing_key => RK, body => Body}, C3}.
 
