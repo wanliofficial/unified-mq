@@ -10,6 +10,12 @@ and the scenario assertion helpers.
 The S1 scenarios (R1a..R7) live in s1_recovery.py and import everything from
 here; the S2-B drivers add their own sys.path entry for tools/docker and import
 it the same way.  See tools/docker/README.md for the evidence trail.
+
+OTP pin (deliberate): these drivers reproduce the dated S1/S2-B evidence, which
+was measured against erlang:28.3.1.0 / ERTS 16.2, so IMAGE and OTP_ROOT stay on
+28.3.1 on purpose -- not a stale copy of the host's current OTP. The guard below
+refuses any other host OTP because a release built by a different OTP major
+would drift inside the container and silently invalidate those numbers.
 """
 
 import argparse
