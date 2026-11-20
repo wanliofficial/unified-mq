@@ -8,6 +8,8 @@
 
 > 本文只回答三个问题：**有哪些应用/进程、谁在什么进程里干活、一次消息从进到出走哪条路**。磁盘格式、刷盘与恢复的细节见 [`storage-and-recovery.md`](storage-and-recovery.md)，协议能力与对端兼容性见 [`protocol-compatibility.md`](protocol-compatibility.md)。
 
+> **OTP 版本口径（2026-11-20 起）**：本仓库当前固定 **OTP 29.1.2 / ERTS 17.1.1**，以根目录 `.tool-versions` 与 `.github/workflows/ci.yml`（`OTP_VERSION`）为准。历史文档、ADR 与 `docs/benchmarks/` 正文中出现的 `OTP 28` / `28.3.1` / `otp-28.3.1` 路径及性能数字，均为**撰写当时的实测快照，原样保留以保证记录真实性**，不代表当前固定版本；复跑命令请改用 OTP 29.1.2 工具链。涉及 OTP 28→29 行为差异的修复记录见对应提交（如 MQTT-SN DTLS PSK 拒绝的归一）。
+
 ---
 
 ## 1. 范围与设计约束

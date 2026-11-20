@@ -4,7 +4,7 @@ name: ci
 # protocol compatibility, then chaos, then performance.  A failure in an earlier
 # layer stops later ones, so a broken kernel never burns an hour on benchmarks.
 #
-# NOTE: the repository pins OTP 28.3.1 and vendors `ra` under `_checkouts/`.
+# NOTE: the repository pins OTP 29.1.2 and vendors `ra` under `_checkouts/`.
 # The kernel layer needs no network after checkout.  The protocol layer installs
 # the real client libraries (paho/websocket-client, Go modules, Maven jars) and
 # therefore does need network on a fresh runner; it is a gating job.  The chaos
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  OTP_VERSION: "28.3.1"
+  OTP_VERSION: "29.1.2"
   REBAR_VERSION: "3.27.0"
 
 jobs:

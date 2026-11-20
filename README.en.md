@@ -1,6 +1,7 @@
 # UnifiedMQ
 
-UnifiedMQ is a multi-protocol message broker on Erlang/OTP 28. MQTT 3.1.1/5.0,
+UnifiedMQ is a multi-protocol message broker on Erlang/OTP 29 (pinned to 29.1.2 in
+`.tool-versions` and CI). MQTT 3.1.1/5.0,
 MQTT over WebSocket, MQTT-SN 1.2, MQTT over QUIC, WebSocket, NATS, AMQP 0-9-1,
 Kafka and Pulsar clients share one message kernel, with CloudEvents 1.0 as an
 optional event layer and a Raft/Mnesia control plane.
