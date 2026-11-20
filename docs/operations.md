@@ -1002,7 +1002,7 @@ whereis(ssl_dist_sup).                %% 是个 pid
 `/api/v1/version` 返回：
 
 - `release`：`broker_core` 的 vsn（当前 `0.1.0`）。
-- `otp`：ERTS 版本（本项目固定 OTP 28.3.1 / ERTS 16.2）。
+- `otp`：OTP 的 major 版本号（`erlang:system_info(otp_release)` 原样返回，**不是** ERTS 版本号）。本项目当前固定 **OTP 29.1.2 / ERTS 17.1.1**（`.tool-versions` 为准）——所以该字段现在是 `"29"`；OTP 28.3.1 时代它是 `"28"`。
 - `apps`：所有 `broker_*` app 的 vsn。
 - `data_version`：新写入的 WAL 记录格式版本。
 - `compatible_data_versions`：本节点能读取的版本窗口（当前 `[1]`）。
