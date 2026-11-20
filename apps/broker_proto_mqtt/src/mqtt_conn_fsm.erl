@@ -77,6 +77,7 @@
              sent_at = #{},                %% Pid => monotonic us, for ack_latency_us
              retry_reported = #{},         %% Pid => true, timeout already told to the worker
              will = undefined,             %% #{topic, payload, qos, retain} | undefined
+              will_gen = 1 :: pos_integer(),
              counted = false,              %% this conn's row in connections_current
              inflight_dirty = false,
              %% S2-G: this connection's last reported contribution to the
@@ -423,8 +424,11 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
                     refuse(Code, D);
                 {ok, D1} ->
                     %% §3.1.3.2.2: a new Network Connection for this ClientID cancels a
-                    %% Will that is waiting out its Will Delay Interval.
-                    _ = (catch mqtt_will_server:cancel(C#connect.client_id)),
+                    %% Will that is waiting out its Will Delay Interval. That is now
+                    %% done by the generation bump in `attach_session/4' (which calls
+                    %% `mqtt_will_server:adopt/1' after `broker_subscription:attach/3'),
+                    %% so a parked Will from an older generation is invalidated by
+                    %% generation, not just cleared.
                     %% ADR-018 §18.1: the Will is connection state, held in memory only
                     %% (never persisted, never republished after a broker restart).
                     D1a = D1#st{will = will_of(C)},
@@ -626,6 +630,14 @@ attach_session(ClientId, _Clean, Persist, D) ->
     %% a dead gen_server call, not an `{error, _}' return, so there is no failure
     %% shape to handle here (dialyzer proved the old `error' clause unreachable).
     {ok, Prev} = broker_subscription:attach(ClientId, self(), Persist),
+    %% Take the will_server generation for this ClientID *after* attach: if this
+    %% is a takeover (a previous holder still has a dying Will parked) the bump
+    %% invalidates it, so only a Will this connection later schedules can fire.
+    %% Synchronous, so the next CONNECT cannot race the old connection's death.
+    WillGen = case (catch mqtt_will_server:adopt(ClientId)) of
+                  G when is_integer(G) -> G;
+                  _ -> 1
+              end,
     case Prev of
         Pid when is_pid(Pid), Pid =/= self() ->
             Pid ! {mqtt_takeover, self()},
@@ -635,7 +647,7 @@ attach_session(ClientId, _Clean, Persist, D) ->
             %% its own attach): nothing to hand the socket over to.
             ok
     end,
-    D#st{attached = true, persist = Persist}.
+    D#st{attached = true, persist = Persist, will_gen = WillGen}.
 
 clean_session_teardown(D) ->
     %% ADR-019 §19.2: an exclusive subscription is *removed*, a group membership
@@ -2635,7 +2647,8 @@ publish_will(Reason, #st{will = Will, tenant_id = Tenant,
     case DelayS of
         S when is_integer(S), S > 0 ->
             _ = (catch mqtt_will_server:schedule(ClientId, Will, S * 1000,
-                                                 Tenant, Principal)),
+                                                 Tenant, Principal,
+                                                 D#st.will_gen)),
             log(warning, "will delayed ~ps (reason=~p, client_id=~p)",
                 [S, Reason, ClientId]),
             ok;
