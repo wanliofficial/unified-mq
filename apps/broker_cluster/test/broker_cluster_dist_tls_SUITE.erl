@@ -37,7 +37,9 @@ all() ->
      render_optfile_uses_absolute_paths,
      render_optfile_round_trips_through_validate,
      vm_args_lines_are_the_two_lines_otp_reads,
-     vm_args_lines_without_an_optfile_says_so].
+     vm_args_lines_without_an_optfile_says_so,
+     shipped_env_declares_dist_tls_off,
+     a_plain_node_with_tls_enabled_refuses_to_start].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -311,6 +313,34 @@ vm_args_lines_without_an_optfile_says_so(Config) ->
         catch
             error:Reason -> Reason
         end,
+    ok.
+
+%%%_* Application wiring -----------------------------------------------------
+
+%% The shipped env is the other half of "default is unchanged": the module's
+%% defaults say off, and so must the .app file a release actually reads. Read
+%% the file itself -- application:get_key/2 reflects set_env, which would make
+%% this tautological.
+shipped_env_declares_dist_tls_off(_Config) ->
+    {dist_tls, DistTls} = lists:keyfind(dist_tls, 1, shipped_env()),
+    false = maps:get(enabled, DistTls),
+    ok.
+
+%% End to end through the application callback, not just the module: an
+%% operator who enables the declaration without booting TLS must get a refused
+%% start, with a reason that names the problem.
+%%
+%% This calls the real start/2 with plain distribution, so the refusal happens
+%% before the supervisor is reached -- no tree is started and nothing leaks. The
+%% assertion that broker_cluster_sup is still absent is the proof: if the hook
+%% were placed after start_link/0, this test would leave a live supervisor
+%% behind and still pass.
+a_plain_node_with_tls_enabled_refuses_to_start(Config) ->
+    set_enabled(self_signed(Config)),
+    undefined = whereis(broker_cluster_sup),
+    {error, Reason} = broker_cluster_app:start(normal, []),
+    {dist_tls_invalid, {dist_tls_enabled_but_booted_plain, _}} = Reason,
+    undefined = whereis(broker_cluster_sup),
     ok.
 
 %%%_* Helpers ---------------------------------------------------------------

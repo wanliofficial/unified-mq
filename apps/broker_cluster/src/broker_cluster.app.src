@@ -4,7 +4,7 @@
     {registered, [broker_cluster_sup, broker_cluster_cache,
                   broker_cluster_meta_ctl]},
     {mod, {broker_cluster_app, []}},
-    {applications, [kernel, stdlib, sasl, crypto, broker_core,
+    {applications, [kernel, stdlib, sasl, crypto, public_key, broker_core,
                     broker_metrics, broker_meta, ra]},
     %% Single-node defaults: the metadata group has one member, the local node
     %% is the only replica, and the queue hooks are still installed. With no
@@ -26,5 +26,13 @@
            {cross_node_delivery, false},
            %% One hop budget for a forwarded call; the caller's protocol
            %% adapter already has its own timeout, so this only bounds the rpc.
-           {cross_node_timeout_ms, 2000}]}
+           {cross_node_timeout_ms, 2000},
+           %% ADR-035: cross-node / replication-channel TLS. Shipped OFF, so
+           %% distribution is still plain `inet_tcp' + cookie and nothing about
+           %% a single-node or existing cluster changes. Turning it on also
+           %% requires `-proto_dist inet_tls -ssl_dist_optfile <File>' in
+           %% vm.args -- this block is the *declaration*, and boot refuses a
+           %% declaration that disagrees with what the node actually booted
+           %% with (see broker_cluster_dist_tls:validate/0).
+           {dist_tls, #{enabled => false}}]}
 ]}.
