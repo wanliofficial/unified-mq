@@ -64,7 +64,7 @@ CoAP（Constrained Application Protocol）是面向受限设备/低功耗网络�
 | 项 | 说明 |
 |---|---|
 | CoAP 代理 / 虚拟主机（Uri-Host / Uri-Port / Proxy-Uri / Proxy-Scheme） | 仓库自述未实现；首期不补 |
-| 完整 RFC 7959 Block-wise | 仓库实现的是 `draft-ietf-core-block-18`，与最终 RFC 有偏差，须在能力矩阵留痕 |
+| ~~完整 RFC 7959 Block-wise~~ → **部分落地（2026-11-20）** | 已实现：Block1 请求重组 + Block2 服务端分块响应（均按 `draft-ietf-core-block-18` 编号，**与最终 RFC 7959 的偏差仍须在能力矩阵留痕**）。仍未做：跨块响应缓存/重传、Observe 通知的分块推送（见 `docs/superpowers/specs/2026-11-20-coap-server-block2-design.md` §4） |
 | CoAP over TCP / WebSocket（RFC 8323）、OSCORE（RFC 8613）、CoAP 组播 | 首期只取 UDP + DTLS |
 | 6LoWPAN / LPWAN 物理层、LwM2M 对象语义 | 载荷语义由上层应用给出，Broker 不解释 |
 | 把 CON 确认等价成 MQTT QoS 1 的持久化 ACK | 两者可靠性层级不同，须按 ADR-007 显式分档，不得含糊表述 |
