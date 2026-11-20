@@ -65,7 +65,7 @@
 
 ## 环境基线
 
-- Erlang/OTP：固定 **OTP 28.3.1**（`/home/wanli/Development/otp-28.3.1`，见 `.tool-versions` / `.envrc`）
+- Erlang/OTP：固定 **OTP 29.1.2 / ERTS 17.1.1**（`/home/wanli/Development/otp-29.1.2`，见 `.tool-versions` / `.envrc`）。此前长期固定 OTP 28.3.1 / ERTS 16.2，2026-11-20 随 `ca04f24` 升级（同日修掉 `catch Expr` 退役与测试套件的连带告警）
 - 构建：rebar3 3.27 umbrella 根（`rebar.config`），spikes 目录独立于 umbrella 之外
 - 数据目录：运行时写入 `spikes/*/.data/`（已加入 `.gitignore`）
 
