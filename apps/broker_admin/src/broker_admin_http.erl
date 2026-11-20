@@ -384,8 +384,7 @@ node_view(DrainState) ->
 %% when the cluster app is down -- in which case the honest answer is "off".
 dist_tls_view() ->
     try broker_cluster_dist_tls:redacted_config() of
-        Map when is_map(Map) -> Map;
-        _ -> #{enabled => false}
+        Map when is_map(Map) -> Map
     catch
         _:_ -> #{enabled => false}
     end.
