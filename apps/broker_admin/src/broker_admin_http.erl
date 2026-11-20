@@ -26,7 +26,7 @@
 %% acceptable on the default loopback bind; `docs/operations.md' calls that out.
 -module(broker_admin_http).
 
--export([handle/4, metrics_text/0]).
+-export([handle/4, metrics_text/0, node_view/0, json_safe/1]).
 
 -define(PROTECTED_ALWAYS, [<<"/api/">>]).
 
@@ -374,7 +374,21 @@ node_view(DrainState) ->
       ready => DrainState =:= up,
       uptime_seconds => uptime_seconds(),
       connections => connections_view(),
-      partitions => partitions_view()}.
+      partitions => partitions_view(),
+      dist_tls => dist_tls_view()}.
+
+%% ADR-035: the feature is a boot-time property of the node, so an operator (or
+%% an LB dashboard) needs to see whether this node's inter-node traffic is
+%% actually encrypted. Tolerated call like `cluster/0' above: `broker_cluster'
+%% is not a declared dependency of this app, and the admin API must answer even
+%% when the cluster app is down -- in which case the honest answer is "off".
+dist_tls_view() ->
+    try broker_cluster_dist_tls:redacted_config() of
+        Map when is_map(Map) -> Map;
+        _ -> #{enabled => false}
+    catch
+        _:_ -> #{enabled => false}
+    end.
 
 %% Aggregate connection counts straight from ranch, so they describe the
 %% listeners that actually exist on this node rather than a counter maintained

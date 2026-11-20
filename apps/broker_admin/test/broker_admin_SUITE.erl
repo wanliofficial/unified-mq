@@ -34,6 +34,7 @@ all() ->
      cluster_members_validates_the_request,
      cluster_members_without_cluster_app_returns_503,
      node_view_reports_state_and_connections,
+     node_view_reports_dist_tls_without_leaking_keys,
      insecure_bind_with_empty_token_refuses_to_start].
 
 init_per_suite(Config) ->
@@ -549,6 +550,23 @@ node_view_reports_state_and_connections(Config) ->
     after
         restore_state()
     end.
+
+%% The node view is what an external LB and an operator read, so the dist TLS
+%% posture belongs there -- but it must never carry key material, and it must
+%% answer even when the cluster app is not running.
+node_view_reports_dist_tls_without_leaking_keys(_Config) ->
+    application:set_env(broker_cluster, dist_tls,
+                        #{enabled => false, certfile => "/secret/path/node.crt",
+                          keyfile => "/secret/path/node.key"}),
+    Map = broker_admin_http:node_view(),
+    DistTls = maps:get(dist_tls, Map),
+    false = maps:get(enabled, DistTls),
+    <<"node.crt">> = maps:get(certfile, DistTls),
+    false = maps:is_key(keyfile, DistTls),
+    %% The path must not leak: basename only.
+    Json = iolist_to_binary(json:encode(broker_admin_http:json_safe(Map))),
+    nomatch = binary:match(Json, <<"/secret/path">>),
+    ok.
 
 %% ADR-032 D2's last clause: a non-loopback bind with an empty token must refuse
 %% to start, rather than serving an unauthenticated management API on every
