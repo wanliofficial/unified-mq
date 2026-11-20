@@ -30,7 +30,14 @@ all() ->
      client_side_fail_if_no_peer_cert_is_refused,
      server_side_missing_fail_if_no_peer_cert_is_refused,
      rejecting_the_field_names_the_problem,
-     validate_zero_argument_on_a_plain_disabled_node_is_ok].
+     validate_zero_argument_on_a_plain_disabled_node_is_ok,
+     ssl_dist_opts_shape_is_mutual_tls,
+     ssl_dist_opts_client_presents_a_certificate,
+     render_optfile_is_parseable_erlang,
+     render_optfile_uses_absolute_paths,
+     render_optfile_round_trips_through_validate,
+     vm_args_lines_are_the_two_lines_otp_reads,
+     vm_args_lines_without_an_optfile_says_so].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -216,6 +223,96 @@ validate_zero_argument_on_a_plain_disabled_node_is_ok(_Config) ->
     ok = broker_cluster_dist_tls:validate(),
     ok.
 
+%%%_* Renderer cases ---------------------------------------------------------
+
+ssl_dist_opts_shape_is_mutual_tls(Config) ->
+    set_enabled(self_signed(Config)),
+    #{server := Server, client := Client} = broker_cluster_dist_tls:ssl_dist_opts(),
+    {verify, verify_peer} = lists:keyfind(verify, 1, Server),
+    {verify, verify_peer} = lists:keyfind(verify, 1, Client),
+    {fail_if_no_peer_cert, true} =
+        lists:keyfind(fail_if_no_peer_cert, 1, Server),
+    ok.
+
+%% The whole point of mTLS: the client side must present a certificate too,
+%% otherwise the peer only proves itself one way.
+ssl_dist_opts_client_presents_a_certificate(Config) ->
+    Self = self_signed(Config),
+    set_enabled(Self),
+    #{client := Client} = broker_cluster_dist_tls:ssl_dist_opts(),
+    Cert = filename:absname(maps:get(certfile, Self)),
+    {certfile, Cert} = lists:keyfind(certfile, 1, Client),
+    {keyfile, _} = lists:keyfind(keyfile, 1, Client),
+    {cacertfile, _} = lists:keyfind(cacertfile, 1, Client),
+    %% Server-only option must not leak into the client block.
+    false = lists:keymember(fail_if_no_peer_cert, 1, Client),
+    ok.
+
+%% The renderer's output is what an operator writes to disk and what
+%% ssl_dist_sup:consult/1 then parses, so "it is a valid Erlang term" is the
+%% only assertion that matters.
+render_optfile_is_parseable_erlang(Config) ->
+    set_enabled(self_signed(Config)),
+    Text = iolist_to_binary(broker_cluster_dist_tls:render_optfile()),
+    {server, Server} = lists:keyfind(server, 1, parse_term(Text)),
+    {client, Client} = lists:keyfind(client, 1, parse_term(Text)),
+    true = is_list(Server),
+    true = is_list(Client),
+    ok.
+
+%% `ssl_dist_sup:consult/1' resolves relative paths against the node's CWD,
+%% which differs between a shell and a release. Absolute paths remove that.
+render_optfile_uses_absolute_paths(Config) ->
+    set_enabled((self_signed(Config))#{certfile => "relative/node.crt"}),
+    Text = iolist_to_binary(broker_cluster_dist_tls:render_optfile()),
+    nomatch = binary:match(Text, <<"\"relative/node.crt\"">>),
+    ok.
+
+%% The rendered optfile must pass the very check that guards boot. If these two
+%% ever disagree, validate/0 would refuse a file this module told the operator
+%% to write.
+render_optfile_round_trips_through_validate(Config) ->
+    Self = self_signed(Config),
+    set_enabled(Self),
+    Text = iolist_to_binary(broker_cluster_dist_tls:render_optfile()),
+    Parsed = parse_term(Text),
+    %% Write it out and point the declaration at it, then validate against a
+    %% boot state built from the rendered options -- exactly the shape a real
+    %% node would have.
+    OptFile = filename:join(?config(tls_dir, Config), "rendered.optfile"),
+    ok = file:write_file(OptFile, Text),
+    set_enabled(Self#{optfile => OptFile}),
+    {server, Server} = lists:keyfind(server, 1, Parsed),
+    {client, Client} = lists:keyfind(client, 1, Parsed),
+    Boot = (tls_boot(Config))#{server_opts => Server, client_opts => Client,
+                                optfile => {ok, [[OptFile]]}},
+    ok = broker_cluster_dist_tls:validate(Boot),
+    ok.
+
+%% Exactly two lines, and OTP reads neither of them from anywhere else.
+vm_args_lines_are_the_two_lines_otp_reads(Config) ->
+    set_enabled((self_signed(Config))#{optfile => "/etc/mq/dist_tls.optfile"}),
+    Text = iolist_to_binary(broker_cluster_dist_tls:vm_args_lines()),
+    {_, _} = binary:match(Text, <<"-proto_dist inet_tls">>),
+    true = binary:match(Text, <<"-ssl_dist_optfile">>) =/= nomatch,
+    true = binary:match(Text, <<"/etc/mq/dist_tls.optfile">>) =/= nomatch,
+    %% The inline form is what we refuse elsewhere; it must never be emitted.
+    nomatch = binary:match(Text, <<"-ssl_dist_opt ">>),
+    ok.
+
+%% No optfile path means nothing coherent to render. Failing here beats emitting
+%% "-ssl_dist_optfile undefined", which would surface much later as a confusing
+%% boot error.
+vm_args_lines_without_an_optfile_says_so(Config) ->
+    set_enabled((self_signed(Config))#{optfile => undefined}),
+    {dist_tls_no_optfile, see_renderer} =
+        try broker_cluster_dist_tls:vm_args_lines() of
+            _ -> no_error
+        catch
+            error:Reason -> Reason
+        end,
+    ok.
+
 %%%_* Helpers ---------------------------------------------------------------
 
 restore(undefined) -> application:unset_env(broker_cluster, dist_tls);
@@ -295,6 +392,14 @@ openssl(Args) ->
     Cmd = lists:flatten([[" ", A] || A <- ["openssl" | Args]]),
     _ = os:cmd(Cmd ++ " 2>/dev/null"),
     ok.
+
+%% The optfile is a plain Erlang term, parsed exactly the way
+%% ssl_dist_sup:consult/1 parses it.
+parse_term(Bin) ->
+    {ok, Tokens, _} = erl_scan:string(binary_to_list(Bin)),
+    {ok, [Expr]} = erl_parse:parse_exprs(Tokens),
+    {value, Value, _} = erl_eval:expr(Expr, erl_eval:new_bindings()),
+    Value.
 
 %% One optfile per peer: each presents its own certificate, all signed by the
 %% same test CA. Server and client sides carry the same identity -- that is what
