@@ -313,5 +313,5 @@ match_levels(_, _) -> false.
 %%%_* Misc --------------------------------------------------------------------
 
 inc(Key) ->
-    _ = (catch broker_metrics:inc(Key)),
+    _ = try broker_metrics:inc(Key) catch _:_ -> ok end,
     ok.

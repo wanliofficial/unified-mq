@@ -95,12 +95,14 @@ get(Req, Cfg, Ctx) ->
 read_resource(Destination, Ctx) ->
     case authorized(Ctx, subscribe, Destination) of
         true ->
-            case catch broker_retain:lookup(Destination) of
+            try broker_retain:lookup(Destination) of
                 {ok, #broker_message{} = Msg} ->
                     {reply, {response, 2, 5}, content_format_options(Msg),
                      Msg#broker_message.payload};
                 _ ->
                     {reply, {response, 4, 4}, [], <<>>}
+            catch
+                _:_ -> {reply, {response, 4, 4}, [], <<>>}
             end;
         false ->
             forbidden(Destination, subscribe, "GET")
@@ -171,7 +173,11 @@ new_message(Destination, Payload, Req, Ctx, Retain) ->
 %% configured tier and follows ADR-018's append -> retain -> dispatch order.
 deliver(Msg0, non, Retain) ->
     _ = retain_update(Msg0, Retain, async),
-    _ = (catch broker_subscription:dispatch([], {undefined, undefined, Msg0})),
+    _ = try
+        broker_subscription:dispatch([], {undefined, undefined, Msg0})
+    catch
+        _:_ -> ok
+    end,
     dispatch_routes(Msg0, non, Retain);
 deliver(Msg0, _Type, Retain) ->
     dispatch_routes(Msg0, sync, Retain).
@@ -203,27 +209,35 @@ dispatch_partitions([{Partition, Refs} | Rest], Msg0, Mode, Retain) ->
             %% Nothing is owed to a client that was not listening, so retained
             %% state and the live push are the whole story.
             _ = retain_update(Msg, Retain, async),
-            _ = (catch broker_subscription:dispatch(Refs,
-                                                   {undefined, undefined, Msg})),
+            _ = try
+                broker_subscription:dispatch(Refs,
+                {undefined, undefined, Msg})
+            catch
+                _:_ -> ok
+            end,
             dispatch_partitions(Rest, Msg0, Mode, Retain);
         sync ->
             case broker_event:apply_policy(Msg) of
                 {ok, Accepted} ->
-                    case catch broker_queue:append(Partition, Accepted,
-                                                   Msg#broker_message.reliability) of
+                    try broker_queue:append(Partition, Accepted,
+                                           Msg#broker_message.reliability) of
                         {ok, Offset} ->
                             case retain_update(Accepted, Retain, sync) of
                                 ok ->
-                                    _ = (catch broker_subscription:dispatch(
-                                                 Refs, {Partition, Offset, Accepted})),
+                                    _ = try
+                                        broker_subscription:dispatch(
+                                        Refs, {Partition, Offset, Accepted})
+                                    catch
+                                        _:_ -> ok
+                                    end,
                                     dispatch_partitions(Rest, Msg0, Mode, Retain);
                                 {error, Reason} ->
                                     {error, {retain_store, Reason}}
                             end;
                         {error, Reason} ->
-                            {error, {append, Reason}};
-                        Other ->
-                            {error, {append_crashed, Other}}
+                            {error, {append, Reason}}
+                    catch
+                        Class:Reason -> {error, {append_crashed, {Class, Reason}}}
                     end;
                 {error, Reason} ->
                     {error, {event_policy, Reason}}
@@ -251,9 +265,11 @@ delete(Req, Ctx) ->
         false ->
             forbidden(Destination, publish, "DELETE");
         true ->
-            case catch broker_retain:delete(Destination, sync) of
+            try broker_retain:delete(Destination, sync) of
                 ok -> {reply, {response, 2, 2}, [], <<>>};
                 _ -> {reply, {response, 4, 4}, [], <<>>}
+            catch
+                _:_ -> {reply, {response, 4, 4}, [], <<>>}
             end
     end.
 
@@ -326,9 +342,10 @@ trim_empties([<<>> | Rest]) -> trim_empties(Rest);
 trim_empties(Path) -> Path.
 
 retained_entries() ->
-    case catch broker_retain:entries() of
-        List when is_list(List) -> List;
-        _ -> []
+    try broker_retain:entries() of
+        List when is_list(List) -> List
+    catch
+        _:_ -> []
     end.
 
 %%%_* Helpers --------------------------------------------------------------

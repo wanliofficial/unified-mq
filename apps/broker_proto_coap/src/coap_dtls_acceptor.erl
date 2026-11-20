@@ -41,7 +41,7 @@ await_listen_socket(ListenerPid, Opts) ->
 
 loop(ListenerPid, Listen, Opts) ->
     Timeout = maps:get(dtls_transport_accept_timeout_ms, Opts, 1000),
-    case catch ssl:transport_accept(Listen, Timeout) of
+    try ssl:transport_accept(Listen, Timeout) of
         {ok, Socket0} ->
             handshake(ListenerPid, Socket0, Opts),
             loop(ListenerPid, Listen, Opts);
@@ -53,9 +53,11 @@ loop(ListenerPid, Listen, Opts) ->
             ok;
         {error, Reason} ->
             logger:warning("coap dtls transport_accept failed: ~p", [Reason]),
-            loop(ListenerPid, Listen, Opts);
-        {'EXIT', Reason} ->
-            logger:warning("coap dtls transport_accept crashed: ~p", [Reason]),
+            loop(ListenerPid, Listen, Opts)
+    catch
+        Class:Reason ->
+            logger:warning("coap dtls transport_accept crashed ~p:~p",
+                           [Class, Reason]),
             loop(ListenerPid, Listen, Opts)
     end.
 
@@ -70,23 +72,28 @@ handshake(ListenerPid, Socket0, Opts) ->
     Timeout = maps:get(dtls_handshake_timeout_ms, Opts, 2000),
     %% Nothing from an earlier round may be mistaken for this peer's identity.
     _ = flush_identities(),
-    case catch ssl:handshake(Socket0, Timeout) of
+    try ssl:handshake(Socket0, Timeout) of
         {ok, Socket} ->
-            case catch ssl:peername(Socket) of
+            try ssl:peername(Socket) of
                 {ok, Peer} ->
                     Identity = flush_identities(),
                     offer(ListenerPid, Socket, Peer, Identity);
                 _Other ->
                     _ = flush_identities(),
                     _ = ssl:close(Socket)
+            catch
+                _:_ ->
+                    _ = flush_identities(),
+                    _ = ssl:close(Socket)
             end;
         {error, Reason} ->
             _ = flush_identities(),
             logger:debug("coap dtls handshake refused: ~p", [Reason]),
-            ok;
-        {'EXIT', Reason} ->
+            ok
+    catch
+        Class:Reason ->
             _ = flush_identities(),
-            logger:debug("coap dtls handshake crashed: ~p", [Reason]),
+            logger:debug("coap dtls handshake crashed ~p:~p", [Class, Reason]),
             ok
     end.
 

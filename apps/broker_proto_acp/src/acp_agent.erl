@@ -169,7 +169,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, #st{handle = Handle}) ->
-    catch acp_transport:close(Handle),
+    _ = try acp_transport:close(Handle) catch _:_ -> ok end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->

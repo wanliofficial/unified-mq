@@ -327,7 +327,7 @@ handle_unsub(Rest, St) ->
         [Sid] ->
             {noreply, remove_sid(Sid, St)};
         [Sid, MaxBin] ->
-            case catch binary_to_integer(MaxBin) of
+            case parse_int(MaxBin) of
                 Max when is_integer(Max), Max >= 0 ->
                     set_remaining(Sid, Max, St);
                 _ ->
@@ -381,7 +381,7 @@ handle_hpub_args(Rest, St) ->
     end.
 
 pub_pending(Subject, Reply, SizeBin, St) ->
-    case {valid_subject(Subject, publish), valid_sid(Reply), catch binary_to_integer(SizeBin)} of
+    case {valid_subject(Subject, publish), valid_sid(Reply), parse_int(SizeBin)} of
         {true, true, Size} when is_integer(Size), Size >= 0 ->
             case Size > max_payload() of
                 true ->
@@ -394,8 +394,8 @@ pub_pending(Subject, Reply, SizeBin, St) ->
     end.
 
 hpub_pending(Subject, Reply, HdrBin, TotalBin, St) ->
-    Hdr = catch binary_to_integer(HdrBin),
-    Total = catch binary_to_integer(TotalBin),
+    Hdr = parse_int(HdrBin),
+    Total = parse_int(TotalBin),
     Max = max_payload(),
     case {valid_subject(Subject, publish), valid_sid(Reply), Hdr, Total} of
         {true, true, H, T} when is_integer(H), is_integer(T),
@@ -524,14 +524,18 @@ store_routes([], _Msg) ->
     ok;
 store_routes([{P, Refs} | Rest], Msg) ->
     PartitionMsg = Msg#broker_message{partition_id = P},
-    case (catch broker_queue:append(P, PartitionMsg, fsync)) of
+    try broker_queue:append(P, PartitionMsg, fsync) of
         {ok, Offset} ->
-            _ = (catch broker_subscription:dispatch(Refs, {P, Offset, PartitionMsg})),
+            _ = try
+                broker_subscription:dispatch(Refs, {P, Offset, PartitionMsg})
+            catch
+                _:_ -> ok
+            end,
             store_routes(Rest, Msg);
         {error, Reason} ->
-            {error, Reason};
-        Other ->
-            {error, {append_crashed, Other}}
+            {error, Reason}
+    catch
+        Class:Reason -> {error, {append_crashed, {Class, Reason}}}
     end.
 
 %%%_* Delivery -------------------------------------------------------------
@@ -556,7 +560,11 @@ deliver_exclusive(Ref, P, O, Msg, St) ->
                               St, Sids),
             case Sids of
                 [] -> St1;
-                _ -> _ = (catch broker_subscription:ack(Ref, P, O, St1#st.client_id)), St1
+                _ -> _ = try
+                    broker_subscription:ack(Ref, P, O, St1#st.client_id)
+                catch
+                    _:_ -> ok
+                end, St1
             end
     end.
 
@@ -590,7 +598,7 @@ publisher_of(_Msg) ->
 claim_and_pull(_P, _Ref, St) when St#st.client_id =:= undefined ->
     St;
 claim_and_pull(P, Ref, St) ->
-    case (catch broker_subscription:claim(Ref, P, 32, St#st.client_id)) of
+    try broker_subscription:claim(Ref, P, 32, St#st.client_id) of
         {ok, []} ->
             St;
         {ok, Offsets} ->
@@ -606,18 +614,28 @@ claim_and_pull(P, Ref, St) ->
                                     %% partition. A shared cursor scans the whole
                                     %% partition, so consume the offset for this
                                     %% group without delivering it.
-                                    _ = (catch broker_subscription:ack(
-                                                 Ref, P, O, St#st.client_id)),
+                                    _ = try
+                                        broker_subscription:ack(
+                                        Ref, P, O, St#st.client_id)
+                                    catch
+                                        _:_ -> ok
+                                    end,
                                     Acc
                             end
                     end, St, Read),
             case Missing of
                 [] -> ok;
-                _ -> _ = (catch broker_subscription:release(Ref, P, Missing, St1#st.client_id))
+                _ -> _ = try
+                    broker_subscription:release(Ref, P, Missing, St1#st.client_id)
+                catch
+                    _:_ -> ok
+                end
             end,
             St1;
         _ ->
             St
+    catch
+        _:_ -> St
     end.
 
 %% Ascending offset order (see amqp_conn:read_offsets -- reversed folds
@@ -625,10 +643,12 @@ claim_and_pull(P, Ref, St) ->
 read_offsets(P, Offsets) ->
     {Read, Missing} = lists:foldl(
                         fun(O, {Acc, Miss}) ->
-                                case (catch broker_queue:read_from(P, O, 1)) of
+                                try broker_queue:read_from(P, O, 1) of
                                     {ok, [{O, Msg}], _Next} ->
                                         {[{O, Msg} | Acc], Miss};
                                     _ -> {Acc, [O | Miss]}
+                                catch
+                                    _:_ -> {Acc, [O | Miss]}
                                 end
                         end, {[], []}, lists:sort(Offsets)),
     {lists:reverse(Read), lists:reverse(Missing)}.
@@ -638,7 +658,7 @@ deliver_shared(P, Ref, O, Msg, St) ->
         false ->
             %% Suppressed echo: the offset is consumed (nature of at-most-once),
             %% so advance the cursor instead of leaving it claimed forever.
-            _ = (catch broker_subscription:ack(Ref, P, O, St#st.client_id)),
+            _ = try broker_subscription:ack(Ref, P, O, St#st.client_id) catch _:_ -> ok end,
             St;
         true -> deliver_shared2(P, Ref, O, Msg, St)
     end.
@@ -646,7 +666,7 @@ deliver_shared(P, Ref, O, Msg, St) ->
 deliver_shared2(P, Ref, O, Msg, St) ->
     Sids = [Sid || {Sid, #{ref := R}} <- maps:to_list(St#st.subs), R =:= Ref],
     St1 = lists:foldl(fun(Sid, Acc) -> deliver_to_sid(Sid, P, O, Msg, Acc) end, St, Sids),
-    _ = (catch broker_subscription:ack(Ref, P, O, St1#st.client_id)),
+    _ = try broker_subscription:ack(Ref, P, O, St1#st.client_id) catch _:_ -> ok end,
     St1.
 
 not_yet_read(Ref, P, O) ->
@@ -697,10 +717,10 @@ remove_sid(Sid, St) ->
     end.
 
 drop_ref({exclusive, _ClientId, Filter}, St) ->
-    _ = (catch broker_subscription:unsubscribe(St#st.client_id, Filter)),
+    _ = try broker_subscription:unsubscribe(St#st.client_id, Filter) catch _:_ -> ok end,
     St;
 drop_ref({shared, _Group, _Filter} = Ref, St) ->
-    _ = (catch broker_subscription:leave(Ref, St#st.client_id)),
+    _ = try broker_subscription:leave(Ref, St#st.client_id) catch _:_ -> ok end,
     St.
 
 %%%_* Wire helpers ---------------------------------------------------------
@@ -718,9 +738,11 @@ send_info(St) ->
     send_raw([<<"INFO ">>, json:encode(Info), <<"\r\n">>], St).
 
 listener_port(#st{ref = Ref}) ->
-    case catch ranch:get_port(Ref) of
+    try ranch:get_port(Ref) of
         Port when is_integer(Port) -> Port;
         _ -> 0
+    catch
+        _:_ -> 0
     end.
 
 %% Deliver with `HMSG' when the message carries `ce-*' headers and the client
@@ -788,6 +810,14 @@ admit(St) ->
     end.
 
 %%%_* Subjects -------------------------------------------------------------
+
+%% Integers arrive as decimal text on the wire; a malformed field is a protocol
+%% violation the callers translate. `try' rather than the deprecated
+%% `catch Expr' (OTP 29 warns).
+parse_int(Bin) ->
+    try binary_to_integer(Bin)
+    catch _:_ -> error
+    end.
 
 connected(#st{client_id = undefined}) -> false;
 connected(#st{attached = Attached}) -> Attached.
@@ -888,7 +918,7 @@ cleanup(#st{} = St) ->
     cancel_tick(St),
     case St#st.client_id of
         undefined -> ok;
-        ClientId -> _ = (catch broker_subscription:detach(ClientId, self())), ok
+        ClientId -> _ = try broker_subscription:detach(ClientId, self()) catch _:_ -> ok end, ok
     end.
 
 cancel_tick(#st{tick = undefined}) -> ok;

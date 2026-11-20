@@ -118,8 +118,11 @@ json_depth_counts_nesting(_Config) ->
 
 malformed_limits_config_fails_loudly(_Config) ->
     application:set_env(broker_security, limits, not_a_map),
-    {'EXIT', {{invalid_limits_config, not_a_map}, _Stack}} =
-        (catch broker_limits:limits()),
+    try broker_limits:limits() of
+        _ -> ct:fail({expected_exit, limits})
+    catch
+        error:{invalid_limits_config, not_a_map} -> ok
+    end,
     ok.
 
 non_binary_payload_is_ignored(_Config) ->

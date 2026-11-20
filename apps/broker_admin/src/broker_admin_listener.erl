@@ -103,9 +103,13 @@ handle(Sock) ->
         Class:Reason:Stack ->
             logger:warning("broker_admin handler crashed ~p:~p ~p",
                            [Class, Reason, Stack]),
-            _ = catch send_response(
-                        Sock, {500, "application/json",
-                               <<"{\"error\":\"internal_error\"}">>}),
+            _ = try
+                send_response(
+                Sock, {500, "application/json",
+                       <<"{\"error\":\"internal_error\"}">>})
+            catch
+                _:_ -> ok
+            end,
             ok
     after
         _ = gen_tcp:close(Sock)

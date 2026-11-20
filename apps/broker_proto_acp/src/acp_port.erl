@@ -42,7 +42,9 @@ send(Port, Frame) ->
     end.
 
 close(Port) ->
-    catch port_close(Port),
+    %% `try' rather than the deprecated `catch Expr' (OTP 29 warns): closing a
+    %% port that is already gone must never raise.
+    try port_close(Port) catch _:_ -> ok end,
     ok.
 
 to_str(Value) when is_binary(Value) -> binary_to_list(Value);

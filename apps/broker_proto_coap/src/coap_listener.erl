@@ -406,9 +406,9 @@ terminate(_Reason, #st{transport = dtls} = St) ->
     %% port still held. Each session closes here rather than through
     %% `drop_session/2', so the gauge and the admission slot are settled in the
     %% same place -- the listener going down must not leave leases behind.
-    _ = (catch ssl:close(St#st.dtls_listen)),
+    _ = try ssl:close(St#st.dtls_listen) catch _:_ -> ok end,
     [begin
-         _ = (catch ssl:close(S)),
+         _ = try ssl:close(S) catch _:_ -> ok end,
          _ = broker_metrics:connection_closed(true),
          ok = broker_admission:release(maps:get(S, St#st.admissions, undefined))
      end || S <- maps:keys(St#st.peers)],
@@ -749,11 +749,11 @@ run_resource(Req, Cfg, Endpoint, St) ->
     Ctx = #{endpoint => Endpoint,
             tenant => Tenant,
             principal => Principal},
-    case catch coap_resource:handle(Req, Cfg, Ctx) of
+    try coap_resource:handle(Req, Cfg, Ctx) of
         {reply, Code, Options, Payload} ->
-            {Code, Options, Payload};
-        _ ->
-            {{response, 5, 0}, [], <<>>}
+            {Code, Options, Payload}
+    catch
+        _:_ -> {{response, 5, 0}, [], <<>>}
     end.
 
 endpoint_identity(Endpoint, #st{idents = Idents}) ->
@@ -1126,7 +1126,7 @@ maybe_unsubscribe(Dest, #st{observes = Obs} = St) ->
         true ->
             St;
         false ->
-            _ = (catch broker_subscription:unsubscribe(?COAP_CLIENT, Dest)),
+            _ = try broker_subscription:unsubscribe(?COAP_CLIENT, Dest) catch _:_ -> ok end,
             St
     end.
 
@@ -1135,7 +1135,7 @@ maybe_unsubscribe(Dest, #st{observes = Obs} = St) ->
 maybe_detach(#st{observes = Obs} = St) ->
     case maps:size(Obs) of
         0 ->
-            _ = (catch broker_subscription:detach(?COAP_CLIENT, self())),
+            _ = try broker_subscription:detach(?COAP_CLIENT, self()) catch _:_ -> ok end,
             St;
         _ ->
             St

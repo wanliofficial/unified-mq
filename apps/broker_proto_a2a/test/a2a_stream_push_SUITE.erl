@@ -516,7 +516,7 @@ decode_chunks(Buf) ->
 decode_chunks(Buf, Acc) ->
     case binary:split(Buf, <<"\r\n">>) of
         [SizeLine, Rest] ->
-            case catch binary_to_integer(SizeLine, 16) of
+            case parse_hex(SizeLine) of
                 0 ->
                     {done, Acc};
                 Size when is_integer(Size) ->
@@ -536,8 +536,11 @@ decode_chunks(Buf, Acc) ->
 %% SSE frames are separated by a blank line; keep only `data:' payloads.
 split_sse(Bin) ->
     Parts = binary:split(Bin, <<"\n\n">>, [global]),
+    %% Single-element generator instead of a binding filter: OTP 29 warns
+    %% (export_var_subexpr) when a comprehension filter exports a binding.
     [Payload || Part <- Parts,
-                (Payload = data_of(Part)) =/= none].
+                Payload <- [data_of(Part)],
+                Payload =/= none].
 
 data_of(Part) ->
     Lines = binary:split(Part, <<"\n">>, [global]),
@@ -836,3 +839,10 @@ restore_a2a({K, undefined}) -> application:unset_env(broker_proto_a2a, K).
 
 restore_security({K, {ok, V}}) -> application:set_env(broker_security, K, V);
 restore_security({K, undefined}) -> application:unset_env(broker_security, K).
+
+%% Chunk sizes are hex; a malformed size is a protocol error rather than a
+%% crash. `try' instead of the deprecated `catch Expr' (OTP 29 warns).
+parse_hex(Bin) ->
+    try binary_to_integer(Bin, 16)
+    catch _:_ -> error
+    end.

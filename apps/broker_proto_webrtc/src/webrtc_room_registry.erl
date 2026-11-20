@@ -50,7 +50,7 @@ join(Room, PeerId, Pid, Opts) when is_binary(PeerId), is_pid(Pid) ->
 %% (R-S9). Never raises, because it runs in `terminate/2'.
 -spec leave(binary(), pid()) -> ok.
 leave(Room, Pid) ->
-    _ = catch gen_server:call(shard_for(Room), {leave, Room, Pid}),
+    _ = try gen_server:call(shard_for(Room), {leave, Room, Pid}) catch _:_ -> ok end,
     ok.
 
 %% @doc Where is `PeerId' in `Room'? `undefined' for an unknown peer *and* for a

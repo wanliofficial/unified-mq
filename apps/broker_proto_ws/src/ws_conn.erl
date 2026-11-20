@@ -525,21 +525,25 @@ store_routes([], _Msg, Acc) ->
     {ok, lists:reverse(Acc)};
 store_routes([{P, Refs} | Rest], Msg, Acc) ->
     PartitionMsg = Msg#broker_message{partition_id = P},
-    case (catch broker_queue:append(P, PartitionMsg, fsync)) of
+    try broker_queue:append(P, PartitionMsg, fsync) of
         {ok, Offset} ->
-            _ = (catch broker_subscription:dispatch(Refs, {P, Offset, PartitionMsg})),
+            _ = try
+                broker_subscription:dispatch(Refs, {P, Offset, PartitionMsg})
+            catch
+                _:_ -> ok
+            end,
             store_routes(Rest, Msg, [Offset | Acc]);
         {error, Reason} ->
-            {error, Reason};
-        Other ->
-            {error, {append_crashed, Other}}
+            {error, Reason}
+    catch
+        Class:Reason -> {error, {append_crashed, {Class, Reason}}}
     end.
 
 do_ack(Map, #st{client_id = ClientId} = St) ->
     Id = maps:get(<<"delivery_id">>, Map, undefined),
     case maps:take(Id, St#st.pending) of
         {#{refs := Refs, partition := P, offset := O}, Pending} ->
-            lists:foreach(fun(Ref) -> _ = (catch broker_subscription:ack(Ref, P, O, ClientId)) end,
+            lists:foreach(fun(Ref) -> _ = try broker_subscription:ack(Ref, P, O, ClientId) catch _:_ -> ok end end,
                           Refs),
             {noreply, send_json(#{<<"op">> => <<"ackack">>, <<"delivery_id">> => Id}, 
                                 St#st{pending = Pending})};
@@ -561,8 +565,12 @@ deliver_refs(Refs, P, O, Msg, St) ->
                 0 ->
                     lists:foreach(
                       fun(Ref) ->
-                              _ = (catch broker_subscription:ack(
-                                               Ref, P, O, St#st.client_id))
+                              _ = try
+                                  broker_subscription:ack(
+                                  Ref, P, O, St#st.client_id)
+                              catch
+                                  _:_ -> ok
+                              end
                       end, Mine),
                     St1;
                 _ ->
@@ -644,7 +652,7 @@ catch_up_partition(Ref, QoS, P, St) ->
 catch_up_pages(_Ref, _QoS, _P, _From, St, N) when N >= 1000 ->
     St;
 catch_up_pages(Ref, QoS, P, From, St, N) ->
-    case (catch broker_queue:read_from(P, From, 100)) of
+    try broker_queue:read_from(P, From, 100) of
         {ok, [], _Next} ->
             St;
         {ok, Rows, _Next} when is_list(Rows) ->
@@ -655,8 +663,12 @@ catch_up_pages(Ref, QoS, P, From, St, N) ->
                 0 ->
                     lists:foreach(
                       fun({O, _}) ->
-                              _ = (catch broker_subscription:ack(
-                                               Ref, P, O, St1#st.client_id))
+                              _ = try
+                                  broker_subscription:ack(
+                                  Ref, P, O, St1#st.client_id)
+                              catch
+                                  _:_ -> ok
+                              end
                       end, Rows),
                     ok;
                 _ ->
@@ -666,6 +678,8 @@ catch_up_pages(Ref, QoS, P, From, St, N) ->
             catch_up_pages(Ref, QoS, P, Last + 1, St1, N + 1);
         _ ->
             St
+    catch
+        _:_ -> St
     end.
 
 %%%_* Wire helpers ---------------------------------------------------------
@@ -765,6 +779,6 @@ max_publish_bytes() ->
 cleanup(#st{client_id = undefined}) ->
     ok;
 cleanup(#st{client_id = ClientId, clean = Clean}) ->
-    _ = (catch broker_subscription:detach(ClientId, self())),
+    _ = try broker_subscription:detach(ClientId, self()) catch _:_ -> ok end,
     _ = Clean,
     ok.

@@ -96,7 +96,11 @@ terminate(_Reason, #st{groups = Groups, counted = Counted} = St) ->
     ok = broker_metrics:connection_closed(Counted),
     ok = broker_admission:release(St#st.admission),
     maps:foreach(fun(Group, MemberId) ->
-                         _ = (catch kafka_group:close_member(Group, MemberId))
+                         _ = try
+                             kafka_group:close_member(Group, MemberId)
+                         catch
+                             _:_ -> ok
+                         end
                  end, Groups),
     ok.
 
@@ -489,15 +493,19 @@ append_record(Topic, Partition, Record, Destination, Refs, St) ->
                           event = undefined},
     case broker_event:apply_policy(Msg) of
         {ok, Accepted} ->
-            case (catch broker_queue:append(Partition, Accepted, fsync)) of
+            try broker_queue:append(Partition, Accepted, fsync) of
                 {ok, Offset} ->
-                    _ = (catch broker_subscription:dispatch(
-                                 Refs, {Partition, Offset, Accepted})),
+                    _ = try
+                        broker_subscription:dispatch(
+                        Refs, {Partition, Offset, Accepted})
+                    catch
+                        _:_ -> ok
+                    end,
                     ok;
                 {error, Reason} ->
-                    {error, Reason};
-                Other ->
-                    {error, {append_crashed, Other}}
+                    {error, Reason}
+            catch
+                Class:Reason -> {error, {append_crashed, {Class, Reason}}}
             end;
         {error, Reason} ->
             {error, {cloudevent_rejected, Reason}}
@@ -612,7 +620,7 @@ topic_entries(Partition, Destination) ->
 collect_entries(_Partition, From, High, _Destination, K, Acc) when From >= High ->
     {ok, lists:reverse(Acc), K};
 collect_entries(Partition, From, High, Destination, K, Acc) ->
-    case (catch broker_queue:read_from(Partition, From, 256)) of
+    try broker_queue:read_from(Partition, From, 256) of
         {ok, [], _Next} ->
             {ok, lists:reverse(Acc), K};
         {ok, Page, Next} ->
@@ -624,6 +632,8 @@ collect_entries(Partition, From, High, Destination, K, Acc) ->
             collect_entries(Partition, Next1, High, Destination, K1, Acc1);
         {error, Reason} ->
             {error, Reason}
+    catch
+        Class:Reason -> {error, {read_crashed, {Class, Reason}}}
     end.
 
 collect_page([], _Destination, K, Acc) ->

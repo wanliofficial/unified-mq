@@ -181,7 +181,7 @@ mqtt_recv_or(Client, Timeout, Default) ->
 
 mqtt_recv_or(Client, Timeout, Default, Vsn) ->
     Buf = mqtt_buf(Client),
-    case (catch mqtt_frame:decode(Buf, Vsn)) of
+    try mqtt_frame:decode(Buf, Vsn) of
         {ok, Frame, Rest} ->
             mqtt_set_buf(Client, Rest),
             Frame;
@@ -196,9 +196,10 @@ mqtt_recv_or(Client, Timeout, Default, Vsn) ->
                     {error, closed}
             end;
         {error, Reason} ->
-            exit({mqtt_recv_malformed, Reason, Buf});
-        {'EXIT', Reason} ->
-            exit({mqtt_recv_crashed, Reason, Buf})
+            exit({mqtt_recv_malformed, Reason, Buf})
+    catch
+        Class:Reason ->
+            exit({mqtt_recv_crashed, {Class, Reason}, Buf})
     end.
 
 %% Nothing arrives and the stream stays open for Ms milliseconds.

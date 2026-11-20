@@ -479,11 +479,13 @@ drain({error, Reason}, _Frame) -> {error, Reason}.
 
 prop_never_crashes() ->
     ?FORALL(Bin, binary(),
-            case (catch mqtt_frame:decode(Bin)) of
+            try mqtt_frame:decode(Bin) of
                 {'EXIT', _} -> collect(crashed, false);
                 {ok, F, R} -> is_tuple(F) andalso is_binary(R);
                 {more, B} -> is_binary(B);
                 {error, _} -> true
+            catch
+                _:_ -> collect(crashed, false)
             end).
 
 prop_varint() ->
@@ -503,9 +505,10 @@ prop_encode_rejects() ->
             did_raise(illegal_frame(T))).
 
 did_raise(F) ->
-    case (catch F()) of
-        {'EXIT', _} -> true;
+    try F() of
         _ -> false
+    catch
+        _:_ -> true
     end.
 
 illegal_frame(pub_pid_zero) ->
@@ -563,7 +566,7 @@ prop_bitflip() ->
                             <<Head:J/binary, B:8, Tail/binary>> = Bin,
                             Flipped = <<Head/binary, (B bxor Mask):8,
                                         Tail/binary>>,
-                            case (catch mqtt_frame:decode(Flipped)) of
+                            try mqtt_frame:decode(Flipped) of
                                 {'EXIT', Why} ->
                                     collect({crashed, Why}, false);
                                 {error, _} ->
@@ -576,6 +579,8 @@ prop_bitflip() ->
                                         true -> collect(same_type, true);
                                         false -> collect(type_confused, true)
                                     end
+                            catch
+                                _:_ -> collect({crashed, decode}, false)
                             end
                         end)
             end).

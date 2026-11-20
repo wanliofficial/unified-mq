@@ -584,8 +584,9 @@ unmask(Key, Payload) ->
 %% abrupt teardown is a case's own business (`a_text_frame_is_closed_with_1003',
 %% `will_is_published_when_the_socket_drops').
 close(S) ->
-    catch gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true)),
-    catch gen_tcp:close(S),
+    try gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true))
+    catch _:_ -> ok end,
+    try gen_tcp:close(S) catch _:_ -> ok end,
     ok.
 
 split_in_half(Bin) ->

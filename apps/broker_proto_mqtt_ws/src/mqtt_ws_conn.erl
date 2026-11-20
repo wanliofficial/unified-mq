@@ -87,7 +87,7 @@ terminate(_Reason, #st{} = St) ->
     notify_fsm(St, closing_msg(St)),
     case St#st.socket of
         undefined -> ok;
-        Sock -> _ = (catch (St#st.transport):close(Sock)), ok
+        Sock -> _ = try (St#st.transport):close(Sock) catch _:_ -> ok end, ok
     end.
 
 %%%_* gen_server -------------------------------------------------------------

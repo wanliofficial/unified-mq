@@ -138,9 +138,9 @@ append_copy(#broker_message{} = Original, QoS, Kind, Meta) ->
               event = undefined},
     case route(Destination, Tenant) of
         {ok, Partition} ->
-            case (catch broker_queue:append(Partition,
-                                            Copy#broker_message{partition_id = Partition},
-                                            fsync)) of
+            try broker_queue:append(Partition,
+                                    Copy#broker_message{partition_id = Partition},
+                                    fsync) of
                 {ok, _Offset} ->
                     broker_metrics:inc(dlq_appends),
                     _ = broker_metrics:gauge_add(dlq_size, 1),
@@ -148,6 +148,10 @@ append_copy(#broker_message{} = Original, QoS, Kind, Meta) ->
                 Other ->
                     broker_metrics:inc(dlq_append_failed),
                     {error, {append_failed, Other}}
+            catch
+                Class:Reason ->
+                    broker_metrics:inc(dlq_append_failed),
+                    {error, {append_failed, {Class, Reason}}}
             end;
         {error, Reason} ->
             broker_metrics:inc(dlq_append_failed),

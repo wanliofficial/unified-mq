@@ -287,7 +287,7 @@ stop_probe(Config) ->
     Ref = proplists:get_value(probe_ref, Config),
     %% ranch may not be running: the bind-guard case stops the admin app, and
     %% that app is the only reason ranch is up here.
-    _ = catch ranch:stop_listener(Ref),
+    _ = try ranch:stop_listener(Ref) catch _:_ -> ok end,
     _ = persistent_term:erase({?MODULE, probe_port}),
     ok.
 
@@ -297,9 +297,11 @@ probe_port(Config) ->
     %% `{undefined, undefined}'), while an `undrain' of a `port => 0' listener
     %% picks a *new* ephemeral port. So: prefer the live address, fall back to the
     %% one captured at start.
-    case catch ranch:get_port(Ref) of
+    try ranch:get_port(Ref) of
         Port when is_integer(Port) -> Port;
         _ -> persistent_term:get({?MODULE, probe_port})
+    catch
+        _:_ -> persistent_term:get({?MODULE, probe_port})
     end.
 
 %% `ok' on success, `{error, _}' when the acceptor is suspended.

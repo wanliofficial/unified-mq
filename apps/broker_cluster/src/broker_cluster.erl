@@ -85,7 +85,7 @@ leave(Node, Timeout) when is_atom(Node) ->
 command(Command) ->
     case broker_cluster_meta:command(Command) of
         {ok, Epoch} when is_integer(Epoch) ->
-            _ = (catch broker_metrics:inc(cluster_owner_changes)),
+            _ = try broker_metrics:inc(cluster_owner_changes) catch _:_ -> ok end,
             {ok, Epoch};
         Other ->
             Other
@@ -132,7 +132,7 @@ authorize_append(Partition, Epoch) ->
                 true ->
                     ok;
                 false ->
-                    _ = (catch broker_metrics:inc(cluster_fencing_rejected)),
+                    _ = try broker_metrics:inc(cluster_fencing_rejected) catch _:_ -> ok end,
                     {error, {fenced, #{partition => Partition,
                                        expected_epoch => Current,
                                        actual_epoch => Epoch,
@@ -161,7 +161,7 @@ owner_check(Partition) ->
                 _ -> ok
             end;
         {ok, #{owner := Owner, epoch := E}} ->
-            _ = (catch broker_metrics:inc(cluster_fencing_rejected)),
+            _ = try broker_metrics:inc(cluster_fencing_rejected) catch _:_ -> ok end,
             {error, {fenced, #{partition => Partition, expected_epoch => E,
                                owner => Owner}}}
     end.
@@ -213,8 +213,12 @@ qos0_fanout(Msg) ->
         {ok, Members} ->
             lists:foreach(
               fun(Node) when Node =/= node() ->
-                      _ = (catch rpc:cast(Node, broker_subscription,
-                                          dispatch_qos0, [Msg]));
+                      _ = try
+                          rpc:cast(Node, broker_subscription,
+                          dispatch_qos0, [Msg])
+                      catch
+                          _:_ -> ok
+                      end;
                  (_) ->
                       ok
               end, Members),
@@ -276,7 +280,7 @@ route_op(Op, Partition, Args) ->
         {ok, Owner} ->
             case get('$broker_queue_forwarded') of
                 true ->
-                    _ = (catch broker_metrics:inc(cluster_fencing_rejected)),
+                    _ = try broker_metrics:inc(cluster_fencing_rejected) catch _:_ -> ok end,
                     {error, {not_owner, Owner}};
                 _ ->
                     {forward, Owner}

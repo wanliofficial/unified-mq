@@ -327,7 +327,7 @@ decode_vsn(_) -> auto.
 %% answered (MQTT allows pipelining SUBSCRIBE behind it) are dispatched through
 %% the same loop with the new state name.
 tcp_frames(#st{buf = Buf} = D, StateName) ->
-    case (catch mqtt_frame:decode(Buf, decode_vsn(D))) of
+    try mqtt_frame:decode(Buf, decode_vsn(D)) of
         {ok, Frame, Rest} ->
             case inbound_size_ok(byte_size(Buf) - byte_size(Rest), D) of
                 true ->
@@ -350,12 +350,13 @@ tcp_frames(#st{buf = Buf} = D, StateName) ->
             {state, StateName, D};
         {error, Reason} ->
             broker_metrics:inc(frame_decode_errors),
-            decode_error(Reason, StateName, D);
-        {'EXIT', Reason} ->
+            decode_error(Reason, StateName, D)
+    catch
+        Class:Reason ->
             %% decode/1 promises never to crash; if that ever breaks, the
             %% connection dies and the codec's suite says why.
             broker_metrics:inc(frame_decode_errors),
-            {stop, {decode_crashed, Reason}, D}
+            {stop, {decode_crashed, {Class, Reason}}, D}
     end.
 
 %% §4.5's version posture is fed by the codec's distinct reasons: an unknown
@@ -587,9 +588,12 @@ acl_subscribe(Filter, D) ->
 effective_max_qos(ConfigMax) ->
     Ps = broker_queue:partition_ids(),
     Durable = lists:all(fun(P) ->
-                               case (catch broker_queue:capability(P)) of
-                                   Caps when is_list(Caps) -> lists:member(fsync, Caps);
+                               try broker_queue:capability(P) of
+                                   Caps when is_list(Caps) ->
+                                       lists:member(fsync, Caps);
                                    _ -> false
+                               catch
+                                   _:_ -> false
                                end
                         end, Ps),
     case Ps =/= [] andalso Durable of
@@ -634,9 +638,10 @@ attach_session(ClientId, _Clean, Persist, D) ->
     %% is a takeover (a previous holder still has a dying Will parked) the bump
     %% invalidates it, so only a Will this connection later schedules can fire.
     %% Synchronous, so the next CONNECT cannot race the old connection's death.
-    WillGen = case (catch mqtt_will_server:adopt(ClientId)) of
-                  G when is_integer(G) -> G;
-                  _ -> 1
+    WillGen = try mqtt_will_server:adopt(ClientId) of
+                  G when is_integer(G) -> G
+              catch
+                  _:_ -> 1
               end,
     case Prev of
         Pid when is_pid(Pid), Pid =/= self() ->
@@ -661,7 +666,7 @@ clean_session_teardown(D) ->
       end, broker_subscription:subscriptions(D#st.client_id)),
     %% Clearing the blob here is what makes the boot residue (an empty `.subs'
     %% with no `.inflight') harmless, and is the §4.2 "start from zero".
-    _ = (catch broker_subscription:inflight(D#st.client_id, undefined)),
+    _ = try broker_subscription:inflight(D#st.client_id, undefined) catch _:_ -> ok end,
     D#st{pending = #{}, pending_qos = #{}, released = #{}, received = #{},
          retained_queue = [], pending_rev = #{}, sent = #{}, sent_at = #{},
          retry_reported = #{}, next_pid = 1, inflight_dirty = false}.
@@ -723,7 +728,8 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
 %% races §5.2 note 3 describes).
 subscribe_partitions(D) ->
     Ps = broker_queue:partition_ids(),
-    Results = [{P, (catch broker_queue:subscribe(P, self()))} || P <- Ps],
+    Results = [{P, try broker_queue:subscribe(P, self()) catch _:_ -> ok end}
+               || P <- Ps],
     case Ps =/= [] andalso length([ok || {_, ok} <- Results]) =:= length(Ps) of
         true -> {ok, D#st{partitions = Ps}};
         false -> {error, {partial, Results}}
@@ -894,12 +900,16 @@ store_and_ack(Msg, 0, _Partition, Refs, _WirePid, Retain, D) ->
     %% updated first, in async mode -- QoS0 has no durability promise, so the
     %% ack window is irrelevant here.
     D1 = retain_update(Msg, Retain, async, D),
-    _ = (catch broker_subscription:dispatch(Refs, {undefined, undefined, Msg})),
+    _ = try
+        broker_subscription:dispatch(Refs, {undefined, undefined, Msg})
+    catch
+        _:_ -> ok
+    end,
     {state, connected, D1};
 store_and_ack(Msg, QoS, Partition, Refs, WirePid, Retain, D)
   when QoS =:= 1; QoS =:= 2 ->
     T0 = erlang:monotonic_time(microsecond),
-    case (catch broker_queue:append(Partition, Msg, fsync)) of
+    try broker_queue:append(Partition, Msg, fsync) of
         {ok, Offset} ->
             broker_metrics:observe(
               publish_latency_us,
@@ -932,6 +942,14 @@ store_and_ack(Msg, QoS, Partition, Refs, WirePid, Retain, D)
             end,
             log(warning, "append failed ~p, dropping connection", [Other]),
             {stop, {append_failed, Other}, D}
+    catch
+        Class:Reason ->
+            %% A crashing append is the same honest disconnect as a returned
+            %% error: the record's durability was never confirmed.
+            broker_metrics:inc(backpressure_disconnects),
+            log(warning, "append crashed ~p:~p, dropping connection",
+                [Class, Reason]),
+            {stop, {append_failed, {Class, Reason}}, D}
     end.
 
 %% (e) The ack goes out the moment fsync returned (ADR-007/R1a). The packet id
@@ -943,7 +961,7 @@ ack_and_dispatch(Msg, 1, Partition, Offset, Refs, WirePid, D) ->
     %% routed set is empty; 3.1.1 keeps the same two-byte PUBACK it always had.
     RC = case Refs of [] -> 16#10; _ -> 0 end,
     D1 = send_frame(enc(#puback{packet_id = WirePid, reason_code = RC}, D), D),
-    _ = (catch broker_subscription:dispatch(Refs, {Partition, Offset, Msg})),
+    _ = try broker_subscription:dispatch(Refs, {Partition, Offset, Msg}) catch _:_ -> ok end,
     {state, connected, D1};
 ack_and_dispatch(Msg, 2, Partition, Offset, Refs, WirePid, D0) ->
     %% ADR-018 §18.3 R5 (Method A): the message is delivered on PUBLISH, and
@@ -953,7 +971,11 @@ ack_and_dispatch(Msg, 2, Partition, Offset, Refs, WirePid, D0) ->
     case remember_received(WirePid, D0) of
         {ok, D1} ->
             D2 = send_frame(enc(#pubrec{packet_id = WirePid}, D1), D1),
-            _ = (catch broker_subscription:dispatch(Refs, {Partition, Offset, Msg})),
+            _ = try
+                broker_subscription:dispatch(Refs, {Partition, Offset, Msg})
+            catch
+                _:_ -> ok
+            end,
             {state, connected, D2};
         {overflow, D1} ->
             {stop, qos2_state_overflow, D1}
@@ -1150,8 +1172,12 @@ report_timeout(Pid, D) ->
         {Refs, {P, O}} when is_integer(P), is_integer(O) ->
             ClientId = D#st.client_id,
             lists:foreach(fun(Ref) ->
-                                  _ = (catch broker_subscription:retry(Ref, P, O,
-                                                                      ClientId))
+                                  _ = try
+                                      broker_subscription:retry(Ref, P, O,
+                                      ClientId)
+                                  catch
+                                      _:_ -> ok
+                                  end
                           end, Refs),
             case all_shared(Refs) of
                 true ->
@@ -1239,9 +1265,11 @@ clear_reported(Pid, D) ->
     D#st{retry_reported = maps:remove(Pid, D#st.retry_reported)}.
 
 read_one(P, O) ->
-    case (catch broker_queue:read_from(P, O, 1)) of
+    try broker_queue:read_from(P, O, 1) of
         {ok, [{O, Msg}], _Next} -> {ok, Msg};
         _ -> error
+    catch
+        Class:Reason -> {error, {read_crashed, {Class, Reason}}}
     end.
 
 %% The message expired while it sat in flight: the retry is over, the cursor
@@ -1361,52 +1389,47 @@ remember_sub_flags(Granted, D) ->
 enqueue_retained([], _Existing, D) ->
     D;
 enqueue_retained(Granted, Existing, D) ->
-    Entries = (catch broker_retain:entries()),
-    case is_list(Entries) of
-        false ->
-            %% The retain app is not up (a bare conn in a unit test): nothing
-            %% to replay, and a missing SUBACK-adjacent message is better than
-            %% a crashed connection.
-            log(warning, "retained replay skipped: ~p", [Entries]),
-            D;
-        true ->
-            Wanted =
-                lists:foldl(
-                  fun({Filter, GrantedQoS, NL, _Rap, RH}, Acc0) ->
-                          case replay_wanted(Filter, RH, Existing) of
-                              false ->
-                                  Acc0;
-                              true ->
-                                  lists:foldl(
-                                    fun({Topic, Msg}, Acc) ->
-                                            case mqtt_filter:matches(Topic, Filter) of
+    Entries = try broker_retain:entries() catch _:_ -> [] end,
+    %% `broker_retain:entries/0' is specified to return a list, and the catch
+    %% above yields `[]' when the retain app is not up (a bare conn in a unit
+    %% test): nothing to replay, and a missing SUBACK-adjacent message is better
+    %% than a crashed connection. So `Entries' is always a list here.
+    Wanted =
+        lists:foldl(
+          fun({Filter, GrantedQoS, NL, _Rap, RH}, Acc0) ->
+                  case replay_wanted(Filter, RH, Existing) of
+                      false ->
+                          Acc0;
+                      true ->
+                          lists:foldl(
+                            fun({Topic, Msg}, Acc) ->
+                                    case mqtt_filter:matches(Topic, Filter) of
+                                        true ->
+                                            case NL =:= 1 andalso
+                                                 publisher_of(Msg) =:=
+                                                   D#st.client_id of
                                                 true ->
-                                                    case NL =:= 1 andalso
-                                                         publisher_of(Msg) =:=
-                                                           D#st.client_id of
-                                                        true ->
-                                                            Acc;
-                                                        false ->
-                                                            Q = min(GrantedQoS,
-                                                                    qos_of(Msg)),
-                                                            case maps:find(Topic, Acc) of
-                                                                {ok, {OldMsg, OldQ}} ->
-                                                                    Acc#{Topic => {OldMsg,
-                                                                                   max(OldQ, Q)}};
-                                                                error ->
-                                                                    Acc#{Topic => {Msg, Q}}
-                                                            end
-                                                    end;
+                                                    Acc;
                                                 false ->
-                                                    Acc
-                                            end
-                                    end, Acc0, Entries)
-                          end
-                  end, #{}, Granted),
-            Queue = [{Topic, Msg, Q}
-                     || {Topic, {Msg, Q}} <- lists:sort(maps:to_list(Wanted))],
-            D#st{retained_queue = D#st.retained_queue ++ Queue}
-    end.
+                                                    Q = min(GrantedQoS,
+                                                            qos_of(Msg)),
+                                                    case maps:find(Topic, Acc) of
+                                                        {ok, {OldMsg, OldQ}} ->
+                                                            Acc#{Topic => {OldMsg,
+                                                                           max(OldQ, Q)}};
+                                                        error ->
+                                                            Acc#{Topic => {Msg, Q}}
+                                                    end
+                                            end;
+                                        false ->
+                                            Acc
+                                    end
+                            end, Acc0, Entries)
+                  end
+          end, #{}, Granted),
+    Queue = [{Topic, Msg, Q}
+             || {Topic, {Msg, Q}} <- lists:sort(maps:to_list(Wanted))],
+    D#st{retained_queue = D#st.retained_queue ++ Queue}.
 
 %% RH=0 always replays; RH=1 only for a filter the session has not already
 %% subscribed to; RH=2 never. `Existing' is the pre-SUBSCRIBE filter set.
@@ -1576,8 +1599,12 @@ handle_unsubscribe(#unsubscribe{packet_id = Pid, topics = Filters}, D0) ->
 unsubscribe_one(Filter, D) ->
     case shared_filter(Filter) of
         {shared, Group, Real} ->
-            _ = (catch broker_subscription:leave({shared, Group, Real},
-                                                 D#st.client_id)),
+            _ = try
+                broker_subscription:leave({shared, Group, Real},
+                D#st.client_id)
+            catch
+                _:_ -> ok
+            end,
             ok;
         invalid ->
             ok;
@@ -1930,8 +1957,8 @@ pull_shared(P, Rows, D) ->
 
 claim_and_pull(P, Ref, Filter, SubQoS, D) ->
     ClientId = D#st.client_id,
-    case (catch broker_subscription:claim(Ref, P, opt(pull_page_limit, 32, D),
-                                          ClientId)) of
+    try broker_subscription:claim(Ref, P, opt(pull_page_limit, 32, D),
+                                  ClientId) of
         {ok, []} ->
             %% The tail: the group has nothing unassigned. Not an error.
             {idle, D};
@@ -1944,9 +1971,10 @@ claim_and_pull(P, Ref, Filter, SubQoS, D) ->
             {stalled, D};
         {error, Reason} ->
             log(warning, "claim ~p ~p failed ~p", [Ref, P, Reason]),
-            {idle, D};
-        Other ->
-            log(warning, "claim ~p ~p crashed ~p", [Ref, P, Other]),
+            {idle, D}
+    catch
+        Class:Reason ->
+            log(warning, "claim ~p ~p crashed ~p:~p", [Ref, P, Class, Reason]),
             {idle, D}
     end.
 
@@ -1965,7 +1993,11 @@ deliver_claimed(P, Ref, Filter, SubQoS, Offsets, D) ->
         [] -> ok;
         _ ->
             broker_metrics:inc(shared_claim_rollbacks),
-            _ = (catch broker_subscription:release(Ref, P, Missing, D#st.client_id))
+            _ = try
+                broker_subscription:release(Ref, P, Missing, D#st.client_id)
+            catch
+                _:_ -> ok
+            end
     end,
     {Rank, D1} =
         lists:foldl(
@@ -2002,8 +2034,6 @@ read_run(P, [First | _] = Run, D) ->
 read_run(_P, [], _D) ->
     [].
 
-contiguous_runs([]) ->
-    [];
 contiguous_runs([O | Rest]) ->
     contiguous_runs(Rest, O, O, []).
 
@@ -2035,15 +2065,24 @@ read_page(P, From, D) ->
     read_page(P, From, opt(pull_page_limit, 32, D), D).
 
 read_page(P, From, Limit, _D) ->
-    case (catch broker_queue:read_from(P, From, Limit)) of
+    try broker_queue:read_from(P, From, Limit) of
         {ok, Page, Next} when is_list(Page) -> {ok, Page, Next};
         {error, {stale_handle, _, _, _, _}} ->
             %% broker_queue repairs its registry synchronously before
             %% returning, so one immediate re-read is legitimate; if that also
             %% fails the round gives up and the poll tick retries.
-            (catch broker_queue:read_from(P, From, Limit));
+            try broker_queue:read_from(P, From, Limit) of
+                {ok, Page2, Next2} when is_list(Page2) ->
+                    {ok, Page2, Next2};
+                Other ->
+                    {error, Other}
+            catch
+                Class:Reason -> {error, {Class, Reason}}
+            end;
         Other ->
             {error, Other}
+    catch
+        Class:Reason -> {error, {Class, Reason}}
     end.
 
 %%%_* One stored message, every subscribing filter (pull path) ----------------
@@ -2398,7 +2437,7 @@ unsuback_bin(Pid, N, D) ->
 %% an ack whose consumer does not hold the offset (ADR-019 §19.2), so this is safe
 %% after an UNSUBSCRIBE or a rebalance raced us.
 ack_skip(Ref, P, O, Consumer) ->
-    _ = (catch broker_subscription:ack(Ref, P, O, Consumer)),
+    _ = try broker_subscription:ack(Ref, P, O, Consumer) catch _:_ -> ok end,
     ok.
 
 %%%_* In-flight snapshot (R7 blob) ---------------------------------------------
@@ -2411,7 +2450,7 @@ maybe_snapshot(D) ->
     D.
 
 snapshotted(#st{client_id = ClientId} = D) ->
-    _ = (catch broker_subscription:inflight(ClientId, blob(D))),
+    _ = try broker_subscription:inflight(ClientId, blob(D)) catch _:_ -> ok end,
     D#st{inflight_dirty = false}.
 
 %% The conn's memory is the authority; this layer stores it without inspecting
@@ -2489,7 +2528,7 @@ send_frame(Bin, #st{socket = Sock} = D) ->
             broker_metrics:inc(mqtt_publish_dropped_oversize),
             D;
         true ->
-            case (catch (D#st.transport):send(Sock, Bin)) of
+            try (D#st.transport):send(Sock, Bin) of
                 ok ->
                     broker_metrics:inc(bytes_out, byte_size(Bin)),
                     D;
@@ -2498,6 +2537,10 @@ send_frame(Bin, #st{socket = Sock} = D) ->
                     %% send is not a protocol error, and S1 has no backpressure to
                     %% fail.
                     log(warning, "send failed ~p", [Other]),
+                    D
+            catch
+                Class:Reason ->
+                    log(warning, "send raised ~p:~p", [Class, Reason]),
                     D
             end
     end.
@@ -2605,21 +2648,26 @@ terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
                 (D#st.inflight_dirty =:= true orelse session_expiring(D)),
     case WriteBlob of
         true ->
-            _ = (catch broker_subscription:inflight(D#st.client_id,
-                                                    blob_with_expiry(D))),
+            _ = try
+                broker_subscription:inflight(D#st.client_id,
+                blob_with_expiry(D))
+            catch
+                _:_ -> ok
+            end,
             ok;
         false ->
             ok
     end,
-    lists:foreach(fun(P) -> _ = (catch broker_queue:unsubscribe(P, self())) end, Ps),
+    lists:foreach(fun(P) -> _ = try broker_queue:unsubscribe(P, self()) catch _:_ -> ok end end, Ps),
     if
         D#st.attached ->
-            _ = (catch broker_subscription:detach(D#st.client_id, self())),
+            _ = try broker_subscription:detach(D#st.client_id, self()) catch _:_ -> ok end,
             ok;
         true ->
             ok
     end,
-    _ = D#st.socket =/= undefined andalso (catch (D#st.transport):close(D#st.socket)),
+    _ = D#st.socket =/= undefined
+        andalso (try (D#st.transport):close(D#st.socket) catch _:_ -> ok end),
     ok.
 
 publish_will(mqtt_disconnect, _D) ->
@@ -2646,9 +2694,13 @@ publish_will(Reason, #st{will = Will, tenant_id = Tenant,
              end,
     case DelayS of
         S when is_integer(S), S > 0 ->
-            _ = (catch mqtt_will_server:schedule(ClientId, Will, S * 1000,
-                                                 Tenant, Principal,
-                                                 D#st.will_gen)),
+            _ = try
+                mqtt_will_server:schedule(ClientId, Will, S * 1000,
+                Tenant, Principal,
+                D#st.will_gen)
+            catch
+                _:_ -> ok
+            end,
             log(warning, "will delayed ~ps (reason=~p, client_id=~p)",
                 [S, Reason, ClientId]),
             ok;
@@ -2657,7 +2709,7 @@ publish_will(Reason, #st{will = Will, tenant_id = Tenant,
             %% down, the retain app may be restarting). A dying process must
             %% not log a crash on top of the reason it is dying, so the
             %% failure is contained here.
-            _ = (catch mqtt_will:publish(Will, Tenant, Principal)),
+            _ = try mqtt_will:publish(Will, Tenant, Principal) catch _:_ -> ok end,
             log(warning, "will published (reason=~p, client_id=~p)",
                 [Reason, ClientId]),
             ok

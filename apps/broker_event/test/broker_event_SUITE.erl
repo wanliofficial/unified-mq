@@ -609,7 +609,7 @@ with_dedup(Fun) ->
 stop_dedup() ->
     case whereis(broker_event_dedup) of
         undefined -> ok;
-        Pid -> _ = (catch gen_server:stop(Pid)), ok
+        Pid -> _ = try gen_server:stop(Pid) catch _:_ -> ok end, ok
     end.
 
 %% Returns every application this fixture started, so teardown can stop

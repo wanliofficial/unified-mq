@@ -61,13 +61,13 @@ end_per_testcase(_Case, _Config) ->
     ok.
 
 stop_node() ->
-    _ = (catch broker_cluster:uninstall_hooks()),
+    _ = try broker_cluster:uninstall_hooks() catch _:_ -> ok end,
     _ = application:stop(broker_queue),
     _ = application:stop(broker_storage),
-    _ = (catch gen_server:stop(broker_cluster_meta_ctl)),
-    _ = (catch ra:stop_server(default, ?SERVER)),
-    _ = (catch ra_system:stop_default()),
-    _ = (catch gen_server:stop(broker_cluster_cache)),
+    _ = try gen_server:stop(broker_cluster_meta_ctl) catch _:_ -> ok end,
+    _ = try ra:stop_server(default, ?SERVER) catch _:_ -> ok end,
+    _ = try ra_system:stop_default() catch _:_ -> ok end,
+    _ = try gen_server:stop(broker_cluster_cache) catch _:_ -> ok end,
     ok.
 
 %%%_* Ownership -------------------------------------------------------------

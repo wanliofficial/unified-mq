@@ -220,7 +220,11 @@ bump(#st{gen = Gen}) ->
 %% runs with the server up; the catch keeps a unit test that never starts the app
 %% from turning a missing server into a crashed writer.
 report_rows(Trie) ->
-    _ = (catch broker_metrics:gauge(router_index_rows, ets:info(Trie, size))),
+    _ = try
+        broker_metrics:gauge(router_index_rows, ets:info(Trie, size))
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %% The store owns its own split so a write never needs the filter binary again

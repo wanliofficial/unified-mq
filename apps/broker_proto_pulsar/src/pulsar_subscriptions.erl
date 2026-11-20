@@ -256,13 +256,15 @@ take_record(#{scan := Scan, destination := Destination} = S) ->
         High when Scan >= High ->
             empty;
         _ ->
-            case (catch broker_queue:read_from(?PARTITION, Scan, ?EMPTY_PAGE)) of
+            try broker_queue:read_from(?PARTITION, Scan, ?EMPTY_PAGE) of
                 {ok, [], _Next} ->
                     empty;
                 {ok, Page, _Next} ->
                     walk(Page, Destination, S);
                 {error, _} ->
                     empty
+            catch
+                _:_ -> empty
             end
     end.
 
@@ -371,7 +373,7 @@ count_topic(Destination, High) ->
 count_page(From, High, _Destination, Acc) when From >= High ->
     Acc;
 count_page(From, High, Destination, Acc) ->
-    case (catch broker_queue:read_from(?PARTITION, From, 128)) of
+    try broker_queue:read_from(?PARTITION, From, 128) of
         {ok, [], _Next} ->
             Acc;
         {ok, Page, Next} ->
@@ -381,6 +383,8 @@ count_page(From, High, Destination, Acc) ->
             count_page(From1, High, Destination, Acc1);
         {error, _} ->
             Acc
+    catch
+        _:_ -> Acc
     end.
 
 destination(Topic) ->

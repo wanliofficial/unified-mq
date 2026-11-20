@@ -37,14 +37,18 @@ replicate(Partition, Msg, Replicas) ->
     Acks = 1 + parallel_append(Partition, Msg, Others, Timeout),
     %% The local fsync already happened, so this measures the replica round
     %% only: majority wait on success, timeout when the majority never forms.
-    _ = (catch broker_metrics:observe(
-                   cluster_replication_latency_us,
-                   erlang:monotonic_time(microsecond) - Started)),
+    _ = try
+        broker_metrics:observe(
+        cluster_replication_latency_us,
+        erlang:monotonic_time(microsecond) - Started)
+    catch
+        _:_ -> ok
+    end,
     case Acks >= Needed of
         true ->
             ok;
         false ->
-            _ = (catch broker_metrics:inc(cluster_replication_failed)),
+            _ = try broker_metrics:inc(cluster_replication_failed) catch _:_ -> ok end,
             {error, {replication_failed, Acks, Needed}}
     end.
 

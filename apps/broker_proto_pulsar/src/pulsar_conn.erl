@@ -68,7 +68,11 @@ terminate(_Reason, #st{consumers = Consumers, counted = Counted} = St) ->
     ok = broker_metrics:connection_closed(Counted),
     ok = broker_admission:release(St#st.admission),
     maps:foreach(fun({Topic, Sub}, ConsumerId) ->
-                         _ = (catch pulsar_subscriptions:close_consumer(Topic, Sub, ConsumerId))
+                         _ = try
+                             pulsar_subscriptions:close_consumer(Topic, Sub, ConsumerId)
+                         catch
+                             _:_ -> ok
+                         end
                  end, Consumers),
     ok.
 
@@ -393,10 +397,11 @@ append_record(Topic, EntryId, {Meta, Payload}, Tenant) ->
                           event = undefined},
     case broker_event:apply_policy(Msg) of
         {ok, Accepted} ->
-            case (catch broker_queue:append(?PARTITION, Accepted, fsync)) of
+            try broker_queue:append(?PARTITION, Accepted, fsync) of
                 {ok, _Offset} -> ok;
-                {error, Reason} -> {error, Reason};
-                Other -> {error, {append_crashed, Other}}
+                {error, Reason} -> {error, Reason}
+            catch
+                Class:Reason -> {error, {append_crashed, {Class, Reason}}}
             end;
         {error, Reason} ->
             {error, {cloudevent_rejected, Reason}}
@@ -527,7 +532,7 @@ high_watermark() ->
 count_page(From, High, _Destination, Acc) when From >= High ->
     Acc;
 count_page(From, High, Destination, Acc) ->
-    case (catch broker_queue:read_from(?PARTITION, From, 128)) of
+    try broker_queue:read_from(?PARTITION, From, 128) of
         {ok, [], _Next} ->
             Acc;
         {ok, Page, Next} ->
@@ -537,4 +542,6 @@ count_page(From, High, Destination, Acc) ->
             count_page(From1, High, Destination, Acc1);
         {error, _} ->
             Acc
+    catch
+        _:_ -> Acc
     end.

@@ -350,7 +350,7 @@ start_agent() ->
     Pid.
 
 stop_agent(Pid) ->
-    _ = catch gen_server:stop(Pid),
+    _ = try gen_server:stop(Pid) catch _:_ -> ok end,
     flush().
 
 reply_initialize(Pid) ->

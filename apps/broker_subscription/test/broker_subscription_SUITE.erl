@@ -520,9 +520,11 @@ persisted_inflight_blob_decodes_without_the_mqtt_apps_atoms(Config) ->
     end.
 
 peer_has_atom(Peer, Name) ->
-    case catch peer:call(Peer, erlang, list_to_existing_atom, [Name]) of
+    try peer:call(Peer, erlang, list_to_existing_atom, [Name]) of
         Atom when is_atom(Atom) -> true;
         _ -> false
+    catch
+        _:_ -> false
     end.
 
 %%%_* dispatch (H7, §5.1(f)/K9) ------------------------------------------------

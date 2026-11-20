@@ -906,9 +906,11 @@ compute_committed(State) ->
 sample_gauges(#{partitions := Partitions}) ->
     Marks = maps:from_list(
               [{P, WM} || P <- Partitions,
-                          WM <- [case (catch broker_queue:watermarks(P)) of
+                          WM <- [try broker_queue:watermarks(P) of
                                      {ok, _C, _H} = Ok -> Ok;
                                      _ -> undefined
+                                 catch
+                                     _:_ -> undefined
                                  end],
                           WM =/= undefined]),
     {Backlog, Lag} =

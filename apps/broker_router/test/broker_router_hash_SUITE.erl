@@ -46,7 +46,7 @@ init_per_testcase(_Case, Config) ->
     [{env, Env} | Config].
 
 end_per_testcase(_Case, _Config) ->
-    catch gen_server:stop(?STORE, normal, 1000),
+    _ = try gen_server:stop(?STORE, normal, 1000) catch _:_ -> ok end,
     ok.
 
 init_per_suite(Config) ->
@@ -427,7 +427,10 @@ reader_loop(Env, Stop, Tenant, Expected, Parent, Count, Misses) ->
                         false -> {Topic, Ref, Refs}
                     end
                 end,
-            Found = [M || E <- Expected, (M = RouteOne(E)) =/= ok],
+            %% A single-element generator instead of a binding filter: OTP 29
+            %% warns (export_var_subexpr) when a comprehension filter exports a
+            %% binding.
+            Found = [M || E <- Expected, M <- [RouteOne(E)], M =/= ok],
             Misses1 = case Found of
                           [] -> Misses;
                           _ -> lists:sublist(Misses ++ Found, 5)

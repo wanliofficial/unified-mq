@@ -670,8 +670,9 @@ unmask(Key, Payload) ->
     crypto:exor(Payload, binary:part(Stream, 0, Size)).
 
 close(S) ->
-    catch gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true)),
-    catch gen_tcp:close(S),
+    try gen_tcp:send(S, ws_frame:encode(8, ws_frame:close_payload(1000, <<>>), true))
+    catch _:_ -> ok end,
+    try gen_tcp:close(S) catch _:_ -> ok end,
     ok.
 
 current() ->

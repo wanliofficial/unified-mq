@@ -269,7 +269,7 @@ dispatch_local(SubRefs, {PartitionId, _Offset, _Msg} = Delivery) ->
 maybe_fanout_qos0(Msg) ->
     case persistent_term:get({?MODULE, qos0_fanout}, undefined) of
         Fanout when is_function(Fanout, 1) ->
-            _ = (catch Fanout(Msg)),
+            _ = try Fanout(Msg) catch _:_ -> ok end,
             ok;
         _ ->
             ok
@@ -302,7 +302,11 @@ subscriptions(ClientId) ->
     [subscription(SubRef, Info)
      || {{C, SubRef}} <- ets:match_object(?MEMBERS, {{ClientId, '_'}}),
         C =:= ClientId,
-        (Info = entity(SubRef)) =/= none].
+        %% A single-element generator rather than a filter assignment: OTP 29
+        %% warns (export_var_subexpr) when a comprehension filter exports a
+        %% binding, and warns_as_errors turns that into a build failure.
+        Info <- [entity(SubRef)],
+        Info =/= none].
 
 %% @doc The next offset this subscription will read in a partition: `low' for a
 %% shared row (the first offset nobody acked), the scalar cursor otherwise.

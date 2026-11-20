@@ -148,7 +148,8 @@ peer_cannot_see_other_tenants_subscriptions(_Config) ->
         [] = Refs2,
         ok
     after
-        catch gen_server:stop(broker_router_hash_store, normal, 1000)
+        _ = try gen_server:stop(broker_router_hash_store, normal, 1000)
+            catch _:_ -> ok end
     end.
 
 legacy_wildcard_subscription_is_visible_to_all(_Config) ->
@@ -167,7 +168,8 @@ legacy_wildcard_subscription_is_visible_to_all(_Config) ->
         [_] = Refs2,
         ok
     after
-        catch gen_server:stop(broker_router_hash_store, normal, 1000)
+        _ = try gen_server:stop(broker_router_hash_store, normal, 1000)
+            catch _:_ -> ok end
     end.
 
 %%%_* Helpers -------------------------------------------------------------

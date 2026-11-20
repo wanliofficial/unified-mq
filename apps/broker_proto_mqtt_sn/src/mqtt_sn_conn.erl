@@ -902,25 +902,30 @@ ack_delivery_pos(_Refs, {undefined, _Offset}, St) ->
 ack_delivery_pos(Refs, {Partition, Offset}, St) ->
     lists:foreach(
       fun(Ref) ->
-              _ = (catch broker_subscription:ack(Ref, Partition, Offset,
-                                                 St#st.client_id))
+              _ = try
+                  broker_subscription:ack(Ref, Partition, Offset,
+                  St#st.client_id)
+              catch
+                  _:_ -> ok
+              end
       end, Refs),
     St.
 
 %% Retained replay after SUBACK: one message per matching topic, at the lower of
 %% the granted QoS and what was retained.
 replay_retained(SubRef, Filter, GrantedQoS, St) ->
-    case catch broker_retain:entries() of
+    try broker_retain:entries() of
         Entries when is_list(Entries) ->
             deliver_all(
               [{Msg, min(GrantedQoS,
                          max(maps:get(qos, Msg#broker_message.proto_meta, 0), 0))}
                || {_Topic, Msg} <- Entries,
                   mqtt_sn_filter:matches(Msg#broker_message.destination, Filter)],
-              SubRef, St);
-        _ ->
-            %% The retain app is not running (a session in a unit test): no
-            %% replay is better than a crashed connection.
+              SubRef, St)
+    catch
+        _:_ ->
+            %% The retain app is not running (a session in a unit test) or the
+            %% replay crashed: no replay is better than a crashed connection.
             {ok, St}
     end.
 
@@ -980,7 +985,7 @@ positions(Partition, St) ->
 catch_up_pages(_Partition, _From, _Positions, St, N) when N >= 8 ->
     {ok, St};
 catch_up_pages(Partition, From, Positions, St, N) ->
-    case catch broker_queue:read_from(Partition, From, 100) of
+    try broker_queue:read_from(Partition, From, 100) of
         {ok, [], _Next} ->
             {ok, St};
         {ok, Page, _Next} when is_list(Page) ->
@@ -993,6 +998,8 @@ catch_up_pages(Partition, From, Positions, St, N) ->
             end;
         _ ->
             {ok, St}
+    catch
+        _:_ -> {ok, St}
     end.
 
 catch_up_page(_Partition, [], _Positions, St) ->
@@ -1051,7 +1058,11 @@ catch_up_qos(Hits, Msg) ->
     min(Granted, Published).
 
 ack_skip(Ref, Partition, Offset, St) ->
-    _ = (catch broker_subscription:ack(Ref, Partition, Offset, St#st.client_id)),
+    _ = try
+        broker_subscription:ack(Ref, Partition, Offset, St#st.client_id)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %%%_* Publish path (shared by PUBLISH and the Will) -------------------------
@@ -1090,26 +1101,34 @@ store(Msg, QoS, _Partition, Refs, Retain) when QoS =:= 0; QoS =:= -1 ->
     %% that was not listening. Retained state is still updated, async, because
     %% there is no durability promise to wait for.
     _ = retain_update(Msg, Retain, async),
-    _ = (catch broker_subscription:dispatch(Refs, {undefined, undefined, Msg})),
+    _ = try
+        broker_subscription:dispatch(Refs, {undefined, undefined, Msg})
+    catch
+        _:_ -> ok
+    end,
     ok;
 store(Msg, _QoS, Partition, Refs, Retain) ->
-    case catch broker_queue:append(Partition, Msg, fsync) of
+    try broker_queue:append(Partition, Msg, fsync) of
         {ok, Offset} ->
             %% ADR-018 §18.2 order: append(fsync) -> retain(fsync) -> ACK ->
             %% dispatch. The retained state is part of the publish's durability
             %% promise, so a failed retain store must not be acked.
             case retain_update(Msg, Retain, sync) of
                 ok ->
-                    _ = (catch broker_subscription:dispatch(
-                                 Refs, {Partition, Offset, Msg})),
+                    _ = try
+                        broker_subscription:dispatch(
+                        Refs, {Partition, Offset, Msg})
+                    catch
+                        _:_ -> ok
+                    end,
                     ok;
                 {error, Reason} ->
                     {error, {retain_store, Reason}}
             end;
         {error, Reason} ->
-            {error, {append, Reason}};
-        Other ->
-            {error, {append_crashed, Other}}
+            {error, {append, Reason}}
+    catch
+        Class:Reason -> {error, {append_crashed, {Class, Reason}}}
     end.
 
 retain_update(_Msg, false, _Mode) ->
@@ -1219,7 +1238,7 @@ clean_session_teardown(ClientId) ->
               _ = broker_subscription:unsubscribe(ClientId, Filter)
       end, broker_subscription:subscriptions(ClientId)),
     %% The same "start from zero" also drops any persisted inflight snapshot.
-    _ = (catch broker_subscription:inflight(ClientId, undefined)),
+    _ = try broker_subscription:inflight(ClientId, undefined) catch _:_ -> ok end,
     ok.
 
 session_subs(ClientId) ->

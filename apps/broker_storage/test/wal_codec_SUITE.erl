@@ -221,9 +221,11 @@ body_decodes_without_the_writing_apps_modules(_Config) ->
 %%%_* Helpers ------------------------------------------------------------
 
 peer_has_atom(Peer, Name) ->
-    case catch peer:call(Peer, erlang, list_to_existing_atom, [Name]) of
+    try peer:call(Peer, erlang, list_to_existing_atom, [Name]) of
         Atom when is_atom(Atom) -> true;
         _ -> false
+    catch
+        _:_ -> false
     end.
 
 msg() ->

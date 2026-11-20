@@ -54,7 +54,7 @@ init_per_testcase(Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     case get(writer) of
-        Pid when is_pid(Pid) -> catch wal_writer:stop(Pid);
+        Pid when is_pid(Pid) -> _ = try wal_writer:stop(Pid) catch _:_ -> ok end;
         _ -> ok
     end,
     ok.

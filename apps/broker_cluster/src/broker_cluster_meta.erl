@@ -271,5 +271,5 @@ timeout() ->
     application:get_env(broker_cluster, quorum_timeout_ms, 5000).
 
 no_quorum() ->
-    _ = (catch broker_metrics:inc(cluster_no_quorum)),
+    _ = try broker_metrics:inc(cluster_no_quorum) catch _:_ -> ok end,
     {error, no_quorum}.

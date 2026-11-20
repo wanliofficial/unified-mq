@@ -95,9 +95,9 @@ init([]) ->
     %% live in broker_subscription's own files; this keeps membership honest
     %% across partial state loss.
     lists:foreach(fun rejoin_consumer/1, maps:values(Consumers)),
-    _ = (catch broker_subscription:attach(?JS_CLIENT, self(), false)),
-    _ = (catch broker_subscription:subscribe(?JS_CLIENT, ?API_FILTER, 1)),
-    _ = (catch broker_subscription:subscribe(?JS_CLIENT, ?ACK_FILTER, 1)),
+    _ = try broker_subscription:attach(?JS_CLIENT, self(), false) catch _:_ -> ok end,
+    _ = try broker_subscription:subscribe(?JS_CLIENT, ?API_FILTER, 1) catch _:_ -> ok end,
+    _ = try broker_subscription:subscribe(?JS_CLIENT, ?ACK_FILTER, 1) catch _:_ -> ok end,
     {ok, #st{dir = Dir, streams = Streams, consumers = Consumers}}.
 
 handle_call({managed, Subject}, _From, #st{streams = Streams} = St) ->
@@ -119,8 +119,12 @@ handle_cast(_Msg, St) ->
 handle_info({broker_deliver, ?JS_CLIENT, _MaxQoS, Refs, {P, O, Msg}}, St) ->
     St1 = handle_internal(Msg, P, O, Refs, St),
     lists:foreach(fun(Ref) ->
-                          _ = (catch broker_subscription:ack(Ref, P, O,
-                                                             ?JS_CLIENT))
+                          _ = try
+                              broker_subscription:ack(Ref, P, O,
+                              ?JS_CLIENT)
+                          catch
+                              _:_ -> ok
+                          end
                   end, Refs),
     {noreply, St1};
 handle_info({broker_deliver, _Other, _MaxQoS, _Refs, _Delivery}, St) ->
@@ -134,9 +138,9 @@ handle_info(_Other, St) ->
     {noreply, St}.
 
 terminate(_Reason, _St) ->
-    _ = (catch broker_subscription:unsubscribe(?JS_CLIENT, ?API_FILTER)),
-    _ = (catch broker_subscription:unsubscribe(?JS_CLIENT, ?ACK_FILTER)),
-    _ = (catch broker_subscription:detach(?JS_CLIENT, self())),
+    _ = try broker_subscription:unsubscribe(?JS_CLIENT, ?API_FILTER) catch _:_ -> ok end,
+    _ = try broker_subscription:unsubscribe(?JS_CLIENT, ?ACK_FILTER) catch _:_ -> ok end,
+    _ = try broker_subscription:detach(?JS_CLIENT, self()) catch _:_ -> ok end,
     ok.
 
 code_change(_OldVsn, St, _Extra) -> {ok, St}.
@@ -226,13 +230,19 @@ store_routes([], _Msg, Stored) when Stored > 0 -> {ok, Stored};
 store_routes([], _Msg, 0) -> {error, nothing_stored};
 store_routes([{P, Refs} | Rest], Msg, Stored) ->
     PartitionMsg = Msg#broker_message{partition_id = P},
-    case (catch broker_queue:append(P, PartitionMsg, fsync)) of
+    try broker_queue:append(P, PartitionMsg, fsync) of
         {ok, Offset} ->
-            _ = (catch broker_subscription:dispatch(Refs,
-                                                    {P, Offset, PartitionMsg})),
+            _ = try
+                broker_subscription:dispatch(Refs,
+                {P, Offset, PartitionMsg})
+            catch
+                _:_ -> ok
+            end,
             store_routes(Rest, Msg, Stored + 1);
         _ ->
             store_routes(Rest, Msg, Stored)
+    catch
+        _:_ -> store_routes(Rest, Msg, Stored)
     end.
 
 %% Reply to a request inbox. The reply subject is NATS-form (`_INBOX.x.y');
@@ -269,15 +279,18 @@ handle_api(Destination, Payload, Reply, St) ->
         [<<"$JS">>, <<"API">>, <<"STREAM">>, <<"NAMES">>] ->
             %% nats.go locates a stream by subject through this API: filter the
             %% names by the request body's `subject' pattern.
-            Wanted = case catch json:decode(Payload) of
-                         #{<<"subject">> := Pat} when is_binary(Pat) ->
-                             [Name || {Name, Meta} <- maps:to_list(St#st.streams),
-                                      lists:any(fun(Subj) ->
-                                                    subject_matches(Subj, Pat)
-                                            end,
-                                            maps:get(subjects, Meta, []))];
-                         _ -> maps:keys(St#st.streams)
-                     end,
+            Wanted =
+                try json:decode(Payload) of
+                    #{<<"subject">> := Pat} when is_binary(Pat) ->
+                        [Name || {Name, Meta} <- maps:to_list(St#st.streams),
+                                 lists:any(fun(Subj) ->
+                                               subject_matches(Subj, Pat)
+                                           end,
+                                           maps:get(subjects, Meta, []))];
+                    _ -> maps:keys(St#st.streams)
+                catch
+                    _:_ -> maps:keys(St#st.streams)
+                end,
             reply_json(Reply, json:encode(#{<<"streams">> => Wanted}), St),
             St;
         [<<"$JS">>, <<"API">>, <<"STREAM">>, <<"CREATE">>, Name] ->
@@ -456,13 +469,15 @@ fetch_serve(Stream, CName, Consumer, Reply, Remaining, St0, Rounds) ->
     VClient = maps:get(vclient, Consumer),
     Partition = stream_partition_for(Stream, St0),
     Match = consumer_filter(Consumer),
-    case (catch broker_subscription:claim(Ref, Partition, Remaining, VClient)) of
+    try broker_subscription:claim(Ref, Partition, Remaining, VClient) of
         {ok, Offsets} when Offsets =/= [] ->
             {Read, Missing} = read_offsets(Partition, Offsets),
             _ = case Missing of
                     [] -> ok;
-                    _ -> (catch broker_subscription:release(Ref, Partition,
-                                                            Missing, VClient))
+                    _ -> try broker_subscription:release(Ref, Partition,
+                                                         Missing, VClient)
+                        catch _:_ -> ok
+                        end
                 end,
             {Delivered, Remaining1, St1} =
                 lists:foldl(
@@ -479,8 +494,12 @@ fetch_serve(Stream, CName, Consumer, Reply, Remaining, St0, Rounds) ->
                                   %% Foreign/filtered: consume the offset
                                   %% without delivering (AMQP skip pattern).
                                   %% The batch counts DELIVERED messages only.
-                                  _ = (catch broker_subscription:ack(
-                                             Ref, Partition, O, VClient)),
+                                  _ = try
+                                      broker_subscription:ack(
+                                      Ref, Partition, O, VClient)
+                                  catch
+                                      _:_ -> ok
+                                  end,
                                   {N, Rem, Acc}
                           end
                   end, {0, Remaining, St0}, Read),
@@ -493,6 +512,8 @@ fetch_serve(Stream, CName, Consumer, Reply, Remaining, St0, Rounds) ->
             end;
         _ ->
             {empty, St0}
+    catch
+        _:_ -> {empty, St0}
     end.
 
 fetch_deliver(Reply, Stream, CName, Partition, O, Msg, St0) ->
@@ -558,7 +579,7 @@ handle_ack(Destination, Payload, St0) ->
 %% tuple here would corrupt it and silently degrade every later API call to
 %% the catch-all error).
 ack_apply(ack, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0) ->
-    _ = (catch broker_subscription:ack(Ref, P, O, VClient)),
+    _ = try broker_subscription:ack(Ref, P, O, VClient) catch _:_ -> ok end,
     CKey = consumer_key(Stream, CName),
     Consumer1 = Consumer#{refs => maps:remove(Seq,
                                               maps:get(refs, Consumer, #{}))},
@@ -566,7 +587,7 @@ ack_apply(ack, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0) ->
                                  maps:put(CKey, Consumer1,
                                           St0#st.consumers)});
 ack_apply(nak, Ref, P, O, VClient, _Stream, _CName, _Seq, _Consumer, St) ->
-    _ = (catch broker_subscription:release(Ref, P, [O], VClient)),
+    _ = try broker_subscription:release(Ref, P, [O], VClient) catch _:_ -> ok end,
     St;
 ack_apply(term, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0) ->
     ack_apply(ack, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0);
@@ -628,9 +649,9 @@ consumer_setup(Consumer, St) ->
                  all -> #{anchor => earliest};
                  _ -> #{}
              end,
-    case (catch broker_subscription:join(shared, Group, VClient,
-                                         js_destination(Stream), 1,
-                                         <<"*">>, Anchor)) of
+    try broker_subscription:join(shared, Group, VClient,
+                                 js_destination(Stream), 1,
+                                 <<"*">>, Anchor) of
         {ok, Ref} ->
             Consumer1 = Consumer#{ref => Ref, group => Group,
                                   vclient => VClient},
@@ -640,11 +661,19 @@ consumer_setup(Consumer, St) ->
         {error, Reason} ->
             logger:warning("nats js consumer join failed: ~p", [Reason]),
             {ok, St}
+    catch
+        Class:Reason ->
+            logger:warning("nats js consumer join crashed ~p:~p", [Class, Reason]),
+            {ok, St}
     end.
 
 consumer_teardown(Consumer, St) ->
-    _ = (catch broker_subscription:leave(maps:get(group, Consumer),
-                                         maps:get(vclient, Consumer))),
+    _ = try
+        broker_subscription:leave(maps:get(group, Consumer),
+        maps:get(vclient, Consumer))
+    catch
+        _:_ -> ok
+    end,
     St.
 
 rejoin_consumer(Consumer) ->
@@ -654,10 +683,14 @@ rejoin_consumer(Consumer) ->
                  all -> #{anchor => earliest};
                  _ -> #{}
              end,
-    _ = (catch broker_subscription:join(shared, js_consumer_group(Stream, CName),
-                                        js_consumer_vclient(Stream, CName),
-                                        js_destination(Stream), 1,
-                                        <<"*">>, Anchor)),
+    _ = try
+        broker_subscription:join(shared, js_consumer_group(Stream, CName),
+        js_consumer_vclient(Stream, CName),
+        js_destination(Stream), 1,
+        <<"*">>, Anchor)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 stream_seq_of(Msg) ->
@@ -843,10 +876,12 @@ parse_fetch(Payload) ->
 read_offsets(P, Offsets) ->
     {Read, Missing} = lists:foldl(
                         fun(O, {Acc, Miss}) ->
-                                case (catch broker_queue:read_from(P, O, 1)) of
+                                try broker_queue:read_from(P, O, 1) of
                                     {ok, [{O, Msg}], _Next} ->
                                         {[{O, Msg} | Acc], Miss};
                                     _ -> {Acc, [O | Miss]}
+                                catch
+                                    _:_ -> {Acc, [O | Miss]}
                                 end
                         end, {[], []}, lists:sort(Offsets)),
     {lists:reverse(Read), lists:reverse(Missing)}.
@@ -936,9 +971,12 @@ ack_action(Payload) ->
 ack_tokens(Destination) ->
     case binary:split(Destination, <<"/">>, [global]) of
         [<<"$JS">>, <<"ACK">>, Stream, CName, _D, SeqBin, _C, _Ts, _Pend] ->
-            case catch binary_to_integer(SeqBin) of
-                Seq when is_integer(Seq) -> {ok, Stream, CName, Seq};
-                _ -> error
+            %% `try' rather than the deprecated `catch Expr' (OTP 29 warns);
+            %% a malformed sequence number is simply not an ack.
+            try binary_to_integer(SeqBin) of
+                Seq when is_integer(Seq) -> {ok, Stream, CName, Seq}
+            catch
+                _:_ -> error
             end;
         _ ->
             error

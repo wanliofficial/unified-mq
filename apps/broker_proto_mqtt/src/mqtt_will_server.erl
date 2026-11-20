@@ -129,7 +129,7 @@ handle_info({will_due, ClientId, Gen}, #st{entries = Entries} = St) ->
     case maps:get(ClientId, Entries, undefined) of
         {Gen, #entry{will = Will, tenant = Tenant, principal = Principal}} ->
             St1 = St#st{entries = maps:remove(ClientId, Entries)},
-            _ = (catch mqtt_will:publish(Will, Tenant, Principal)),
+            _ = try mqtt_will:publish(Will, Tenant, Principal) catch _:_ -> ok end,
             logger:log(warning, "mqtt_will_server: delayed will published "
                                 "(client_id=~ts)", [ClientId]),
             {noreply, St1};

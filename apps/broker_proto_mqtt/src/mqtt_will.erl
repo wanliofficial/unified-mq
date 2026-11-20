@@ -37,28 +37,41 @@ publish(#{topic := Topic, payload := Payload, qos := QoS, retain := Retain},
             0 ->
                 %% §4.4: QoS 0 never enters the log, so there is no offset to
                 %% dispatch and no cursor to leave behind.
-                _ = (catch broker_retain_put(Msg, Retain, async)),
-                _ = (catch broker_subscription:dispatch(
-                               Refs, {undefined, undefined, Msg})),
+                _ = try broker_retain_put(Msg, Retain, async) catch _:_ -> ok end,
+                _ = try
+                    broker_subscription:dispatch(
+                    Refs, {undefined, undefined, Msg})
+                catch
+                    _:_ -> ok
+                end,
                 broker_metrics:inc(will_published),
                 ok;
             _ ->
-                case (catch broker_queue:append(Partition, Msg, fsync)) of
+                try broker_queue:append(Partition, Msg, fsync) of
                     {ok, Offset} ->
-                        _ = (catch broker_retain_put(Msg, Retain, sync)),
-                        _ = (catch broker_subscription:dispatch(
-                                       Refs, {Partition, Offset, Msg})),
+                        _ = try broker_retain_put(Msg, Retain, sync) catch _:_ -> ok end,
+                        _ = try
+                            broker_subscription:dispatch(
+                            Refs, {Partition, Offset, Msg})
+                        catch
+                            _:_ -> ok
+                        end,
                         broker_metrics:inc(will_published),
                         ok;
                     Other ->
                         log(warning, "will append failed ~p", [Other]),
                         {error, Other}
+                catch
+                    Class:Reason ->
+                        log(warning, "will append crashed ~p:~p",
+                            [Class, Reason]),
+                        {error, {Class, Reason}}
                 end
         end
     catch
-        Class:Reason:Stack ->
-            log(warning, "will publish failed ~p:~p ~p", [Class, Reason, Stack]),
-            {error, {Class, Reason}}
+        _:_:Stack ->
+            log(warning, "will publish failed ~p", [Stack]),
+            {error, publish_failed}
     end.
 
 %%%_* Internal ----------------------------------------------------------------

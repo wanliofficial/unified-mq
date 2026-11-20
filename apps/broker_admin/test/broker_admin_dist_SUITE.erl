@@ -203,7 +203,9 @@ start_peers(Case, Config) ->
         end, [], lists:zip([1, 2, 3], Names))).
 
 stop_peers(Peers) ->
-    lists:foreach(fun(#{pid := Pid}) -> catch peer:stop(Pid) end, Peers),
+    lists:foreach(fun(#{pid := Pid}) ->
+                          _ = try peer:stop(Pid) catch _:_ -> ok end
+                  end, Peers),
     ok.
 
 peer_name(Case, I) ->

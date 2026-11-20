@@ -810,13 +810,19 @@ store_routes([], _Msg, 0) ->
     {error, nothing_stored};
 store_routes([{P, Refs} | Rest], Msg, Stored) ->
     PartitionMsg = Msg#broker_message{partition_id = P},
-    case (catch broker_queue:append(P, PartitionMsg, fsync)) of
+    try broker_queue:append(P, PartitionMsg, fsync) of
         {ok, Offset} ->
-            _ = (catch broker_subscription:dispatch(Refs,
-                                                    {P, Offset, PartitionMsg})),
+            _ = try
+                broker_subscription:dispatch(Refs,
+                {P, Offset, PartitionMsg})
+            catch
+                _:_ -> ok
+            end,
             store_routes(Rest, Msg, Stored + 1);
         _ ->
             store_routes(Rest, Msg, Stored)
+    catch
+        Class:Reason -> {error, {append_crashed, {Class, Reason}}}
     end.
 
 %%%_* Delivery --------------------------------------------------------------
@@ -854,7 +860,7 @@ room(Channel, false, St) ->
     end.
 
 pull_partition(Channel, Ref, Queue, NoAck, Max, P, St) ->
-    case (catch broker_subscription:claim(Ref, P, Max, St#st.client_id)) of
+    try broker_subscription:claim(Ref, P, Max, St#st.client_id) of
         {ok, []} ->
             St;
         {ok, Offsets} ->
@@ -870,18 +876,28 @@ pull_partition(Channel, Ref, Queue, NoAck, Max, P, St) ->
                                     %% same partition. A shared cursor scans the
                                     %% whole partition, so consume the offset for
                                     %% this group without delivering it.
-                                    _ = (catch broker_subscription:ack(
-                                                 Ref, P, O, St#st.client_id)),
+                                    _ = try
+                                        broker_subscription:ack(
+                                        Ref, P, O, St#st.client_id)
+                                    catch
+                                        _:_ -> ok
+                                    end,
                                     Acc
                             end
                     end, St, Read),
             case Missing of
                 [] -> ok;
-                _ -> _ = (catch broker_subscription:release(Ref, P, Missing, St1#st.client_id))
+                _ -> _ = try
+                    broker_subscription:release(Ref, P, Missing, St1#st.client_id)
+                catch
+                    _:_ -> ok
+                end
             end,
             St1;
         _ ->
             St
+    catch
+        _:_ -> St
     end.
 
 %% Ascending offset order, both lists: the claim comes back sorted, and the
@@ -890,10 +906,12 @@ pull_partition(Channel, Ref, Queue, NoAck, Max, P, St) ->
 read_offsets(P, Offsets) ->
     {Read, Missing} = lists:foldl(
                         fun(O, {Acc, Miss}) ->
-                                case (catch broker_queue:read_from(P, O, 1)) of
+                                try broker_queue:read_from(P, O, 1) of
                                     {ok, [{O, Msg}], _Next} ->
                                         {[{O, Msg} | Acc], Miss};
                                     _ -> {Acc, [O | Miss]}
+                                catch
+                                    _:_ -> {Acc, [O | Miss]}
                                 end
                         end, {[], []}, lists:sort(Offsets)),
     {lists:reverse(Read), lists:reverse(Missing)}.
@@ -904,7 +922,11 @@ deliver(Channel, Ref, _Queue, NoAck, P, O, Msg, St) ->
     Consumers = [T || {T, #{ref := R}} <- maps:to_list(Ch#ch.consumers), R =:= Ref],
     case Consumers of
         [] ->
-            _ = (catch broker_subscription:release(Ref, P, [O], St#st.client_id)),
+            _ = try
+                broker_subscription:release(Ref, P, [O], St#st.client_id)
+            catch
+                _:_ -> ok
+            end,
             mark_redelivered(P, O, St);
         [ConsumerTag | _] ->
             #{<<"amqp">> := #{<<"exchange">> := Exchange,
@@ -921,7 +943,11 @@ deliver(Channel, Ref, _Queue, NoAck, P, O, Msg, St) ->
                                props_of(Msg), St1),
             case NoAck of
                 true ->
-                    _ = (catch broker_subscription:ack(Ref, P, O, St2#st.client_id)),
+                    _ = try
+                        broker_subscription:ack(Ref, P, O, St2#st.client_id)
+                    catch
+                        _:_ -> ok
+                    end,
                     put_ch(Channel, Ch#ch{next_tag = Tag + 1}, St2);
                 false ->
                     Ch1 = Ch#ch{next_tag = Tag + 1,
@@ -946,28 +972,32 @@ props_of(#broker_message{proto_meta = Meta} = Msg) ->
 %% another consumer while this channel still owes the ack.
 basic_get(Channel, Queue, NoAck, St0) ->
     Client = St0#st.client_id,
-    case (catch broker_subscription:join(shared, Queue, Client,
-                                         queue_filter(Queue), 1,
-                                         St0#st.tenant,
-                                         #{anchor => earliest})) of
+    try broker_subscription:join(shared, Queue, Client,
+                                 queue_filter(Queue), 1,
+                                 St0#st.tenant,
+                                 #{anchor => earliest}) of
         {ok, Ref} ->
             get_scan(Channel, Ref, Queue, NoAck, broker_queue:partition_ids(), St0);
         _ ->
             get_empty(Channel, St0)
+    catch
+        _:_ -> get_empty(Channel, St0)
     end.
 
 get_scan(Channel, Ref, _Queue, _NoAck, [], St) ->
     %% Nothing ready anywhere: drop the transient membership, answer empty.
-    _ = (catch broker_subscription:leave(Ref, St#st.client_id)),
+    _ = try broker_subscription:leave(Ref, St#st.client_id) catch _:_ -> ok end,
     get_empty(Channel, St);
 get_scan(Channel, Ref, Queue, NoAck, [P | Ps], St0) ->
     Client = St0#st.client_id,
-    case (catch broker_subscription:claim(Ref, P, 1, Client)) of
+    try broker_subscription:claim(Ref, P, 1, Client) of
         {ok, [_ | _] = Offsets} ->
             {Read, Missing} = read_offsets(P, Offsets),
             _ = case Missing of
                     [] -> ok;
-                    _ -> (catch broker_subscription:release(Ref, P, Missing, Client))
+                    _ -> try broker_subscription:release(Ref, P, Missing, Client)
+                        catch _:_ -> ok
+                        end
                 end,
             Expected = queue_filter(Queue),
             case [{O, M} || {O, M} <- Read,
@@ -981,6 +1011,8 @@ get_scan(Channel, Ref, Queue, NoAck, [P | Ps], St0) ->
             end;
         _ ->
             get_scan(Channel, Ref, Queue, NoAck, Ps, St0)
+    catch
+        _:_ -> get_scan(Channel, Ref, Queue, NoAck, Ps, St0)
     end.
 
 get_deliver(Channel, Ref, Queue, NoAck, P, O, Msg, St0) ->
@@ -1002,7 +1034,7 @@ get_deliver(Channel, Ref, Queue, NoAck, P, O, Msg, St0) ->
     %% real bug later.
     case NoAck =:= 1 of
         true ->
-            _ = (catch broker_subscription:ack(Ref, P, O, St2#st.client_id)),
+            _ = try broker_subscription:ack(Ref, P, O, St2#st.client_id) catch _:_ -> ok end,
             put_ch(Channel, Ch#ch{next_tag = Tag + 1}, St2);
         _ ->
             put_ch(Channel, Ch#ch{next_tag = Tag + 1,
@@ -1021,8 +1053,12 @@ basic_recover(Channel, St0) ->
     Ch = ch(Channel, St0),
     Red = lists:foldl(
             fun({_T, {Ref, P, O}}, Acc) ->
-                    _ = (catch broker_subscription:release(Ref, P, [O],
-                                                           St0#st.client_id)),
+                    _ = try
+                        broker_subscription:release(Ref, P, [O],
+                        St0#st.client_id)
+                    catch
+                        _:_ -> ok
+                    end,
                     Acc#{{P, O} => true}
             end, St0#st.redelivered, maps:to_list(Ch#ch.deliveries)),
     St1 = put_ch(Channel, Ch#ch{deliveries = #{}},
@@ -1052,8 +1088,12 @@ ack_deliveries(Channel, Tag, Multiple, Mode, MethodId, St0) ->
                   fun({_T, {Ref, P, O}}, {Acc, StAcc}) ->
                           case Mode of
                               ack ->
-                                  _ = (catch broker_subscription:ack(Ref, P, O,
-                                                                     StAcc#st.client_id)),
+                                  _ = try
+                                      broker_subscription:ack(Ref, P, O,
+                                      StAcc#st.client_id)
+                                  catch
+                                      _:_ -> ok
+                                  end,
                                   %% An acked position can never be redelivered on
                                   %% this connection (queue offsets are unique per
                                   %% append), so drop its marker. Keeping it made
@@ -1062,8 +1102,12 @@ ack_deliveries(Channel, Tag, Multiple, Mode, MethodId, St0) ->
                                   %% long-lived channel.
                                   {maps:remove({P, O}, Acc), StAcc};
                               release ->
-                                  _ = (catch broker_subscription:release(Ref, P, [O],
-                                                                         StAcc#st.client_id)),
+                                  _ = try
+                                      broker_subscription:release(Ref, P, [O],
+                                      StAcc#st.client_id)
+                                  catch
+                                      _:_ -> ok
+                                  end,
                                   {Acc#{{P, O} => true}, StAcc}
                           end
                   end, {St0#st.redelivered, St0}, Do),
@@ -1187,8 +1231,12 @@ close_channel(Channel, St) ->
         {ok, #ch{deliveries = Deliveries, consumers = Consumers}} ->
             St1 = maps:fold(
                     fun(_T, {Ref, P, O}, Acc) ->
-                            _ = (catch broker_subscription:release(
-                                           Ref, P, [O], Acc#st.client_id)),
+                            _ = try
+                                broker_subscription:release(
+                                Ref, P, [O], Acc#st.client_id)
+                            catch
+                                _:_ -> ok
+                            end,
                             %% Same bookkeeping as a nack-with-requeue: the next
                             %% delivery of this position on this connection is
                             %% redelivered=1 (RQ-11).
@@ -1196,7 +1244,11 @@ close_channel(Channel, St) ->
                     end, St, Deliveries),
             lists:foreach(
               fun({_T, #{ref := Ref}}) ->
-                      _ = (catch broker_subscription:leave(Ref, St1#st.client_id))
+                      _ = try
+                          broker_subscription:leave(Ref, St1#st.client_id)
+                      catch
+                          _:_ -> ok
+                      end
               end, maps:to_list(Consumers)),
             drop_channel(Channel, St1);
         error ->
@@ -1245,17 +1297,25 @@ cleanup(#st{} = St) ->
       fun({Channel, #ch{} = Ch}) ->
               lists:foreach(
                 fun({_T, {Ref, P, O}}) ->
-                        _ = (catch broker_subscription:release(Ref, P, [O], St#st.client_id))
+                        _ = try
+                            broker_subscription:release(Ref, P, [O], St#st.client_id)
+                        catch
+                            _:_ -> ok
+                        end
                 end, maps:to_list(Ch#ch.deliveries)),
               lists:foreach(
                 fun({_T, #{ref := Ref}}) ->
-                        _ = (catch broker_subscription:leave(Ref, St#st.client_id))
+                        _ = try
+                            broker_subscription:leave(Ref, St#st.client_id)
+                        catch
+                            _:_ -> ok
+                        end
                 end, maps:to_list(Ch#ch.consumers)),
               _ = Channel
       end, maps:to_list(St#st.channels)),
     case St#st.client_id of
         undefined -> ok;
-        ClientId -> _ = (catch broker_subscription:detach(ClientId, self())), ok
+        ClientId -> _ = try broker_subscription:detach(ClientId, self()) catch _:_ -> ok end, ok
     end.
 
 arm_heartbeat(#st{heartbeat = 0} = St) ->

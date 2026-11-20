@@ -554,7 +554,7 @@ recv(Sock, Timeout) ->
 
 recv_or(Sock, Timeout) ->
     Buf = buf(Sock),
-    case (catch mqtt_frame:decode(Buf)) of
+    try mqtt_frame:decode(Buf) of
         {ok, Frame, Rest} ->
             set_buf(Sock, Rest),
             Frame;
@@ -567,9 +567,10 @@ recv_or(Sock, Timeout) ->
                 {error, Reason} -> {error, Reason}
             end;
         {error, Reason} ->
-            exit({s1_recv_malformed, Reason, Buf});
-        {'EXIT', Reason} ->
-            exit({s1_recv_crashed, Reason, Buf})
+            exit({s1_recv_malformed, Reason, Buf})
+    catch
+        Class:Reason ->
+            exit({s1_recv_crashed, {Class, Reason}, Buf})
     end.
 
 buf(Sock) ->

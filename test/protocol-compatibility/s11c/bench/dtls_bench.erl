@@ -230,7 +230,7 @@ concurrent_level(Port, Workers, Reqs, Payload) ->
                        end) || {I, S} <- lists:zip(lists:seq(1, Workers), Sockets)],
     Results = [receive {done, P, R} -> R end || P <- Pids],
     Elapsed = erlang:monotonic_time(microsecond) - T0,
-    [_ = catch ssl:close(S) || S <- Sockets],
+    lists:foreach(fun(S) -> _ = try ssl:close(S) catch _:_ -> ok end end, Sockets),
     Ok = lists:sum([O || {O, _E} <- Results]),
     Err = lists:sum([E || {_O, E} <- Results]),
     #{"workers" => Workers,
@@ -339,9 +339,9 @@ storm_connect(Identity, Id, Port) ->
             {reuseaddr, true},
             {mode, binary},
             {active, false}],
-    case catch ssl:connect(?HOST, Port, Opts, 20000) of
+    case try_connect(?HOST, Port, Opts, 20000) of
         {ok, S} ->
-            Status = case catch coap_put(S, Id, <<"warm">>, <<>>) of
+            Status = case try_coap_put(S, Id, <<"warm">>, <<>>) of
                          {ok, _} -> ok;
                          _ -> admit_refused
                      end,
@@ -349,7 +349,7 @@ storm_connect(Identity, Id, Port) ->
             %% `{bad_action_from_state_function, ...}' from
             %% dtls_client_connection:init). The status is already known; the
             %% teardown must not change the verdict nor kill the bench.
-            _ = catch ssl:close(S),
+            _ = try ssl:close(S) catch _:_ -> ok end,
             Status;
         {error, timeout} -> handshake_timeout;
         {error, _} -> handshake_error;
@@ -374,7 +374,7 @@ identity(I) ->
 worker_loop(_S, _Id, 0, Ok, Err) ->
     {Ok, Err};
 worker_loop(S, Id, N, Ok, Err) ->
-    case catch coap_get(S, Id, <<"tp">>) of
+    case try_coap_get(S, Id, <<"tp">>) of
         {ok, _} -> worker_loop(S, Id + 1, N - 1, Ok + 1, Err);
         _ -> worker_loop(S, Id + 1, N - 1, Ok, Err + 1)
     end.
@@ -472,6 +472,18 @@ coap_get(S, Id, Path) ->
     ok = ssl:send(S, coap_codec:encode(
                         coap_codec:request(con, get, Id, [{uri_path, Path}]))),
     expect(S, ack, {response, 2, 5}).
+
+%% The bench treats a transport-level failure as a data point, not a crash, so
+%% each call is wrapped. `try' rather than the deprecated `catch Expr' (OTP 29
+%% warns; a torn-down DTLS socket can raise out of ssl:send/2 and ssl:recv/3).
+try_connect(Host, Port, Opts, Timeout) ->
+    try ssl:connect(Host, Port, Opts, Timeout) catch C:R -> {C, R} end.
+
+try_coap_put(S, Id, Path, Payload) ->
+    try coap_put(S, Id, Path, Payload) catch C:R -> {C, R} end.
+
+try_coap_get(S, Id, Path) ->
+    try coap_get(S, Id, Path) catch C:R -> {C, R} end.
 
 expect(S, Type, Code) ->
     case ssl:recv(S, 0, 5000) of

@@ -225,7 +225,7 @@ open(Port, Extra) ->
 %% connection in `terminate/2', which is exactly the "connection died" case the
 %% broker has to survive (and, for a Will client, act on).
 stop(Client) ->
-    _ = (catch gen_statem:stop(Client)),
+    _ = try gen_statem:stop(Client) catch _:_ -> ok end,
     ok.
 
 %%%_* Assertions --------------------------------------------------------------
