@@ -16,7 +16,8 @@
 %% 这是「默认逐字节不变」的守门。
 -module(broker_cluster_dist_tls).
 
--export([enabled/0, config/0, effective/0, redacted_config/0]).
+-export([enabled/0, config/0, effective/0, validate/0, validate/1,
+         redacted_config/0]).
 
 -export_type([config/0]).
 
@@ -100,4 +101,178 @@ dist_opts(Type) ->
         [] -> undefined
     catch
         error:badarg -> undefined
+    end.
+
+%%%_* Boot-time check -------------------------------------------------------
+
+%% @doc Boot-time check, as the application calls it.
+-spec validate() -> ok | {error, term()}.
+validate() ->
+    validate(effective()).
+
+%% @doc The check itself, over an explicit boot state so a test can pin every
+%% refusal without rebooting a node with different flags.
+%%
+%% The two directions are both drift and both are refused:
+%%
+%%   declared TLS + booted plain  -- the operator believes traffic is encrypted.
+%%   booted TLS + declared plain  -- traffic is encrypted but nothing says so,
+%%                                   so the admin view and the audit trail lie.
+%%
+%% Only when the two agree do the file checks run, and only when TLS is on: a
+%% disabled block must never require PEM files, or the default deployment would
+%% stop booting.
+-spec validate(map()) -> ok | {error, term()}.
+validate(#{proto_dist := ProtoDist} = Boot) ->
+    Cfg = config(),
+    case {maps:get(enabled, Cfg), proto_dist_mode(ProtoDist)} of
+        {false, plain} ->
+            check_disabled_boot(Boot);
+        {true, plain} ->
+            {error, {dist_tls_enabled_but_booted_plain, ProtoDist}};
+        {true, tls} ->
+            check_enabled_boot(Cfg, Boot);
+        {false, tls} ->
+            {error, {dist_tls_booted_with_tls_but_disabled,
+                     proto_dist_name(ProtoDist)}}
+    end.
+
+%% A boot that is already encrypted without being declared is also drift --
+%% whether the app is asked to validate or not. `plain' is the only state a
+%% disabled declaration accepts.
+check_disabled_boot(#{tls_booted := false}) -> ok;
+check_disabled_boot(#{proto_dist := ProtoDist}) ->
+    {error, {dist_tls_booted_with_tls_but_disabled,
+             proto_dist_name(ProtoDist)}}.
+
+check_enabled_boot(Cfg, #{inline_opt := Inline, optfile := OptFile} = Boot) ->
+    case {Inline, OptFile} of
+        {{ok, _}, error} ->
+            %% Readable options are the point; the inline form has none.
+            {error, {dist_tls_requires_optfile, see_renderer}};
+        _ ->
+            check_enabled_files(Cfg, Boot)
+    end.
+
+check_enabled_files(Cfg, Boot) ->
+    Required = [{certfile, maps:get(certfile, Cfg)},
+                {keyfile, maps:get(keyfile, Cfg)},
+                {cacertfile, maps:get(cacertfile, Cfg)},
+                {optfile, maps:get(optfile, Cfg)}],
+    case first_missing(Required) of
+        {missing, Which, Path} ->
+            {error, {missing_file, Which, Path}};
+        none ->
+            case first_bad_pem([{certfile, maps:get(certfile, Cfg)},
+                                {keyfile, maps:get(keyfile, Cfg)},
+                                {cacertfile, maps:get(cacertfile, Cfg)}]) of
+                {bad, Which, Path} -> {error, {bad_pem, Which, Path}};
+                none -> check_drift(Cfg, Boot)
+            end
+    end.
+
+%% The declaration and the options `inet_tls_dist' will really use must agree
+%% field by field. Paths are normalised first: the optfile may legitimately
+%% carry a relative path, and comparing raw strings would report drift for two
+%% spellings of the same file.
+check_drift(Cfg, #{server_opts := Server, client_opts := Client} = Boot) ->
+    case {Server, Client} of
+        {undefined, _} -> {error, {dist_tls_optfile_unreadable, server}};
+        {_, undefined} -> {error, {dist_tls_optfile_unreadable, client}};
+        _ ->
+            case first_drift(declared_fields(Cfg), normalize_opts(Server),
+                             normalize_opts(Client)) of
+                none -> check_fail_if_no_peer_cert(Cfg, Boot);
+                {drift, Field, Declared, Actual} ->
+                    {error, {dist_tls_optfile_drift, Field, Declared, Actual}}
+            end
+    end.
+
+%% Server and client must both carry the same view of identity: mTLS means the
+%% client side also presents a certificate and verifies the peer's.
+%% `fail_if_no_peer_cert' is deliberately absent here -- it is asymmetric (server
+%% only) and is checked separately by check_fail_if_no_peer_cert/2.
+declared_fields(Cfg) ->
+    [{certfile, abs_path(maps:get(certfile, Cfg))},
+     {keyfile, abs_path(maps:get(keyfile, Cfg))},
+     {cacertfile, abs_path(maps:get(cacertfile, Cfg))},
+     {verify, maps:get(verify, Cfg)},
+     {versions, maps:get(versions, Cfg)}].
+
+first_drift([], _Server, _Client) -> none;
+first_drift([{Field, Declared} | Rest], Server, Client) ->
+    Actual = proplists:get_value(Field, Server),
+    ClientActual = proplists:get_value(Field, Client),
+    case {same(Field, Declared, Actual), same(Field, Declared, ClientActual)} of
+        {true, true} -> first_drift(Rest, Server, Client);
+        {false, _} -> {drift, Field, Declared, Actual};
+        {_, false} -> {drift, Field, Declared, ClientActual}
+    end.
+
+same(Field, Declared, Actual) -> Declared =:= normalize_value(Field, Actual).
+
+%% `fail_if_no_peer_cert' is server-only in `ssl', so the two sides are checked
+%% in opposite directions:
+%%
+%%   * server must carry it when the declaration says mTLS. Absent there means
+%%     the listener accepts connections with no client certificate -- the exact
+%%     opposite of what the operator declared.
+%%   * client must NOT carry it. `ssl' rejects the option on a client socket at
+%%     connect time, so a node that booted with it would look healthy and then
+%%     fail every outbound handshake.
+check_fail_if_no_peer_cert(Cfg, #{server_opts := Server, client_opts := Client}) ->
+    Declared = maps:get(fail_if_no_peer_cert, Cfg),
+    case {proplists:get_value(fail_if_no_peer_cert, Server),
+          proplists:get_value(fail_if_no_peer_cert, Client)} of
+        {Declared, undefined} -> ok;
+        {ServerValue, _} when ServerValue =/= Declared ->
+            {error, {dist_tls_optfile_drift, fail_if_no_peer_cert,
+                     Declared, ServerValue}};
+        {_, ClientValue} ->
+            {error, {dist_tls_optfile_drift, fail_if_no_peer_cert,
+                     undefined, ClientValue}}
+    end.
+
+normalize_value(certfile, V) -> abs_path(V);
+normalize_value(keyfile, V) -> abs_path(V);
+normalize_value(cacertfile, V) -> abs_path(V);
+normalize_value(_Field, V) -> V.
+
+normalize_opts(Opts) ->
+    [{K, normalize_value(K, V)} || {K, V} <- Opts].
+
+%% Not named abs/1: that BIF is auto-imported, and a local abs/1 makes every
+%% call ambiguous (compiler warning).
+abs_path(undefined) -> undefined;
+abs_path(Path) -> filename:absname(Path).
+
+proto_dist_mode({ok, [["inet_tls"]]}) -> tls;
+proto_dist_mode({ok, [["inet6_tls"]]}) -> tls;
+proto_dist_mode(_) -> plain.
+
+proto_dist_name({ok, [[Name]]}) -> list_to_atom(Name);
+proto_dist_name(Other) -> Other.
+
+first_missing([]) -> none;
+first_missing([{Which, undefined} | _]) -> {missing, Which, undefined};
+first_missing([{Which, Path} | Rest]) ->
+    case filelib:is_regular(Path) of
+        true -> first_missing(Rest);
+        false -> {missing, Which, Path}
+    end.
+
+%% `public_key:pem_decode/1' needs no running `ssl' application (measured), so
+%% a boot check can parse the files before any listener exists.
+first_bad_pem([]) -> none;
+first_bad_pem([{Which, Path} | Rest]) ->
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            case public_key:pem_decode(Bin) of
+                [] -> {bad, Which, Path};
+                _ -> first_bad_pem(Rest)
+            end;
+        {error, _} ->
+            %% Missing files were already caught by first_missing/1; a read
+            %% error here means it disappeared in between.
+            {bad, Which, Path}
     end.

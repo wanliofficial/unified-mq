@@ -20,7 +20,17 @@ all() ->
      config_merges_overrides_onto_defaults,
      redacted_config_never_contains_key_material,
      effective_reports_the_plain_default,
-     effective_reads_the_arguments_this_node_booted_with].
+     effective_reads_the_arguments_this_node_booted_with,
+     disabled_is_always_valid,
+     enabled_but_booted_plain_is_refused,
+     enabled_with_inline_opt_is_refused,
+     booted_with_tls_but_disabled_is_refused,
+     missing_files_are_refused,
+     bad_pem_is_refused,
+     client_side_fail_if_no_peer_cert_is_refused,
+     server_side_missing_fail_if_no_peer_cert_is_refused,
+     rejecting_the_field_names_the_problem,
+     validate_zero_argument_on_a_plain_disabled_node_is_ok].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -109,10 +119,130 @@ effective_reads_the_arguments_this_node_booted_with(_Config) ->
     true = lists:member(maps:get(longnames, Eff), [true, false]),
     ok.
 
+%%%_* Validation cases -------------------------------------------------------
+
+%% Disabled must never require files: that is what keeps an untouched
+%% single-node deployment byte-for-byte identical.
+disabled_is_always_valid(_Config) ->
+    application:set_env(broker_cluster, dist_tls, #{enabled => false}),
+    ok = broker_cluster_dist_tls:validate(plain_boot()),
+    ok.
+
+%% The most likely operator mistake: they set the env but forgot vm.args.
+%% Refusing here is the whole point of the feature -- a node that thinks it
+%% encrypts while it does not is worse than one that fails to boot.
+enabled_but_booted_plain_is_refused(Config) ->
+    set_enabled(self_signed(Config)),
+    {error, {dist_tls_enabled_but_booted_plain, error}} =
+        broker_cluster_dist_tls:validate(plain_boot()),
+    ok.
+
+%% The inline -ssl_dist_opt form works at the OTP level but leaves no readable
+%% options, so the declaration can never be verified against reality. Refuse
+%% it and point at the renderer rather than accepting an unverifiable setup.
+enabled_with_inline_opt_is_refused(Config) ->
+    set_enabled(self_signed(Config)),
+    Boot = (tls_boot(Config))#{inline_opt => {ok, [["server_certfile", "x"]]},
+                               optfile => error},
+    {error, {dist_tls_requires_optfile, see_renderer}} =
+        broker_cluster_dist_tls:validate(Boot),
+    ok.
+
+%% The mirror image: someone enabled TLS in vm.args but left the env at its
+%% shipped default. The node *is* encrypted, but nobody declared it, so the
+%% admin view would lie. Both directions are drift.
+booted_with_tls_but_disabled_is_refused(Config) ->
+    application:set_env(broker_cluster, dist_tls, #{enabled => false}),
+    {error, {dist_tls_booted_with_tls_but_disabled, inet_tls}} =
+        broker_cluster_dist_tls:validate(tls_boot(Config)),
+    ok.
+
+missing_files_are_refused(Config) ->
+    Self = self_signed(Config),
+    set_enabled(Self#{certfile => "/nonexistent/node.crt"}),
+    {error, {missing_file, certfile, "/nonexistent/node.crt"}} =
+        broker_cluster_dist_tls:validate(tls_boot(Config)),
+    ok.
+
+bad_pem_is_refused(Config) ->
+    Self = self_signed(Config),
+    Junk = filename:join(?config(tls_dir, Config), "junk.crt"),
+    ok = file:write_file(Junk, <<"this is not a certificate">>),
+    set_enabled(Self#{certfile => Junk}),
+    {error, {bad_pem, certfile, Junk}} =
+        broker_cluster_dist_tls:validate(tls_boot(Config)),
+    ok.
+
+%% ssl rejects fail_if_no_peer_cert on a client socket at connect time, so a
+%% node that booted with it in the client block would look healthy and then
+%% fail every outbound handshake. Catch it at boot instead.
+client_side_fail_if_no_peer_cert_is_refused(Config) ->
+    Self = self_signed(Config),
+    set_enabled(Self),
+    Boot = tls_boot(Config),
+    Client = [{fail_if_no_peer_cert, true}
+              | maps:get(client_opts, Boot)],
+    {error, {dist_tls_optfile_drift, fail_if_no_peer_cert, undefined, true}} =
+        broker_cluster_dist_tls:validate(Boot#{client_opts => Client}),
+    ok.
+
+%% The mirror of the case above, and the more dangerous one: without
+%% fail_if_no_peer_cert on the server, ssl happily accepts a connection that
+%% presents no certificate at all. The node would claim mTLS and admit anonymous
+%% peers.
+server_side_missing_fail_if_no_peer_cert_is_refused(Config) ->
+    Self = self_signed(Config),
+    set_enabled(Self),
+    Boot = tls_boot(Config),
+    Server = lists:keydelete(fail_if_no_peer_cert, 1,
+                             maps:get(server_opts, Boot)),
+    {error, {dist_tls_optfile_drift, fail_if_no_peer_cert, true, undefined}} =
+        broker_cluster_dist_tls:validate(Boot#{server_opts => Server}),
+    ok.
+
+%% An error that names the field without naming the file it compared is not
+%% actionable. Pin the shape.
+rejecting_the_field_names_the_problem(Config) ->
+    set_enabled((self_signed(Config))#{verify => verify_none}),
+    {error, {dist_tls_optfile_drift, verify, verify_none, verify_peer}} =
+        broker_cluster_dist_tls:validate(tls_boot(Config)),
+    ok.
+
+%% The zero-arity form is what the app calls. On a plain, disabled node it must
+%% be a no-op -- this is the "1472 tests keep passing" guard expressed as a
+%% test rather than as a hope.
+validate_zero_argument_on_a_plain_disabled_node_is_ok(_Config) ->
+    application:set_env(broker_cluster, dist_tls, #{enabled => false}),
+    ok = broker_cluster_dist_tls:validate(),
+    ok.
+
 %%%_* Helpers ---------------------------------------------------------------
 
 restore(undefined) -> application:unset_env(broker_cluster, dist_tls);
 restore(Value) -> application:set_env(broker_cluster, dist_tls, Value).
+
+plain_boot() ->
+    #{proto_dist => error, optfile => error, inline_opt => error,
+      tls_booted => false, server_opts => undefined, client_opts => undefined}.
+
+%% A TLS boot whose declared options match exactly what self_signed/1 declares,
+%% so only the drift check under test can fail.
+tls_boot(Config) ->
+    Declared = self_signed(Config),
+    Opts = [{certfile, maps:get(certfile, Declared)},
+            {keyfile, maps:get(keyfile, Declared)},
+            {cacertfile, maps:get(cacertfile, Declared)},
+            {verify, maps:get(verify, Declared)},
+            {fail_if_no_peer_cert, maps:get(fail_if_no_peer_cert, Declared)},
+            {versions, maps:get(versions, Declared)}],
+    #{proto_dist => {ok, [["inet_tls"]]},
+      optfile => {ok, [[maps:get(optfile, Declared)]]},
+      inline_opt => error,
+      tls_booted => true,
+      server_opts => Opts,
+      %% The client side never carries fail_if_no_peer_cert: ssl rejects it
+      %% there at connect time.
+      client_opts => lists:keydelete(fail_if_no_peer_cert, 1, Opts)}.
 
 %% Turning the declaration on for a test. Runtime env only: the boot state is
 %% injected through validate/1, so nothing here touches real distribution.
