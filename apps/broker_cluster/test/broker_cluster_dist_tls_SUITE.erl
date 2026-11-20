@@ -39,7 +39,9 @@ all() ->
      vm_args_lines_are_the_two_lines_otp_reads,
      vm_args_lines_without_an_optfile_says_so,
      shipped_env_declares_dist_tls_off,
-     a_plain_node_with_tls_enabled_refuses_to_start].
+     a_plain_node_with_tls_enabled_refuses_to_start,
+     a_two_node_ra_group_forms_over_tls_distribution,
+     a_write_commits_and_the_remote_node_sees_the_owner].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -49,19 +51,59 @@ init_per_suite(Config) ->
     _ = file:del_dir_r(Dir),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     Certs = gen_certs(Dir),
-    [{saved_dist_tls, Saved}, {tls_dir, Dir}, {certs, Certs} | Config].
+    %% `peer' needs a distributed origin: a peer with a name is contacted over
+    %% distribution. CT normally runs as `nonode@nohost', so this suite starts
+    %% short-name distribution itself and stops it again if it did.
+    %%
+    %% Do not touch the cookie: before distribution is up, `erlang:get_cookie()'
+    %% answers `nocookie', and re-applying that after `net_kernel:start/1'
+    %% leaves the node with a cookie the peers (which read ~/.erlang.cookie)
+    %% cannot authenticate against. The effect is a `peer:start_link' that waits
+    %% for the whole `wait_boot' and then exits with `timeout'.
+    HostStart = case node() of
+                    nonode@nohost ->
+                        case net_kernel:start([unifiedmq_dtls_ct, shortnames]) of
+                            {ok, _} -> true;
+                            {error, {already_started, _}} -> false;
+                            {error, Reason} ->
+                                ct:fail({cannot_start_distribution, Reason})
+                        end;
+                    _ -> false
+                end,
+    [{saved_dist_tls, Saved}, {tls_dir, Dir}, {certs, Certs},
+     {host_started_net, HostStart} | Config].
 
 end_per_suite(Config) ->
+    case ?config(host_started_net, Config) of
+        true -> _ = net_kernel:stop(), ok;
+        false -> ok
+    end,
     restore(?config(saved_dist_tls, Config)),
     ok.
 
-init_per_testcase(_Case, Config) ->
-    application:unset_env(broker_cluster, dist_tls),
-    Config.
+init_per_testcase(Case, Config) ->
+    case is_dist_case(Case) of
+        true ->
+            application:unset_env(broker_cluster, dist_tls),
+            [{peers, start_tls_peers(Case, Config, 2)} | Config];
+        false ->
+            application:unset_env(broker_cluster, dist_tls),
+            Config
+    end.
 
-end_per_testcase(_Case, Config) ->
-    restore(?config(saved_dist_tls, Config)),
-    ok.
+end_per_testcase(Case, Config) ->
+    case is_dist_case(Case) of
+        true ->
+            stop_peers(?config(peers, Config)),
+            application:unset_env(broker_cluster, dist_tls),
+            ok;
+        false ->
+            restore(?config(saved_dist_tls, Config))
+    end.
+
+is_dist_case(a_two_node_ra_group_forms_over_tls_distribution) -> true;
+is_dist_case(a_write_commits_and_the_remote_node_sees_the_owner) -> true;
+is_dist_case(_) -> false.
 
 %%%_* Pure cases ------------------------------------------------------------
 
@@ -343,10 +385,149 @@ a_plain_node_with_tls_enabled_refuses_to_start(Config) ->
     undefined = whereis(broker_cluster_sup),
     ok.
 
+%%%_* Distributed cases -----------------------------------------------------
+
+%% The happy path: two real nodes whose only transport is mTLS form one ra group
+%% and agree on the committed owner. This is S12-D's cluster claim run on an
+%% encrypted channel.
+a_two_node_ra_group_forms_over_tls_distribution(Config) ->
+    [A, B] = ?config(peers, Config),
+    NodeA = maps:get(node, A),
+    NodeB = maps:get(node, B),
+    PidA = maps:get(pid, A),
+    PidB = maps:get(pid, B),
+    %% Proof the channel really is TLS: both peers booted with it.
+    {ok, [["inet_tls"]]} = peer:call(PidA, init, get_argument, [proto_dist]),
+    true = peer:call(PidA, erlang, whereis, [ssl_dist_sup]) =/= undefined,
+    {ok, _Meta} = peer:call(PidA, broker_cluster_meta, start_link, [], 60000),
+    {ok, 1} = peer:call(PidA, broker_cluster, assign,
+                        [0, NodeA, [NodeA, NodeB], 1], 30000),
+    %% The remote node sees the committed owner over the encrypted channel.
+    {ok, Owner} = peer:call(PidB, broker_cluster, owner, [0], 30000),
+    NodeA = Owner,
+    ok.
+
+a_write_commits_and_the_remote_node_sees_the_owner(Config) ->
+    [A, B] = ?config(peers, Config),
+    NodeA = maps:get(node, A), NodeB = maps:get(node, B),
+    PidA = maps:get(pid, A), PidB = maps:get(pid, B),
+    {ok, _} = peer:call(PidA, broker_cluster_meta, start_link, [], 60000),
+    {ok, 1} = peer:call(PidA, broker_cluster, assign,
+                        [0, NodeA, [NodeA, NodeB], 1], 30000),
+    %% A second command from the *other* node, which must route over TLS to
+    %% whoever is leader.
+    {ok, 2} = peer:call(PidB, broker_cluster, assign,
+                        [1, NodeB, [NodeA, NodeB], 2], 30000),
+    lists:foreach(
+      fun({Pid, Expected}) ->
+              {ok, Epoch} = peer:call(Pid, broker_cluster, epoch, [1], 30000),
+              Expected = Epoch
+      end, [{PidA, 2}, {PidB, 2}]),
+    ok.
+
 %%%_* Helpers ---------------------------------------------------------------
 
 restore(undefined) -> application:unset_env(broker_cluster, dist_tls);
 restore(Value) -> application:set_env(broker_cluster, dist_tls, Value).
+
+%%%_* Distributed helpers ---------------------------------------------------
+
+peer_name(Case, I) ->
+    list_to_atom("dtls_" ++ sanitise(atom_to_list(Case)) ++ "_" ++
+                 integer_to_list(I)).
+
+%% Underscores are legal in an atom but illegal in a DNS hostname, and a
+%% longnames peer needs a resolvable FQDN -- so sanitise to '-' rather than '_'.
+sanitise(S) ->
+    [case C of _ when C >= $a, C =< $z -> C;
+                 _ when C >= $A, C =< $Z -> C;
+                 _ when C >= $0, C =< $9 -> C;
+                 _ -> $- end || C <- S].
+
+is_code_dir(Dir) ->
+    filename:basename(Dir) =:= "ebin".
+
+code_paths() ->
+    %% Only `.../ebin' directories: passing CT's priv/log dirs makes peer boot
+    %% needlessly slow and can time out.
+    SuiteDir = filename:dirname(code:which(?MODULE)),
+    lists:usort([SuiteDir | [D || D <- code:get_path(), is_code_dir(D)]]).
+
+%% One optfile per peer: each presents its own certificate, all signed by the
+%% same test CA.
+write_peer_optfile(Config, Case, I, Certs) ->
+    Dir = filename:join([?config(priv_dir, Config), atom_to_list(Case),
+                         "n" ++ integer_to_list(I)]),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    Prefix = "n" ++ integer_to_list(I),
+    Spec = #{cert => maps:get(list_to_atom(Prefix ++ "_crt"), Certs),
+             key => maps:get(list_to_atom(Prefix ++ "_key"), Certs),
+             ca => maps:get(ca_crt, Certs)},
+    OptFile = filename:join(Dir, "dist_tls.optfile"),
+    ok = file:write_file(OptFile, peer_optfile_text(Spec)),
+    OptFile.
+
+start_tls_peers(Case, Config, N) ->
+    CodePaths = code_paths(),
+    Certs = ?config(certs, Config),
+    Names = [peer_name(Case, I) || I <- lists:seq(1, N)],
+    Peers = [begin
+                 OptFile = write_peer_optfile(Config, Case, I, Certs),
+                 DataDir = filename:join([?config(priv_dir, Config),
+                                          atom_to_list(Case),
+                                          "n" ++ integer_to_list(I), "ra"]),
+                 {ok, Pid, Node} =
+                     peer:start_link(#{name => Name,
+                                       connection => standard_io,
+                                       wait_boot => 60000,
+                                       args => ["-pa" | CodePaths] ++
+                                               ["-proto_dist", "inet_tls",
+                                                "-ssl_dist_optfile", OptFile]}),
+                 #{pid => Pid, node => Node, name => Name, data_dir => DataDir}
+             end || {I, Name} <- lists:zip(lists:seq(1, N), Names)],
+    ok = connect_all(Peers),
+    [ok = prepare_tls_peer(P, Peers) || P <- Peers],
+    Peers.
+
+%% Peers only reach each other once distribution is up on both sides; ra's
+%% bootstrap rpcs to the other member, so this must happen first. Note the shape:
+%% for each peer, dial every *other* peer from inside that peer -- the host
+%% cannot dial a TLS peer at all (it is plain inet_tcp).
+connect_all(Peers) ->
+    lists:foreach(
+      fun(#{pid := Pid, node := Me}) ->
+              Others = [N || #{node := N} <- Peers, N =/= Me],
+              [true = peer:call(Pid, net_kernel, connect_node, [N], 60000)
+               || N <- Others]
+      end, Peers),
+    ok.
+
+prepare_tls_peer(Peer, Peers) ->
+    DataDir = maps:get(data_dir, Peer),
+    Nodes = [maps:get(node, P) || P <- Peers],
+    Pid = maps:get(pid, Peer),
+    %% application may not be loaded on a bare peer.
+    ok = peer:call(Pid, application, load, [broker_cluster], 30000),
+    ok = peer:call(Pid, application, set_env, [broker_cluster, data_dir, DataDir]),
+    ok = peer:call(Pid, application, set_env, [broker_cluster, members, Nodes]),
+    ok = peer:call(Pid, application, set_env,
+                  [broker_cluster, quorum_timeout_ms, 5000]),
+    ok = peer:call(Pid, application, set_env,
+                  [broker_cluster, replicate_timeout_ms, 2000]),
+    ok = peer:call(Pid, filelib, ensure_dir, [filename:join(DataDir, "x")]),
+    {ok, _} = peer:call(Pid, application, ensure_all_started, [ra], 60000),
+    ok = peer:call(Pid, application, set_env,
+                  [ra, data_dir, filename:absname(DataDir)]),
+    {ok, _} = peer:call(Pid, ra_system, start_default, [], 60000),
+    {ok, Cache} = peer:call(Pid, broker_cluster_cache, start_link, [], 30000),
+    %% The cache is linked to the caller's (host) process; a dying peer must not
+    %% take the suite down with it.
+    true = peer:call(Pid, erlang, unlink, [Cache]),
+    ok.
+
+stop_peers(Peers) ->
+    lists:foreach(fun(#{pid := Pid}) -> catch peer:stop(Pid) end, Peers),
+    ok.
 
 plain_boot() ->
     #{proto_dist => error, optfile => error, inline_opt => error,
@@ -385,6 +566,7 @@ set_enabled(Cfg) ->
 %% side DOES check the peer's SAN (spec §1.1 finding 4) -- a wrong SAN is a
 %% handshake failure, not a silent pass.
 gen_certs(Dir) ->
+    Hostname = inet_db:gethostname(),
     CaKey = filename:join(Dir, "ca.key"),
     CaCrt = filename:join(Dir, "ca.crt"),
     ok = openssl(["req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -393,7 +575,8 @@ gen_certs(Dir) ->
     SanCnf = filename:join(Dir, "san.cnf"),
     ok = file:write_file(SanCnf,
                          "[req]\ndistinguished_name=dn\n[dn]\n"
-                         "[ext]\nsubjectAltName=IP:127.0.0.1\n"),
+                         "[ext]\n"
+                         "subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:" ++ Hostname ++ "\n"),
     Certs = lists:foldl(
               fun(I, Acc) ->
                       Prefix = "n" ++ integer_to_list(I),
