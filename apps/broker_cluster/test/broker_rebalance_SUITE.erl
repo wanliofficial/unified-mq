@@ -57,7 +57,7 @@ init_per_testcase(Case, Config) ->
     {ok, _} = broker_cluster_meta:start_link(),
     %% Clear the cooldown clock (persistent_term) and the test clock (process
     %% dictionary) so a move recorded by one case cannot gate the next.
-    catch persistent_term:erase(?PT_LAST),
+    _ = try persistent_term:erase(?PT_LAST) catch _:_ -> ok end,
     erase(rebalance_clock),
     rebalance_env(#{enabled => false}),
     [{data_dir, DataDir} | Config].

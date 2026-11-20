@@ -70,7 +70,7 @@ end_per_testcase(_Case, Config) ->
     %% before the fixture peers so its teardown never races a peer the cluster
     %% still references.
     case ?config(new_peer, Config) of
-        #{pid := Pid} -> catch peer:stop(Pid);
+        #{pid := Pid} -> _ = try peer:stop(Pid) catch _:_ -> ok end;
         undefined -> ok
     end,
     stop_peers(?config(peers, Config)),
@@ -594,10 +594,12 @@ start_meta(Members) ->
 %% system is stopped last: stopping the server first would leave the system up
 %% with a stale server id registered, which is not what a restart looks like.
 crash_meta() ->
-    catch gen_server:stop(broker_cluster_meta_ctl, kill, 1000),
-    catch ra:stop_server(default, {broker_cluster_meta, node()}),
-    catch ra_system:stop_default(),
-    catch gen_server:stop(broker_cluster_cache),
+    _ = try gen_server:stop(broker_cluster_meta_ctl, kill, 1000)
+         catch _:_ -> ok end,
+    _ = try ra:stop_server(default, {broker_cluster_meta, node()})
+         catch _:_ -> ok end,
+    _ = try ra_system:stop_default() catch _:_ -> ok end,
+    _ = try gen_server:stop(broker_cluster_cache) catch _:_ -> ok end,
     ok.
 
 whereis_meta() -> whereis(broker_cluster_meta).

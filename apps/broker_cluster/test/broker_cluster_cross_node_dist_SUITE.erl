@@ -370,7 +370,9 @@ start_peers(Case, Config) ->
         end, [], lists:zip(lists:seq(1, ?NODES), Names))).
 
 stop_peers(Peers) ->
-    lists:foreach(fun(#{pid := Pid}) -> catch peer:stop(Pid) end, Peers),
+    lists:foreach(fun(#{pid := Pid}) ->
+                      _ = try peer:stop(Pid) catch _:_ -> ok end
+                  end, Peers),
     ok.
 
 peer_name(Case, I) ->
@@ -604,9 +606,11 @@ wait_until(Pred) -> wait_until(Pred, 20000, 100).
 
 wait_until(_Pred, 0, _Step) -> ct:fail({timeout, ?MODULE});
 wait_until(Pred, Wait, Step) ->
-    case catch Pred() of
+    try Pred() of
         true -> ok;
         _ -> timer:sleep(Step), wait_until(Pred, Wait - Step, Step)
+    catch
+        _:_ -> timer:sleep(Step), wait_until(Pred, Wait - Step, Step)
     end.
 
 %%%_* RPC -------------------------------------------------------------------

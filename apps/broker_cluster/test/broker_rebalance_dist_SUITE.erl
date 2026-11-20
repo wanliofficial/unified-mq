@@ -299,12 +299,14 @@ start_peers(Case, Config) ->
     Peers.
 
 stop_peers(Peers) ->
-    lists:foreach(fun(#{pid := Pid}) -> catch peer:stop(Pid) end, Peers),
+    lists:foreach(fun(#{pid := Pid}) ->
+                      _ = try peer:stop(Pid) catch _:_ -> ok end
+                  end, Peers),
     ok.
 
 stop_peer(Config, Node) ->
     case [P || #{node := N} = P <- ?config(peers, Config), N =:= Node] of
-        [#{pid := Pid}] -> catch peer:stop(Pid), ok;
+        [#{pid := Pid}] -> _ = try peer:stop(Pid) catch _:_ -> ok end, ok;
         _ -> ok
     end.
 
