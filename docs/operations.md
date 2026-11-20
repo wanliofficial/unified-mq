@@ -897,6 +897,104 @@ broker_rebalance:finish_pending().
 - **只有同主机证据**。跨机 / 跨 AZ 时转发 RPC 的 RTT 会成为主导项，本仓无跨机集群实测，不要把上面的毫秒数外推。
 - **关闭时不追求「灰度混跑」**。开关是节点级的，同一分区在「开」和「关」的节点之间会发生视图不一致的拒绝（`{not_owner, _}` / `{fenced, _}`），不会损坏数据，但会在滚动切换期间产生可见错误率。要开请**全组一起开**（滚动重启的窗口里如实计入错误率），不要长期半开半关。
 
+## 5.5 跨节点通道 TLS（`dist_tls`，ADR-035）
+
+**默认关闭，没有新端口、新进程、新依赖。**关着的时候 `broker_cluster.dist_tls.enabled` 是 `false`，`validate/0` 立即返回 `ok`、不读任何文件，分布仍是明文 `inet_tcp` + cookie，与 S12 收口时**逐字节相同**。
+
+**它能做什么**：把节点间**全部**流量（ra 元数据复制 + 跨节点 RPC，含 S12-D 的 QoS0 广播与转发读写）放进 TLS，并要求每个节点出示受信 CA 签发的证书。**不能**只加密 ra——ra 就走节点分布，没有单独通道。
+
+**为什么不能像 `broker_security.tls` 那样热切**：Erlang 用 `-proto_dist` 在 **boot 期**选定分布协议，早于任何应用加载。所以这是**部署期**决策，不是运行时开关；证书轮换 = 换 PEM + 重启节点（见下）。
+
+### 开启步骤
+
+1. **准备证书**。每个节点一张证书 + 私钥，全部由**同一个** CA 签发。CA 信任是双向准入闸门——不同 CA 的节点根本建立不了分布会话。**证书的 `subjectAltName` 必须包含其它节点拨它时用的地址**（`@IP` → `IP:` SAN，`@hostname` → `DNS:` SAN），因为拨出方向会校验对端 SAN，写错就是握手失败。
+
+2. **生成 optfile**（不要手抄）。在**目标节点的同版本代码**上跑：
+
+```erlang
+%% erl -noshell -eval '...'
+{ok, _} = application:ensure_all_started(broker_cluster),
+application:set_env(broker_cluster, dist_tls,
+    #{enabled    => true,
+      certfile   => "/etc/unified-mq/node.crt",
+      keyfile    => "/etc/unified-mq/node.key",
+      cacertfile => "/etc/unified-mq/ca.crt",
+      optfile    => "/etc/unified-mq/dist_tls.optfile"}),
+ok = broker_cluster_dist_tls:validate(),          %% 先自检
+io:format("~ts", [broker_cluster_dist_tls:render_optfile()]).
+```
+
+把输出写到 `optfile` 指向的路径（上面例子里是 `/etc/unified-mq/dist_tls.optfile`）。`render_optfile/0` 输出的是**绝对路径**——相对的会被 `ssl_dist_sup` 按各节点 CWD 解析，shell 与 release 不一样。
+
+3. **在 vm.args 追加两行**（由 `vm_args_lines/0` 生成，同样不必手抄）：
+
+```
+-proto_dist inet_tls
+-ssl_dist_optfile /etc/unified-mq/dist_tls.optfile
+```
+
+4. **在 sys.config 把声明打开**（与第 2 步一致）：
+
+```erlang
+{broker_cluster, [{dist_tls, #{enabled    => true,
+                               certfile   => "/etc/unified-mq/node.crt",
+                               keyfile    => "/etc/unified-mq/node.key",
+                               cacertfile => "/etc/unified-mq/ca.crt",
+                               optfile    => "/etc/unified-mq/dist_tls.optfile"}}]}
+```
+
+5. **全组重启**。不能灰度：TLS 节点与明文节点**无法**建立分布会话，所以要么全组都开、要么全组都不开。滚动窗口内跨节点调用会失败——按你的可用性预算安排。
+
+### 它一定会在启动时拒你的四种情况
+
+`broker_cluster` 在起监督树**之前**校验，任一条不满足就 `{error, {dist_tls_invalid, Reason}}`，节点不起：
+
+| Reason | 意思 / 处置 |
+|---|---|
+| `{dist_tls_enabled_but_booted_plain, _}` | 你开了 env 但忘了 vm.args 的两行。补上并重启 |
+| `{dist_tls_booted_with_tls_but_disabled, _}` | 反过来：vm.args 开了但 env 还是默认关闭。管理面/审计会说假话，所以也拒 |
+| `{dist_tls_requires_optfile, see_renderer}` | 你用了内联 `-ssl_dist_opt`。那个写法即使拼对也**无法回读选项**，所以不接受；改用 optfile（第 2~3 步） |
+| `{missing_file, Which, Path}` / `{bad_pem, Which, Path}` | 路径不存在，或文件不是合法 PEM。检查权限与内容 |
+| `{dist_tls_optfile_drift, Field, Declared, Actual}` | env 与 optfile 说的不一致（最常见：换了证书路径但只改了其中一处）。用 `render_optfile/0` 重新生成 |
+
+**注意一个反直觉的失败模式**：`-ssl_dist_optfile` 指向的文件**不存在时节点根本起不来**（`{bad_ssl_dist_optfile, Path}`，在 `net_sup` 启动阶段）。这是好事——没有「配了 TLS 却静默明文」这条路——但排错时要知道它发生在应用启动之前，日志里看到的是 supervisor 报告而不是 `broker_cluster` 的错误。
+
+### 主机名校验：一个方向有、一个方向没有
+
+这是最容易误解的一点，实测结论（ADR-035 §D2）：
+
+- **拨出方向（本节点去连别人）默认校验对端证书的 SAN。**`inet_tls_dist` 恒注入 `{server_name_indication, Host}`，`ssl` 据此做标准 hostname 校验。所以**每张节点证书的 `subjectAltName` 必须匹配其它节点拨它时用的地址**：节点名是 `name@10.0.0.7` 就要 `IP:10.0.0.7`；是 `name@mq-1.internal` 就要 `DNS:mq-1.internal`。写错的表现是握手失败：`{bad_cert,{hostname_check_failed,{requested,"10.0.0.7"},...}}`，节点连不上。
+- **拨入方向（别人来连本节点）默认不校验对方 SAN。**一个持有受信 CA 签发证书、但 SAN 写错的节点，仍可拨进来。
+
+也就是说：**CA 信任是双向准入闸门，SAN 绑定只在拨出方向生效**。若合规要求拨入方向也绑定客户端身份，需要额外的 `verify_fun` marker 加上运行期 `net_kernel:allow/1` 白名单，本期**没有**实现。
+
+### 证书轮换
+
+换掉 PEM 文件后**重启节点**。TLS 分布在 boot 期读一次选项，没有热加载路径（这与 `broker_security.tls` 的 `POST /api/v1/tls/reload` 不同——那个只影响面向客户端的 listener）。轮换顺序建议：先换 CA 信任链（各节点 cacertfile 都指向包含新旧两张 CA 的 bundle），再逐节点换证书与私钥并重启。
+
+### 怎么确认它真的开着
+
+```bash
+curl -s localhost:8090/api/v1/node | jq .dist_tls
+```
+
+`enabled` 为 `true` 且 `verify` 为 `verify_peer` 才算是真开了。也可以在节点上直接查：
+
+```erlang
+init:get_argument(proto_dist).        %% {ok,[["inet_tls"]]}
+whereis(ssl_dist_sup).                %% 是个 pid
+```
+
+两个都符合才说明这条节点的分布**真的**走了 TLS——只看 sys.config 不算。
+
+### 边界（别指望它）
+
+- **不能灰度混跑**：见上，TLS 与明文节点之间没有会话。
+- **拨入方向不校验客户端 SAN**：见上。拨出方向会校验，所以证书 SAN 必须写对。
+- **不做证书热加载 / ACME / 轮转编排**：换 PEM + 重启。
+- **不改变任何协议语义**：分布在所有协议之下，线上帧格式、QoS、ACK 全不变。
+- **不加指标键**：`broker_metrics` 冻结集不变；要知道开没开，看节点视图或 `init:get_argument/1`。
+
 ---
 
 ## 6. 滚动升级与版本兼容
