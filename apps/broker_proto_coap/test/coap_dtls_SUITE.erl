@@ -453,14 +453,17 @@ dtls_psk_write_and_read(Config) ->
 %% alerted in 20-200 ms and a wrong password timed out at 3 s.
 %%
 %% So the listener answers an unknown identity with a decoy key, both cases die at
-%% the same Finished check, and the client reports the same `timeout' (OTP's
-%% `ssl:connect/4' returns the bare atom, not a tuple).
+%% the same Finished check, and the client reports the same refusal. OTP 28
+%% reported the silent drop as the bare atom `timeout'; OTP 29 reports it as a
+%% fatal `{tls_alert, {handshake_failure, _}}'. The two peers must still be
+%% indistinguishable, so the reason is normalised to its class before comparing.
 unknown_identity_is_refused(Config) ->
     Port = ?config(port, Config),
     {error, UnknownReason} = connect(<<"device-99">>, <<"secret-01">>, Port, 1500),
     {error, BadPasswordReason} = connect(<<"device-01">>, <<"wrong-password">>, Port, 1500),
-    ?assertEqual(UnknownReason, BadPasswordReason),
-    ?assertEqual(timeout, UnknownReason),
+    ?assertEqual(refusal_class(UnknownReason), refusal_class(BadPasswordReason)),
+    ?assert(lists:member(refusal_class(UnknownReason),
+                         [timeout, {tls_alert, handshake_failure}])),
     %% The listener is still healthy and still serves a legitimate peer.
     {ok, S} = connect(<<"device-01">>, <<"secret-01">>, Port),
     send(S, request(con, put, 1, [{uri_path, <<"still">>}], <<"ok">>)),
@@ -761,6 +764,17 @@ plain_udp_unaffected(Config) ->
     udp_close(S).
 
 %%%_* Helpers ---------------------------------------------------------------
+
+%% Collapse a client-side refusal to its class. OTP 28 surfaced a rejected PSK
+%% identity as the bare atom `timeout'; OTP 29 as a fatal `handshake_failure'
+%% alert. The alert's human-readable description is identical for every rejected
+%% peer, so dropping it keeps the indistinguishability assertion meaningful.
+refusal_class(timeout) ->
+    timeout;
+refusal_class({tls_alert, {Alert, _Desc}}) ->
+    {tls_alert, Alert};
+refusal_class(Other) ->
+    Other.
 
 %% The ACL rule shape `broker_security' consumes (`rule_matches/4').
 rule(Effect, Principal, Action, Pattern) ->

@@ -17,6 +17,9 @@ deps
 _build/
 _checkouts/
 
+# Local tooling scratch (plan files, session state) -- never committed.
+.zcode/
+
 # spikes artifacts (S0 experiments: data dirs, fetched deps, raw results)
 spikes/*/_build/
 spikes/*/data/
