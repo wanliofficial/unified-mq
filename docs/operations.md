@@ -773,6 +773,228 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | 投影与日志不一致的嫌疑 | `a2a_task_recovery` 的重放耗时异常增长 | 日志变大而 checkpoint 未做（S9-F）；短期靠增加 `task_shards` 分摊，长期等 checkpoint |
 | 状态机拒绝 | `a2a_state_violation` 语义的日志行（`illegal_transition`） | 客户端在终态上重发/重取消；属客户端错误，`-32002`/`-32004` 是正常答复，不是故障 |
 
+## 5.3 分区再平衡（`broker_rebalance`，S12-C / ADR-032 D4）
+
+**默认关闭，没有后台进程。**再平衡器是一个**模块**，不是 `gen_server`：`broker_cluster` 的监督树没有多出任何子项，也没有任何 tick 或定时器会调用它。节点加入/退出**不会自动触发**迁移——这正是 ADR-021「S4 不做自动再平衡」的延续，也是 ADR-032 D4 的裁决。要不要动，是运维按下回车的那一刻决定的。
+
+```erlang
+%% 打开（默认 enabled => false，即 evaluate/0 与 step/0 恒回 {disabled}）
+{broker_cluster, [{rebalance, #{enabled => true,
+                               hysteresis => 1,        %% 分区数极差容许值
+                               cooldown_ms => 300000}}]}  %% 两次迁移的最小间隔
+```
+
+**它搬什么**：只搬**分区归属元数据** `(owner, epoch)`，走 ADR-021 D3 的两阶段 `migrate` → `finish_migration`。**不搬任何活进程、不搬队列内容、不搬连接**。消费者重连后重建（ADR-019）——这是 ADR-032 D5 写明的限制，不是缺陷。
+
+**它怎么决定**：目标函数是 `count(partitions where owner = Node)`（**按 owner 计数**，含 `migrating` 阶段，因为 `migrate` 一提交目标就是 owner 了）。双门限同时成立才动手：
+
+1. 各节点分区数极差 > `hysteresis`（默认 1）；
+2. 距上次迁移 ≥ `cooldown_ms`（默认 300000）。
+
+一次 `step/0` 只发**一条**命令（一轮一移），因此把集群搬到均衡是「重复 step 直到 `{stable, _}`」。极差不超过阈值时答 `{stable, _}` 而非 `{cooldown, _}`——先判阈值再判冷却，稳定的视图不该报冷却。
+
+```erlang
+broker_rebalance:status().
+%% #{enabled => true, hysteresis => 1, cooldown_ms => 300000,
+%%   members => ['a@h','b@h','c@h'],
+%%   counts => #{'a@h' => 3, 'b@h' => 2, 'c@h' => 2},
+%%   spread => 1, orphaned => [], last_migration_ms => 1732...}
+
+broker_rebalance:evaluate().
+%% {stable, Summary} | {cooldown, Summary} | {rebalance, Plan} | {disabled}
+%% Plan 里带着 action / partition / from / to / epoch / command，可先看后做
+
+broker_rebalance:step().
+%% {migrated, P, From, To} | {reassigned, P, To} | {stable, _}
+%% | {cooldown, _} | {disabled} | {error, no_quorum}
+```
+
+**循环搬到均衡**：
+
+```erlang
+%% 控制台里手推，直到 stable。有 cooldown 时靠 sleep 跨过冷却窗口。
+lists:foldl(fun(_, _) ->
+                case broker_rebalance:step() of
+                    {migrated, _, _, _} -> timer:sleep(300000), again;
+                    {reassigned, _, _} -> again;
+                    {stable, _} = S -> S;
+                    Other -> Other
+                end
+            end, again, lists:seq(1, 64)).
+```
+
+**两阶段：`step` 只做前半段。**`migrate` 之后分区处于 `migrating`，源仍可读、`authorize_append` 已把旧 epoch 挡成 `{fenced, _}`。数据追上后调：
+
+```erlang
+broker_rebalance:finish_pending().
+%% {finished, [0, 3]}   -- 把当前所有 migrating 分区推回 active（epoch+1）
+```
+
+不调也不丢数据，但视图会一直停在 `migrating`；`/status` 的 `cluster` 段能看出还有几个。**建议每次搬完就 `finish_pending/0`**，或者至少在把节点交还业务前跑一次。
+
+**孤儿分区**：owner 已不在成员集里的分区（节点没 drain 就消失）优先回收，走 `assign` 落到最轻负载的成员，**不受 `cooldown` 约束**——那是恢复，不是调优。`status/0` 的 `orphaned` 列出它们。
+
+**失去多数派时**：`step/0` 返回 `{error, no_quorum}`，视图不变。这是诚实的答复（ADR-021 D4），不存在「本地搬了但集群没提交」这种状态。
+
+**推荐的节点下线流程**（顺序很重要）：
+
+1. `POST /api/v1/drain` 摘流，等 `/api/v1/node` 的 `connections.active` 归零；
+2. 确认 `broker_rebalance:status()` 的 `orphaned` 为空——若不为空，说明还有分区挂在这个节点上；
+3. 若要以「优雅退出」而非「故障」语义交接，先在**还活着的节点**上把它的分区 `step` 走（owner 换到别人），再停进程；
+4. 停进程。
+
+反过来（先停进程再 step）也能收敛，但中间会有一段时间分区 owner 指向一个不存在的节点，写入被 fence、消费者没人可连——这是故障恢复路径，不是推荐路径。
+
+**边界（别指望它）**：
+
+- 不迁移**活连接**。drain 只停 accept，在用连接留在原节点直到客户端重连或宽限期结束。
+- 不跨 group 均衡。单 group 内最小搬迁单位是 1 个分区；跨 group 的均衡要改配置（ADR-008 :15-19）。
+- 不按连接数/内存/CPU 加权。连接数只覆盖 MQTT 系（ADR-032 D7），内存 CPU 不在冻结指标集里——按假数据加权比不加权更糟。
+- 不自动运行。没有 watchdog、没有 cron、没有节点事件订阅。要自动化请在外层调度器里调 `step/0`。
+**搬迁有多快**：一次完整搬迁（`migrate` + `finish_migration`）在同主机 3 peer 下 p50 约 **2 ms**、p99 约 **4 ms**，决策 `evaluate/0` 约 0.2 ms——成本几乎全在 raft 多数派提交，不在搬迁逻辑。迁移期间源仍可读、旧 epoch 被 fence、不搬数据不搬连接，**对业务延迟贡献为零**。数字与方法见 [`docs/benchmarks/2026-11-19-s12c-rebalance.md`](benchmarks/2026-11-19-s12c-rebalance.md)（同主机下界，跨机需另测）。
+- 不感知**动态成员变更**。成员集取自节点启动时的 `broker_cluster.members`（本仓今天没有 `ra:add_member` 的调用路径）。改成员配置后请**重启该节点**，否则触发者仍在按旧成员集判断，会把新节点的分区当孤儿、把分区搬给已移除的节点（后者只会反复返回错误，不会损坏数据）。临时绕过：用 `broker_rebalance:evaluate/1` / `step/1` 显式传入成员列表。
+
+## 5.4 跨节点投递（`cross_node_delivery`，S12-D / ADR-034）
+
+**默认关闭，没有新进程、新端口、新应用。**关着的时候路由钩子根本不安装（`{broker_queue, router}` / `{broker_subscription, owner}` / `{broker_subscription, qos0_fanout}` 都不存在），`broker_queue` / `broker_subscription` 的每条路径与 S1~S4 **逐字节相同**——非 owner 的 append 仍被 fencing guard 拒成 `{error, {fenced, _}}`。这是 ADR-034 D8 的裁决，也是它敢默认关的前提。
+
+```erlang
+%% 打开（默认两者分别是 false / 2000）
+{broker_cluster, [{cross_node_delivery, true},
+                  {cross_node_timeout_ms, 2000}]}  %% 一次转发的 rpc 预算
+```
+
+钩子在 `broker_cluster` 应用启动时装（`install_hooks/0`），**改配置要重启该节点**。运行期临时切换可用 `broker_cluster:reinstall_hooks(true | false)`（它会先卸干净再装，避免残留旧 router）——这是运维/测试辅助函数，不是热配置。
+
+**它做什么**：一个分区**只有 owner 的一份权威日志**。非 owner 节点上的 publish 被转发到 owner 写，非 owner 节点上的订阅从 owner 拉——所以**全仓仍然只有一份日志，没有本地双写**（ADR-034 D2）。转发到的调用走 `forwarded/3`，owner 上的 guard 照样执行，因此「路由视图滞后」不会写出一个 fencing 层本来会拒绝的记录。QoS0 例外：它不进日志，改为 `rpc:cast` 广播给成员、每个成员按**自己的**索引重路由（D4），是 L1 尽力而为——不可达的成员静默丢弃、不重试、不落盘、发布方不阻塞。
+
+**开之前必须满足的前提**（ADR-034 D7，代码会拒）：
+
+1. `replicated_commit` 已启用（`broker_cluster_rep` 的复制路径在）；
+2. 每个**可能成为 owner** 的节点都已持有该分区的副本。
+
+不满足时 `assign` / `migrate` 在进日志前就被拒：`{error, {cross_node_delivery_requires_replica, Partition, Target}}`。原因是 S12-D 不做字节 handoff（ADR-032 D5 不迁移活进程/队列内容），owner 换到一个没有副本的节点就等于丢历史。
+
+**报错速查**（都应当**不 ACK**，让客户端重试或换节点）：
+
+| 返回 | 含义 / 处置 |
+|---|---|
+| `{error, {cross_node_unreachable, Node, Reason}}` | 转发时 owner 不可达（`Reason` 是 `badrpc` 的原因）。发布方**没有**在本地写任何记录，可以安全重试。先查 owner 是否活着、`epmd`/分布端口是否通 |
+| `{error, {not_owner, Owner}}` | 你的路由视图和对方不一致：调用被转发到的节点已不是 owner。会累加 `cluster_fencing_rejected`。等 `broker_cluster_cache` 追上元数据后重试；持续出现说明成员/元数据视图滞后，查 `GET /api/v1/node` 与 `broker_cluster:partition_view/0` |
+| `{error, {fenced, #{...}}}` | 写入携带的 epoch 或本节点归属已过期（`expected_epoch` / `actual_epoch` / `owner` 都在里面）。同属正常拒绝，不丢数据 |
+| `{error, {cross_node_shared_unsupported, Partition}}` | 跨节点 **shared** 订阅被拒（ADR-034 D5）：`claim/4` 在每节点独立分发 offset，跨节点会**静默重复投递**。把该 shared 组消费者放到 owner 所在节点，或改用 exclusive/failover（这两类跨节点是正确的） |
+
+`committed` 在这种模式下是**各节点候选游标的最小值**（D6）：只要还有任一节点的消费者没读过去，owner 就不会 GC 那段。**只有显式离开的节点会退出聚合**——对它调 `broker_cluster:leave/1`（ADR-033 的成员变更路径）会清掉它在这个节点上的候选条目；**仅仅是不可达的节点会保留最后一次上报的值**，它只能把 floor 压住（保守：绝不抬高，因此绝不会提前删数据），但不能自行释放。所以硬故障节点想释放 GC 必须补一次 `leave`，否则那个分区的 committed 会停在它最后的位置——**这是「不丢数据」换来的空间占用，不是缺陷**；需要空间时按本文件 §5.3 的节点下线流程显式摘除。
+
+**有多快**：同主机 2 peer 下，跨节点 append p50 ≈ **3.0 ms**（本地 append 的 2.0 ms 落盘 + 约 1 ms 转发），跨节点 read p50 ≈ **1.4 ms**，QoS0 dispatch 发布方侧 ≈ **0.3 ms**。转发的 1 ms 是常数级路径开销，**写放大量不变**（只写 owner 一份）。数字与方法见 [`docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`](benchmarks/2026-11-19-s12d-cross-node-delivery.md)（同主机下界，跨机需另测）。
+
+**边界（别指望它）**：
+
+- **不保证跨节点 exactly-once**。QoS0 广播是尽力而为；跨节点重试语义仍由各协议的 QoS 决定，本仓不新增去重层。
+- **不交付跨节点 shared 组**。见上表最后一行，是显式拒绝，不是静默降级。
+- **owner 是读热点**。所有读汇聚到 owner，单次读便宜（~1.4 ms）但会随订阅者数量线性叠加——容量规划按 owner 侧 QPS 算，不要按「分摊到 N 节点」算。
+- **不搬活进程、不搬队列内容、不搬连接**。与 §5.3 同一限制（ADR-032 D5）。
+- **只有同主机证据**。跨机 / 跨 AZ 时转发 RPC 的 RTT 会成为主导项，本仓无跨机集群实测，不要把上面的毫秒数外推。
+- **关闭时不追求「灰度混跑」**。开关是节点级的，同一分区在「开」和「关」的节点之间会发生视图不一致的拒绝（`{not_owner, _}` / `{fenced, _}`），不会损坏数据，但会在滚动切换期间产生可见错误率。要开请**全组一起开**（滚动重启的窗口里如实计入错误率），不要长期半开半关。
+
+## 5.5 跨节点通道 TLS（`dist_tls`，ADR-035）
+
+**默认关闭，没有新端口、新进程、新依赖。**关着的时候 `broker_cluster.dist_tls.enabled` 是 `false`，`validate/0` 立即返回 `ok`、不读任何文件，分布仍是明文 `inet_tcp` + cookie，与 S12 收口时**逐字节相同**。
+
+**它能做什么**：把节点间**全部**流量（ra 元数据复制 + 跨节点 RPC，含 S12-D 的 QoS0 广播与转发读写）放进 TLS，并要求每个节点出示受信 CA 签发的证书。**不能**只加密 ra——ra 就走节点分布，没有单独通道。
+
+**为什么不能像 `broker_security.tls` 那样热切**：Erlang 用 `-proto_dist` 在 **boot 期**选定分布协议，早于任何应用加载。所以这是**部署期**决策，不是运行时开关；证书轮换 = 换 PEM + 重启节点（见下）。
+
+### 开启步骤
+
+1. **准备证书**。每个节点一张证书 + 私钥，全部由**同一个** CA 签发。CA 信任是双向准入闸门——不同 CA 的节点根本建立不了分布会话。**证书的 `subjectAltName` 必须包含其它节点拨它时用的地址**（`@IP` → `IP:` SAN，`@hostname` → `DNS:` SAN），因为拨出方向会校验对端 SAN，写错就是握手失败。
+
+2. **生成 optfile**（不要手抄）。在**目标节点的同版本代码**上跑：
+
+```erlang
+%% erl -noshell -eval '...'
+{ok, _} = application:ensure_all_started(broker_cluster),
+application:set_env(broker_cluster, dist_tls,
+    #{enabled    => true,
+      certfile   => "/etc/unified-mq/node.crt",
+      keyfile    => "/etc/unified-mq/node.key",
+      cacertfile => "/etc/unified-mq/ca.crt",
+      optfile    => "/etc/unified-mq/dist_tls.optfile"}),
+ok = broker_cluster_dist_tls:validate(),          %% 先自检
+io:format("~ts", [broker_cluster_dist_tls:render_optfile()]).
+```
+
+把输出写到 `optfile` 指向的路径（上面例子里是 `/etc/unified-mq/dist_tls.optfile`）。`render_optfile/0` 输出的是**绝对路径**——相对的会被 `ssl_dist_sup` 按各节点 CWD 解析，shell 与 release 不一样。
+
+3. **在 vm.args 追加两行**（由 `vm_args_lines/0` 生成，同样不必手抄）：
+
+```
+-proto_dist inet_tls
+-ssl_dist_optfile /etc/unified-mq/dist_tls.optfile
+```
+
+4. **在 sys.config 把声明打开**（与第 2 步一致）：
+
+```erlang
+{broker_cluster, [{dist_tls, #{enabled    => true,
+                               certfile   => "/etc/unified-mq/node.crt",
+                               keyfile    => "/etc/unified-mq/node.key",
+                               cacertfile => "/etc/unified-mq/ca.crt",
+                               optfile    => "/etc/unified-mq/dist_tls.optfile"}}]}
+```
+
+5. **全组重启**。不能灰度：TLS 节点与明文节点**无法**建立分布会话，所以要么全组都开、要么全组都不开。滚动窗口内跨节点调用会失败——按你的可用性预算安排。
+
+### 它一定会在启动时拒你的四种情况
+
+`broker_cluster` 在起监督树**之前**校验，任一条不满足就 `{error, {dist_tls_invalid, Reason}}`，节点不起：
+
+| Reason | 意思 / 处置 |
+|---|---|
+| `{dist_tls_enabled_but_booted_plain, _}` | 你开了 env 但忘了 vm.args 的两行。补上并重启 |
+| `{dist_tls_booted_with_tls_but_disabled, _}` | 反过来：vm.args 开了但 env 还是默认关闭。管理面/审计会说假话，所以也拒 |
+| `{dist_tls_requires_optfile, see_renderer}` | 你用了内联 `-ssl_dist_opt`。那个写法即使拼对也**无法回读选项**，所以不接受；改用 optfile（第 2~3 步） |
+| `{missing_file, Which, Path}` / `{bad_pem, Which, Path}` | 路径不存在，或文件不是合法 PEM。检查权限与内容 |
+| `{dist_tls_optfile_drift, Field, Declared, Actual}` | env 与 optfile 说的不一致（最常见：换了证书路径但只改了其中一处）。用 `render_optfile/0` 重新生成 |
+
+**注意一个反直觉的失败模式**：`-ssl_dist_optfile` 指向的文件**不存在时节点根本起不来**（`{bad_ssl_dist_optfile, Path}`，在 `net_sup` 启动阶段）。这是好事——没有「配了 TLS 却静默明文」这条路——但排错时要知道它发生在应用启动之前，日志里看到的是 supervisor 报告而不是 `broker_cluster` 的错误。
+
+### 主机名校验：一个方向有、一个方向没有
+
+这是最容易误解的一点，实测结论（ADR-035 §D2）：
+
+- **拨出方向（本节点去连别人）默认校验对端证书的 SAN。**`inet_tls_dist` 恒注入 `{server_name_indication, Host}`，`ssl` 据此做标准 hostname 校验。所以**每张节点证书的 `subjectAltName` 必须匹配其它节点拨它时用的地址**：节点名是 `name@10.0.0.7` 就要 `IP:10.0.0.7`；是 `name@mq-1.internal` 就要 `DNS:mq-1.internal`。写错的表现是握手失败：`{bad_cert,{hostname_check_failed,{requested,"10.0.0.7"},...}}`，节点连不上。
+- **拨入方向（别人来连本节点）默认不校验对方 SAN。**一个持有受信 CA 签发证书、但 SAN 写错的节点，仍可拨进来。
+
+也就是说：**CA 信任是双向准入闸门，SAN 绑定只在拨出方向生效**。若合规要求拨入方向也绑定客户端身份，需要额外的 `verify_fun` marker 加上运行期 `net_kernel:allow/1` 白名单，本期**没有**实现。
+
+### 证书轮换
+
+换掉 PEM 文件后**重启节点**。TLS 分布在 boot 期读一次选项，没有热加载路径（这与 `broker_security.tls` 的 `POST /api/v1/tls/reload` 不同——那个只影响面向客户端的 listener）。轮换顺序建议：先换 CA 信任链（各节点 cacertfile 都指向包含新旧两张 CA 的 bundle），再逐节点换证书与私钥并重启。
+
+### 怎么确认它真的开着
+
+```bash
+curl -s localhost:8090/api/v1/node | jq .dist_tls
+```
+
+`enabled` 为 `true` 且 `verify` 为 `verify_peer` 才算是真开了。也可以在节点上直接查：
+
+```erlang
+init:get_argument(proto_dist).        %% {ok,[["inet_tls"]]}
+whereis(ssl_dist_sup).                %% 是个 pid
+```
+
+两个都符合才说明这条节点的分布**真的**走了 TLS——只看 sys.config 不算。
+
+### 边界（别指望它）
+
+- **不能灰度混跑**：见上，TLS 与明文节点之间没有会话。
+- **拨入方向不校验客户端 SAN**：见上。拨出方向会校验，所以证书 SAN 必须写对。
+- **不做证书热加载 / ACME / 轮转编排**：换 PEM + 重启。
+- **不改变任何协议语义**：分布在所有协议之下，线上帧格式、QoS、ACK 全不变。
+- **不加指标键**：`broker_metrics` 冻结集不变；要知道开没开，看节点视图或 `init:get_argument/1`。
+
 ---
 
 ## 6. 滚动升级与版本兼容

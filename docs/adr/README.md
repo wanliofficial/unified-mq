@@ -70,8 +70,18 @@
 | ADR | 主题 | 关键依据 |
 |---|---|---|
 | [032](032-s12-node-view-drain-and-rebalance-boundary.md) | S12 节点视图真相 / drain / 再平衡边界：**ra 为唯一真相**（Mnesia `cluster_node`/`partition_meta` 退役为遗留视图）、节点自身 `up\|draining\|down` **存本地不进 ra**（失去多数派仍可 drain）、**外部 LB + 8090 供契约**不做四层代理/DNS-SD/客户端路由、再平衡器在 `broker_cluster` 内**默认关闭**且目标函数只含分区数（滞后+冷却双门限、一次一轮）、**只迁移分区归属不迁移活进程**、不引入一致性哈希且不改 `phash2` 编号、写可用性矩阵绑定 ADR-007 三档、不内部排队、指标不扩容只修 `connections_current` 记账、ADR-021 两项遗留不并入、**跨节点投递不在 S12 范围（单列 S12-D）** | 收敛报告 §1 的 9 条负向发现（`broker_meta:reconcile/0` 不存在、两份平行元数据、`/readyz` 查 loaded 非 started、跨节点投递不存在、无 drain/无节点级容量闸门/无节点视图）；ADR-001/002/007/008/010/011/013/015/016/019/021 |
+| [033](033-online-cluster-membership-change.md) | S12-D 前置·成员在线变更：**接线既有 `ra:add_member`/`remove_member`**（不新增共识/app/端口）、**admin 驱动显式 `join`/`leave` 同步 API 落在 8090 管理面**、再平衡成员取值点从启动配置改为 **`ra:members({local,_})`** 实时视图（落实 ADR-032 那条 TODO）、可用性绑定 ADR-007 三档且「join 成功 ≠ 新成员可用」（被公告成员抬高 quorum）、数据面两步（元数据变更 → 建分区 → `/readyz`+`/api/v1/node` 如实 not-ready 直到就绪）、**不做自动扩缩容/故障剔除**、不改分区数 G/`phash2`、不引入第二套共识 | vendored `ra.erl:582-635` 已提供 `add_member`/`remove_member`；`broker_cluster_meta` 0 处调用（接线缺口非共识缺陷）；ADR-032「成员集取自启动配置」TODO + 「单节点无法加入运行中的组」实测；ADR-007/010/011/019/021/032 |
 
-> S12 决策只冻结边界与形状，**不写代码、不开端口、不新增 app / 依赖**；S12-A/B/C 均未开工（roadmap §14）。跨节点投递（S12-D）需新增 ADR，不在本轮范围。
+> S12 决策只冻结边界与形状，**不写代码、不开端口、不新增 app / 依赖**；S12-A/B/C 均已交付（roadmap §14）。跨节点投递（S12-D）本体需新增 ADR、另见 [`s12d-cross-node-delivery-convergence.md`](../design/s12d-cross-node-delivery-convergence.md)，ADR-033 只交付其前置「成员在线变更」。
+
+### S12-D 本体（**已接受**，2026-11-19 评审签认）
+
+| ADR | 主题 | 关键依据 |
+|---|---|---|
+| [034](034-s12d-cross-node-delivery.md) | S12-D 本体·跨节点消息投递：**owner 权威日志 + 跨节点读写路由（D′）**——一个分区只有 owner 的一份权威日志，publish 路由到 owner 写、订阅者所在节点从 owner **pull** 读；**不做全量复制 / 不做 owner 侧代理 / 不建订阅者节点索引**（因此 **ADR-010 / ADR-019 冻结正文不改**）；写侧在 `broker_queue:append/3` 单点转发、失败一律不 ACK 且**无本地双写**；读侧 `read_from`/`watermarks`/`advance_committed`/`capability`/`subscribe`/`unsubscribe` 路由到 owner，wake 靠跨节点 pid 直投 + 既有 monitor；QoS0 广播到成员、各节点本地 `route`+`dispatch`（ADR-007 L1）；**shared 组跨节点不交付**（显式拒绝，不静默重复）；`committed` 由 owner 对「各节点候选」取最小（ADR-014「永不删过 committed」不变）；迁移继承 S12-C「无字节 handoff」，故前置 **副本集覆盖可能 owner + `replicated_commit`**；**默认关闭**，关闭时单节点行为字节级不变；不新增 app / 端口 / 依赖 / 指标键 | 收敛调查 §2 缺四件与 §3 A~E 路子；代码事实：`broker_queue.erl:123,193,215,270,289`、`broker_cluster.erl:113,135,164`、`broker_cluster_rep.erl:21,28,59`、`broker_queue_partition.erl:66-89`、`broker_subscription.erl:157,222`、`broker_cluster_meta_machine.erl:35-37`、`wal_gc.erl:14-16`、`mqtt_conn_fsm.erl:752,821,833,964`；ADR-007/010/011/013/014/016/019/021/032/033 |
+| [035](035-cluster-distribution-tls.md) | 集群跨节点 / 复制通道 TLS：**OTP `-proto_dist inet_tls` + mTLS**，独立 `broker_cluster.dist_tls` 块、默认关闭、保留 cookie、选项只走 optfile、boot 期双向漂移校验。收口 `docs/security.md` §12 第 1 条。诚实边界：CA 是双向准入闸门，**拨出按 SAN 绑定对端、拨入不校验客户端 SAN** | 设计文档 `docs/superpowers/specs/2026-11-20-cluster-distribution-tls-design.md`；实现 `broker_cluster_dist_tls.erl`；CT 29 例（25 纯函数 + 2 真实分布 + 2 负向）；ADR-021/032/034 |
+
+> ADR-034 已于 2026-11-19 评审签认（四项待签认问题全部签认），裁决正文冻结；落地实现（D2/D3/D4/D5/D6/D8）已交付 dist CT **10 例**（语义 7 + 负载 2 + 容量 1），全量 `rebar3 ct` **1472/1472**，容量/延迟证据见 `docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`，详见 [ADR-034 文末](034-s12d-cross-node-delivery.md)。
 
 ## Gate S0 验收清单（roadmap §2）
 

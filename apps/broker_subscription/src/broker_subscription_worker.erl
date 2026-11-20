@@ -646,8 +646,22 @@ reply_new_subscribe(SubRef, Info, State) ->
             {reply, {error, {router_register, Reason}}, State}
     end.
 
-reply_new_subscribe2(SubRef, Info, State) ->
+reply_new_subscribe2(SubRef = {Kind, _, _}, Info, State) ->
     #{partitions := Partitions} = State,
+    %% ADR-034 D5: `shared' claims offsets from a worker-local row, so two nodes
+    %% would each hand out the same offset. Refuse instead of duplicating.
+    case cross_node_subscribe_ok(Kind, Partitions) of
+        ok ->
+            new_subscribe_cursors(SubRef, Info, Partitions, State);
+        {error, Reason} ->
+            _ = broker_router:unregister(SubRef),
+            {reply, {error, Reason}, State}
+    end.
+
+%% RQ-01 (`anchor => earliest`) still decides where a new cursor starts, so the
+%% cross-node guard above is a gate on top of the same cursor initialisation,
+%% not a second one.
+new_subscribe_cursors(SubRef, Info, Partitions, State) ->
     case init_cursors(Info, Partitions) of
         {ok, InitCursors} ->
             Full = Info#{init_cursors => InitCursors,
@@ -702,6 +716,36 @@ tail_offsets([P | Rest], Acc) ->
     end;
 tail_offsets([], Acc) ->
     {ok, lists:reverse(Acc)}.
+
+%% ADR-034 D5: with cross-node delivery on, a `shared' group is refused unless
+%% this node owns every partition it covers. `claim/4' distributes offsets from
+%% a worker-local ETS row, so two nodes claiming independently would deliver the
+%% same offset twice -- a violation that is silent, not an error. Exclusive and
+%% failover are correct across nodes (one reader, cursor-local), so they are
+%% untouched.
+cross_node_subscribe_ok(Kind, _Partitions) when Kind =/= shared ->
+    ok;
+cross_node_subscribe_ok(shared, Partitions) ->
+    case persistent_term:get({broker_subscription, owner}, undefined) of
+        Owner when is_function(Owner, 1) ->
+            case [P || P <- Partitions, not owner_is_self(Owner, P)] of
+                [] -> ok;
+                [P | _] -> {error, {cross_node_shared_unsupported, P}}
+            end;
+        _ ->
+            ok
+    end.
+
+owner_is_self(Owner, Partition) ->
+    try Owner(Partition) of
+        {ok, Node} -> Node =:= node();
+        %% No ownership metadata means the single-node default: nobody is fenced,
+        %% so the subscription is allowed (the same answer `route_op' gives).
+        not_found -> true;
+        _ -> false
+    catch
+        _:_ -> false
+    end.
 
 persist_entity(SubRef, #{kind := Kind, key := Key, filter := Filter, qos := QoS,
                          consumers := Consumers, init_cursors := Init} = Info) ->

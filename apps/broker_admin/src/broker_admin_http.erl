@@ -13,6 +13,7 @@
 %%   GET  /api/v1/node         node view for an external LB (state, weight, conns)
 %%   POST /api/v1/drain        stop accepting new connections (S12-A, ADR-032 D2)
 %%   POST /api/v1/undrain      resume accepting
+%%   POST /api/v1/cluster/members   online join/leave (ADR-033 D2)
 %%   GET  /api/v1/config       redacted config audit snapshot + sha256
 %%   GET  /api/v1/version      release / OTP / data-format versions
 %%   GET  /api/v1/backups      backup inventory
@@ -25,7 +26,7 @@
 %% acceptable on the default loopback bind; `docs/operations.md' calls that out.
 -module(broker_admin_http).
 
--export([handle/4, metrics_text/0]).
+-export([handle/4, metrics_text/0, node_view/0, json_safe/1]).
 
 -define(PROTECTED_ALWAYS, [<<"/api/">>]).
 
@@ -94,11 +95,15 @@ route(post, <<"/api/v1/tls/reload">>, _H, _B) ->
         Class:Reason ->
             json(500, #{error => to_bin(io_lib:format("~p:~p", [Class, Reason]))})
     end;
+route(post, <<"/api/v1/cluster/members">>, _H, Body) ->
+    cluster_members(Body);
 route(_Method, <<"/healthz">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, <<"/readyz">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, <<"/metrics">>, _H, _B) ->
+    json(405, #{error => method_not_allowed});
+route(_Method, <<"/api/v1/cluster/members">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, _Path, _H, _B) ->
     json(404, #{error => not_found}).
@@ -133,6 +138,89 @@ cluster() ->
         Nodes -> Nodes
     catch
         _:_ -> []
+    end.
+
+%%%_* Cluster membership change (ADR-033 D2) --------------------------------
+
+%% Admin-driven, explicit online membership change. The body names an action
+%% (`join' / `leave') and a node; the handler delegates to `broker_cluster',
+%% which wraps the ra membership change. Synchronous: `ok' means the membership
+%% command was accepted by the leader's log -- not that the node is ready to
+%% serve (ADR-033 D4/D5 poll `/api/v1/node' for readiness).
+cluster_members(Body) ->
+    case parse_members_body(Body) of
+        {ok, Action, Node} ->
+            apply_membership(Action, Node);
+        {error, Error} ->
+            json(400, Error)
+    end.
+
+parse_members_body(<<>>) ->
+    {error, #{error => body_required}};
+parse_members_body(Body) ->
+    try json:decode(Body) of
+        #{<<"action">> := Action, <<"node">> := NodeBin} ->
+            case {parse_action(Action), node_atom(NodeBin)} of
+                {{ok, A}, {ok, N}} -> {ok, A, N};
+                {{error, _}, _} -> {error, #{error => invalid_action}};
+                {_, {error, unknown_node}} ->
+                    {error, #{error => unknown_node}};
+                {_, {error, _}} -> {error, #{error => invalid_node}}
+            end;
+        _ ->
+            {error, #{error => body_must_have_action_and_node}}
+    catch
+        _:_ -> {error, #{error => invalid_json}}
+    end.
+
+parse_action(<<"join">>) -> {ok, join};
+parse_action(<<"leave">>) -> {ok, leave};
+parse_action(_) -> {error, invalid}.
+
+%% A node name is an atom the VM already knows -- a reachable cluster member is
+%% up in the distribution -- so `binary_to_existing_atom' cannot mint atoms from
+%% attacker input. An unknown name is a 400, never a new atom.
+node_atom(NodeBin) when is_binary(NodeBin) ->
+    try binary_to_existing_atom(NodeBin, utf8) of
+        Node when is_atom(Node) -> {ok, Node}
+    catch
+        _:_ -> {error, unknown_node}
+    end;
+node_atom(_) ->
+    {error, invalid_node}.
+
+apply_membership(Action, Node) ->
+    case started(broker_cluster) of
+        false ->
+            json(503, #{error => cluster_not_running,
+                        action => Action, node => Node});
+        true ->
+            call_cluster(Action, Node)
+    end.
+
+%% `broker_cluster' is started but the metadata group may still refuse the
+%% change (no quorum, already a member, ...). Map its replies onto HTTP: a
+%% committed `ok' is 200, a no-quorum is 503 so an LB/operator backs off, and
+%% anything unexpected is a 503 rather than a 500 crash of the listener.
+call_cluster(join, Node) ->
+    reply_cluster(join, broker_cluster:join(Node));
+call_cluster(leave, Node) ->
+    reply_cluster(leave, broker_cluster:leave(Node)).
+
+reply_cluster(Action, Result) ->
+    case Result of
+        ok ->
+            json(200, #{status => ok, action => Action});
+        {ok, already_member} ->
+            json(200, #{status => already_member, action => Action});
+        {ok, not_member} ->
+            json(200, #{status => not_member, action => Action});
+        {error, no_quorum} ->
+            json(503, #{error => no_quorum, action => Action});
+        {error, Reason} ->
+            json(503, #{error => cluster_membership_failed,
+                        reason => to_bin(io_lib:format("~p", [Reason])),
+                        action => Action})
     end.
 
 safe_snapshot() ->
@@ -286,7 +374,20 @@ node_view(DrainState) ->
       ready => DrainState =:= up,
       uptime_seconds => uptime_seconds(),
       connections => connections_view(),
-      partitions => partitions_view()}.
+      partitions => partitions_view(),
+      dist_tls => dist_tls_view()}.
+
+%% ADR-035: the feature is a boot-time property of the node, so an operator (or
+%% an LB dashboard) needs to see whether this node's inter-node traffic is
+%% actually encrypted. Tolerated call like `cluster/0' above: `broker_cluster'
+%% is not a declared dependency of this app, and the admin API must answer even
+%% when the cluster app is down -- in which case the honest answer is "off".
+dist_tls_view() ->
+    try broker_cluster_dist_tls:redacted_config() of
+        Map when is_map(Map) -> Map
+    catch
+        _:_ -> #{enabled => false}
+    end.
 
 %% Aggregate connection counts straight from ranch, so they describe the
 %% listeners that actually exist on this node rather than a counter maintained

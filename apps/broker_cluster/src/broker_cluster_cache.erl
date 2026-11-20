@@ -14,13 +14,18 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, put/2, get/1, all/0, clear/0, clear_partition/1,
-         owner/1, epoch/1, replicas/1]).
+-export([start_link/0, put/2, get/1, all/0, partition_view/0, clear/0,
+         clear_partition/1, owner/1, epoch/1, replicas/1]).
+%% ADR-034 D6: the committed floor is a minimum over every node's cursor. The
+%% reports live here because this server already owns the local mirror, and the
+%% table is *not* a second cursor truth: it only answers "how far may GC go".
+-export([report_committed/3, forget_committed/1, committed_floor/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -define(TAB, broker_cluster_cache).
+-define(COMMITTED, broker_cluster_committed).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -47,8 +52,19 @@ all() ->
     catch _:_ -> []
     end.
 
+%% @doc The cache keyed by partition. `all/0' drops the key (its existing
+%% callers only want the metas), but a rebalancer has to name the partition it
+%% wants to move, so this keeps the pair.
+partition_view() ->
+    try maps:from_list(ets:tab2list(?TAB))
+    catch _:_ -> #{}
+    end.
+
 clear() ->
     try ets:delete_all_objects(?TAB) catch _:_ -> true end,
+    %% ADR-034 D6: a cleared mirror must not leave stale committed candidates
+    %% pinning a partition nobody owns any more.
+    try ets:delete_all_objects(?COMMITTED) catch _:_ -> true end,
     ok.
 
 clear_partition(Partition) ->
@@ -73,6 +89,35 @@ replicas(Partition) ->
         not_found -> not_found
     end.
 
+%% @doc Record one node's candidate and answer the floor this owner may apply
+%% (ADR-034 D6). The floor is `min' over every node that has reported for this
+%% partition, which is exactly ADR-014's "never delete past `committed'"
+%% applied across nodes: one slow consumer anywhere pins the owner's GC.
+%%
+%% A node that leaves (`forget_committed/1') drops out; a node that is merely
+%% unreachable keeps its last value, which can only be conservative (it may pin
+%% the floor, it can never raise it). A missing table means the cache is not up,
+%% and the caller then falls back to its own candidate -- the single-node rule.
+report_committed(Partition, Node, Candidate) when is_integer(Candidate) ->
+    try
+        true = ets:insert(?COMMITTED, {{Partition, Node}, Candidate}),
+        committed_floor(Partition)
+    catch
+        _:_ -> undefined
+    end.
+
+%% @doc ADR-033 `leave' hook: the departed node no longer holds a cursor here.
+forget_committed(Node) ->
+    try ets:match_delete(?COMMITTED, {{'_', Node}, '_'}), ok
+    catch _:_ -> ok
+    end.
+
+committed_floor(Partition) ->
+    case lists:append(ets:match(?COMMITTED, {{Partition, '_'}, '$1'})) of
+        [] -> undefined;
+        Candidates -> lists:min(Candidates)
+    end.
+
 %%%_* gen_server ----------------------------------------------------------
 
 init([]) ->
@@ -80,6 +125,17 @@ init([]) ->
         undefined ->
             _ = ets:new(?TAB, [named_table, public, set,
                                {read_concurrency, true}]);
+        _ ->
+            ok
+    end,
+    %% ADR-034 D6: written by whichever process reports a candidate (usually a
+    %% subscription worker), read by the owner's routing hook. `protected' would
+    %% force every reporter through this server for no benefit -- the rows are
+    %% independent keys and a lost update is re-reported on the next tick.
+    case ets:info(?COMMITTED, name) of
+        undefined ->
+            _ = ets:new(?COMMITTED, [named_table, public, set,
+                                     {read_concurrency, true}]);
         _ ->
             ok
     end,
