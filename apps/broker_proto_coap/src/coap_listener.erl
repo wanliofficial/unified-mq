@@ -641,7 +641,54 @@ send_to(IP, Port, Bin, #st{socks = Socks}) ->
 
 resource_reply(Req, Cfg, Endpoint, St) ->
     {ReplyCode, Options, Payload} = run_resource(Req, Cfg, Endpoint, St),
-    encode_reply(Req, reply_type(Req), ReplyCode, Options, Payload).
+    block2_slice(Req, reply_type(Req), ReplyCode, Options, Payload).
+
+%%%_* Block2 (server-side chunking, RFC 7959 §3) --------------------------------
+%%
+%% A GET carrying a `block2' option is answered with the requested slice of the
+%% resource's full representation; a GET without one is answered whole (the
+%% pre-Block2 behaviour, unchanged). Only a 2.xx content response is sliced: an
+%% error code (4.04 / 4.05 / 5.xx) has no body to divide, so it passes through.
+%% The block size is the client's requested `ReqSize' (Block2 lets the downloader
+%% pick it); there is no server-side cache -- each block is a fresh projection of
+%% the current retained state, so no per-transfer table is needed.
+block2_slice(Req, Type, Code, Options, Payload) ->
+    case {is_content_code(Code), coap_codec:block(block2, Req)} of
+        {true, {Num, _More, ReqSize}} ->
+            {Slice, ActualSize} = block2_payload(Payload, Num, ReqSize),
+            More = block2_more(Payload, Num, ReqSize),
+            BlockOpts = lists:keystore(block2, 1, Options,
+                                       {block2, coap_codec:block_value(Num, More, ActualSize)}),
+            encode_reply(Req, Type, Code, BlockOpts, Slice);
+        _ ->
+            encode_reply(Req, Type, Code, Options, Payload)
+    end.
+
+%% True when the code is a 2.xx success carrying a representational body.
+is_content_code({response, Class, _Detail}) when Class >= 2, Class =< 2 ->
+    true;
+is_content_code(_) ->
+    false.
+
+%% The Num-th `ReqSize'-byte slice of `Payload', and the size actually used
+%% (== ReqSize except when the final block is short). An out-of-range Num yields
+%% an empty slice -- RFC 7959 §3.5 lets the server close with an empty last
+%% block (More=false), which the client recognises and stops on.
+block2_payload(Payload, Num, ReqSize) ->
+    Offset = Num * ReqSize,
+    Total = byte_size(Payload),
+    case Offset >= Total of
+        true ->
+            {<<>>, ReqSize};
+        false ->
+            Len = min(ReqSize, Total - Offset),
+            Slice = binary:part(Payload, Offset, Len),
+            {Slice, ReqSize}
+    end.
+
+%% More=true when at least one byte follows this block.
+block2_more(Payload, Num, ReqSize) ->
+    ((Num + 1) * ReqSize) < byte_size(Payload).
 
 %% RFC 7252 §5.2.1: a reply to a CON rides in the ACK; a reply to a NON is a
 %% separate NON response. Both echo the request's token.
