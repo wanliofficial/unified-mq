@@ -189,11 +189,34 @@ block2_streams_a_three_block_body(Config) ->
                          (coap_codec:payload(B2))/binary>>),
     close(S).
 
-block2_streams_a_single_block_when_body_fits(_Config) ->
-    ok.
+%% A plain GET with NO block2 option returns the whole representation in one
+%% 2.05 with NO block2 option -- the pre-Block2 behaviour is untouched.
+block2_is_not_used_without_the_option(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    Body = binary:copy(<<"z">>, 3000),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"whole">>}], Body)),
+    #{code := {response, 2, 4}} = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"whole">>}])),
+    Reply = expect(S, ack, {response, 2, 5}),
+    ?assertEqual(undefined, coap_codec:block(block2, Reply)),
+    ?assertEqual(Body, coap_codec:payload(Reply)),
+    close(S).
 
-block2_is_not_used_without_the_option(_Config) ->
-    ok.
+%% A body that fits in one requested block comes back as a single block with
+%% More=false (block2:0/1024). The client stops after one round-trip.
+block2_streams_a_single_block_when_body_fits(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    Body = binary:copy(<<"q">>, 1024),   %% exactly one block
+    send(S, Port, request(con, put, 1, [{uri_path, <<"one">>}], Body)),
+    #{code := {response, 2, 4}} = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2,
+                          [{uri_path, <<"one">>}, {block2, {0, true, 1024}}])),
+    B0 = expect(S, ack, {response, 2, 5}),
+    ?assertEqual({0, false, 1024}, coap_codec:block(block2, B0)),
+    ?assertEqual(Body, coap_codec:payload(B0)),
+    close(S).
 
 %% A GET with Observe=0 AND block2 registers the relationship and answers the
 %% initial 2.05 carrying BOTH the `observe' sequence option AND a `block2'
@@ -215,5 +238,14 @@ block2_combines_with_observe_zero(Config) ->
     ?assert(is_integer(coap_codec:option(observe, Init))),
     close(S).
 
-block2_on_missing_resource_is_still_404(_Config) ->
-    ok.
+%% A block2 GET on an absent resource is still 4.04: an error code has no body
+%% to slice, so no block2 option and no payload are attached.
+block2_on_missing_resource_is_still_404(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(con, get, 1,
+                          [{uri_path, <<"nope">>}, {block2, {0, true, 1024}}])),
+    Reply = expect(S, ack, {response, 4, 4}),
+    ?assertEqual(undefined, coap_codec:block(block2, Reply)),
+    ?assertEqual(<<>>, coap_codec:payload(Reply)),
+    close(S).
