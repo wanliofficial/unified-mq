@@ -52,6 +52,10 @@ all() ->
      v5_connack_capabilities_can_be_disabled,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
      connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
+     %% MQ-05: the enhanced-auth framework and its first method, `plain'.
+     auth_plain_begin_continue_ok,
+     auth_plain_wrong_password,
+     auth_plain_unknown_nonce,
      v5_publish_properties_reach_the_subscriber,
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
@@ -421,6 +425,36 @@ connect_mqtt5_with_empty_client_id_gets_the_v5_refusal(_Config) ->
     {ok, <<16#20, 3, 0, 16#85, 0>>} = gen_tcp:recv(Client, 5, 3000),
     ok = expect_closed(Client),
     {ok, normal} = expect_down(Monitor, Pid),
+    ok.
+
+%% broker_auth_plain: begin issues a nonce-bound challenge; continue with the
+%% right password succeeds, wrong password fails. No new crypto dependency.
+auth_plain_begin_continue_ok(_Config) ->
+    ok = boot(),
+    Ctx = #{client_id => <<"c">>},
+    {continue, Challenge, AuthState} =
+        broker_auth:'begin'(<<"plain">>, undefined, Ctx),
+    ?assert(is_binary(Challenge)),
+    Resp = term_to_binary({<<"alice">>, Challenge, <<"pw">>}),
+    {ok, <<"alice">>, _Ctx2} =
+        broker_auth:continue(<<"plain">>, AuthState, Resp),
+    ok.
+
+auth_plain_wrong_password(_Config) ->
+    ok = boot(),
+    {continue, Challenge, AuthState} =
+        broker_auth:'begin'(<<"plain">>, undefined, #{}),
+    Resp = term_to_binary({<<"alice">>, Challenge, <<"wrong">>}),
+    {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
+    ok.
+
+auth_plain_unknown_nonce(_Config) ->
+    ok = boot(),
+    {continue, _Challenge, AuthState} =
+        broker_auth:'begin'(<<"plain">>, undefined, #{}),
+    %% A response naming a nonce we never issued for this handshake.
+    Resp = term_to_binary({<<"alice">>, <<"bogus-nonce">>, <<"pw">>}),
+    {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
     ok.
 
 connect_wrong_protocol_level_is_refused_1(_Config) ->
