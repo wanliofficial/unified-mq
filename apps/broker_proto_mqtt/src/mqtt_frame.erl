@@ -259,33 +259,17 @@ do_parse_body(Type, _Flags, _Body, _Vsn) ->
 
 p_connect(Body) ->
     case read_string(Body) of
+        %% MQTT 3.1.1 (level 4) and 5.0 (level 5) share the protocol name "MQTT".
         {<<"MQTT">>, <<4, Flags, KeepAlive:16, Rest/binary>>} ->
-            %% §3.1.2.3 bit table: 0 reserved, 1 clean session, 2 will flag,
-            %% 4-3 will QoS, 5 will retain, 6 password, 7 user name.
-            CSession = (Flags band 2#00000010) bsr 1,
-            Will = (Flags band 2#00000100) bsr 2,
-            WillQoS = (Flags band 2#00011000) bsr 3,
-            WillRetain = (Flags band 2#00100000) bsr 5,
-            UserPass = Flags band 2#11000000,
-            Reserved = Flags band 2#00000001,
-            if
-                Reserved =/= 0 ->
-                    %% §3.1.2.3: the reserved bit must be 0.
-                    {error, {malformed_packet, connect_reserved_bit}};
-                Will =:= 0 andalso (WillQoS =/= 0 orelse WillRetain =/= 0) ->
-                    %% §3.1.2.4: Will QoS/Retain are meaningless (must be 0)
-                    %% without the Will Flag.
-                    {error, {malformed_packet, will_flags_without_will}};
-                WillQoS > 2 ->
-                    %% §3.1.2.4: QoS 3 is reserved; S2-C carries 0/1/2.
-                    {error, {unsupported_will_qos, WillQoS}};
-                true ->
-                    connect_tail(Rest, CSession, Will, WillQoS,
-                                 WillRetain, UserPass, KeepAlive)
-            end;
+            connect_flags(Flags, KeepAlive, Rest, 4);
         {<<"MQTT">>, <<5, Flags, KeepAlive:16, Rest/binary>>} ->
             connect_v5_tail(Rest, Flags, KeepAlive);
+        %% MQTT 3.1 (MQ-16): the protocol name is "MQIsdp" and the level is 3.
+        {<<"MQIsdp">>, <<3, Flags, KeepAlive:16, Rest/binary>>} ->
+            connect_flags(Flags, KeepAlive, Rest, 3);
         {<<"MQTT">>, <<Other, _/binary>>} ->
+            {error, {unsupported_protocol_version, Other}};
+        {<<"MQIsdp">>, <<Other, _/binary>>} ->
             {error, {unsupported_protocol_version, Other}};
         {error, Reason} ->
             {error, Reason};
@@ -295,11 +279,40 @@ p_connect(Body) ->
             {error, {unsupported_protocol, Other}}
     end.
 
+%% The Connect Flags bit table (§3.1.2.3) is identical across 3.1/3.1.1/5.0, so
+%% the decode is shared; only the level-dependent payload tail differs (Will
+%% Message is a UTF-8 string in 3.1 but arbitrary bytes in 3.1.1/5.0, and the
+%% credentials obey Remaining-Length precedence in 3.1 only).
+connect_flags(Flags, KeepAlive, Rest, Level) ->
+    %% §3.1.2.3 bit table: 0 reserved, 1 clean session, 2 will flag,
+    %% 4-3 will QoS, 5 will retain, 6 password, 7 user name.
+    CSession = (Flags band 2#00000010) bsr 1,
+    Will = (Flags band 2#00000100) bsr 2,
+    WillQoS = (Flags band 2#00011000) bsr 3,
+    WillRetain = (Flags band 2#00100000) bsr 5,
+    UserPass = Flags band 2#11000000,
+    Reserved = Flags band 2#00000001,
+    if
+        Reserved =/= 0 ->
+            %% §3.1.2.3: the reserved bit must be 0.
+            {error, {malformed_packet, connect_reserved_bit}};
+        Will =:= 0 andalso (WillQoS =/= 0 orelse WillRetain =/= 0) ->
+            %% §3.1.2.4: Will QoS/Retain are meaningless (must be 0)
+            %% without the Will Flag.
+            {error, {malformed_packet, will_flags_without_will}};
+        WillQoS > 2 ->
+            %% §3.1.2.4: QoS 3 is reserved; S2-C carries 0/1/2.
+            {error, {unsupported_will_qos, WillQoS}};
+        true ->
+            connect_tail(Rest, CSession, Will, WillQoS,
+                         WillRetain, UserPass, KeepAlive, Level)
+    end.
+
 connect_tail(<<Len:16, Id:Len/binary, R0/binary>>, CS, WF, WQ, WR, UserPass,
-             KeepAlive) ->
+             KeepAlive, Level) ->
     case validate_client_id(Id) of
         ok ->
-            case read_will(R0, WF) of
+            case read_will(R0, WF, Level) of
                 {error, Reason} ->
                     {error, Reason};
                 {WT, WP, R2} ->
@@ -307,7 +320,7 @@ connect_tail(<<Len:16, Id:Len/binary, R0/binary>>, CS, WF, WQ, WR, UserPass,
                         {error, Reason} ->
                             {error, Reason};
                         ok ->
-                            case read_creds(R2, UserPass) of
+                            case read_creds(R2, UserPass, Level) of
                                 {error, Reason} ->
                                     {error, Reason};
                                 {U, P, <<>>} ->
@@ -320,7 +333,8 @@ connect_tail(<<Len:16, Id:Len/binary, R0/binary>>, CS, WF, WQ, WR, UserPass,
                                                   will_topic = WT,
                                                   will_payload = WP,
                                                   username = U,
-                                                  password = P}};
+                                                  password = P,
+                                                  proto_level = proto_level(Level)}};
                                 {_U, _P, _Trailing} ->
                                     {error, {malformed_packet,
                                             connect_trailing_bytes}}
@@ -330,33 +344,80 @@ connect_tail(<<Len:16, Id:Len/binary, R0/binary>>, CS, WF, WQ, WR, UserPass,
         {error, Reason} ->
             {error, Reason}
     end;
-connect_tail(_Short, _CS, _WF, _WQ, _WR, _UserPass, _KeepAlive) ->
+connect_tail(_Short, _CS, _WF, _WQ, _WR, _UserPass, _KeepAlive, _Level) ->
     {error, malformed_connect_truncated}.
+
+%% A 3.1/3.1.1 CONNECT names its level in the record (3 for 3.1, 4 for 3.1.1);
+%% 5.0 CONNECTs are built by connect_v5_payload/8 which sets it directly.
+proto_level(3) -> 3;
+proto_level(4) -> 4.
 
 %% The optional sections are read as complete packages: a present Will Flag
 %% consumes topic+payload, present credential flags consume username+password
 %% together, and a half-set flag pair is rejected rather than silently
-%% dropped (the record cannot represent an asymmetric pair).
-read_will(R0, 0) ->
+%% dropped (the record cannot represent an asymmetric pair) -- except MQTT 3.1,
+%% where Remaining Length takes precedence (see read_creds/3).
+read_will(R0, 0, _Level) ->
     {undefined, undefined, R0};
-read_will(R0, 1) ->
+read_will(R0, 1, Level) ->
     case read_string(R0) of
         {error, Reason} ->
             {error, Reason};
         too_short ->
             {error, {malformed_packet, will_topic_truncated}};
         {WT, RA} ->
-            case read_binary(RA) of
+            case read_will_payload(RA, Level) of
+                {error, Reason} ->
+                    {error, Reason};
                 {WP, RB} ->
-                    {WT, WP, RB};
-                too_short ->
-                    {error, {malformed_packet, will_payload_truncated}}
+                    {WT, WP, RB}
             end
     end.
 
-read_creds(R2, 0) ->
+%% Will Message payload: MQTT 3.1 (§2.2.2.6) is a UTF-8 string (zero-length
+%% allowed); 3.1.1/5.0 carry raw bytes. The 3.1 "must only consist of 7-bit
+%% ASCII" is a sender obligation (design §4) -- the broker stores/publishes the
+%% bytes as-is and only enforces valid UTF-8 here.
+read_will_payload(RA, 3) ->
+    case read_string(RA) of
+        {error, Reason} ->
+            {error, Reason};
+        too_short ->
+            {error, {malformed_packet, will_payload_truncated}};
+        {WP, RB} ->
+            {WP, RB}
+    end;
+read_will_payload(RA, _Level) ->
+    case read_binary(RA) of
+        {WP, RB} ->
+            {WP, RB};
+        too_short ->
+            {error, {malformed_packet, will_payload_truncated}}
+    end.
+
+%% Credentials, version-dependent.
+%%   00: no credentials (all versions).
+%%   11: 3.1.1/5.0 require both strings (read_creds_both); 3.1 reads each
+%%        optionally because Remaining Length takes precedence (missing =
+%%        absent, not truncated).
+%%   10: username only -- legal in every version (MQTT-3.1.2-22); in 3.1 a
+%%        missing username string is tolerated as anonymous.
+%%   01: password without a user name -- invalid in every version.
+read_creds(R2, 0, _Level) ->
     {undefined, undefined, R2};
-read_creds(R2, 2#11000000) ->
+read_creds(R2, 2#11000000, 3) ->
+    read_creds_v31_both(R2);
+read_creds(R2, 2#11000000, _Level) ->
+    read_creds_both(R2);
+read_creds(R2, 2#10000000, 3) ->
+    read_creds_v31_username_only(R2);
+read_creds(R2, 2#10000000, _Level) ->
+    read_creds_username_only(R2);
+read_creds(_R2, 2#01000000, _Level) ->
+    {error, {malformed_packet, password_without_username}}.
+
+%% 3.1.1/5.0: both flag bits set, both strings required (password as raw bytes).
+read_creds_both(R2) ->
     case read_string(R2) of
         {error, Reason} ->
             {error, Reason};
@@ -369,11 +430,58 @@ read_creds(R2, 2#11000000) ->
                 too_short ->
                     {error, {malformed_packet, password_truncated}}
             end
-    end;
-read_creds(_R2, 2#10000000) ->
-    {error, {malformed_packet, username_without_password}};
-read_creds(_R2, 2#01000000) ->
-    {error, {malformed_packet, password_without_username}}.
+    end.
+
+%% MQTT-3.1.2-22 / 5.0: a User Name without a Password is legal.
+read_creds_username_only(R2) ->
+    case read_string(R2) of
+        {error, Reason} ->
+            {error, Reason};
+        too_short ->
+            {error, {malformed_packet, username_truncated}};
+        {U, R3} ->
+            {U, undefined, R3}
+    end.
+
+%% MQTT 3.1 (§2.2.2.7/8): Remaining Length takes precedence over the flags, so a
+%% set flag whose string is simply absent (wire exhausted) is read as absent
+%% (anonymous), while a length prefix that promises more bytes than remain is a
+%% truncated frame.
+read_creds_v31_both(R2) ->
+    case optional_string(R2) of
+        {error, Reason} ->
+            {error, Reason};
+        {U, R3} ->
+            case optional_string(R3) of
+                {error, Reason} ->
+                    {error, Reason};
+                {P, R4} ->
+                    {U, P, R4}
+            end
+    end.
+
+read_creds_v31_username_only(R2) ->
+    case optional_string(R2) of
+        {error, Reason} ->
+            {error, Reason};
+        {U, R3} ->
+            {U, undefined, R3}
+    end.
+
+%% Read a UTF-8 string that a 3.1 flag says is present: an exhausted wire means
+%% the field is absent (undefined, connection continues); a present but short
+%% length prefix is truncated.
+optional_string(<<>>) ->
+    {undefined, <<>>};
+optional_string(Bin) ->
+    case read_string(Bin) of
+        {error, Reason} ->
+            {error, Reason};
+        too_short ->
+            {error, {malformed_packet, string_truncated}};
+        {S, Rest} ->
+            {S, Rest}
+    end.
 
 %% The 3.1.1 set is 0..5 and the rest is "reserved for future versions", but
 %% design §4.5 (MQTT 5.0 CONNECT -> 0x87 Not supported) makes this broker SEND
@@ -530,7 +638,7 @@ connect_v5_payload(<<Len:16, Id:Len/binary, R0/binary>>, CS, WF, WQ, WR,
                         {error, Reason} ->
                             {error, Reason};
                         ok ->
-                            case read_creds(R1, UserPass) of
+                            case read_creds(R1, UserPass, 5) of
                                 {U, P, <<>>} ->
                                     {ok, #connect{proto_level = 5,
                                                   client_id = Id,
@@ -1051,8 +1159,12 @@ encode_v4(#connect{client_id = ClientId, keep_alive = KA, clean_session = CS,
                 will_flag = WF, will_qos = WQ, will_retain = WR,
                 will_topic = WTopic, will_payload = WPayload,
                 username = User, password = Pass}) ->
-    HasCreds = is_binary(User) andalso is_binary(Pass),
+    %% MQTT-3.1.2-22: a User Name without a Password is legal, so the username
+    %% flag is derived from User alone; the password flag still requires both.
+    HasUser = is_binary(User),
+    HasPass = is_binary(Pass),
     NoCreds = User =:= undefined andalso Pass =:= undefined,
+    CredsOk = NoCreds orelse HasUser,
     if
         is_binary(ClientId), byte_size(ClientId) =< 65535,
         is_integer(KA), KA >= 0, KA =< 65535,
@@ -1061,18 +1173,21 @@ encode_v4(#connect{client_id = ClientId, keep_alive = KA, clean_session = CS,
         (WF =:= 0 andalso WTopic =:= undefined andalso WPayload =:= undefined)
             orelse (WF =:= 1 andalso is_binary(WTopic) andalso
                     is_binary(WPayload)),
-        HasCreds orelse NoCreds ->
+        CredsOk ->
             Flags = (CS bsl 1) bor (WF bsl 2) bor (WQ bsl 3) bor (WR bsl 5)
-                    bor (bitval(HasCreds) bsl 6) bor (bitval(HasCreds) bsl 7),
+                    bor (bitval(HasUser) bsl 6) bor (bitval(HasPass) bsl 7),
             WillPart = case WF of
                            1 -> <<(len16(WTopic))/binary, WTopic/binary,
                                   (len16(WPayload))/binary, WPayload/binary>>;
                            0 -> <<>>
                        end,
-            CredsPart = case HasCreds of
-                            true -> <<(len16(User))/binary, User/binary,
-                                      (len16(Pass))/binary, Pass/binary>>;
-                            false -> <<>>
+            CredsPart = case {HasUser, HasPass} of
+                            {true, true} ->
+                                <<(len16(User))/binary, User/binary,
+                                  (len16(Pass))/binary, Pass/binary>>;
+                            {true, false} ->
+                                <<(len16(User))/binary, User/binary>>;
+                            {false, _} -> <<>>
                         end,
             Body = <<(len16(<<"MQTT">>))/binary, "MQTT", 4, Flags, KA:16,
                     (len16(ClientId))/binary, ClientId/binary,
@@ -1171,8 +1286,11 @@ encode_v5(#connect{client_id = ClientId, keep_alive = KA, clean_session = CS,
                    will_topic = WTopic, will_payload = WPayload,
                    username = User, password = Pass, props = Props,
                    will_props = WProps}) ->
-    HasCreds = is_binary(User) andalso is_binary(Pass),
+    %% MQTT-3.1.2-22 / 5.0: a User Name without a Password is legal.
+    HasUser = is_binary(User),
+    HasPass = is_binary(Pass),
     NoCreds = User =:= undefined andalso Pass =:= undefined,
+    CredsOk = NoCreds orelse HasUser,
     if
         is_binary(ClientId), byte_size(ClientId) =< 65535,
         is_integer(KA), KA >= 0, KA =< 65535,
@@ -1181,19 +1299,22 @@ encode_v5(#connect{client_id = ClientId, keep_alive = KA, clean_session = CS,
         (WF =:= 0 andalso WTopic =:= undefined andalso WPayload =:= undefined)
             orelse (WF =:= 1 andalso is_binary(WTopic) andalso
                     is_binary(WPayload)),
-        HasCreds orelse NoCreds ->
+        CredsOk ->
             Flags = (CS bsl 1) bor (WF bsl 2) bor (WQ bsl 3) bor (WR bsl 5)
-                    bor (bitval(HasCreds) bsl 6) bor (bitval(HasCreds) bsl 7),
+                    bor (bitval(HasUser) bsl 6) bor (bitval(HasPass) bsl 7),
             WillPart = case WF of
                            1 -> <<(props_bin(WProps))/binary,
                                   (len16(WTopic))/binary, WTopic/binary,
                                   (len16(WPayload))/binary, WPayload/binary>>;
                            0 -> <<>>
                        end,
-            CredsPart = case HasCreds of
-                            true -> <<(len16(User))/binary, User/binary,
-                                      (len16(Pass))/binary, Pass/binary>>;
-                            false -> <<>>
+            CredsPart = case {HasUser, HasPass} of
+                            {true, true} ->
+                                <<(len16(User))/binary, User/binary,
+                                  (len16(Pass))/binary, Pass/binary>>;
+                            {true, false} ->
+                                <<(len16(User))/binary, User/binary>>;
+                            {false, _} -> <<>>
                         end,
             Body = <<(len16(<<"MQTT">>))/binary, "MQTT", 5, Flags, KA:16,
                     (props_bin(Props))/binary,

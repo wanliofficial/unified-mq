@@ -48,6 +48,17 @@ all() ->
      connect_with_bad_password_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
+     %% MQ-16: MQTT 3.1 (Protocol Level 3 / "MQIsdp") end-to-end.
+     connect_mqtt31_is_accepted,
+     connect_mqtt31_client_id_23_chars_is_accepted,
+     connect_mqtt31_client_id_24_chars_is_refused_2,
+     connect_mqtt31_empty_client_id_is_refused_2,
+     connect_mqtt31_connack_reserved_byte_is_zero,
+     connect_mqtt31_username_without_password_is_refused_4,
+     connect_mqtt31_missing_credentials_are_anonymous,
+     connect_mqtt31_pubsub_roundtrip,
+     connect_mqtt31_will_is_published_on_abnormal_disconnect,
+     connect_mqtt31_auth_failure_is_refused_4,
     v5_connack_announces_topic_alias_maximum,
      v5_topic_alias_zero_still_rejects,
      v5_publish_with_topic_name_and_alias_registers_it,
@@ -421,6 +432,135 @@ connect_mqtt5_is_accepted(_Config) ->
                  maps:without([topic_alias_maximum], AckProps)),
     ?assertNot(maps:is_key(maximum_qos, AckProps)),
     #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%%%_* MQ-16: MQTT 3.1 (Protocol Level 3 / "MQIsdp") end-to-end -----------------
+%% 3.1 shares its post-CONNECT frame shape with 3.1.1 byte-for-byte, so the verbs
+%% below are the 3.1.1 ones; only the CONNECT (and the CONNACK reserved byte)
+%% differ, and both are pinned in mqtt_frame / handle_connect.
+
+connect_mqtt31_is_accepted(_Config) ->
+    ok = boot(),
+    %% Anonymous 3.1 CONNECT -> CONNACK rc=0; PINGREQ/PINGRESP is 3.1.1-shaped.
+    {Conn, #connack{session_present = 0, return_code = 0}} =
+        mqtt_open_v31(#{client_id => <<"c31">>}),
+    #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt31_client_id_23_chars_is_accepted(_Config) ->
+    ok = boot(),
+    %% §2.2.2.6: the 1-23 character bound is inclusive, so 23 is accepted. The
+    %% count is in Unicode code points; plain ASCII makes bytes == characters.
+    Id = binary:copy(<<"a">>, 23),
+    {Conn, #connack{return_code = 0}} = mqtt_open_v31(#{client_id => Id}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt31_client_id_24_chars_is_refused_2(_Config) ->
+    ok = boot(),
+    %% One character over the bound: CONNACK rc=2 (Identifier Rejected), not a
+    %% silent drop.
+    Id = binary:copy(<<"a">>, 24),
+    {Conn, #connack{return_code = 2}} = mqtt_open_v31(#{client_id => Id}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt31_empty_client_id_is_refused_2(_Config) ->
+    ok = boot(),
+    %% The lower half of the 1-23 bound: an empty ClientID is refused rc=2 too.
+    {Conn, #connack{return_code = 2}} = mqtt_open_v31(#{client_id => <<>>}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt31_connack_reserved_byte_is_zero(_Config) ->
+    ok = boot(),
+    %% §2.4.2.3: the CONNACK first byte is the "Topic Name Compression Response"
+    %% in 3.1, a Reserved value, never Session Present. A persisted (clean=false)
+    %% session would set Session Present on a 3.1.1 reconnect; 3.1 must still
+    %% carry 0 in that byte even though the session resumes.
+    {A, _} = mqtt_open_v31(#{client_id => <<"c31r">>, clean => false}),
+    {ok, normal} = mqtt_close(A),
+    {Client, Pid} = mqtt_pair(),
+    ok = gen_tcp:send(Client,
+                      mqtt31_connect_bin(#{client_id => <<"c31r">>, clean => false})),
+    Bytes = connack_raw(Client),
+    %% byte 0: 0x20 (CONNACK), byte 1: 0x02 (remaining length),
+    %% byte 2: reserved / Session-Present, byte 3: return code.
+    ?assertEqual(16#20, binary:at(Bytes, 0)),
+    ?assertEqual(2, binary:at(Bytes, 1)),
+    ?assertEqual(0, binary:at(Bytes, 2)),
+    ?assertEqual(0, binary:at(Bytes, 3)),
+    ok = gen_tcp:close(Client),
+    _ = Pid,
+    ok.
+
+connect_mqtt31_username_without_password_is_refused_4(_Config) ->
+    ok = boot(),
+    %% The flag pair 10 parses (MQ-16 §3.5 / §2.2.2.7): the broker reaches
+    %% authentication and, the named user requiring a password, refuses rc=4 --
+    %% a real CONNACK, not a silent drop.
+    {Conn, #connack{return_code = 4}} =
+        mqtt_open_v31(#{client_id => <<"c31up">>, username => <<"alice">>}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt31_missing_credentials_are_anonymous(_Config) ->
+    ok = boot(),
+    %% §2.2.2.7/8: both credential flags set but the strings simply absent
+    %% (Remaining Length ends at the ClientID) -- the absent strings mean
+    %% anonymous, so this CONNECTs with rc=0 rather than being truncated.
+    {Client, Pid} = mqtt_pair(),
+    Body = <<0, 6, "MQIsdp", 3, 2#11000010, 0, 60, 0, 5, "c31an">>,
+    ok = gen_tcp:send(Client, <<16#10, (byte_size(Body)), Body/binary>>),
+    #connack{return_code = 0} = mqtt_recv(Client),
+    ok = gen_tcp:close(Client),
+    _ = Pid,
+    ok.
+
+connect_mqtt31_pubsub_roundtrip(_Config) ->
+    ok = boot(),
+    {Conn, _} = mqtt_open_v31(#{client_id => <<"c31p">>}),
+    %% QoS 0: subscribe, publish, receive the loopback copy.
+    0 = sub(Conn, 1, <<"rt/#">>, 0),
+    ok = mqtt_publish(Conn, undefined, <<"rt/a">>, <<"zero">>, 0),
+    {Pub0, _} = recv_publish(csock(Conn)),
+    #publish{qos = 0, dup = 0, retain = 0, topic = <<"rt/a">>,
+             payload = <<"zero">>} = Pub0,
+    %% QoS 1: the same path, this time earning a PUBACK and a durable delivery.
+    1 = sub(Conn, 2, <<"rt/#">>, 1),
+    #puback{packet_id = 7} = pub(Conn, 7, <<"rt/a">>, <<"one">>, 1),
+    {Pub1, _} = recv_publish(csock(Conn)),
+    #publish{qos = 1, dup = 0, retain = 0, topic = <<"rt/a">>,
+             payload = <<"one">>} = Pub1,
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+connect_mqtt31_will_is_published_on_abnormal_disconnect(_Config) ->
+    ok = boot(),
+    {Watcher, _} = mqtt_open_v31(#{client_id => <<"w31">>}),
+    1 = sub(Watcher, 1, <<"will31/#">>, 1),
+    %% A 3.1 Will (a UTF-8 string, §2.2.2.6); a transport death -- not a
+    %% DISCONNECT -- must fire it.
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v31(#{client_id => <<"c31w">>, will_topic => <<"will31/c">>,
+                        will_payload => <<"bye31">>, will_qos => 1}),
+    {ok, normal} = mqtt_close(Conn),
+    {Pub, _} = recv_publish(csock(Watcher)),
+    #publish{qos = 1, retain = 0, topic = <<"will31/c">>,
+             payload = <<"bye31">>} = Pub,
+    ok = mqtt_puback(Watcher, Pub#publish.packet_id),
+    {ok, normal} = mqtt_close(Watcher),
+    ok.
+
+connect_mqtt31_auth_failure_is_refused_4(_Config) ->
+    ok = boot(),
+    %% Wrong password for a known user: rc=4, the same non-distinguishing code
+    %% 3.1.1 uses.
+    {Conn, #connack{return_code = 4}} =
+        mqtt_open_v31(#{client_id => <<"c31bad">>, username => <<"alice">>,
+                        password => <<"wrong">>}),
     {ok, normal} = mqtt_close(Conn),
     ok.
 
@@ -2710,6 +2850,19 @@ wait_inflight(ClientId, Pred, Budget) ->
 %% one that asserts its packet id.
 recv_publish(Client) ->
     recv_publish(Client, []).
+
+%% Accumulate >= 4 bytes of a CONNACK for the MQ-16 reserved-byte assertion:
+%% 0x20 (type), 0x02 (remaining length), then the reserved/Session-Present byte
+%% and the return code. The frame is written atomically on this box, but loop so
+%% a split delivery cannot flake the byte offsets.
+connack_raw(Client) -> connack_raw(Client, <<>>).
+connack_raw(_Client, Acc) when byte_size(Acc) >= 4 ->
+    Acc;
+connack_raw(Client, Acc) ->
+    case gen_tcp:recv(Client, 0, 5000) of
+        {ok, Data} -> connack_raw(Client, <<Acc/binary, Data/binary>>);
+        {error, R} -> exit({mqtt_connack_closed, R})
+    end.
 
 recv_publish(Client, Seen) ->
     case mqtt_recv(Client) of

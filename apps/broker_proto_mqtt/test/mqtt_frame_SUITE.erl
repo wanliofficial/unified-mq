@@ -47,6 +47,12 @@ all() ->
      connect_will_qos_two_roundtrip,
      connect_reserved_bit_rejected,
      connect_username_without_password_rejected,
+     connect_mqtt31_roundtrip,
+     connect_mqtt31_version_mismatch_rejected,
+     connect_mqtt31_will_is_a_utf8_string,
+     connect_mqtt31_username_without_password,
+     connect_mqtt31_missing_credentials_are_tolerated,
+     connect_mqtt31_password_without_username_rejected,
      utf8_rejections,
      truncated_frames_never_produce_ok,
      fixed_header_flag_rejections,
@@ -329,16 +335,80 @@ connect_reserved_bit_rejected(_Config) ->
     ok.
 
 connect_username_without_password_rejected(_Config) ->
-    %% The record cannot represent "username only" (the pair is a package on
-    %% the wire as decoded): rejected, not silently dropped.
+    %% MQTT-3.1.2-22 / 5.0: a User Name without a Password is LEGAL. The record
+    %% represents it faithfully (password = undefined); this is the §3.5 fix --
+    %% the old behaviour rejected it, which was over-strict. Renamed/kept name
+    %% for the registration, but now asserts acceptance.
     Body = <<0, 4, "MQTT", 4, 2#10000010, 0, 60, 0, 2, "mo", 0, 2, "al">>,
-    {error, {malformed_packet, username_without_password}} =
+    {ok, #connect{username = <<"al">>, password = undefined}, <<>>} =
         mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
+    %% Password without a User Name is still invalid.
+    Body2 = <<0, 4, "MQTT", 4, 2#01000010, 0, 60, 0, 2, "mo", 0, 3, "pwd">>,
+    {error, {malformed_packet, password_without_username}} =
+        mqtt_frame:decode(<<16#10, (byte_size(Body2)), Body2/binary>>),
     %% Both flags set round-trips through the record.
-    Body2 = <<0, 4, "MQTT", 4, 2#11000010, 0, 60, 0, 2, "mo",
+    Body3 = <<0, 4, "MQTT", 4, 2#11000010, 0, 60, 0, 2, "mo",
               0, 2, "al", 0, 3, "pwd">>,
     {ok, #connect{username = <<"al">>, password = <<"pwd">>}, <<>>} =
-        mqtt_frame:decode(<<16#10, (byte_size(Body2)), Body2/binary>>),
+        mqtt_frame:decode(<<16#10, (byte_size(Body3)), Body3/binary>>),
+    ok.
+
+%% MQTT 3.1 (MQ-16) codec: protocol name "MQIsdp", level 3.
+connect_mqtt31_roundtrip(_Config) ->
+    Body = <<0, 6, "MQIsdp", 3, 2#00000010, 0, 60, 0, 1, "c">>,
+    {ok, #connect{proto_level = 3, client_id = <<"c">>, clean_session = 1,
+                  keep_alive = 60}, <<>>} =
+        mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
+    ok.
+
+connect_mqtt31_version_mismatch_rejected(_Config) ->
+    %% Name and level must be paired: "MQIsdp" only with level 3; "MQTT" with 3
+    %% is not 3.1; a wrong-length name is an unsupported protocol.
+    ?assertEqual({error, {unsupported_protocol_version, 2}},
+                 mqtt31_decode(<<"MQIsdp">>, 2)),
+    ?assertEqual({error, {unsupported_protocol_version, 4}},
+                 mqtt31_decode(<<"MQIsdp">>, 4)),
+    ?assertEqual({error, {unsupported_protocol_version, 3}},
+                 mqtt31_decode(<<"MQTT">>, 3)),
+    ?assertEqual({error, {unsupported_protocol, <<"MQT">>}},
+                 mqtt31_decode(<<"MQT">>, 3)),
+    ok.
+
+connect_mqtt31_will_is_a_utf8_string(_Config) ->
+    %% §2.2.2.6: the 3.1 Will Message is a UTF-8 string and may be zero-length;
+    %% invalid UTF-8 is malformed.
+    ?assertMatch({ok, #connect{will_topic = <<"wt">>, will_payload = <<"hello">>}, _},
+                 mqtt31_will_decode(<<"hello">>)),
+    ?assertMatch({ok, #connect{will_topic = <<"wt">>, will_payload = <<>>}, _},
+                 mqtt31_will_decode(<<>>)),
+    ?assertEqual({error, {malformed_packet, invalid_utf8}},
+                 mqtt31_will_decode(<<237, 160, 128>>)),
+    ok.
+
+connect_mqtt31_username_without_password(_Config) ->
+    %% §2.2.2.7 Remaining-Length precedence does not forbid username-only here;
+    %% the flag pair 10 reads the username and leaves the password undefined.
+    Payload = <<0, 1, "c", 0, 1, "u">>,
+    Body = <<0, 6, "MQIsdp", 3, 2#10000010, 0, 60, Payload/binary>>,
+    {ok, #connect{username = <<"u">>, password = undefined}, <<>>} =
+        mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
+    ok.
+
+connect_mqtt31_missing_credentials_are_tolerated(_Config) ->
+    %% §2.2.2.7/8: both flags set but Remaining Length ends right after the
+    %% ClientID -- the strings are simply absent (anonymous), not truncated.
+    Payload = <<0, 1, "c">>,
+    Body = <<0, 6, "MQIsdp", 3, 2#11000010, 0, 60, Payload/binary>>,
+    {ok, #connect{username = undefined, password = undefined}, <<>>} =
+        mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
+    ok.
+
+connect_mqtt31_password_without_username_rejected(_Config) ->
+    %% §2.2.2.8: password flag without the user name flag is invalid.
+    Payload = <<0, 1, "c", 0, 3, "pwd">>,
+    Body = <<0, 6, "MQIsdp", 3, 2#01000010, 0, 60, Payload/binary>>,
+    {error, {malformed_packet, password_without_username}} =
+        mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>),
     ok.
 
 utf8_rejections(_Config) ->
@@ -524,7 +594,7 @@ prop_encode_rejects() ->
     ?FORALL(T, oneof([pub_pid_zero, pub_pid_undefined,
                       pub_empty_topic, pub_wildcard_topic,
                       sub_empty, suback_empty, unsub_empty,
-                      conn_asymmetric_creds, conn_will_split,
+                      conn_password_without_username, conn_will_split,
                       conn_clean_2, rl_too_big]),
             did_raise(illegal_frame(T))).
 
@@ -551,10 +621,12 @@ illegal_frame(suback_empty) ->
     fun() -> mqtt_frame:encode(#suback{packet_id = 1, return_codes = []}) end;
 illegal_frame(unsub_empty) ->
     fun() -> mqtt_frame:encode(#unsubscribe{packet_id = 1, topics = []}) end;
-illegal_frame(conn_asymmetric_creds) ->
+illegal_frame(conn_password_without_username) ->
+    %% §3.5 made username-without-password LEGAL, so the only illegal credential
+    %% shape left is a password with no user name (MQTT-3.1.2-22).
     fun() -> mqtt_frame:encode(#connect{client_id = <<"c">>,
-                                        username = <<"u">>,
-                                        password = undefined}) end;
+                                        username = undefined,
+                                        password = <<"p">>}) end;
 illegal_frame(conn_will_split) ->
     fun() -> mqtt_frame:encode(#connect{client_id = <<"c">>, will_flag = 1,
                                         will_topic = <<"w">>,
@@ -707,3 +779,17 @@ unhex(Hex) ->
     Cleaned = binary:replace(Hex, <<"0x">>, <<>>, [global]),
     Tokens = binary:split(Cleaned, [<<" ">>, <<"\n">>], [global, trim_all]),
     iolist_to_binary([binary:decode_hex(T) || T <- Tokens, T =/= <<>>]).
+
+%% MQTT 3.1 (MQ-16) CONNECT test builders: a bare ClientID-only frame naming the
+%% given protocol (Name) and level, with clean-session set so it parses far
+%% enough to surface the version/protocol decision.
+mqtt31_decode(Name, Level) ->
+    Body = <<(byte_size(Name)):16, Name/binary, Level, 2, 0, 60, 0, 0>>,
+    mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>).
+
+%% A 3.1 CONNECT with a Will (clean-session + will-flag, QoS 0, no retain) whose
+%% Will Message is the given UTF-8 string.
+mqtt31_will_decode(WillMsg) ->
+    Payload = <<0, 1, "c", 0, 2, "wt", (byte_size(WillMsg)):16, WillMsg/binary>>,
+    Body = <<0, 6, "MQIsdp", 3, 2#00000110, 0, 60, Payload/binary>>,
+    mqtt_frame:decode(<<16#10, (byte_size(Body)), Body/binary>>).

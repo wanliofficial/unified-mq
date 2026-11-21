@@ -15,7 +15,7 @@
 来源：`github.com/mbilling/fss-mqtt-broker`（mqttd）
 
 **协议与核心语义**
-- MQTT **3.1.1 与 5.0** 双协议支持。
+- MQTT **3.1 / 3.1.1 / 5.0** 三协议支持（3.1 即 `MQIsdp`/Level 3，见 §4.6 MQ-16）。
 - **Durable QoS 1 默认复制**：ack 后做 fsync + 另一节点 quorum 副本；2,000,000 msg/s 零丢失（12 节点）。
 - 确认的 QoS 1/2 消息**可幸存节点丢失**（SIGKILL 与网络分区 harness 证明）。
 
@@ -77,7 +77,7 @@
 
 | 维度 | 当前状态 |
 |---|---|
-| 协议版本 | MQTT 3.1.1 + **5.0 子集**（S2.5/ADR-017） |
+| 协议版本 | MQTT 3.1 + 3.1.1 + **5.0 子集**（3.1 即 `MQIsdp`/Level 3，MQ-16；S2.5/ADR-017） |
 | QoS | 0/1/2 全实现；QoS2 **跨崩溃至少一次**（非 exactly-once，ADR-012/018） |
 | Retain | 独立 `broker_retain`，持久化 + 订阅补发 + 零长度清除 |
 | Will | 异常发布已实现 |
@@ -165,6 +165,7 @@
 - [x] **超大出站消息丢弃（MQ-12）**：超过客户端 Maximum Packet Size 的 PUBLISH 直接丢弃并计数，不拆包、不改错误码。这是线格式边界的刻意处理，已选语义+测试覆盖。
 - [x] **Will 不落盘（MQ-13）**：遗嘱只在连接进程内存里，broker 重启不补发；mosquitto 默认亦如此。要「进程被 kill 也发遗嘱」则需持久化，当前未做，已选语义+测试覆盖。
 - [x] **离线追赶无优先级（MQ-14）**：积压与新消息按 offset 混在同一序列，深度越大首条越慢；无独立离线队列。这是当前排序语义，已选语义+测试覆盖。
+- [x] **MQTT 3.1（Protocol Level 3 / `MQIsdp`，MQ-16）**：broker 接受 3.1 客户端的 CONNECT，并在 3.1 自己定义的语义上工作——ClientID 1–23（按 Unicode 码点计，超出回 CONNACK rc=2）、Will Message 为 UTF-8 字符串（零长度合法、非 ASCII 的合法 UTF-8 照常存储/发布）、凭据按 Remaining-Length 优先（flag 置位但字符串缺失视为匿名）、password-without-username 仍拒绝。3.1 与 3.1.1 在 CONNECT 之后的报文形状逐字节相同（CONNACK 首字节对 3.1 恒 0），故 WS/QUIC 入口自动继承。顺带按 MQTT-3.1.2-22 放宽 3.1.1/5.0 的 username-without-password（原先过严拒绝）。设计见 `docs/superpowers/specs/2026-11-21-mqtt31-design.md`。
 - [ ] **P2 背压（慢消费者隔离，MQ-11）**：在上方「停投」语义之上再引入流控/隔离；两项目有此能力。待办：评估 per-subscriber 背压。
 
 ### 4.7 测试资产（已在 `protocol-conformance-validation.md` 立项）
@@ -176,7 +177,7 @@
 
 ## 5. 对齐项（本仓库已与两项目一致，记入备查）
 
-- [x] MQTT 3.1.1 + 5.0 双协议（robustmq 还含 3.1，本仓库 3.1.1 已覆盖 3.1 语义）。
+- [x] MQTT 3.1 + 3.1.1 + 5.0（robustmq 还含 3.1；本仓库 3.1 由 MQ-16 落地，3.1 与 3.1.1 在 CONNECT 后报文相同，见 §4.6）。
 - [x] QoS 0/1/2、Retain、Will、会话持久化、通配符、Shared 订阅（`$share`）。
 - [x] 统一身份表 + ACL（first-match、deny 无匹配）+ 租户隔离先于 ACL。
 - [x] 多协议统一消息模型（本仓库 CloudEvents 层 / robustmq unified storage 同方向）。

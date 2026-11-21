@@ -86,7 +86,7 @@
              reported_inflight = 0 :: non_neg_integer(),
              %% S2.5 (ADR-017): the negotiated MQTT level. `undefined' before
              %% CONNECT (decode/1's `auto' is legal for exactly one frame).
-             proto_level = undefined :: undefined | 4 | 5,
+             proto_level = undefined :: undefined | 3 | 4 | 5,
              %% MQ-04: the Topic Alias Maximum the broker ANNOUNCED in this
              %% connection's CONNACK (env `mqtt_topic_alias_maximum'). It is the
              %% upper bound for an INBOUND alias the client may send (§3.3.2.3.4
@@ -376,6 +376,10 @@ event(Other, StateName, D) ->
 %% legal pre-CONNECT frame carries its own level), then the negotiated one.
 decode_vsn(#st{proto_level = 5}) -> 5;
 decode_vsn(#st{proto_level = 4}) -> 4;
+%% MQ-16: MQTT 3.1 shares 3.1.1's post-CONNECT frame shape byte-for-byte, so a
+%% settled 3.1 connection decodes exactly like 3.1.1 (the only 3.1-specific
+%% bytes are inside CONNECT, which carries its own protocol name/level).
+decode_vsn(#st{proto_level = 3}) -> 4;
 decode_vsn(_) -> auto.
 
 %%%_* TCP framing ---------------------------------------------------------------
@@ -462,9 +466,25 @@ handle_connect(#connect{client_id = <<>>, proto_level = Level}, D0) ->
     log(warning, "identifier rejected (empty client_id)", []),
     refuse(2, D0#st{proto_level = Level});
 handle_connect(#connect{proto_level = Level} = C, D0) ->
-    %% S2.5 (ADR-017): the negotiated version and the CONNECT-level properties
-    %% become connection state before authentication, so a v5 refusal is framed
-    %% the way that client parses CONNACK.
+    %% MQ-16 (§2.2.2.6): MQTT 3.1 requires a ClientID of 1-23 characters, counted
+    %% in Unicode code points (the spec says "characters" and the codec already
+    %% guarantees valid UTF-8). Over 23 is rejected with CONNACK rc=2 rather than
+    %% a silent drop. The empty case (the 1-23 lower bound) is handled by the
+    %% clause above; 3.1.1/5.0 have no such limit, so the guard is a no-op for
+    %% them.
+    case Level =:= 3 andalso
+         length(unicode:characters_to_list(C#connect.client_id)) > 23 of
+        true ->
+            log(warning, "identifier rejected (MQTT 3.1 client_id > 23 characters)", []),
+            refuse(2, D0#st{proto_level = 3});
+        false ->
+            connect_body(C, D0)
+    end.
+
+%% The shared CONNECT tail (version negotiation already done): the negotiated
+%% version and CONNECT-level properties become connection state before
+%% authentication, so a v5 refusal is framed the way that client parses CONNACK.
+connect_body(#connect{proto_level = Level} = C, D0) ->
     Props = C#connect.props,
     D0a = D0#st{client_id = C#connect.client_id, proto_level = Level,
                 session_expiry = maps:get(session_expiry_interval, Props, 0),
@@ -2727,7 +2747,15 @@ connack_bin(SP, RC, D) ->
     Props = maps:merge(maps:merge(connack_capability_props(RC, D),
                                   AliasProps),
                         ResponseInfoProps),
-    enc(#connack{session_present = SP, return_code = RC, props = Props}, D).
+    %% MQ-16 (§2.4.2.3): the CONNACK first byte is the "Topic Name Compression
+    %% Response" in 3.1, a Reserved value that is not used -- Session Present is
+    %% a 3.1.1-only concept. A 3.1 client never sees bit 0 set, so pin it to 0
+    %% even for a resumed persistent session (which 3.1 cannot observe).
+    SP1 = case D#st.proto_level of
+              3 -> 0;
+              _ -> SP
+          end,
+    enc(#connack{session_present = SP1, return_code = RC, props = Props}, D).
 
 suback_bin(Pid, Codes, D) ->
     enc(#suback{packet_id = Pid, return_codes = Codes}, D).
@@ -2822,6 +2850,8 @@ is_position_entry(_) -> false.
 %% once by CONNECT. Before that point nothing is sent except a refusal, which
 %% carries its own literal bytes.
 vsn(#st{proto_level = 5}) -> 5;
+%% MQ-16: MQTT 3.1 encodes outbound frames identically to 3.1.1.
+vsn(#st{proto_level = 3}) -> 4;
 vsn(_) -> 4.
 
 enc(Frame, D) ->

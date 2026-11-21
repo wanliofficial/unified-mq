@@ -1,5 +1,5 @@
 {application, broker_proto_mqtt, [
-    {description, "MQTT 3.1.1 adapter: frame codec, connection FSM, message construction"},
+    {description, "MQTT 3.1/3.1.1 adapter: frame codec, connection FSM, message construction"},
     {vsn, "0.1.0"},
     {registered, [broker_proto_mqtt_sup, mqtt_conn_sup]},
     {mod, {broker_proto_mqtt_app, []}},

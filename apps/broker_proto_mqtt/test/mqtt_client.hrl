@@ -245,3 +245,53 @@ mqtt_raw_publish_qos3(Topic, Payload) ->
 mqtt_raw_publish_v5_empty_topic(Payload) ->
     Body = <<0:16, 0, Payload/binary>>,
     <<16#30, (byte_size(Body)), Body/binary>>.
+
+%% MQ-16: raw MQTT 3.1 ("MQIsdp", level 3) CONNECT bytes from knobs. The Will
+%% Message is a UTF-8 string (§2.2.2.6) and credentials follow the 3.1 flags.
+mqtt31_connect_bin(Knobs) ->
+    ClientId = maps:get(client_id, Knobs),
+    Clean = case maps:get(clean, Knobs, true) of true -> 2#00000010; false -> 0 end,
+    WillTopic = maps:get(will_topic, Knobs, undefined),
+    WillQoS = maps:get(will_qos, Knobs, 0),
+    {WillBit, WillTail} = case WillTopic of
+                              undefined -> {0, <<>>};
+                          _ ->
+                              WP = maps:get(will_payload, Knobs, <<>>),
+                              %% §2.2.2.3: Will QoS lives in bits 4-3 of the flags.
+                              {2#00000100 bor ((WillQoS band 3) bsl 3),
+                               <<(byte_size(WillTopic)):16, WillTopic/binary,
+                                 (byte_size(WP)):16, WP/binary>>}
+                          end,
+    User = maps:get(username, Knobs, undefined),
+    Pass = maps:get(password, Knobs, undefined),
+    {CredBit, CredTail} = mqtt31_creds(User, Pass),
+    Flags = Clean bor WillBit bor CredBit,
+    Body = <<0, 6, "MQIsdp", 3, Flags, (maps:get(keep_alive, Knobs, 0)):16,
+             (byte_size(ClientId)):16, ClientId/binary,
+             WillTail/binary, CredTail/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
+mqtt31_creds(undefined, undefined) -> {0, <<>>};
+mqtt31_creds(U, undefined) -> {2#10000000, <<(byte_size(U)):16, U/binary>>};
+mqtt31_creds(U, P) ->
+    {2#11000000, <<(byte_size(U)):16, U/binary, (byte_size(P)):16, P/binary>>}.
+
+%% Open a 3.1 connection: send the raw CONNECT, read the CONNACK (decoded as
+%% 3.1.1, which is identical post-CONNECT).
+mqtt_open_v31(Knobs) ->
+    {Client, Pid} = mqtt_pair(),
+    ok = gen_tcp:send(Client, mqtt31_connect_bin(Knobs)),
+    Connack = mqtt_recv(Client),
+    {#{sock => Client, pid => Pid}, Connack}.
+
+%% 3.1 post-CONNECT frames encode as 3.1.1 (encode/1).
+mqtt_send_v31(#{sock := Client}, Frame) ->
+    ok = gen_tcp:send(Client, mqtt_frame:encode(Frame)).
+
+%% Raw bytes off the socket (no decode), for asserting the CONNACK first byte.
+mqtt_recv_raw(Client) -> mqtt_recv_raw(Client, 5000).
+mqtt_recv_raw(Client, Timeout) ->
+    case gen_tcp:recv(Client, 0, Timeout) of
+        {ok, Data} -> Data;
+        {error, R} -> exit({mqtt_recv_closed, R})
+    end.
