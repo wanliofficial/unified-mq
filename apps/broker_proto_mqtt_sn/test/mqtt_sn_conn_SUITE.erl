@@ -44,6 +44,9 @@ all() ->
      unsubscribe_stops_delivery,
      retained_publish_is_replayed_on_subscribe,
      will_is_published_when_the_session_dies,
+     will_delay_zero_publishes_immediately,
+     will_delay_defers_the_publish,
+     will_delay_cancelled_by_reconnect,
      takeover_closes_the_old_session_without_a_will,
      sleep_then_pingreq_wakes_and_delivers_the_backlog,
      qos_minus1_publishes_without_a_connection,
@@ -285,6 +288,19 @@ connect_with_will(S, Port, ClientId, Topic, Payload) ->
                     protocol_id => 1, duration => 60, client_id => ClientId}),
     #{type := willtopicreq} = expect(S, willtopicreq),
     send(S, Port, #{type => willtopic, qos => 0, retain => false, topic => Topic}),
+    #{type := willmsgreq} = expect(S, willmsgreq),
+    send(S, Port, #{type => willmsg, payload => Payload}),
+    #{type := connack, return_code := 0} = expect(S, connack),
+    ok.
+
+%% Same as connect_with_will/5 but with a Will Delay Interval (seconds).
+connect_with_will_delay(S, Port, ClientId, Topic, Payload, DelayS) ->
+    send(S, Port, #{type => connect, will => true, clean_session => true,
+                    protocol_id => 1, duration => 60, will_delay => DelayS,
+                    client_id => ClientId}),
+    #{type := willtopicreq} = expect(S, willtopicreq),
+    send(S, Port, #{type => willtopic, qos => 0, retain => false,
+                    topic => Topic}),
     #{type := willmsgreq} = expect(S, willmsgreq),
     send(S, Port, #{type => willmsg, payload => Payload}),
     #{type := connack, return_code := 0} = expect(S, connack),
@@ -534,6 +550,63 @@ will_is_published_when_the_session_dies(Config) ->
     ok = gen_server:stop(ConnPid, boom, 1000),
     #{type := publish, payload := <<"byebye">>} = expect(Sub, publish),
     close(Sub),
+    close(W).
+
+will_delay_zero_publishes_immediately(Config) ->
+    Port = ?config(port, Config),
+    Sub = open(),
+    connect(Sub, Port, <<"sn-d0-sub">>),
+    _ = subscribe(Sub, Port, <<"sn/d0/t">>, 1),
+    Before = conn_pids(),
+    W = open(),
+    connect_with_will_delay(W, Port, <<"sn-d0-client">>, <<"sn/d0/t">>,
+                            <<"now">>, 0),
+    [ConnPid] = conn_pids() -- Before,
+    ok = gen_server:stop(ConnPid, boom, 1000),
+    %% delay=0: the Will fires at once, same as the no-delay path.
+    #{type := publish, payload := <<"now">>} = expect(Sub, publish),
+    close(Sub),
+    close(W).
+
+will_delay_defers_the_publish(Config) ->
+    Port = ?config(port, Config),
+    Sub = open(),
+    connect(Sub, Port, <<"sn-dd-sub">>),
+    _ = subscribe(Sub, Port, <<"sn/dd/t">>, 1),
+    Before = conn_pids(),
+    W = open(),
+    connect_with_will_delay(W, Port, <<"sn-dd-client">>, <<"sn/dd/t">>,
+                            <<"later">>, 2),
+    [ConnPid] = conn_pids() -- Before,
+    ok = gen_server:stop(ConnPid, boom, 1000),
+    %% The Will is deferred: NOTHING arrives within a window shorter than 2s.
+    refute(Sub, publish, 1000),
+    %% Now let it elapse; the Will arrives.
+    #{type := publish, payload := <<"later">>} = expect(Sub, publish),
+    close(Sub),
+    close(W).
+
+will_delay_cancelled_by_reconnect(Config) ->
+    Port = ?config(port, Config),
+    Sub = open(),
+    connect(Sub, Port, <<"sn-dc-sub">>),
+    _ = subscribe(Sub, Port, <<"sn/dc/t">>, 1),
+    Before = conn_pids(),
+    W = open(),
+    connect_with_will_delay(W, Port, <<"sn-dc-client">>, <<"sn/dc/t">>,
+                            <<"gone">>, 3),
+    [ConnPid] = conn_pids() -- Before,
+    %% Drop the will-owner abnormally; the deferred will is now registered.
+    ok = gen_server:stop(ConnPid, boom, 1000),
+    refute(Sub, publish, 500),
+    %% Reconnect the SAME client id within the window: cancels the deferred Will.
+    Again = open(),
+    connect(Again, Port, <<"sn-dc-client">>),
+    %% The window elapses; the cancelled Will never arrives.
+    timer:sleep(3200),
+    refute(Sub, publish, 500),
+    close(Sub),
+    close(Again),
     close(W).
 
 takeover_closes_the_old_session_without_a_will(Config) ->
