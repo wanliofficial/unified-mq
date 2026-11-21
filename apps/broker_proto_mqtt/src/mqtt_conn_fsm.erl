@@ -106,7 +106,7 @@
              auth_deadline = undefined :: undefined | integer(),
              %% MQ-05: the CONNECT that started the handshake, stashed so the
              %% attach tail (connect_success/2) can run after it completes.
-             auth_connect = undefined}).
+             auth_connect = undefined :: undefined | #connect{}}).
 
 %%%_* API ---------------------------------------------------------------------
 
