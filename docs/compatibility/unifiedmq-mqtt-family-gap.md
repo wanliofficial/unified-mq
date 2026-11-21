@@ -56,7 +56,7 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-05 | 已支持 | AUTH 增强认证 | AUTH 包（type 15，仅 v5）与 challenge/response：`broker_auth` 框架按 `mqtt_auth_methods` 派发到 `broker_auth_<name>`，内置 `plain` 方法做 nonce 绑定的用户名/密码校验并复用既有用户库；会话内 re-auth 成功回 AUTH `0x00`，失败回 DISCONNECT `0x9C`（2026-11-21 落地于 mq-auth-connack） | MQTT 5 AUTH；也没有 OIDC/JWKS |
 | MQ-06 | 已支持 | Request Response Information | CONNECT 带 `request_response_information=1` 且 broker 配了 `mqtt_response_information`（默认 undefined 关）时，成功 CONNACK 回填该值作为响应主题前缀；客户端据此拼 `Response Topic = RI ++ Correlation Data`。请求/响应经既有 topic 路由透传 `response_topic`/`correlation_data`，无特殊路由（2026-11-21 落地于 mq-request-response） | 这是 broker 分配响应主题命名空间的能力，不是消息字段透传 |
 | MQ-07 | 已支持 | CONNACK 能力回填 | v5 CONNACK 在连接成功（RC=0）时回填**四个**静态能力位：retain / wildcard / subscription-identifier / shared-subscription available 均为 1；**不发 `maximum_qos`**（§3.2.2.3.4 只允许 0/1，值 2 是 Protocol Error；缺省即表示最大 QoS 2，支持 QoS 2 靠省略表达，MQTT-3.2.2-9）；由 `mqtt_connack_props_v5` 开关控制（默认开）。Server Keep Alive、Assigned Client Identifier 仍不回（2026-11-21 落地于 mq-auth-connack，同日按规范修正 maximum_qos） | 不回不等于撒谎；空 ClientID 仍直接拒绝，不会分配一个 |
-| MQ-08 | 语义缺口 | QoS 2 跨崩溃 | 崩溃后允许重复，对外必须说至少一次。线协议和跨重连不重复是成立的 | 不是 exactly-once。这是设计，不是忘了写 |
+| MQ-08 | 语义缺口 | QoS 2 跨崩溃 | 崩溃后允许重复，对外明确「至少一次」而非 exactly-once；线协议和跨重连不重复已成立，对外说明已写入 `docs/mqtt-feature-comparison.md`（§3 状态表 + QoS 行 + 已知限制） | 不是 exactly-once。这是设计，不是忘了写 |
 | MQ-09 | 语义缺口 | 没有发布侧重试定时器 | 同一条连接对未确认消息只投一次。重发只发生在重连 | 规范允许发送方重试。慢客户端或丢 PUBACK 时，要断线才补 |
 | MQ-10 | 语义缺口 | in-flight 默认 100ms 才刷盘 | 崩溃可能让**不同消息**复用同一个 packet id。`inflight_flush_interval_ms=0` 可以把窗口压到最小 | 按 packet id 去重的客户端会误伤 |
 | MQ-11 | 语义缺口 | 只有停投，没有背压 | in-flight 默认 64，满了就停。不通知发布者，不踢慢消费者 | 生产上慢订阅者会拖住分区 |

@@ -83,7 +83,7 @@
 | Will | 异常发布已实现 |
 | 会话 | clean/persistent session、per-session 订阅+cursor+in-flight 跨连接持久化；离线追赶（无优先级、无独立队列） |
 | 通配符 | `+` / `#`（Annex A 校验） |
-| MQTT 5.0 特性 | session expiry、message expiry、reason codes、properties、user properties、`$share/{group}/{filter}` Shared 订阅、Maximum Packet Size 出站丢弃 |
+| MQTT 5.0 特性 | session expiry、message expiry、reason codes、properties、user properties、Subscription Identifier 透传（MQ-01）、Will Delay（MQ-02）、SUBSCRIBE 选项 no_local/retain_as_published/retain_handling（MQ-03）、Topic Alias（MQ-04，默认关闭）、AUTH 扩展认证（MQ-05，默认仅 `plain`）、Request Response Information（MQ-06，默认关闭）、CONNACK 能力回填（MQ-07）、`$share/{group}/{filter}` Shared 订阅、Maximum Packet Size 出站丢弃 |
 | 认证 | `broker_security` 统一身份表（user_pass / token），六协议共用；匿名可配；空 ClientID 拒绝 |
 | ACL | 有序 first-match，**规则列表无匹配即 deny**；默认值为 `allow`（legacy，可配为规则列表实现 deny-by-default） |
 | 租户隔离 | 认证身份绑定租户，租户隔离先于 ACL；事件属性永不改变身份/租户/目标 |
@@ -93,7 +93,7 @@
 | 跨协议 | CloudEvents 统一消息模型；逐协议 `ce-*` Binding（S7 结案） |
 | 测试 | 帧层 CT + 真实 paho/mosquitto 逐帧字节一致（T15）+ 崩溃恢复（T14） |
 
-**已知对外限制**（与两项目对照时即为差距）：无 topic alias、无 AUTH 扩展认证、subscription identifier 不透传、QoS2 非 exactly-once、无背压只有停投、无集群级共享订阅/桥接/规则引擎。
+**已知对外限制**（与两项目对照时即为差距）：MQTT 5 子集里 Subscription Identifier / Will Delay / SUBSCRIBE 选项 / Topic Alias / AUTH / Request Response / CONNACK 能力回填均已补齐（见 §4.6，多数默认关闭需配置启用）；QoS2 跨崩溃非 exactly-once（至少一次，ADR-012/018）、无背压只有停投、无集群级共享订阅/桥接/规则引擎。
 
 ---
 
@@ -151,11 +151,15 @@
 
 ### 4.6 协议语义补齐（MQTT 自身）
 
-- [ ] **P1 topic alias（MQTT 5.0）**：本仓库未实现；补编解码与映射。
-- [ ] **P1 AUTH 扩展认证（MQTT 5.0）**：本仓库未实现；与 §4.2 OIDC 关联。
-- [ ] **P2 subscription identifier 透传到投递帧**：当前 `mqtt_conn_fsm` 不透传；补 v5 语义。
-- [ ] **P0 QoS2 exactly-once 边界澄清**：本仓库明确「跨崩溃至少一次」（ADR-012）；与 fss 的「acked QoS1/2 survives node loss（集群副本）」语义不同（本仓库是单节点 WAL 保证，非集群副本）。待办：文档红线已就位，需补集群副本下的 exactly-once 承诺界定。
-- [ ] **P2 背压（慢消费者隔离）**：本仓库只有「停投」无背压；两项目有流控/隔离。待办：评估 per-subscriber 背压。
+- [x] **MQTT 5.0 Subscription Identifier 透传（MQ-01）**：SUBSCRIBE 写入 `sub_ids`，出站 PUBLISH 经 `matching_ids/3` 带进属性（§3.3.4）。
+- [x] **MQTT 5.0 Topic Alias（MQ-04）**：入站按 §3.3.2.3.4 校验+解析，出站按客户端 CONNECT 的 `topic_alias_maximum` 分配（默认关闭 `mqtt_topic_alias_maximum=0`）。
+- [x] **MQTT 5.0 Will Delay（MQ-02）**：`will_delay_interval` 生效，延迟>0 停靠 `mqtt_will_server`，重连取消。
+- [x] **MQTT 5.0 SUBSCRIBE 选项（MQ-03）**：`no_local` / `retain_as_published` / `retain_handling` 全部生效。
+- [x] **MQTT 5.0 AUTH 扩展认证（MQ-05）**：`broker_auth` 框架 + 内置 `plain`（nonce 绑定用户名/密码），支持 challenge/response 与会话中 re-auth；未引入新加密依赖。
+- [x] **MQTT 5.0 Request Response Information（MQ-06）**：CONNECT 带 `request_response_information=1` 且配了 `mqtt_response_information` 时，成功 CONNACK 回填响应主题前缀（默认关闭）。
+- [x] **MQTT 5.0 CONNACK 能力回填（MQ-07）**：v5 成功 CONNACK 回填保留/通配/订阅标识/共享订阅可用位；Maximum QoS 按 §3.2.2.3.4 省略（缺省即 QoS 2）。
+- [ ] **QoS2 exactly-once 边界（MQ-08）**：本仓库明确「跨崩溃至少一次」（ADR-012/018），与 fss 的「acked QoS1/2 survives node loss（集群副本）」不同——本仓库是单节点 WAL 保证，非集群副本。文档红线已就位（§3 状态表 + 本表 QoS 行）；剩余是把集群副本下的 exactly-once 承诺写清，属集群副本工作项，非 MQTT 协议缺口。
+- [ ] **P2 背压（慢消费者隔离，MQ-11）**：本仓库只有「停投」无背压；两项目有流控/隔离。待办：评估 per-subscriber 背压。
 
 ### 4.7 测试资产（已在 `protocol-conformance-validation.md` 立项）
 
