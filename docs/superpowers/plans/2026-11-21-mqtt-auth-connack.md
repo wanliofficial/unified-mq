@@ -113,7 +113,7 @@ v5_connack_capabilities_can_be_disabled(_Config) ->
 
 - [ ] **Step 2：跑测试确认失败**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=v5_connack_capabilities_are_exact`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=v5_connack_capabilities_are_exact`
 Expected: FAIL — 现 `connack_bin/3` 不填 props，`AckProps` 为 `#{}`，`?assertEqual(2, maps:get(...))` 报 key not found。
 
 - [ ] **Step 3：实现 `connack_bin/3` 能力位**
@@ -148,7 +148,7 @@ connack_bin(SP, RC, D) ->
 
 - [ ] **Step 4：跑测试确认通过**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=v5_connack_capabilities_are_exact --case=v5_connack_capabilities_can_be_disabled --case=connect_mqtt5_is_accepted`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=v5_connack_capabilities_are_exact --case=v5_connack_capabilities_can_be_disabled --case=connect_mqtt5_is_accepted`
 Expected: 3 PASS。
 
 - [ ] **Step 5：提交**
@@ -203,7 +203,7 @@ auth_roundtrip_v5(_Config) ->
 
 - [ ] **Step 2：跑测试确认失败**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_frame_SUITE --case=auth_roundtrip_v5`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_frame_SUITE.erl --case=auth_roundtrip_v5`
 Expected: FAIL — `#auth{}` 未定义（编译错误 undefined record）或 decode 返回 `bad_fixed_header_or_type`。
 
 - [ ] **Step 3：加 `#auth{}` 记录**
@@ -264,7 +264,7 @@ encode_v4(#auth{}) ->
 
 - [ ] **Step 6：跑测试确认通过**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_frame_SUITE --case=auth_roundtrip_v5 --case=streaming_decode_loop`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_frame_SUITE.erl --case=auth_roundtrip_v5 --case=streaming_decode_loop`
 Expected: PASS。
 
 - [ ] **Step 7：提交**
@@ -328,7 +328,7 @@ auth_plain_unknown_nonce(_Config) ->
 
 - [ ] **Step 2：跑测试确认失败**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=auth_plain_begin_continue_ok`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=auth_plain_begin_continue_ok`
 Expected: FAIL — `broker_auth` 模块不存在。
 
 - [ ] **Step 2b（实现前先读）：明确 plain 的 nonce 语义**
@@ -464,7 +464,7 @@ reauth(_Method, Ctx, Data) ->
 
 - [ ] **Step 5：跑测试确认通过**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=auth_plain_begin_continue_ok --case=auth_plain_wrong_password --case=auth_plain_unknown_nonce`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=auth_plain_begin_continue_ok --case=auth_plain_wrong_password --case=auth_plain_unknown_nonce`
 Expected: 3 PASS。
 
 - [ ] **Step 6：提交**
@@ -520,7 +520,7 @@ connect_without_auth_method_unchanged(_Config) ->
 
 - [ ] **Step 2：跑测试确认失败**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=connect_with_auth_method_gets_challenge`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=connect_with_auth_method_gets_challenge`
 Expected: FAIL — 现 `handle_connect` 忽略 `authentication_method` 走同步 authenticate（无 user/pass → anonymous → 直接 CONNACK），测试收到的第一帧是 CONNACK 而非 `#auth{}`，模式匹配失败。
 
 - [ ] **Step 3：加 `#st{}` auth 字段**
@@ -630,7 +630,7 @@ connect_success(#connect{clean_session = Clean0} = C, D1) ->
 
 - [ ] **Step 6：跑测试确认通过 + 回归**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=connect_with_auth_method_gets_challenge --case=connect_without_auth_method_unchanged --case=connect_anonymous_is_granted_with_session_present_zero --case=connect_with_bad_password_is_refused_4`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=connect_with_auth_method_gets_challenge --case=connect_without_auth_method_unchanged --case=connect_anonymous_is_granted_with_session_present_zero --case=connect_with_bad_password_is_refused_4`
 Expected: 4 PASS（含两条零回归）。
 
 - [ ] **Step 7：提交**
@@ -734,7 +734,7 @@ auth_reauth_failure_disconnects_0x9c(_Config) ->
 
 - [ ] **Step 2：跑测试确认失败**
 
-Run: `rm -rf _build/test/exers 2>/dev/null; rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=auth_challenge_continues_then_succeeds`
+Run: `rm -rf _build/test/exers 2>/dev/null; rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=auth_challenge_continues_then_succeeds`
 Expected: FAIL — `awaiting_auth` 状态不存在，FSM 收到 AUTH 帧时落 `event(Other, awaiting_connect, D)` 的 protocol_error 分支（`:313`）或直接 stop，客户端收不到预期 CONNACK。
 
 - [ ] **Step 3：加 `awaiting_auth` 状态入口 + 超时**
@@ -850,7 +850,7 @@ send_auth_continue(Method, Challenge, #st{proto_level = 5} = D) ->
 
 - [ ] **Step 6：跑测试确认通过**
 
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=auth_challenge_continues_then_succeeds --case=auth_wrong_password_is_not_authorized --case=auth_unknown_nonce_is_not_authorized --case=auth_reauth_success_returns_auth_success --case=auth_reauth_failure_disconnects_0x9c`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=auth_challenge_continues_then_succeeds --case=auth_wrong_password_is_not_authorized --case=auth_unknown_nonce_is_not_authorized --case=auth_reauth_success_returns_auth_success --case=auth_reauth_failure_disconnects_0x9c`
 Expected: 5 PASS。
 
 - [ ] **Step 7：AUTH 超时用例（可选但推荐）**
@@ -867,7 +867,7 @@ auth_timeout_disconnects(_Config) ->
     {ok, normal} = mqtt_close(Conn),
     ok.
 ```
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=broker_proto_mqtt:test/mqtt_conn_SUITE --case=auth_timeout_disconnects`
+Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl --case=auth_timeout_disconnects`
 Expected: PASS（`mqtt_close` 收到 DOWN）。
 
 - [ ] **Step 8：提交**
