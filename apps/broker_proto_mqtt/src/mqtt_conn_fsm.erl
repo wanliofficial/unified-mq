@@ -2675,7 +2675,7 @@ add_trace_headers(Props, Headers) when is_map(Headers) ->
 %% S2.5 direct builds. 3.1.1 keeps the historical two-byte PUBACK / three-byte
 %% SUBACK; v5 appends the reason code + zero properties so the client's v5
 %% parser sees the shape it expects.
-%% MQ-07 (spec §3.1): the five static capability bits a v5 CONNACK advertises.
+%% MQ-07 (spec §3.1): the four static capability bits a v5 CONNACK advertises.
 %% They are unconditionally true of this broker, so advertising them costs
 %% nothing and lets a compliant client stop asking. Gated on a config switch so
 %% an operator can retreat to "silent" without a code change. Advertised only on
@@ -2685,8 +2685,12 @@ add_trace_headers(Props, Headers) when is_map(Headers) ->
 connack_capability_props(0, #st{proto_level = 5} = D) ->
     case opt(mqtt_connack_props_v5, true, D) of
         true ->
-            #{maximum_qos => 2,
-              retain_available => 1,
+            %% No Maximum QoS here. §3.2.2.3.4 only permits a byte of 0 or 1 and
+            %% makes any other value a Protocol Error; an absent maximum already
+            %% means QoS 2 (MQTT-3.2.2-9), so supporting QoS 2 is advertised by
+            %% omission. The four `available' bits below are 0/1 with a default
+            %% of 1, so spelling out 1 is legal (just explicit).
+            #{retain_available => 1,
               wildcard_subscription_available => 1,
               subscription_identifier_available => 1,
               shared_subscription_available => 1};
@@ -2699,7 +2703,7 @@ connack_bin(SP, RC, D) ->
     %% (property 0x22) when the broker honours inbound aliases (> 0). 0 means the
     %% feature is off, so the property is absent and a client that uses an alias
     %% -- even one in range -- gets 0x94 (handle_publish).
-    %% MQ-07: the five static capability bits ride the same CONNACK on RC = 0.
+    %% MQ-07: the four static capability bits ride the same CONNACK on RC = 0.
     AliasProps = case vsn(D) of
                      5 when D#st.topic_alias_max > 0 ->
                          #{topic_alias_maximum => D#st.topic_alias_max};

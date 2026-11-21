@@ -5,7 +5,7 @@
 | Spec | [2026-11-21-mqtt-auth-connack-design.md](../specs/2026-11-21-mqtt-auth-connack-design.md)（已批准，已据真实代码修正） |
 | Worktree | `~/.local/share/opencode/worktree/10af50/mq-auth-connack`（分支 `mq-auth-connack`） |
 | 基线 | 全量 CT 1579 passed / 95 suites / 0 failed（OTP 29.1.2，2026-11-21） |
-| 特性 | MQ-05（AUTH 增强认证，challenge/response + 可插拔 method）、MQ-07（CONNACK 五项能力位） |
+| 特性 | MQ-05（AUTH 增强认证，challenge/response + 可插拔 method）、MQ-07（CONNACK 四项能力位） |
 
 ## 环境（每个命令都适用）
 
@@ -24,7 +24,7 @@ export PATH="$HOME/.local/bin:$PATH"   # rebar3
 
 - `#connack{}` 记录**已有** `props = #{}`：`apps/broker_proto_mqtt/include/mqtt_frame.hrl:34`。
 - CONNACK v5 编解码**已就绪**：`encode_v5(#connack{... props=Props})`（`mqtt_frame.erl:1067`）、`do_parse_body(2,0,...,5)`（`:150`）已编/解 props。`prop_bin/2`（`:1264` 起）已能编五个能力位 key。
-- 五个能力位属性 id（codec 已就绪）：`maximum_qos`=0x24、`retain_available`=0x25、`wildcard_subscription_available`=0x28、`subscription_identifier_available`=0x29、`shared_subscription_available`=0x2A。
+- 五个能力位属性 id（codec 已就绪）：`maximum_qos`=0x24、`retain_available`=0x25、`wildcard_subscription_available`=0x28、`subscription_identifier_available`=0x29、`shared_subscription_available`=0x2A。**`maximum_qos` 只编解码、不发送**（§3.2.2.3.4 只允许 0/1，缺省即 2）。
 - **MQ-07 唯一改动点**：`connack_bin/3`（`mqtt_conn_fsm.erl:2423`）恒 `enc(#connack{session_present=SP, return_code=RC}, D)`，需按 v5 填能力位。
 - `#connect{}` 已能解 `authentication_method`(0x15)/`authentication_data`(0x16)（`mqtt_frame.erl:762-763`）。
 - **无 AUTH 包**（control type 0x0F）：需新增 `#auth{}` 记录 + encode/decode。
@@ -34,7 +34,7 @@ export PATH="$HOME/.local/bin:$PATH"   # rebar3
 - `enc/2`（`:2516`）= `mqtt_frame:encode(Frame, vsn(D))`；`vsn/1`（`:2513`）按 `proto_level`。`opt/3`（`:2729`）读 opts map。
 - 测试用户表 `?USERS`（`mqtt_conn_SUITE.erl:39`）：`alice/pw`（tenant t1）、`guest/guest`（tenant t0）。`broker_security:authenticate/2` 比对 password 字段。
 - v5 测试助手：`mqtt_open_v5/1`（`mqtt_client.hrl:45`）、`mqtt_send_v5/2`、`mqtt_recv_v5/1`、`mqtt_pair/0`。
-- **现有断言会被 MQ-07 打破**：`connect_mqtt5_is_accepted`（`mqtt_conn_SUITE.er:361`）断言 `?assertEqual(#{}, AckProps)`——MQ-07 后 v5 CONNACK 带五个能力位，此断言必须改。
+- **现有断言会被 MQ-07 打破**：`connect_mqtt5_is_accepted`（`mqtt_conn_SUITE.er:361`）断言 `?assertEqual(#{}, AckProps)`——MQ-07 后 v5 CONNACK 带四个能力位，此断言必须改。
 
 ## 文件结构
 
@@ -55,9 +55,9 @@ export PATH="$HOME/.local/bin:$PATH"   # rebar3
 
 ---
 
-## Task 1 — MQ-07：CONNACK v5 五项能力位
+## Task 1 — MQ-07：CONNACK v5 能力位
 
-**目标**：v5 CONNACK 在 `mqtt_connack_props_v5`（默认 true）时携带 `maximum_qos=2` + 四个 `available=1`；3.1.1 字节完全不变（零回归）。无 codec 改动。
+**目标**：v5 CONNACK 在 `mqtt_connack_props_v5`（默认 true）时携带四个 `available=1`，**不发 `maximum_qos`**（§3.2.2.3.4：该属性只允许 0/1，缺省即 2，支持 QoS 2 靠省略表达）；3.1.1 字节完全不变（零回归）。无 codec 改动。
 
 **Files**
 - Modify: `apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl`（`connack_bin/3`，`:2423`）
@@ -78,25 +78,31 @@ export PATH="$HOME/.local/bin:$PATH"   # rebar3
 改为
 ```erlang
     %% MQ-07: a v5 CONNACK advertises the broker's static capabilities.
-    ?assertEqual(#{maximum_qos => 2,
-                  retain_available => 1,
+    %% Maximum QoS is absent: §3.2.2.3.4 only lets it carry 0 or 1, and an
+    %% absent value already means 2 (MQTT-3.2.2-9), which is what we support.
+    ?assertEqual(#{retain_available => 1,
                   wildcard_subscription_available => 1,
                   subscription_identifier_available => 1,
                   shared_subscription_available => 1}, AckProps),
+    ?assertNot(maps:is_key(maximum_qos, AckProps)),
 ```
 新增两个用例（放 `connect_mqtt5_is_accepted` 之后）：
 ```erlang
-%% MQ-07: the five capability bits are exactly the set, no more no less.
+%% MQ-07: the four capability bits that can be spelled out are exactly the set,
+%% no more no less. Maximum QoS is deliberately NOT among them: §3.2.2.3.4 only
+%% allows a byte of 0 or 1 and calls any other value a Protocol Error, while an
+%% absent Maximum QoS already means 2. A broker that supports QoS 2 therefore
+%% advertises it by omission (MQTT-3.2.2-9), never as `maximum_qos => 2`.
 v5_connack_capabilities_are_exact(_Config) ->
     ok = boot(),
     {Conn, #connack{return_code = 0, props = P}} =
         mqtt_open_v5(#{client_id => <<"v5cap">>, props => #{}}),
-    ?assertEqual(2, maps:get(maximum_qos, P)),
+    ?assertNot(maps:is_key(maximum_qos, P)),
     ?assertEqual(1, maps:get(retain_available, P)),
     ?assertEqual(1, maps:get(wildcard_subscription_available, P)),
     ?assertEqual(1, maps:get(subscription_identifier_available, P)),
     ?assertEqual(1, maps:get(shared_subscription_available, P)),
-    ?assertEqual(5, maps:size(P)),
+    ?assertEqual(4, maps:size(P)),
     {ok, normal} = mqtt_close(Conn),
     ok.
 
@@ -120,22 +126,21 @@ Expected: FAIL — 现 `connack_bin/3` 不填 props，`AckProps` 为 `#{}`，`?a
 
 在 `mqtt_conn_fsm.erl` 加一个私有构造器（放 `connack_bin/3` 上方）：
 ```erlang
-%% MQ-07 (spec §3.1): the five static capability bits a v5 CONNACK advertises.
-%% They are unconditionally true of this broker, so advertising them costs
-%% nothing and lets a compliant client stop asking. Gated on a config switch so
-%% an operator can retreat to "silent" without a code change. 3.1.1 never
-%% reaches here (vsn/1 = 4), so its CONNACK bytes are untouched.
-connack_capability_props(#st{proto_level = 5} = D) ->
+%% MQ-07 (spec §3.1): the four static capability bits a v5 CONNACK advertises.
+%% Gated on a config switch so an operator can retreat to "silent" without a
+%% code change. 3.1.1 never reaches here (vsn/1 = 4), so its CONNACK bytes are
+%% untouched. No Maximum QoS: §3.2.2.3.4 only permits 0 or 1 and an absent value
+%% already means QoS 2 (MQTT-3.2.2-9), so QoS 2 is advertised by omission.
+connack_capability_props(0, #st{proto_level = 5} = D) ->
     case opt(mqtt_connack_props_v5, true, D) of
         true ->
-            #{maximum_qos => 2,
-              retain_available => 1,
+            #{retain_available => 1,
               wildcard_subscription_available => 1,
               subscription_identifier_available => 1,
               shared_subscription_available => 1};
         _ -> #{}
     end;
-connack_capability_props(_) -> #{}.
+connack_capability_props(_, _) -> #{}.
 ```
 > `connack_bin/3` 已经持有 `#st{}`，所以直接把 D 传进来读全局开关，不用字面 `#st{}`。
 
@@ -932,7 +937,7 @@ Expected: `1579 + 新增`（本特性约 +13：MQ-07 两个 + AUTH codec 1 + pla
 
 在 `docs/compatibility/unifiedmq-mqtt-family-gap.md`：
 - §3 表 MQ-05 行（`:56`）：级别改「已支持」，「现在」列改为「AUTH 包 + challenge/response（`broker_auth` 框架 + `plain` method：nonce 绑定 username/password，复用现有用户库）；会话中 re-auth 成功回 AUTH 0x00、失败 DISCONNECT 0x9C」。
-- MQ-07 行（`:58`）：级别改「已支持」，「现在」列改为「v5 CONNACK 回填五项静态能力位（max_qos=2 + retain/wildcard/subid/shared available=1），`mqtt_connack_props_v5` 可关」。
+- MQ-07 行（`:58`）：级别改「已支持」，「现在」列改为「v5 CONNACK 回填四个静态能力位（retain/wildcard/subid/shared available=1；不发 `maximum_qos`，§3.2.2.3.4 只允许 0/1、缺省即 2），`mqtt_connack_props_v5` 可关」。
 - §7 状态表（`:143` 附近）：`Topic Alias / AUTH / Request-Response / CONNACK 能力` 行——把 AUTH / CONNACK 能力标「完成（MQ-05/07）」，Topic Alias / Request-Response 仍「未做」。
 - §8 结论（`:167`）：把 AUTH 增强认证（MQ-05）、CONNACK 能力回填（MQ-07）从「范围外、还没做」移到「已支持」；Topic Alias（MQ-04，在途）、Request Response（MQ-06）保留在列。
 - 日期：在改动处追加 `（2026-11-21 落地于 mq-auth-connack）` 形式的批注，历史实测记录正文不改。
@@ -974,3 +979,11 @@ Expected: merge 干净（本 worktree 只改 `mqtt_conn_fsm.erl`/`mqtt_frame.*`/
 - **类型一致**：`broker_auth:initiate/3`/`continue/3`/`reauth/3` 在 Task 3 定义、Task 4/5 调用，签名一致（`{ok, Principal, Ctx}` / `{continue, Challenge, AuthState}` / `{error, Reason}` / reauth `{ok, Ctx}`|`{error, Reason}`）。`initiate`（非 `begin`）因 `begin` 是 Erlang 保留字。
 - **无新依赖**：`broker_auth_plain` 只用 `erlang:unique_integer`/`monotonic_time`/`binary_to_term`/`broker_security:authenticate`——全是既有。
 - **已知风险**：`binary_to_term` 的 dialyzer unsafe 警告（Task 6 Step 3 有 fallback：换显式 decoder）；`#st{}` 加字段不影响既有构造（都有默认值）。
+
+---
+
+## 修订记录
+
+### 2026-11-21：Task 1 去掉 `maximum_qos`（§3.2.2.3.4 / MQTT-3.2.2-9）
+
+Task 1 最初按原稿发出 `maximum_qos => 2`。对照 OASIS MQTT-5.0 正式文本核对，确认这是 Protocol Error：该属性只允许 0 或 1，值 2 非法；缺省即最大 QoS 2，所以支持 QoS 2 的 broker 必须**省略**该属性（MQTT-3.2.2-9）。已删除该键，保留四个 `*_available => 1`；`v5_connack_capabilities_are_exact` 断言四个属性 + `maximum_qos` 缺席 + `maps:size(P)=:=4`，`connect_mqtt5_is_accepted` 同步；spec 文末 §8 有同样的修订记录。Task 1 的其它目标（RC=0 才回填、开关默认开、3.1.1 字节不变）不变。本修订不涉 AUTH（Task 2–6）。

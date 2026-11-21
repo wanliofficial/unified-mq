@@ -401,12 +401,14 @@ connect_mqtt5_is_accepted(_Config) ->
         mqtt_open_v5(#{client_id => <<"v5c">>, props => Props}),
     %% The static capability bits ride CONNACK; Topic Alias Maximum is absent
     %% here because the suite leaves mqtt_topic_alias_maximum at its default 0.
-    ?assertEqual(#{maximum_qos => 2,
-                  retain_available => 1,
+    %% Maximum QoS is absent too: §3.2.2.3.4 only lets it carry 0 or 1, and an
+    %% absent value already means 2 (MQTT-3.2.2-9), which is what we support.
+    ?assertEqual(#{retain_available => 1,
                   wildcard_subscription_available => 1,
                   subscription_identifier_available => 1,
                   shared_subscription_available => 1},
                  maps:without([topic_alias_maximum], AckProps)),
+    ?assertNot(maps:is_key(maximum_qos, AckProps)),
     #ping{kind = resp} = mqtt_ping(Conn),
     {ok, normal} = mqtt_close(Conn),
     ok.
@@ -663,17 +665,21 @@ v5_outbound_publish_uses_allocated_alias(_Config) ->
     {ok, normal} = mqtt_close(Pub),
     ok.
 
-%% MQ-07: the five capability bits are exactly the set, no more no less.
+%% MQ-07: the four capability bits that can be spelled out are exactly the set,
+%% no more no less. Maximum QoS is deliberately NOT among them: §3.2.2.3.4 only
+%% allows a byte of 0 or 1 and calls any other value a Protocol Error, while an
+%% absent Maximum QoS already means 2. A broker that supports QoS 2 therefore
+%% advertises it by omission (MQTT-3.2.2-9), never as `maximum_qos => 2`.
 v5_connack_capabilities_are_exact(_Config) ->
     ok = boot(),
     {Conn, #connack{return_code = 0, props = P}} =
         mqtt_open_v5(#{client_id => <<"v5cap">>, props => #{}}),
-    ?assertEqual(2, maps:get(maximum_qos, P)),
+    ?assertNot(maps:is_key(maximum_qos, P)),
     ?assertEqual(1, maps:get(retain_available, P)),
     ?assertEqual(1, maps:get(wildcard_subscription_available, P)),
     ?assertEqual(1, maps:get(subscription_identifier_available, P)),
     ?assertEqual(1, maps:get(shared_subscription_available, P)),
-    ?assertEqual(5, maps:size(P)),
+    ?assertEqual(4, maps:size(P)),
     {ok, normal} = mqtt_close(Conn),
     ok.
 

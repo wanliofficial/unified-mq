@@ -16,7 +16,9 @@
            %% challenge/response handshake deadline.
            {mqtt_auth_methods, [<<"plain">>]},
            {mqtt_auth_timeout_ms, 30000},
-           %% MQ-07: advertise the five static capability bits on a v5 CONNACK.
+           %% MQ-07: advertise the four static capability bits on a v5 CONNACK.
+           %% `maximum_qos' is deliberately omitted (§3.2.2.3.4 only allows 0/1;
+           %% absent means QoS 2, which is what we support).
            {mqtt_connack_props_v5, true},
            %% MQ-06: prefix handed back as response_information when a v5 CONNECT
            %% sets request_response_information. undefined = feature off (no
