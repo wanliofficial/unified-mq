@@ -87,6 +87,10 @@
              %% S2.5 (ADR-017): the negotiated MQTT level. `undefined' before
              %% CONNECT (decode/1's `auto' is legal for exactly one frame).
              proto_level = undefined :: undefined | 4 | 5,
+             %% MQ-04: the Topic Alias Maximum announced in this connection's
+             %% CONNACK (env `mqtt_topic_alias_maximum'). 0 = feature off; an
+             %% inbound alias is then a 0x94 violation.
+             topic_alias_max = 0 :: non_neg_integer(),
              session_expiry = 0 :: non_neg_integer(),   %% seconds, v5 only
              receive_maximum = 65535 :: pos_integer(),  %% peer's outbound window
              max_packet_size = undefined :: undefined | pos_integer(),
@@ -412,7 +416,8 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
     D0a = D0#st{client_id = C#connect.client_id, proto_level = Level,
                 session_expiry = maps:get(session_expiry_interval, Props, 0),
                 receive_maximum = maps:get(receive_maximum, Props, 65535),
-                max_packet_size = maps:get(maximum_packet_size, Props, undefined)},
+                max_packet_size = maps:get(maximum_packet_size, Props, undefined),
+                topic_alias_max = opt(mqtt_topic_alias_maximum, 0, D0)},
     %% S12-B (ADR-032 D7): the node-level admission gate, asked before any
     %% per-connection work so an over-capacity CONNECT costs a CONNACK and
     %% nothing else. It sits after `proto_level' is in state because the refusal
@@ -2421,7 +2426,16 @@ add_trace_headers(Props, Headers) when is_map(Headers) ->
 %% SUBACK; v5 appends the reason code + zero properties so the client's v5
 %% parser sees the shape it expects.
 connack_bin(SP, RC, D) ->
-    enc(#connack{session_present = SP, return_code = RC}, D).
+    %% MQ-04 (§3.2.2.3): a v5 CONNACK carries Topic Alias Maximum when the broker
+    %% honours aliases (> 0). 0 means the feature is off, so the property is
+    %% absent and a client that uses an alias anyway gets 0x94 (handle_publish).
+    Props = case vsn(D) of
+                5 when D#st.topic_alias_max > 0 ->
+                    #{topic_alias_maximum => D#st.topic_alias_max};
+                _ ->
+                    #{}
+            end,
+    enc(#connack{session_present = SP, return_code = RC, props = Props}, D).
 
 suback_bin(Pid, Codes, D) ->
     enc(#suback{packet_id = Pid, return_codes = Codes}, D).

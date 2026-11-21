@@ -48,6 +48,7 @@ all() ->
      connect_with_bad_password_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
+     v5_connack_announces_topic_alias_maximum,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
      connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
      v5_publish_properties_reach_the_subscriber,
@@ -361,6 +362,25 @@ connect_mqtt5_is_accepted(_Config) ->
     ?assertEqual(#{}, AckProps),
     #ping{kind = resp} = mqtt_ping(Conn),
     {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-04: CONNACK (v5) advertises the Topic Alias Maximum the broker will honor.
+%% 0 (default) means the feature is off and the property is absent, so a client
+%% that uses an alias anyway is rejected with 0x94 (zero regression for clients
+%% that never send an alias). A positive maximum announces the cap.
+v5_connack_announces_topic_alias_maximum(_Config) ->
+    ok = boot(),
+    %% Off by default: no property on the wire.
+    {Off, #connack{props = OffProps}} =
+        mqtt_open_v5(#{client_id => <<"taoff">>, props => #{}}),
+    ?assertNot(maps:is_key(topic_alias_maximum, OffProps)),
+    {ok, normal} = mqtt_close(Off),
+    %% On: the cap rides CONNACK.
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {On, #connack{props = OnProps}} =
+        mqtt_open_v5(#{client_id => <<"taon">>, props => #{}}),
+    ?assertEqual(10, maps:get(topic_alias_maximum, OnProps, undefined)),
+    {ok, normal} = mqtt_close(On),
     ok.
 
 connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
