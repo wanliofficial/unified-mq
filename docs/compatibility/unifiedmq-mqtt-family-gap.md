@@ -37,7 +37,7 @@ MQTT-SN **不走** 这台状态机。UDP 没有连接，报文也不是字节流
 - MQTT 5 里已经生效的：Session Expiry、Receive Maximum（只收窄出站窗口）、Maximum Packet Size、User Properties、Payload Format、Content Type、Message Expiry、Response Topic 与 Correlation Data 的存储并在投递时写回、v5 reason code、`$share/{group}/{filter}` 的单节点竞争消费。
 - 真实客户端字节级对照做过（T15）。`kill -9` 恢复做过（T14）。
 
-MQTT-SN 已实现规范里的 27 种报文、两种长度头、QoS −1/0/1/2、Retain、Will 四步握手与更新、predefined / normal / short 三种 topic id、休眠与换端口唤醒、SEARCHGW / ADVERTISE、keepalive 1.5× 探测和 2× 判死。
+MQTT-SN 已实现规范里的 27 种报文、两种长度头、QoS −1/0/1/2、Retain、Will 四步握手与更新（含 v1.2 §5.4.4 Will Delay Interval：异常断连延迟发布、窗口内重连取消）、predefined / normal / short 三种 topic id、休眠与换端口唤醒、SEARCHGW / ADVERTISE、keepalive 1.5× 探测和 2× 判死。
 
 MQTT-WS 已实现子协议 `mqtt` / `mqttv3.1` / `mqttv3.1.1`、任意 path、binary 帧、跨帧重组、单帧多报文、ping/pong、wss。
 
