@@ -48,7 +48,7 @@ all() ->
      connect_with_bad_password_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
-     v5_connack_announces_topic_alias_maximum,
+    v5_connack_announces_topic_alias_maximum,
      v5_topic_alias_zero_still_rejects,
      v5_publish_with_topic_name_and_alias_registers_it,
      v5_publish_with_empty_topic_and_known_alias,
@@ -56,8 +56,24 @@ all() ->
      v5_publish_with_empty_topic_and_no_alias_is_protocol_error,
      v5_publish_alias_survives_reconnect,
      v5_outbound_publish_uses_allocated_alias,
+     v5_connack_capabilities_are_exact,
+     v5_connack_capabilities_can_be_disabled,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
      connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
+     %% MQ-05: the enhanced-auth framework and its first method, `plain'.
+     auth_plain_begin_continue_ok,
+     auth_plain_wrong_password,
+     auth_plain_unknown_nonce,
+     %% MQ-05: a CONNECT naming a method is routed through the framework.
+     connect_with_auth_method_gets_challenge,
+     connect_without_auth_method_unchanged,
+     %% MQ-05: the full AUTH challenge/response state machine (gap MQ-05).
+     auth_challenge_continues_then_succeeds,
+     auth_wrong_password_is_not_authorized,
+     auth_unknown_nonce_is_not_authorized,
+     auth_reauth_success_returns_auth_success,
+     auth_reauth_failure_disconnects_0x9c,
+     auth_timeout_disconnects,
      v5_publish_properties_reach_the_subscriber,
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
@@ -188,6 +204,7 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_security, limits,
                              #{max_connections => infinity}),
     ok = application:set_env(broker_proto_mqtt, pull_page_limit, 32),
+    ok = application:set_env(broker_proto_mqtt, mqtt_connack_props_v5, true),
     ok = application:set_env(broker_proto_mqtt, max_inflight, 64),
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 1000),
     ok = application:set_env(broker_proto_mqtt, inflight_snapshot_ms, 20),
@@ -369,7 +386,14 @@ connect_mqtt5_is_accepted(_Config) ->
               user_properties => [{<<"who">>, <<"test">>}]},
     {Conn, #connack{session_present = 0, return_code = 0, props = AckProps}} =
         mqtt_open_v5(#{client_id => <<"v5c">>, props => Props}),
-    ?assertEqual(#{}, AckProps),
+    %% The static capability bits ride CONNACK; Topic Alias Maximum is absent
+    %% here because the suite leaves mqtt_topic_alias_maximum at its default 0.
+    ?assertEqual(#{maximum_qos => 2,
+                  retain_available => 1,
+                  wildcard_subscription_available => 1,
+                  subscription_identifier_available => 1,
+                  shared_subscription_available => 1},
+                 maps:without([topic_alias_maximum], AckProps)),
     #ping{kind = resp} = mqtt_ping(Conn),
     {ok, normal} = mqtt_close(Conn),
     ok.
@@ -550,6 +574,30 @@ v5_outbound_publish_uses_allocated_alias(_Config) ->
     {ok, normal} = mqtt_close(Pub),
     ok.
 
+%% MQ-07: the five capability bits are exactly the set, no more no less.
+v5_connack_capabilities_are_exact(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"v5cap">>, props => #{}}),
+    ?assertEqual(2, maps:get(maximum_qos, P)),
+    ?assertEqual(1, maps:get(retain_available, P)),
+    ?assertEqual(1, maps:get(wildcard_subscription_available, P)),
+    ?assertEqual(1, maps:get(subscription_identifier_available, P)),
+    ?assertEqual(1, maps:get(shared_subscription_available, P)),
+    ?assertEqual(5, maps:size(P)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-07: with the switch off, v5 CONNACK carries no capability props.
+v5_connack_capabilities_can_be_disabled(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_connack_props_v5, false),
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"v5nocap">>, props => #{}}),
+    ?assertEqual(#{}, P),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
 connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
     ok = boot(),
     %% ADR-017 §17.4: a level >= 5 this build does not know is answered in the
@@ -576,6 +624,137 @@ connect_mqtt5_with_empty_client_id_gets_the_v5_refusal(_Config) ->
     {ok, <<16#20, 3, 0, 16#85, 0>>} = gen_tcp:recv(Client, 5, 3000),
     ok = expect_closed(Client),
     {ok, normal} = expect_down(Monitor, Pid),
+    ok.
+
+%% broker_auth_plain: initiate issues a nonce-bound challenge; continue with the
+%% right password succeeds, wrong password fails. No new crypto dependency.
+auth_plain_begin_continue_ok(_Config) ->
+    ok = boot(),
+    Ctx = #{client_id => <<"c">>},
+    {continue, Challenge, AuthState} =
+        broker_auth:initiate(<<"plain">>, undefined, Ctx),
+    ?assert(is_binary(Challenge)),
+    Resp = term_to_binary({<<"alice">>, Challenge, <<"pw">>}),
+    {ok, <<"alice">>, _Ctx2} =
+        broker_auth:continue(<<"plain">>, AuthState, Resp),
+    ok.
+
+auth_plain_wrong_password(_Config) ->
+    ok = boot(),
+    {continue, Challenge, AuthState} =
+        broker_auth:initiate(<<"plain">>, undefined, #{}),
+    Resp = term_to_binary({<<"alice">>, Challenge, <<"wrong">>}),
+    {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
+    ok.
+
+auth_plain_unknown_nonce(_Config) ->
+    ok = boot(),
+    {continue, _Challenge, AuthState} =
+        broker_auth:initiate(<<"plain">>, undefined, #{}),
+    %% A response naming a nonce we never issued for this handshake.
+    Resp = term_to_binary({<<"alice">>, <<"bogus-nonce">>, <<"pw">>}),
+    {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
+    ok.
+
+%% A v5 CONNECT naming an auth method gets an AUTH 0x18 (Continue authentication)
+%% with the method + a binary challenge, instead of an immediate CONNACK.
+connect_with_auth_method_gets_challenge(_Config) ->
+    ok = boot(),
+    %% mqtt_open_v5 sends the CONNECT and returns the FIRST frame back. For a
+    %% method-named CONNECT that frame is the AUTH 0x18 challenge, not a CONNACK.
+    {Conn, #auth{reason_code = 16#18,
+                  props = #{authentication_method := <<"plain">>,
+                            authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authc">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ?assert(is_binary(Challenge)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A CONNECT without an auth method is unaffected: it still gets a CONNACK.
+connect_without_auth_method_unchanged(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"noauth">>, props => #{}}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A v5 CONNECT with an auth method: the challenge is answered, the handshake
+%% completes, and the session is live (can subscribe). Proves the attach tail ran.
+auth_challenge_continues_then_succeeds(_Config) ->
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18, props = #{authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authok">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => term_to_binary({<<"alice">>, Challenge, <<"pw">>})}}),
+    {ok, #connack{return_code = 0}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    ?assertMatch({ok, #{online := true}},
+                 broker_subscription:session(<<"authok">>)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% Wrong password at the challenge -> refused (0x86) at the CONNECT stage.
+auth_wrong_password_is_not_authorized(_Config) ->
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18, props = #{authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authbad">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => term_to_binary({<<"alice">>, Challenge, <<"wrong">>})}}),
+    {ok, #connack{return_code = 16#86}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A response naming a nonce we never issued -> refused (0x86).
+auth_unknown_nonce_is_not_authorized(_Config) ->
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18}} =
+        mqtt_open_v5(#{client_id => <<"authnonce">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => term_to_binary({<<"alice">>, <<"bogus">>, <<"pw">>})}}),
+    {ok, #connack{return_code = 16#86}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% In-session re-auth success -> AUTH 0x00 back.
+auth_reauth_success_returns_auth_success(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"reauthok">>, username => <<"alice">>,
+                      password => <<"pw">>}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 0,
+        props = #{authentication_method => <<"plain">>,
+                  authentication_data => term_to_binary({<<"alice">>, <<"pw">>})}}),
+    {ok, #auth{reason_code = 0}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% In-session re-auth failure -> DISCONNECT 0x9C.
+auth_reauth_failure_disconnects_0x9c(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"reauthbad">>, username => <<"alice">>,
+                      password => <<"pw">>}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 0,
+        props = #{authentication_method => <<"plain">>,
+                  authentication_data => term_to_binary({<<"alice">>, <<"wrong">>})}}),
+    {ok, #disconnect{reason_code = 16#9C}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% Handshake deadline fires and the connection drops (client never answers).
+auth_timeout_disconnects(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_auth_timeout_ms, 100),
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18}} =
+        mqtt_open_v5(#{client_id => <<"authto">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    %% The challenge arrived (consumed by mqtt_open_v5); the client never
+    %% answers, so the handshake deadline drops the connection on its own.
+    {ok, _} = mqtt_expect_down(mqtt_monitor(Conn), cpid(Conn)),
+    {ok, normal} = mqtt_close(Conn),
     ok.
 
 connect_wrong_protocol_level_is_refused_1(_Config) ->
@@ -2233,6 +2412,10 @@ open(Knobs) ->
 
 csock(#{sock := Sock}) -> Sock.
 cpid(#{pid := Pid}) -> Pid.
+
+%% The socket half of a Conn map, spelled out for the AUTH cases (which read the
+%% challenge / answer frames off the raw socket rather than going through a verb).
+mqtt_sock(Conn) -> maps:get(sock, Conn).
 
 %% sub/4 answers the single granted code; subscribed/3 answers the SubRef the
 %% cursor assertions need (the same {ClientId, Filter} the Router holds, K2).

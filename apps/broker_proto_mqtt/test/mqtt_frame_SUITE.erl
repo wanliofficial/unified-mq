@@ -29,6 +29,7 @@ all() ->
      golden_vectors_encode,
      direct_builds_match_records,
      streaming_decode_loop,
+     auth_roundtrip_v5,
      non_minimal_varint_accepted,
      publish_qos0_no_pid,
      puback_zero_pid_rejected,
@@ -67,6 +68,12 @@ golden_vectors_decode(_Config) ->
          {<<"0x20 0x02 00 00">>, #connack{session_present = 0, return_code = 0}},
          {<<"0x20 0x02 00 01">>, #connack{session_present = 0, return_code = 1}},
          {<<"0x20 0x02 01 00">>, #connack{session_present = 1, return_code = 0}},
+         %% MQTT 5 AUTH (type 15): reason 0x18 (continue) + properties.
+         {<<"F0 02 18 00">>, #auth{reason_code = 16#18, props = #{}}},
+         %% reason 0x18, props len 8, authentication_method (0x15) len 5 "hello".
+         {<<"F0 0A 18 08 15 00 05 68 65 6C 6C 6F">>,
+          #auth{reason_code = 16#18,
+                props = #{authentication_method => <<"hello">>}}},
          {<<"0x30 0x09 00 06 2F 61 2F 62 2F 63 00">>,
           #publish{qos = 0, topic = <<"/a/b/c">>, payload = <<0>>}},
          {<<"0x3A 0x15 00 05 61 2F 62 2F 63 00 0A 68 65 6C 6C 6F 20 77 6F 72 6C 64 29">>,
@@ -128,12 +135,17 @@ vectors(V) ->
     lists:foreach(
       fun({Hex, Expected}) ->
               Bin = unhex(Hex),
-              case mqtt_frame:decode(Bin) of
+              case mqtt_frame:decode(Bin, vector_vsn(Expected)) of
                   {ok, Got, <<>>} -> ?assertEqual(Expected, Got);
                   Other -> ct:fail({decode_failed, Hex, Other})
               end
       end, V),
     ok.
+
+%% AUTH is a v5-only packet (§3.15); every 3.1.1 vector must still decode
+%% through the `auto' path a reader uses before CONNECT names the version.
+vector_vsn(#auth{}) -> 5;
+vector_vsn(_) -> auto.
 
 %%%_* Behavior cases ---------------------------------------------------------
 
@@ -149,6 +161,18 @@ streaming_decode_loop(_Config) ->
     ?assertEqual(#ping{kind = req}, F2),
     {ok, F3, <<>>} = mqtt_frame:decode(R2),
     ?assertEqual(#subscribe{packet_id = 7, topics = [{<<"t/">>, 1}]}, F3),
+    ok.
+
+auth_roundtrip_v5(_Config) ->
+    lists:foreach(
+      fun(F) ->
+          Bin = mqtt_frame:encode(F, 5),
+          {ok, Got, <<>>} = mqtt_frame:decode(Bin, 5),
+          ?assertEqual(F, Got)
+      end,
+      [#auth{reason_code = 16#18, props = #{}},
+       #auth{reason_code = 16#00, props = #{authentication_method => <<"plain">>}},
+       #auth{reason_code = 0, props = #{authentication_data => <<1,2,3>>}}]),
     ok.
 
 non_minimal_varint_accepted(_Config) ->

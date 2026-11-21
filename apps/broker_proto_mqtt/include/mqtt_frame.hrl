@@ -83,6 +83,12 @@
 -record(disconnect, {reason_code = 0 :: 0..255,
                      props = #{}     :: map()}).
 
+%% MQTT 5 AUTH (§3.15): reason_code + properties. Used for the enhanced-auth
+%% challenge/response exchange (MQ-05). v5 only — 3.1.1 has no AUTH packet, so
+%% encode_v4 rejects it.
+-record(auth, {reason_code = 16#18 :: 0..255,
+               props = #{}          :: map()}).
+
 -record(ping, {kind = resp :: req | resp}).
 
 -endif.
