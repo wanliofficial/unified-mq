@@ -238,8 +238,9 @@ event({broker_deliver, _ClientId, _MaxQoS, Refs, {undefined, undefined, Msg}},
     case push_wanted(Refs, Msg, D) of
         true ->
             note_delivery(Msg),
+            {AliasProps, D1} = maybe_alias(Msg#broker_message.destination, D),
             {state, connected,
-             send_frame(publish_bin(0, 0, Msg, undefined, D), D)};
+             send_frame(publish_bin(0, 0, 0, Msg, undefined, AliasProps, D1), D1)};
         false ->
             {state, connected, D}
     end;
@@ -1489,7 +1490,8 @@ drain_retained(#st{retained_queue = []} = D) ->
     {state, connected, D};
 drain_retained(#st{retained_queue = [{_Topic, Msg, 0} | Rest]} = D) ->
     note_delivery(Msg),
-    D1 = send_frame(publish_bin(0, 0, 1, Msg, undefined, D), D),
+    {AliasProps, D0} = maybe_alias(Msg#broker_message.destination, D),
+    D1 = send_frame(publish_bin(0, 0, 1, Msg, undefined, AliasProps, D0), D0),
     drain_retained(D1#st{retained_queue = Rest});
 drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
     case maps:size(D#st.pending) >= inflight_limit(D) of
@@ -1508,7 +1510,9 @@ drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
                      retained_queue = Rest,
                      inflight_dirty = true})),
             note_delivery(Msg),
-            drain_retained(send_frame(publish_bin(QoS, 0, 1, Msg, Pid, D2), D2))
+            {AliasProps, D3} = maybe_alias(Msg#broker_message.destination, D2),
+            drain_retained(send_frame(
+                             publish_bin(QoS, 0, 1, Msg, Pid, AliasProps, D3), D3))
     end.
 
 %% S2.5 (ADR-017): `$share/{group}/{filter}' becomes a Shared membership; the
@@ -2228,7 +2232,9 @@ handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D0) ->
                 0 ->
                     ack_skip(Ref, P, O, D#st.client_id),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(0, 0, Msg, undefined, D), D), progress};
+                    {AliasProps, D1} = maybe_alias(Topic, D),
+                    {send_frame(publish_bin(0, 0, 0, Msg, undefined, AliasProps, D1),
+                                D1), progress};
                 DeliverQoS ->
                     deliver(P, O, Msg, DeliverQoS, [Ref], [], D)
             end
@@ -2273,7 +2279,11 @@ deliver(P, O, Msg, DeliverQoS, Refs, Others, D) ->
                              pending_rev = maps:put(Pos, Pid, D1#st.pending_rev),
                              inflight_dirty = true})),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(DeliverQoS, 0, Msg, Pid, D2), D2), progress}
+                    {AliasProps, D3} =
+                        maybe_alias(Msg#broker_message.destination, D2),
+                    {send_frame(
+                       publish_bin(DeliverQoS, 0, 0, Msg, Pid, AliasProps, D3),
+                       D3), progress}
             end
     end.
 
@@ -2295,8 +2305,9 @@ resend(Pid, _P, _O, Msg, D) ->
         false ->
             QoS = maps:get(Pid, D#st.pending_qos, 1),
             note_delivery(Msg),
-            {send_frame(publish_bin(QoS, 1, Msg, Pid, D),
-                        mark_sent_at(Pid, mark_sent(Pid, D))), idle}
+            {AliasProps, D1} = maybe_alias(Msg#broker_message.destination, D),
+            {send_frame(publish_bin(QoS, 1, 0, Msg, Pid, AliasProps, D1),
+                        mark_sent_at(Pid, mark_sent(Pid, D1))), idle}
     end.
 
 mark_sent(Pid, #st{sent = Sent} = D) ->
@@ -2336,17 +2347,21 @@ next_pid_after(N) -> N + 1.
 publish_bin(QoS, Dup, Msg, Pid, D) ->
     publish_bin(QoS, Dup, 0, Msg, Pid, D).
 
-%% `RetainFlag' is 1 only on a retained replay (§3.3.1.3: a live subscriber
-%% always sees retain=0, a replay always sees retain=1). On every other path
-%% §3.8.3.1 Retain As Published decides: when a matching subscription asked for
-%% it, the message's original retain bit travels; otherwise 0.
+%% MQ-04 §3.3.3.1: an outbound PUBLISH may carry a broker-assigned Topic Alias.
+%% `AliasProps' is the (possibly empty) map `maybe_alias/2' produced for this
+%% topic on THIS connection; it is merged over the computed props so the alias
+%% travels with the real topic name (a v5 peer uses the alias to elide the name
+%% on repeat publishes).
 publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
+    publish_bin(QoS, Dup, RetainFlag, Msg, Pid, #{}, D).
+
+publish_bin(QoS, Dup, RetainFlag, Msg, Pid, AliasProps, D) ->
     Topic = Msg#broker_message.destination,
     Retain = case RetainFlag of
                  1 -> 1;
                  _ -> rap_retain(Topic, Msg, D)
              end,
-    Props0 = publish_props(Msg),
+    Props0 = maps:merge(publish_props(Msg), AliasProps),
     %% §3.3.4 (MQTT-3.3.4-4): one copy carries the Subscription Identifiers of
     %% every matching subscription that is not No-Local-suppressed.
     Props = case matching_ids(Topic, Msg, D) of
@@ -2358,6 +2373,29 @@ publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
                  packet_id = Pid,
                  payload = Msg#broker_message.payload,
                  props = Props}, D).
+
+%% MQ-04 §3.3.3.1: assign (or reuse) a Topic Alias for `Topic' on this outbound
+%% connection. Returns the prop map to merge into the PUBLISH and the state with
+%% `alias_out'/`next_alias_out' advanced. Off for 3.1.1 or a 0 maximum; once the
+%% broker has handed out `topic_alias_max' aliases it stops (no reclaim).
+maybe_alias(Topic, #st{proto_level = 5, topic_alias_max = Max} = D)
+  when Max > 0 ->
+    case D#st.alias_out of
+        #{Topic := Alias} ->
+            {#{topic_alias => Alias}, D};
+        _ ->
+            Next = D#st.next_alias_out,
+            case Next =< Max of
+                true ->
+                    {#{topic_alias => Next},
+                     D#st{alias_out = maps:put(Topic, Next, D#st.alias_out),
+                          next_alias_out = Next + 1}};
+                false ->
+                    {#{}, D}
+            end
+    end;
+maybe_alias(_Topic, D) ->
+    {#{}, D}.
 
 matching_ids(Topic, Msg, #st{sub_ids = Ids, sub_flags = Flags} = D) ->
     Own = publisher_of(Msg) =:= D#st.client_id,

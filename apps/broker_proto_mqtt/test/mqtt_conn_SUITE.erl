@@ -525,6 +525,27 @@ v5_publish_alias_survives_reconnect(_Config) ->
     {ok, normal} = mqtt_close(Again),
     ok.
 
+%% MQ-04 §3.3.3.1: the broker assigns an outbound Topic Alias and puts it on a
+%% delivered PUBLISH. The topic name still travels (v5 allows both), so a v5
+%% subscriber sees the alias property alongside the real topic.
+v5_outbound_publish_uses_allocated_alias(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 5),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"oa-sub">>, props => #{}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"oa/real">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"oa-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 2, <<"oa/real">>, <<"first">>, 1, #{}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{topic = <<"oa/real">>, payload = <<"first">>, props = Got} =
+        mqtt_recv_v5(csock(Sub)),
+    %% The broker assigned alias 1 to oa/real on this connection.
+    ?assertEqual(1, maps:get(topic_alias, Got, undefined)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
 connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
     ok = boot(),
     %% ADR-017 §17.4: a level >= 5 this build does not know is answered in the
