@@ -219,7 +219,12 @@
     %% at publish time. 0/undefined means no expiry (S1 semantics).
     {message_ttl_ms, 0},
     %% S2.5 (ADR-017 §17.3): inbound packet cap in bytes; 0 disables it.
-    {mqtt_max_packet_size, 0}
+    {mqtt_max_packet_size, 0},
+    %% MQ-04 (§3.3.2.3.2): the Topic Alias Maximum a v5 CONNACK announces. 0 (the
+    %% default) turns Topic Alias off: the property is absent from CONNACK and any
+    %% inbound alias is a 0x94 protocol error (zero regression for clients that
+    %% never send one). A positive value enables inbound/outbound aliasing.
+    {mqtt_topic_alias_maximum, 0}
   ]},
 
   {broker_proto_ws, [

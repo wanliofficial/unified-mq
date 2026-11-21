@@ -185,7 +185,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 - `$share/{group}/{filter}`：非空 group、无通配符、合法真实 filter；`join(shared, ...)` 建组，UNSUBSCRIBE 走 `leave`；SUBACK 返回请求 QoS。
 - Subscription Identifier（v5 §3.3.4，2026-11-17 补齐）：SUBSCRIBE 的 `subscription_identifier`（单个正整数；多个 = 0x82 断连）按真实 filter 存入会话并随 `.inflight` blob **v3** 跨重连保留；单副本投递的出站 PUBLISH 携带**全部**匹配订阅的 identifier（可重复 0x0B 属性），No-Local 抑制的订阅不计入。客户端→服务端的 PUBLISH 携带该属性 = 协议错误 **0x82 断连**。
 - SUBSCRIBE 选项（v5 §3.8.3.1，2026-11-17 补齐）：**No Local**（本连接自己的发布不再回投，共享订阅上置位 = 0x82 断连）、**Retain As Published**（置位时转发保留消息原 retain 位）、**Retain Handling**（0 = 补发；1 = 会话已有同 filter 订阅则不补发；2 = 不补发；3 = 畸形断连）。选项随 blob v3 跨重连保留；UNSUBSCRIBE 一并清除 id 与选项。
-- topic_alias：本 broker 不宣告 Topic Alias Maximum（=0），客户端 PUBLISH 携带 `topic_alias` 按 **0x94** 断连（v5 §3.3.2.3.4）。
+- topic_alias（v5 §3.3.2.3.2 / §3.3.3.1，2026-11-21 补齐）：env `mqtt_topic_alias_maximum`（默认 **0** = 关闭）。0 时 CONNACK 不发 `topic_alias_maximum`、入站 PUBLISH 携带 `topic_alias` 按 **0x94** 断连（保留历史零回归行为）。>0 时 CONNACK 宣布该上限并启用双向别名：入站「非空 topic + alias」登记/覆盖映射、空 topic + 已知 alias 还原、空 topic + 未登记 alias = 0x94、空 topic 无 alias = 0x91；出站为 topic 分配别名并写进 PUBLISH 属性（topic 名照常并存，别名用尽即停发、不回收）；别名表随会话 blob **vsn 4** 跨重连保留。
 
 **证据**
 
@@ -2180,7 +2180,7 @@ ADR-034 的跨节点投递是**节点间的路由选择**，不是新的协议�
 1. **Subscription Identifier 投递**（原 MQ-01）：SUBSCRIBE 的 id 按 filter 保存、随 blob v3 跨重连保留，出站 PUBLISH 携带全部匹配订阅的 identifier；UNSUBSCRIBE 清除。客户端 PUBLISH 带 id = 0x82 断连。
 2. **Will Delay**（原 MQ-02）：`will_delay_interval` 生效，停靠 `mqtt_will_server`（新模块），延迟 = min(delay, session expiry)，重连取消；**takeover 不再发布 Will**（原实现违反 §3.1.2.5，测试 `will_is_published_on_takeover` 已改为断言标准行为）。
 3. **SUBSCRIBE 选项**（原 MQ-03）：No Local / Retain As Published / Retain Handling 全部生效并跨重连保留；共享订阅 + No Local = 0x82；RH=3 = 畸形断连。
-4. 入站 PUBLISH 携带 `topic_alias` = 0x94 断连（本端宣告 0）。
+4. 入站 PUBLISH 携带 `topic_alias` = 0x94 断连（本端宣告 0）。此条为 2026-11-17 的默认姿态；MQ-04 之后仍以 0 为默认，配置 `mqtt_topic_alias_maximum` >0 时改为启用 Topic Alias（详见 §4.2「S2.5 追加」的 topic_alias 条目）。
 
 **AMQP 0-9-1（`broker_proto_amqp`）**
 
