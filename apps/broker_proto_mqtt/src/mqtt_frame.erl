@@ -44,7 +44,7 @@
 %% hands it to encode/1), so declaring the union opaque would make the conn's
 %% own legal frame a type error at the call site. Illegal frames are refused at
 %% runtime by encode/1's field guards, which is where the guarantee actually is.
--type frame() :: #connect{} | #connack{} | #publish{} | #puback{}
+-type frame() :: #connect{} | #connack{} | #auth{} | #publish{} | #puback{}
                | #pubrec{} | #pubrel{} | #pubcomp{}
                | #subscribe{} | #suback{} | #unsubscribe{} | #unsuback{}
                | #disconnect{} | #ping{}.
@@ -80,7 +80,6 @@ decode(<<TypeFlags:8, Rest0/binary>>, Vsn) ->
     end.
 
 reserved_type(0) -> true;    %% §2.1.3 reserved
-reserved_type(15) -> true;   %% §2.1.3 reserved
 reserved_type(_) -> false.
 
 decode_after_type(Type, Flags, Rest0, Vsn) ->
@@ -147,6 +146,15 @@ do_parse_body(1, 0, Body, _Vsn) when byte_size(Body) >= 10 ->
     p_connect(Body);
 %% -- MQTT 5 shapes (ADR-017). Every one is selected by the version the
 %% CONNECT negotiated; the 3.1.1 clauses below never see a properties length.
+%% MQTT 5 AUTH (§3.15): reason code + properties, flags 0, v5 only.
+do_parse_body(15, 0, <<RC>>, 5) ->
+    {ok, #auth{reason_code = RC}};
+do_parse_body(15, 0, <<RC, Rest/binary>>, 5) ->
+    case read_props(Rest) of
+        {ok, Props, <<>>} -> {ok, #auth{reason_code = RC, props = Props}};
+        {ok, _, _} -> {error, {malformed_packet, auth_trailing_bytes}};
+        {error, R} -> {error, {malformed_packet, R}}
+    end;
 do_parse_body(2, 0, <<SP, RC, PropsBin/binary>>, 5) ->
     case read_props(PropsBin) of
         {ok, Props, <<>>} when SP =< 1 ->
@@ -1023,6 +1031,9 @@ encode_v4(#unsuback{packet_id = Pid}) ->
     end;
 encode_v4(#disconnect{}) ->
     fixed_header(14, 0, <<>>);
+%% 3.1.1 has no AUTH packet; building one is a programming error.
+encode_v4(#auth{}) ->
+    erlang:error({malformed_frame_out, auth_not_in_v3});
 encode_v4(#ping{kind = req}) ->
     fixed_header(12, 0, <<>>);
 encode_v4(#ping{kind = resp}) ->
@@ -1064,6 +1075,8 @@ encode_v4(#connect{client_id = ClientId, keep_alive = KA, clean_session = CS,
 
 %%%_* MQTT 5 encoders (S2.5, ADR-017) ----------------------------------------
 
+encode_v5(#auth{reason_code = RC, props = Props}) ->
+    fixed_header(15, 0, <<RC, (props_bin(Props))/binary>>);
 encode_v5(#connack{session_present = SP, return_code = RC, props = Props}) ->
     if
         is_integer(SP), SP band 16#FE =:= 0,
