@@ -427,13 +427,13 @@ connect_mqtt5_with_empty_client_id_gets_the_v5_refusal(_Config) ->
     {ok, normal} = expect_down(Monitor, Pid),
     ok.
 
-%% broker_auth_plain: begin issues a nonce-bound challenge; continue with the
+%% broker_auth_plain: initiate issues a nonce-bound challenge; continue with the
 %% right password succeeds, wrong password fails. No new crypto dependency.
 auth_plain_begin_continue_ok(_Config) ->
     ok = boot(),
     Ctx = #{client_id => <<"c">>},
     {continue, Challenge, AuthState} =
-        broker_auth:'begin'(<<"plain">>, undefined, Ctx),
+        broker_auth:initiate(<<"plain">>, undefined, Ctx),
     ?assert(is_binary(Challenge)),
     Resp = term_to_binary({<<"alice">>, Challenge, <<"pw">>}),
     {ok, <<"alice">>, _Ctx2} =
@@ -443,7 +443,7 @@ auth_plain_begin_continue_ok(_Config) ->
 auth_plain_wrong_password(_Config) ->
     ok = boot(),
     {continue, Challenge, AuthState} =
-        broker_auth:'begin'(<<"plain">>, undefined, #{}),
+        broker_auth:initiate(<<"plain">>, undefined, #{}),
     Resp = term_to_binary({<<"alice">>, Challenge, <<"wrong">>}),
     {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
     ok.
@@ -451,7 +451,7 @@ auth_plain_wrong_password(_Config) ->
 auth_plain_unknown_nonce(_Config) ->
     ok = boot(),
     {continue, _Challenge, AuthState} =
-        broker_auth:'begin'(<<"plain">>, undefined, #{}),
+        broker_auth:initiate(<<"plain">>, undefined, #{}),
     %% A response naming a nonce we never issued for this handshake.
     Resp = term_to_binary({<<"alice">>, <<"bogus-nonce">>, <<"pw">>}),
     {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),

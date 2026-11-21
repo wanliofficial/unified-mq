@@ -11,10 +11,9 @@
 %% registry/dispatcher, not an implementer, so it does NOT carry
 %% -behaviour(broker_auth). The implementers (broker_auth_plain) do.
 %%
-%% NOTE: `begin' is an Erlang reserved word, so the callback, the export and
-%% every call site quote it: broker_auth:'begin'(Method, Data, Ctx). That is
-%% the entry point the FSM's `awaiting_auth' step will use.
--export(['begin'/3, continue/3, reauth/3, enabled_methods/0]).
+%% `initiate/3' is the entry point the FSM's `awaiting_auth' step will use. It
+%% was renamed from the reserved-word name Erlang would not accept unquoted.
+-export([initiate/3, continue/3, reauth/3, enabled_methods/0]).
 
 -type method()  :: binary().
 -type result() :: {ok, term(), map()}
@@ -23,8 +22,8 @@
 
 -export_type([method/0, result/0]).
 
--callback 'begin'(Method :: method(), InitialData :: binary() | undefined,
-                  Ctx :: map()) -> result().
+-callback initiate(Method :: method(), InitialData :: binary() | undefined,
+                   Ctx :: map()) -> result().
 -callback continue(Method :: method(), AuthState :: term(),
                    ResponseData :: binary() | undefined) -> result().
 -callback reauth(Method :: method(), Ctx :: map(),
@@ -34,10 +33,10 @@
 enabled_methods() ->
     application:get_env(broker_proto_mqtt, mqtt_auth_methods, [<<"plain">>]).
 
--spec 'begin'(method(), binary() | undefined, map()) -> result().
-'begin'(Method, Data, Ctx) ->
+-spec initiate(method(), binary() | undefined, map()) -> result().
+initiate(Method, Data, Ctx) ->
     case module_for(Method) of
-        {ok, Mod} -> Mod:'begin'(Method, Data, Ctx);
+        {ok, Mod} -> Mod:initiate(Method, Data, Ctx);
         error -> {error, unknown_auth_method}
     end.
 

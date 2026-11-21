@@ -5,21 +5,21 @@
 %%% same framework later.
 %%%
 %%% Wire shape:
-%%%   begin    -> challenge data is a fresh Nonce binary.
+%%%   initiate -> challenge data is a fresh Nonce binary.
 %%%   continue -> response data is term_to_binary({User, Nonce, Pass}). The
-%%%               Nonce must equal the one begin issued for this handshake, and
-%%%               broker_security:authenticate(User, Pass) must pass.
+%%%               Nonce must equal the one initiate issued for this handshake,
+%%%               and broker_security:authenticate(User, Pass) must pass.
 %%%   reauth   -> data is term_to_binary({User, Pass}).
 -module(broker_auth_plain).
 -behaviour(broker_auth).
--export(['begin'/3, continue/3, reauth/3]).
+-export([initiate/3, continue/3, reauth/3]).
 
 %% A short, unique, non-secret nonce. Not crypto-grade on purpose: it binds a
 %% response to its handshake, it does not resist an active attacker (TLS does).
 nonce() ->
     term_to_binary({unique_integer, erlang:monotonic_time()}).
 
-'begin'(_Method, _InitialData, Ctx) when is_map(Ctx) ->
+initiate(_Method, _InitialData, Ctx) when is_map(Ctx) ->
     Nonce = nonce(),
     {continue, Nonce, {Nonce, Ctx}}.
 
