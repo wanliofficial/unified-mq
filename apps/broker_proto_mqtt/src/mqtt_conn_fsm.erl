@@ -114,7 +114,7 @@
              %% deadline of the handshake. `undefined' outside a handshake.
              auth_method = undefined :: undefined | binary(),
              auth_state = undefined :: undefined | term(),
-             auth_deadline = undefined :: undefined | integer(),
+             auth_deadline = undefined,    %% {Ref, TRef} | undefined
              %% MQ-05: the CONNECT that started the handshake, stashed so the
              %% attach tail (connect_success/2) can run after it completes.
              auth_connect = undefined :: undefined | #connect{}}).
