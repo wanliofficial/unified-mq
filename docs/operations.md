@@ -524,7 +524,7 @@ const pc = new RTCPeerConnection({
   {max_dedup_entries, 4096},
   {max_requests_per_second, 100},                         %% 每端点令牌桶（放大防御）
   {max_endpoints, 4096},                                 %% 新来源上限，满了拒绝新桶而非驱逐
-  {block_size, 1024},                                     %% 预留（Block2 未实现，当前无效果；Block1 用客户端 SZX）
+  {block_size, 1024},                                     %% 未被消费：块大小完全由客户端 block2 的 ReqSize 决定（Block1 用客户端 SZX）
   {max_block1_bytes, 262144},                             %% 每端点 Block1 重组缓冲上限
   {resources, []},                                        %% 静态资源（保留态自动通告）
   {recbuf_bytes, 65536},
@@ -545,7 +545,7 @@ const pc = new RTCPeerConnection({
 - **`coaps` 的 PSK 来自 `users` 表，realm 绑定**：`broker_security:psk_for_identity/1` 对 identity 查 `users` 的 `password`，派生 `SHA-256("unifiedmq-coaps-psk" ‖0‖ identity ‖0‖ realm ‖0‖ password)`（域分隔，含 0 分隔符防拼接歧义）。**realm 取自 `broker_security.coaps.realm`（默认 `<<"unifiedmq">>`，与 `broker_security.tls` 那份证书配置完全无关）**；realm 一旦上线不要改——改了等于让所有客户端手里的 PSK 失效（realm 是 key 的一部分）。
 - **`require_auth` 对两个方向分别校验**（`broker_proto_coap_app:guard/0`）：`coap`（明文）**不可能携带凭据**，出现在 `require_auth` 里直接启动失败 `{error, {require_auth_unsupported, coap}}`；`coaps` 要求认证时，**所有** enabled listener 必须都是 DTLS，否则 `{error, {require_auth_needs_dtls, coaps}}`。想强制认证就只开 coaps、并把 `coaps` 放进 `broker_security.require_auth`。
 - **PSK-only，没有证书 / 没有 mTLS**：DTLS 不加载任何证书，服务端从不证明自己；`ssl:listen` 强制 `{mode, binary}`。cert-based DTLS、OSCORE、CoAP over TCP/WebSocket **均不做**（ADR-031 非目标，见 `docs/security.md` §12.6）。
-- **Block1 互通，Block2 不做 ⇒ 响应实际上限约 1 KB**：请求方向按 RFC 7959 分块重组（流键优先 `Request-Tag`、缺省 token；`2.31` 回**收到的**块号）。**响应方向不分块**，整条响应一个数据报发出；真实客户端（libcoap v4.3.5，默认接收 PDU 1500 B）会丢弃超过约 1.1 KB 的响应（`coap_pdu_resize: pdu too big`）。所以 `max_message_bytes`（65535）**不是**可用上限——一个 2 KB 的 retained payload 写得进去、**读不回来**。要读大对象请把响应压到 1 KB 以内，或等 Block2。实测证据见 `test/protocol-compatibility/s11c/libcoap/`。
+- **Block1 与 Block2 均已支持（2026-11-20 更新）**：请求方向按 RFC 7959 分块重组（流键优先 `Request-Tag`、缺省 token；`2.31` 回**收到的**块号）。**响应方向支持 Block2 分块**：GET 带 `block2:{Num,_,ReqSize}` 时按客户端请求的块大小切片回送，末块 `More=false`；块大小完全由客户端 `ReqSize` 决定。**不带 `block2` 的 GET 行为不变**——整条响应一个数据报发出，此时真实客户端（libcoap v4.3.5，默认接收 PDU 1500 B）仍会丢弃超过约 1.1 KB 的响应（`coap_pdu_resize: pdu too big`），这是**非分块客户端的**限制，不是服务端上限：`max_message_bytes`（65535）也不是。**要想读回 >1.1 KB 的 retained 表示，请让客户端带 `block2` 选项**。**仍不做**：跨块响应缓存/重传（每块是当前 retained 状态的自包含投影）、Observe 通知的分块推送（通知仍是单数据报）。Block1 实测证据见 `test/protocol-compatibility/s11c/libcoap/`；Block2 见 `apps/broker_proto_coap/test/coap_block2_SUITE.erl`。
 - **串行握手是硬约束，不是可调旋钮**：PSK identity 只能被同步 `user_lookup_fun` 观察到，并发握手会串身份，因此 DTLS acceptor **单进程串行**跑 `accept → handshake → drain identity → offer → controlling_process → 移交`。代价是**握手速率约 41 次/秒**（p50 ~22 ms）——**冷启动时大批设备必须错峰上线**（见下「排查」与容量报告）。
 - **会话有界**：DTLS 会话表（`{IP,Port}` → socket）与每主体计数（`principal`/`tenant` → 会话数）都是**硬上限**（`max_dtls_sessions` / `dtls_max_sessions_per_principal`），超限拒绝新会话而非驱逐；关闭即释放（`terminate` 先关 listen socket 再关每条 peer）。九张运行期表里，随 peer 存活而存在的那**六张**（`peers`/`socks`/`idents`/`principal_sessions`/`observes`/`pending`）在关闭后归零（`dtls_close_cleans_up` 断言），其余三张（`dedup`/`endpoints`/`block1`）由 1 s tick 清扫。
 - **未知身份不发 TLS alert，回诱饵密钥**：实测未知 identity 的 alert 在 20–200 ms 返回、「用户存在+口令错」走 Finished 校验失败 → 客户端 3 s 超时，二者可区分 ⇒ 用户名枚举 oracle。故未知 / 错口令统一回诱饵密钥 `SHA-256("unifiedmq-coaps-psk-decoy" ‖0‖ 每 listener 随机 32 字节 ‖0‖ Identity)`，让两条错误路径**不可区分**。**诱饵是缓解不是证明**（`docs/security.md` §12.6）。

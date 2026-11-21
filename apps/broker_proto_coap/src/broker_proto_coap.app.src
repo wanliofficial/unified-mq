@@ -28,8 +28,10 @@
            %% only observable as a rate.
            {max_requests_per_second, 100},
            {max_endpoints, 4096},
-           %% Block-wise payload unit (RFC 7959 §2.2; the app follows
-           %% draft-ietf-core-block-18 per ADR-031 §D7).
+           %% Block-wise payload unit (RFC 7959 §2.2). Note: the listener does
+           %% not read this -- a Block2 download's block size is the client's
+           %% own ReqSize, and Block1 uses the client's SZX. Kept as the
+           %% declared default only.
            {block_size, 1024},
            %% Ceiling for a Block1 reassembly buffer, per endpoint.
            {max_block1_bytes, 262144},
