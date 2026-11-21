@@ -48,6 +48,14 @@ all() ->
      connect_with_bad_password_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
+     v5_connack_announces_topic_alias_maximum,
+     v5_topic_alias_zero_still_rejects,
+     v5_publish_with_topic_name_and_alias_registers_it,
+     v5_publish_with_empty_topic_and_known_alias,
+     v5_publish_with_empty_topic_and_unknown_alias_is_protocol_error,
+     v5_publish_with_empty_topic_and_no_alias_is_protocol_error,
+     v5_publish_alias_survives_reconnect,
+     v5_outbound_publish_uses_allocated_alias,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
      connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
      v5_publish_properties_reach_the_subscriber,
@@ -97,7 +105,7 @@ all() ->
      puback_for_a_qos2_delivery_does_not_advance_the_cursor,
      reconnect_before_pubrec_resends_a_dup_publish,
      reconnect_after_pubrec_resends_pubrel_only,
-     inflight_blob_is_v3_and_skips_retained_entries,
+     inflight_blob_is_v4_and_skips_retained_entries,
      subscribe_receives_retained_after_suback,
      retained_qos_is_capped_by_the_grant,
      retained_wildcard_delivers_each_topic_in_topic_order,
@@ -185,6 +193,9 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_proto_mqtt, inflight_snapshot_ms, 20),
     ok = application:set_env(broker_proto_mqtt, max_keepalive_ms, 60000),
     ok = application:set_env(broker_proto_mqtt, mqtt_max_qos, 2),
+    %% MQ-04: Topic Alias is off unless a case opts in. Reset it here so a case
+    %% that enabled it cannot poison the next one (the same J10 rule as above).
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 0),
     ok = application:set_env(broker_proto_mqtt, max_qos2_state_per_session, 100),
     %% S2-E knobs (ADR-015): every case starts from the production defaults, and
     %% a case that needs another posture re-sets them before boot/0.
@@ -361,6 +372,182 @@ connect_mqtt5_is_accepted(_Config) ->
     ?assertEqual(#{}, AckProps),
     #ping{kind = resp} = mqtt_ping(Conn),
     {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-04: CONNACK (v5) advertises the Topic Alias Maximum the broker will honor.
+%% 0 (default) means the feature is off and the property is absent, so a client
+%% that uses an alias anyway is rejected with 0x94 (zero regression for clients
+%% that never send an alias). A positive maximum announces the cap.
+v5_connack_announces_topic_alias_maximum(_Config) ->
+    ok = boot(),
+    Previous = application:get_env(broker_proto_mqtt, mqtt_topic_alias_maximum),
+    try
+        %% Off: absent (0 and "omitted" are the same statement on the wire, but
+        %% only an announced value can ever license an alias).
+        ok = application:set_env(broker_proto_mqtt,
+                                 mqtt_topic_alias_maximum, 0),
+        {Off, #connack{return_code = 0, props = OffProps}} =
+            mqtt_open_v5(#{client_id => <<"taoff">>, props => #{}}),
+        ?assertNot(maps:is_key(topic_alias_maximum, OffProps)),
+        {ok, normal} = mqtt_close(Off),
+        %% On: the cap rides CONNACK.
+        ok = application:set_env(broker_proto_mqtt,
+                                 mqtt_topic_alias_maximum, 10),
+        {On, #connack{return_code = 0, props = OnProps}} =
+            mqtt_open_v5(#{client_id => <<"taon">>, props => #{}}),
+        ?assertEqual(10, maps:get(topic_alias_maximum, OnProps, undefined)),
+        {ok, normal} = mqtt_close(On)
+    after
+        %% This knob is not part of the suite's per-case default table, so hand
+        %% back whatever the previous case saw.
+        case Previous of
+            {ok, Value} ->
+                ok = application:set_env(broker_proto_mqtt,
+                                         mqtt_topic_alias_maximum, Value);
+            undefined ->
+                ok = application:unset_env(broker_proto_mqtt,
+                                           mqtt_topic_alias_maximum)
+        end
+    end,
+    ok.
+
+%% MQ-04 zero regression: with no announced maximum (the default 0) an inbound
+%% PUBLISH carrying topic_alias is still the 0x94 protocol error it was before
+%% aliases existed. (Accepting a registered alias is Task 2's change, and it
+%% only applies on a connection whose CONNACK announced a positive maximum.)
+v5_topic_alias_zero_still_rejects(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = Props}} =
+        mqtt_open_v5(#{client_id => <<"tazero">>, props => #{}}),
+    ?assertNot(maps:is_key(topic_alias_maximum, Props)),
+    ok = mqtt_send_v5(Conn, #publish{qos = 1, topic = <<"ta/zero">>,
+                                     packet_id = 1, payload = <<"x">>,
+                                     props = #{topic_alias => 1}}),
+    #disconnect{reason_code = 16#94} = mqtt_recv_v5(csock(Conn)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-04 §3.3.2.3.2: a topic name sent together with an alias registers the
+%% mapping; the real topic name still drives delivery, so a subscriber on the
+%% real topic gets the message regardless of the alias.
+v5_publish_with_topic_name_and_alias_registers_it(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"ta-sub">>, props => #{}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"ta/real">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"ta-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 2, <<"ta/real">>, <<"with-alias">>, 1,
+                         #{topic_alias => 1}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    %% The subscriber is a v5 peer, so read with the v5 decoder: the 3.1.1
+    %% `auto' path would read the property-length byte as the first payload byte.
+    #publish{topic = <<"ta/real">>, payload = <<"with-alias">>} =
+        mqtt_recv_v5(csock(Sub)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% An empty topic name MUST be paired with a known alias; the broker restores
+%% the real topic from its inbound map and delivers normally.
+v5_publish_with_empty_topic_and_known_alias(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"tk-sub">>, props => #{}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"tk/real">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"tk-pub">>, props => #{}}),
+    %% First publish: real topic + alias 1 -> registers the mapping.
+    ok = mqtt_publish_v5(Pub, 2, <<"tk/real">>, <<"first">>, 1,
+                         #{topic_alias => 1}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{payload = <<"first">>} = mqtt_recv_v5(csock(Sub)),
+    %% Second publish: empty topic + alias 1 -> restored to tk/real.
+    ok = mqtt_publish_v5(Pub, 3, <<>>, <<"restored">>, 1, #{topic_alias => 1}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{topic = <<"tk/real">>, payload = <<"restored">>} =
+        mqtt_recv_v5(csock(Sub)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% An empty topic name with an alias the broker never registered is a violation
+%% (0x94), because the real topic is unrecoverable.
+v5_publish_with_empty_topic_and_unknown_alias_is_protocol_error(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"tu-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 1, <<>>, <<"orphan">>, 1, #{topic_alias => 99}),
+    #disconnect{reason_code = 16#94} = mqtt_recv_v5(csock(Pub)),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% An empty topic name with no alias at all cannot be restored (§3.3.2.2): the
+%% broker disconnects with 0x91 Packet payload invalid. The codec will not
+%% encode such a frame (an empty topic needs an alias), so put raw bytes on the
+%% wire to exercise the FSM's defence against a malformed peer.
+v5_publish_with_empty_topic_and_no_alias_is_protocol_error(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"te-pub">>, props => #{}}),
+    ok = gen_tcp:send(csock(Pub), mqtt_raw_publish_v5_empty_topic(<<"noalias">>)),
+    #disconnect{reason_code = 16#91} = mqtt_recv_v5(csock(Pub)),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% MQ-04 §3.3.2.3.2: the inbound alias->topic map rides the session blob, so a
+%% clean=0 reconnect restores an alias the client registered earlier and still
+%% resolves an empty-topic publish through it.
+v5_publish_alias_survives_reconnect(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"tr-sub">>, props => #{}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"tr/real">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    %% First connection: register alias 1 -> tr/real, then drop abnormally.
+    {First, _} = mqtt_open_v5(#{client_id => <<"tr-pub">>, clean => false,
+                                props => #{session_expiry_interval => 300}}),
+    ok = mqtt_publish_v5(First, 1, <<"tr/real">>, <<"reg">>, 1, #{topic_alias => 1}),
+    #puback{} = mqtt_recv_v5(csock(First)),
+    #publish{payload = <<"reg">>} = mqtt_recv_v5(csock(Sub)),
+    FirstPid = cpid(First),
+    ok = gen_tcp:close(csock(First)),
+    {ok, _} = mqtt_expect_down(mqtt_monitor(#{pid => FirstPid}), FirstPid),
+    timer:sleep(200),
+    %% Reconnect clean=0: the alias map is restored from the blob.
+    {Again, _} = mqtt_open_v5(#{client_id => <<"tr-pub">>, clean => false,
+                                props => #{session_expiry_interval => 300}}),
+    ok = mqtt_publish_v5(Again, 2, <<>>, <<"after-reconnect">>, 1,
+                         #{topic_alias => 1}),
+    #puback{} = mqtt_recv_v5(csock(Again)),
+    #publish{topic = <<"tr/real">>, payload = <<"after-reconnect">>} =
+        mqtt_recv_v5(csock(Sub)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Again),
+    ok.
+
+%% MQ-04 §3.3.3.1: the broker assigns an outbound Topic Alias and puts it on a
+%% delivered PUBLISH. The topic name still travels (v5 allows both), so a v5
+%% subscriber sees the alias property alongside the real topic.
+v5_outbound_publish_uses_allocated_alias(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 5),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"oa-sub">>, props => #{}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"oa/real">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"oa-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 2, <<"oa/real">>, <<"first">>, 1, #{}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{topic = <<"oa/real">>, payload = <<"first">>, props = Got} =
+        mqtt_recv_v5(csock(Sub)),
+    %% The broker assigned alias 1 to oa/real on this connection.
+    ?assertEqual(1, maps:get(topic_alias, Got, undefined)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Pub),
     ok.
 
 connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
@@ -1344,7 +1531,7 @@ reconnect_after_pubrec_resends_pubrel_only(_Config) ->
 %% v3 carries the level, the release marks, the inbound set and the §3.8.4
 %% subscription state, and a retained replay (no {Partition, Offset}) is
 %% deliberately absent.
-inflight_blob_is_v3_and_skips_retained_entries(_Config) ->
+inflight_blob_is_v4_and_skips_retained_entries(_Config) ->
     ok = boot(),
     {Conn, _} = mqtt_open_v5(#{client_id => <<"c1">>, props => #{}}),
     %% A Subscription Identifier and No Local / RAP flags are §3.8.4 session
@@ -1362,10 +1549,13 @@ inflight_blob_is_v3_and_skips_retained_entries(_Config) ->
     ok = mqtt_publish_v5(Conn, 11, <<"in/in">>, <<"inbound">>, 2, #{}),
     #pubrec{packet_id = 11} = mqtt_recv_v5(csock(Conn)),
     Blob = wait_inflight(<<"c1">>, fun(B) ->
-                                           maps:get(vsn, B, 0) =:= 3 andalso
+                                           maps:get(vsn, B, 0) =:= 4 andalso
                                            maps:size(maps:get(released, B, #{})) =:= 0
                                    end),
-    #{vsn := 3, pending := Pending, qos := Qos, received := Received} = Blob,
+    %% vsn 4 (MQ-04): Topic Alias state rides the blob, but this connection did
+    %% not enable aliases (topic_alias_maximum is 0), so no `aliases' key exists.
+    #{vsn := 4, pending := Pending, qos := Qos, received := Received} = Blob,
+    ?assertNot(maps:is_key(aliases, Blob)),
     %% The SUBSCRIBE above rides the blob as §3.8.4 subscription state.
     [{<<"b/#">>, 7, 0, 1}] = maps:get(subs, Blob, []),
     %% One positional entry: the delivery owed a PUBACK. Its offset is the

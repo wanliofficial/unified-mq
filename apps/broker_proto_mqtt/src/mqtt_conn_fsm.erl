@@ -87,6 +87,17 @@
              %% S2.5 (ADR-017): the negotiated MQTT level. `undefined' before
              %% CONNECT (decode/1's `auto' is legal for exactly one frame).
              proto_level = undefined :: undefined | 4 | 5,
+             %% MQ-04: the Topic Alias Maximum announced in this connection's
+             %% CONNACK (env `mqtt_topic_alias_maximum'). 0 = feature off; an
+             %% inbound alias is then a 0x94 violation.
+             topic_alias_max = 0 :: non_neg_integer(),
+             %% MQ-04: alias<->topic maps. `alias_in' is client-defined (inbound
+             %% resolution, §3.3.2.3.2); `alias_out' is broker-allocated
+             %% (outbound generation, §3.3.3.1). 0 is not a valid alias; both
+             %% spaces start at 1.
+             alias_in = #{} :: #{pos_integer() => binary()},
+             alias_out = #{} :: #{binary() => pos_integer()},
+             next_alias_out = 1 :: 1..65535,
              session_expiry = 0 :: non_neg_integer(),   %% seconds, v5 only
              receive_maximum = 65535 :: pos_integer(),  %% peer's outbound window
              max_packet_size = undefined :: undefined | pos_integer(),
@@ -227,8 +238,9 @@ event({broker_deliver, _ClientId, _MaxQoS, Refs, {undefined, undefined, Msg}},
     case push_wanted(Refs, Msg, D) of
         true ->
             note_delivery(Msg),
+            {AliasProps, D1} = maybe_alias(Msg#broker_message.destination, D),
             {state, connected,
-             send_frame(publish_bin(0, 0, Msg, undefined, D), D)};
+             send_frame(publish_bin(0, 0, 0, Msg, undefined, AliasProps, D1), D1)};
         false ->
             {state, connected, D}
     end;
@@ -412,7 +424,8 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
     D0a = D0#st{client_id = C#connect.client_id, proto_level = Level,
                 session_expiry = maps:get(session_expiry_interval, Props, 0),
                 receive_maximum = maps:get(receive_maximum, Props, 65535),
-                max_packet_size = maps:get(maximum_packet_size, Props, undefined)},
+                max_packet_size = maps:get(maximum_packet_size, Props, undefined),
+                topic_alias_max = opt(mqtt_topic_alias_maximum, 0, D0)},
     %% S12-B (ADR-032 D7): the node-level admission gate, asked before any
     %% per-connection work so an over-capacity CONNECT costs a CONNACK and
     %% nothing else. It sits after `proto_level' is in state because the refusal
@@ -712,6 +725,16 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
            end,
     SubIds = maps:from_list([{F, Id} || {F, Id, _NL, _Rap} <- Subs]),
     SubFlags = maps:from_list([{F, {NL, Rap}} || {F, _Id, NL, Rap} <- Subs]),
+    %% vsn 4 (MQ-04 §3.3.2.3.2): the inbound/outbound alias maps and the outbound
+    %% cursor. An older blob has no `aliases' key, so the connection keeps the
+    %% defaults (empty maps, cursor 1) -- exactly a fresh connection.
+    {AliasIn, AliasOut, NextAlias} =
+        case maps:get(aliases, Blob, undefined) of
+            {AI, AO, NA} when is_list(AI), is_list(AO), is_integer(NA) ->
+                {maps:from_list(AI), maps:from_list(AO), NA};
+            _ ->
+                {#{}, #{}, 1}
+        end,
     D#st{next_pid = maps:get(next_pid, Blob, 1),
          pending = Pending,
          pending_qos = Qos,
@@ -720,7 +743,10 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
          received = Received,
          pending_rev = Rev,
          sub_ids = SubIds,
-         sub_flags = SubFlags}.
+         sub_flags = SubFlags,
+         alias_in = AliasIn,
+         alias_out = AliasOut,
+         next_alias_out = NextAlias}.
 
 %% The partition notifications this conn needs to wake on (design §5.2). The
 %% subscription set belongs to the queue worker, which monitors us, so an
@@ -740,20 +766,47 @@ subscribe_partitions(D) ->
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain, props = Props},
                #st{proto_level = 5} = D) ->
-    %% v5-only input validation before anything is stored:
+    %% v5-only input validation + Topic Alias resolution (§3.3.2.3) before
+    %% anything is stored:
     %%   * §3.3.2.3.4: a PUBLISH from the client carries no Subscription
     %%     Identifier -- that property is server-to-client only (0x82).
-    %%   * §3.3.2.3.4: Topic Aliases require a Topic Alias Maximum the server
-    %%     announced. This broker announces nothing (0), so any alias use by
-    %%     the client is a violation (0x94).
+    %%   * §3.3.2.3.2: Topic Alias. The server announces a maximum in CONNACK;
+    %%     0 means off, and any alias use is then a 0x94 violation (zero
+    %%     regression for clients that never send an alias). When on, a non-empty
+    %%     topic name may carry an alias (which registers/overwrites the mapping);
+    %%     an empty topic name MUST be paired with a known alias to be restored.
+    %% The resolved real topic goes downstream; the alias itself never rides the
+    %% #broker_message.
     Idx = maps:is_key(subscription_identifier, Props),
-    Alias = maps:is_key(topic_alias, Props),
+    Alias = maps:get(topic_alias, Props, undefined),
+    Max = D#st.topic_alias_max,
     if
-        Idx -> protocol_error(16#82, "subscription_identifier in a client "
-                                   "PUBLISH", D);
-        Alias -> protocol_error(16#94, "topic_alias on a connection without "
-                                     "topic_alias_maximum", D);
-        true -> handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D)
+        Idx ->
+            protocol_error(16#82, "subscription_identifier in a client PUBLISH", D);
+        Max =:= 0, Alias =/= undefined ->
+            %% Feature off but the client used an alias: keep the historical 0x94.
+            protocol_error(16#94, "topic_alias on a connection without "
+                                 "topic_alias_maximum", D);
+        byte_size(Topic) =:= 0, Alias =:= undefined ->
+            %% An empty topic name with no alias cannot be restored (§3.3.2.2:
+            %% the topic must be non-empty); 0x91 Packet payload invalid.
+            protocol_error(16#91, "empty topic without a topic alias", D);
+        byte_size(Topic) =:= 0 ->
+            case maps:find(Alias, D#st.alias_in) of
+                {ok, RealTopic} ->
+                    handle_publish_in(QoS, RealTopic, WirePid, Payload, Retain,
+                                      maps:remove(topic_alias, Props), D);
+                error ->
+                    protocol_error(16#94, "unknown topic alias", D)
+            end;
+        Alias =/= undefined ->
+            %% Non-empty topic + alias: register/overwrite the mapping, dispatch
+            %% on the real topic (§3.3.2.3.2).
+            D1 = D#st{alias_in = maps:put(Alias, Topic, D#st.alias_in)},
+            handle_publish_in(QoS, Topic, WirePid, Payload, Retain,
+                              maps:remove(topic_alias, Props), D1);
+        true ->
+            handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D)
     end;
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain, props = Props}, D) ->
@@ -1450,7 +1503,8 @@ drain_retained(#st{retained_queue = []} = D) ->
     {state, connected, D};
 drain_retained(#st{retained_queue = [{_Topic, Msg, 0} | Rest]} = D) ->
     note_delivery(Msg),
-    D1 = send_frame(publish_bin(0, 0, 1, Msg, undefined, D), D),
+    {AliasProps, D0} = maybe_alias(Msg#broker_message.destination, D),
+    D1 = send_frame(publish_bin(0, 0, 1, Msg, undefined, AliasProps, D0), D0),
     drain_retained(D1#st{retained_queue = Rest});
 drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
     case maps:size(D#st.pending) >= inflight_limit(D) of
@@ -1469,7 +1523,9 @@ drain_retained(#st{retained_queue = [{Topic, Msg, QoS} | Rest]} = D) ->
                      retained_queue = Rest,
                      inflight_dirty = true})),
             note_delivery(Msg),
-            drain_retained(send_frame(publish_bin(QoS, 0, 1, Msg, Pid, D2), D2))
+            {AliasProps, D3} = maybe_alias(Msg#broker_message.destination, D2),
+            drain_retained(send_frame(
+                             publish_bin(QoS, 0, 1, Msg, Pid, AliasProps, D3), D3))
     end.
 
 %% S2.5 (ADR-017): `$share/{group}/{filter}' becomes a Shared membership; the
@@ -2189,7 +2245,9 @@ handle_claimed1(P, O, Msg, Ref, Filter, SubQoS, D0) ->
                 0 ->
                     ack_skip(Ref, P, O, D#st.client_id),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(0, 0, Msg, undefined, D), D), progress};
+                    {AliasProps, D1} = maybe_alias(Topic, D),
+                    {send_frame(publish_bin(0, 0, 0, Msg, undefined, AliasProps, D1),
+                                D1), progress};
                 DeliverQoS ->
                     deliver(P, O, Msg, DeliverQoS, [Ref], [], D)
             end
@@ -2234,7 +2292,11 @@ deliver(P, O, Msg, DeliverQoS, Refs, Others, D) ->
                              pending_rev = maps:put(Pos, Pid, D1#st.pending_rev),
                              inflight_dirty = true})),
                     note_delivery(Msg),
-                    {send_frame(publish_bin(DeliverQoS, 0, Msg, Pid, D2), D2), progress}
+                    {AliasProps, D3} =
+                        maybe_alias(Msg#broker_message.destination, D2),
+                    {send_frame(
+                       publish_bin(DeliverQoS, 0, 0, Msg, Pid, AliasProps, D3),
+                       D3), progress}
             end
     end.
 
@@ -2256,8 +2318,9 @@ resend(Pid, _P, _O, Msg, D) ->
         false ->
             QoS = maps:get(Pid, D#st.pending_qos, 1),
             note_delivery(Msg),
-            {send_frame(publish_bin(QoS, 1, Msg, Pid, D),
-                        mark_sent_at(Pid, mark_sent(Pid, D))), idle}
+            {AliasProps, D1} = maybe_alias(Msg#broker_message.destination, D),
+            {send_frame(publish_bin(QoS, 1, 0, Msg, Pid, AliasProps, D1),
+                        mark_sent_at(Pid, mark_sent(Pid, D1))), idle}
     end.
 
 mark_sent(Pid, #st{sent = Sent} = D) ->
@@ -2297,17 +2360,21 @@ next_pid_after(N) -> N + 1.
 publish_bin(QoS, Dup, Msg, Pid, D) ->
     publish_bin(QoS, Dup, 0, Msg, Pid, D).
 
-%% `RetainFlag' is 1 only on a retained replay (§3.3.1.3: a live subscriber
-%% always sees retain=0, a replay always sees retain=1). On every other path
-%% §3.8.3.1 Retain As Published decides: when a matching subscription asked for
-%% it, the message's original retain bit travels; otherwise 0.
+%% MQ-04 §3.3.3.1: an outbound PUBLISH may carry a broker-assigned Topic Alias.
+%% `AliasProps' is the (possibly empty) map `maybe_alias/2' produced for this
+%% topic on THIS connection; it is merged over the computed props so the alias
+%% travels with the real topic name (a v5 peer uses the alias to elide the name
+%% on repeat publishes).
 publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
+    publish_bin(QoS, Dup, RetainFlag, Msg, Pid, #{}, D).
+
+publish_bin(QoS, Dup, RetainFlag, Msg, Pid, AliasProps, D) ->
     Topic = Msg#broker_message.destination,
     Retain = case RetainFlag of
                  1 -> 1;
                  _ -> rap_retain(Topic, Msg, D)
              end,
-    Props0 = publish_props(Msg),
+    Props0 = maps:merge(publish_props(Msg), AliasProps),
     %% §3.3.4 (MQTT-3.3.4-4): one copy carries the Subscription Identifiers of
     %% every matching subscription that is not No-Local-suppressed.
     Props = case matching_ids(Topic, Msg, D) of
@@ -2319,6 +2386,29 @@ publish_bin(QoS, Dup, RetainFlag, Msg, Pid, D) ->
                  packet_id = Pid,
                  payload = Msg#broker_message.payload,
                  props = Props}, D).
+
+%% MQ-04 §3.3.3.1: assign (or reuse) a Topic Alias for `Topic' on this outbound
+%% connection. Returns the prop map to merge into the PUBLISH and the state with
+%% `alias_out'/`next_alias_out' advanced. Off for 3.1.1 or a 0 maximum; once the
+%% broker has handed out `topic_alias_max' aliases it stops (no reclaim).
+maybe_alias(Topic, #st{proto_level = 5, topic_alias_max = Max} = D)
+  when Max > 0 ->
+    case D#st.alias_out of
+        #{Topic := Alias} ->
+            {#{topic_alias => Alias}, D};
+        _ ->
+            Next = D#st.next_alias_out,
+            case Next =< Max of
+                true ->
+                    {#{topic_alias => Next},
+                     D#st{alias_out = maps:put(Topic, Next, D#st.alias_out),
+                          next_alias_out = Next + 1}};
+                false ->
+                    {#{}, D}
+            end
+    end;
+maybe_alias(_Topic, D) ->
+    {#{}, D}.
 
 matching_ids(Topic, Msg, #st{sub_ids = Ids, sub_flags = Flags} = D) ->
     Own = publisher_of(Msg) =:= D#st.client_id,
@@ -2421,7 +2511,16 @@ add_trace_headers(Props, Headers) when is_map(Headers) ->
 %% SUBACK; v5 appends the reason code + zero properties so the client's v5
 %% parser sees the shape it expects.
 connack_bin(SP, RC, D) ->
-    enc(#connack{session_present = SP, return_code = RC}, D).
+    %% MQ-04 (§3.2.2.3): a v5 CONNACK carries Topic Alias Maximum when the broker
+    %% honours aliases (> 0). 0 means the feature is off, so the property is
+    %% absent and a client that uses an alias anyway gets 0x94 (handle_publish).
+    Props = case vsn(D) of
+                5 when D#st.topic_alias_max > 0 ->
+                    #{topic_alias_maximum => D#st.topic_alias_max};
+                _ ->
+                    #{}
+            end,
+    enc(#connack{session_present = SP, return_code = RC, props = Props}, D).
 
 suback_bin(Pid, Codes, D) ->
     enc(#suback{packet_id = Pid, return_codes = Codes}, D).
@@ -2468,15 +2567,29 @@ blob(D) ->
                   || {Pid, Entry} <- maps:to_list(D#st.pending),
                      is_position_entry(Entry)],
     Pids = [Pid || {Pid, _} <- Positional],
-    #{vsn => 3,
-      next_pid => D#st.next_pid,
-      pending => Positional,
-      qos => maps:with(Pids, D#st.pending_qos),
-      released => maps:with(Pids, D#st.released),
-      received => D#st.received,
-      %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
-      %% and §3.8.3.1 options across reconnects, so they ride the blob too.
-      subs => subs_blob(D)}.
+    Base = #{vsn => 4,
+             next_pid => D#st.next_pid,
+             pending => Positional,
+             qos => maps:with(Pids, D#st.pending_qos),
+             released => maps:with(Pids, D#st.released),
+             received => D#st.received,
+             %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
+             %% and §3.8.3.1 options across reconnects, so they ride the blob too.
+             subs => subs_blob(D)},
+    %% vsn 4 (MQ-04 §3.3.2.3.2): the inbound alias<->topic map must survive a
+    %% reconnect within the session, so it rides the blob -- but only for a v5
+    %% connection that actually honours aliases. Otherwise the key is absent and
+    %% an older reader keeps its defaults.
+    case aliases_blob(D) of
+        undefined -> Base;
+        Aliases -> Base#{aliases => Aliases}
+    end.
+
+aliases_blob(#st{proto_level = 5, topic_alias_max = Max} = D) when Max > 0 ->
+    {maps:to_list(D#st.alias_in), maps:to_list(D#st.alias_out),
+     D#st.next_alias_out};
+aliases_blob(_) ->
+    undefined.
 
 subs_blob(#st{sub_ids = Ids, sub_flags = Flags}) ->
     [{F, Id, NL, Rap}

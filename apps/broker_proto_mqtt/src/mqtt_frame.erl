@@ -581,7 +581,16 @@ parse_publish_v5(Flags, Body) ->
                 {error, Reason} -> {error, Reason};
                 too_short -> {error, {malformed_packet, publish_truncated}};
                 {Topic, R1} ->
-                    case validate_topic_name(Topic) of
+                    %% §3.3.2.2 (MQTT 5): an empty topic name is legal when a
+                    %% Topic Alias rides the same PUBLISH. Whether the alias is
+                    %% present/known is the connection layer's question (the FSM
+                    %% pairs them and answers 0x91/0x94), so the codec parses an
+                    %% empty topic here; a non-empty topic keeps the shape rule.
+                    TopicCheck = case Topic of
+                                     <<>> -> ok;
+                                     _ -> validate_topic_name(Topic)
+                                 end,
+                    case TopicCheck of
                         {error, Reason} ->
                             {error, Reason};
                         ok ->
@@ -1075,7 +1084,10 @@ encode_v5(#connack{session_present = SP, return_code = RC, props = Props}) ->
     end;
 encode_v5(#publish{topic = Topic, payload = Payload, dup = Dup, qos = QoS,
                    retain = Ret, packet_id = Pid, props = Props}) ->
-    case ok_topic(Topic) andalso is_binary(Payload) andalso QoS =< 2 of
+    %% §3.3.2.2 (MQTT 5): a PUBLISH MAY carry an empty topic name when it also
+    %% carries a Topic Alias the broker can resolve; the non-empty topic keeps
+    %% the historical shape rule (no wildcards, <= 65535).
+    case ok_topic_v5(Topic, Props) andalso is_binary(Payload) andalso QoS =< 2 of
         false ->
             erlang:error({malformed_frame_out, publish});
         true ->
@@ -1316,6 +1328,13 @@ ok_topic(Topic) ->
     is_binary(Topic) andalso Topic =/= <<>> andalso
         byte_size(Topic) =< 65535 andalso
         binary:match(Topic, [<<"+">>, <<"#">>]) =:= nomatch.
+
+%% MQTT 5: an empty topic name is valid only alongside a Topic Alias (§3.3.2.2);
+%% a non-empty topic must still obey the historical shape rule (no wildcards).
+ok_topic_v5(<<>>, Props) ->
+    maps:is_key(topic_alias, Props);
+ok_topic_v5(Topic, _Props) ->
+    ok_topic(Topic).
 
 fixed_header(Type, Flags, Content) ->
     Size = byte_size(Content),
