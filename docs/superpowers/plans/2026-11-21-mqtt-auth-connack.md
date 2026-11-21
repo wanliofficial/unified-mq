@@ -300,7 +300,7 @@ auth_plain_begin_continue_ok(_Config) ->
     ok = boot(),
     Ctx = #{client_id => <<"c">>},
     {continue, Challenge, AuthState} =
-        broker_auth:begin(<<"plain">>, undefined, Ctx),
+        broker_auth:initiate(<<"plain">>, undefined, Ctx),
     ?assert(is_binary(Challenge)),
     Resp = term_to_binary({<<"alice">>, Challenge, <<"pw">>}),
     {ok, <<"alice">>, _Ctx2} =
@@ -310,7 +310,7 @@ auth_plain_begin_continue_ok(_Config) ->
 auth_plain_wrong_password(_Config) ->
     ok = boot(),
     {continue, Challenge, AuthState} =
-        broker_auth:begin(<<"plain">>, undefined, #{}),
+        broker_auth:initiate(<<"plain">>, undefined, #{}),
     Resp = term_to_binary({<<"alice">>, Challenge, <<"wrong">>}),
     {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
     ok.
@@ -318,7 +318,7 @@ auth_plain_wrong_password(_Config) ->
 auth_plain_unknown_nonce(_Config) ->
     ok = boot(),
     {continue, _Challenge, AuthState} =
-        broker_auth:begin(<<"plain">>, undefined, #{}),
+        broker_auth:initiate(<<"plain">>, undefined, #{}),
     %% A response naming a nonce we never issued for this handshake.
     Resp = term_to_binary({<<"alice">>, <<"bogus-nonce">>, <<"pw">>}),
     {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
@@ -342,14 +342,16 @@ Expected: FAIL — `broker_auth` 模块不存在。
 %%%
 %%% A CONNECT that names an `authentication_method' is routed here instead of the
 %%% synchronous username/password path. Each method is a `broker_auth_<name>'
-%%% module implementing the `broker_auth_method' behaviour; this module is the
+%%% module implementing this `broker_auth' behaviour; this module is the
 %%% registry that dispatches by method name and reads the enabled list from
 %%% config. A CONNECT without an `authentication_method' never reaches here.
 -module(broker_auth).
 %% NOTE: this module DEFINES the behaviour (the -callback clauses below); it is
 %% the registry/dispatcher, not an implementer, so it does NOT carry
-%% -behaviour(broker_auth_method). The implementers (broker_auth_plain) do.
--export([enabled_methods/0, begin/3, continue/3, reauth/3]).
+%% -behaviour(broker_auth). The implementers (broker_auth_plain) do.
+%% Naming: `begin' is an Erlang reserved word, so the entry callback/API is
+%% `initiate/3' (continue/3 and reauth/3 are not reserved and keep their names).
+-export([enabled_methods/0, initiate/3, continue/3, reauth/3]).
 
 -type method()  :: binary().
 -type result() :: {ok, term(), map()}
@@ -358,7 +360,7 @@ Expected: FAIL — `broker_auth` 模块不存在。
 
 -export_type([method/0, result/0]).
 
--callback begin(Method :: method(), InitialData :: binary() | undefined,
+-callback initiate(Method :: method(), InitialData :: binary() | undefined,
                 Ctx :: map()) -> result().
 -callback continue(Method :: method(), AuthState :: term(),
                    ResponseData :: binary() | undefined) -> result().
@@ -402,7 +404,7 @@ module_for(Method) ->
             error
     end.
 ```
-> 注：`-behaviour(broker_auth_method)` 加在本模块（定义 behaviour 的模块不必声明自己实现它）；**删掉这行**——它是笔误。定义 behaviour 用 `-callback`，不需要本模块也 `-behaviour`。
+> 注：`-behaviour(broker_auth_method)` 是笔误——没有 `broker_auth_method` 这个模块（本特性只新增两个文件）。`broker_auth` 自己定义 behaviour（下面的 `-callback`），实现者应声明 `-behaviour(broker_auth)`。本仓库 `warnings_as_errors`，behaviour 模块不存在会直接编译失败，所以必须用 `-behaviour(broker_auth)`。
 
 - [ ] **Step 4：写 `broker_auth_plain.erl`**
 
@@ -414,15 +416,15 @@ module_for(Method) ->
 %%% same framework later.
 %%%
 %%% Wire shape:
-%%%   begin    -> challenge data is a fresh Nonce binary.
+%%%   initiate -> challenge data is a fresh Nonce binary.
 %%%   continue -> response data is term_to_binary({User, Nonce, Pass}). The
-%%%               Nonce must equal the one begin issued for this handshake
+%%%               Nonce must equal the one initiate issued for this handshake
 %%%               (guards against splicing a response onto the wrong exchange),
 %%%               and broker_security:authenticate(User, Pass) must pass.
 %%%   reauth   -> data is term_to_binary({User, Pass}).
 -module(broker_auth_plain).
--behaviour(broker_auth_method).
--export([begin/3, continue/3, reauth/3]).
+-behaviour(broker_auth).
+-export([initiate/3, continue/3, reauth/3]).
 
 %% A short, unique, non-secret nonce. Not crypto-grade on purpose: it binds a
 %% response to its handshake, it does not resist an active attacker (TLS does).
@@ -473,7 +475,7 @@ Expected: 3 PASS。
 git add apps/broker_proto_mqtt/src/broker_auth.erl apps/broker_proto_mqtt/src/broker_auth_plain.erl apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl
 git commit --no-verify -m "feat(mqtt): broker_auth framework + plain method (MQ-05)
 
-broker_auth is the method registry + behaviour dispatcher (begin/continue/reauth
+broker_auth is the method registry + behaviour dispatcher (initiate/continue/reauth
 by method name, enabled list from mqtt_auth_methods). broker_auth_plain is the
 first method: a nonce-guarded username/password exchange reusing
 broker_security:authenticate — no new crypto dependency. Plain is the only
@@ -484,7 +486,7 @@ method wired up; the framework accepts more later."
 
 ## Task 4 — `#st{}` auth 字段 + CONNECT 分支接入
 
-**目标**：给 `#st{}` 加 `auth_method`/`auth_state`/`auth_deadline`；`handle_connect` 在 CONNECT 带 `authentication_method` 时走 `broker_auth:begin`，否则零回归走原同步 `authenticate/2`。
+**目标**：给 `#st{}` 加 `auth_method`/`auth_state`/`auth_deadline`；`handle_connect` 在 CONNECT 带 `authentication_method` 时走 `broker_auth:initiate`，否则零回归走原同步 `authenticate/2`。
 
 **Files**
 - Modify: `apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl`（`#st{}` 记录、`handle_connect/2`）
@@ -529,7 +531,7 @@ Expected: FAIL — 现 `handle_connect` 忽略 `authentication_method` 走同步
 ```erlang
              %% MQ-05 (spec §3.4): enhanced-auth handshake state. While in the
              %% `awaiting_auth' substate these hold the method + the opaque
-             %% per-method AuthState returned by broker_auth:begin/3, plus the
+             %% per-method AuthState returned by broker_auth:initiate/3, plus the
              %% deadline of the handshake. `undefined' outside a handshake.
              auth_method = undefined :: undefined | binary(),
              auth_state = undefined :: undefined | term(),
@@ -542,7 +544,7 @@ Expected: FAIL — 现 `handle_connect` 忽略 `authentication_method` 走同步
 ```erlang
 %% MQ-05 (spec §3.4): a v5 CONNECT naming an authentication_method is routed to
 %% the enhanced-auth framework instead of the synchronous username/password
-%% path. begin/3 either resolves straight away (-> the same success tail as the
+%% path. initiate/3 either resolves straight away (-> the same success tail as the
 %% synchronous path) or issues a challenge (-> send AUTH 0x18, enter the
 %% awaiting_auth substate). A CONNECT with no method never reaches here.
 handle_auth_method(#connect{props = Props} = C, #st{proto_level = 5} = D0) ->
@@ -551,7 +553,7 @@ handle_auth_method(#connect{props = Props} = C, #st{proto_level = 5} = D0) ->
             authenticate(C, D0);
         Method when is_binary(Method) ->
             Ctx = auth_ctx(C, D0),
-            case broker_auth:begin(Method, maps:get(authentication_data, Props, undefined), Ctx) of
+            case broker_auth:initiate(Method, maps:get(authentication_data, Props, undefined), Ctx) of
                 {ok, Principal, _Ctx2} ->
                     %% The method resolved in one round: run the normal success
                     %% tail with the principal it produced.
@@ -640,7 +642,7 @@ git add apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl apps/broker_proto_mqtt/test
 git commit --no-verify -m "feat(mqtt): route CONNECT-with-method through broker_auth (MQ-05)
 
 handle_connect now checks authentication_method on a v5 CONNECT: present ->
-broker_auth:begin (one-shot resolves through the shared success tail; a
+broker_auth:initiate (one-shot resolves through the shared success tail; a
 challenge sends AUTH 0x18 and enters the awaiting_auth substate). Absent ->
 the existing synchronous authenticate/2 path, unchanged. Adds auth_method /
 auth_state / auth_deadline to #st{}."
@@ -969,6 +971,6 @@ Expected: merge 干净（本 worktree 只改 `mqtt_conn_fsm.erl`/`mqtt_frame.*`/
 
 - **Spec 覆盖**：MQ-07（Task 1 + 6）、MQ-05 codec（Task 2）、framework（Task 3）、状态机+re-auth（Task 4+5）、配置+文档+merge（Task 6）、spec §7 八用例（Task 1 两个 + Task 5 三个 challenge + 两个 reauth + 一个零回归 + Task 3 三个 plain 单元）。
 - **零回归**：不带 method 的 CONNECT 走原 `authenticate/2`（Task 4 Step 4 分派）；3.1.1 CONNACK 字节不变（MQ-07 只在 vsn=5 填 props）；既有 v5 CONNACK `#{}` 断言已在 Task 1 改掉。
-- **类型一致**：`broker_auth:begin/3`/`continue/3`/`reauth/3` 在 Task 3 定义、Task 4/5 调用，签名一致（`{ok, Principal, Ctx}` / `{continue, Challenge, AuthState}` / `{error, Reason}` / reauth `{ok, Ctx}`|`{error, Reason}`）。
+- **类型一致**：`broker_auth:initiate/3`/`continue/3`/`reauth/3` 在 Task 3 定义、Task 4/5 调用，签名一致（`{ok, Principal, Ctx}` / `{continue, Challenge, AuthState}` / `{error, Reason}` / reauth `{ok, Ctx}`|`{error, Reason}`）。`initiate`（非 `begin`）因 `begin` 是 Erlang 保留字。
 - **无新依赖**：`broker_auth_plain` 只用 `erlang:unique_integer`/`monotonic_time`/`binary_to_term`/`broker_security:authenticate`——全是既有。
 - **已知风险**：`binary_to_term` 的 dialyzer unsafe 警告（Task 6 Step 3 有 fallback：换显式 decoder）；`#st{}` 加字段不影响既有构造（都有默认值）。

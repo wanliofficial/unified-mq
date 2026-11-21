@@ -47,7 +47,7 @@
 新增 `broker_auth.erl`，定义 behaviour 并做 method 注册表：
 
 ```erlang
--callback begin(Method :: binary(), InitialData :: binary() | undefined,
+-callback initiate(Method :: binary(), InitialData :: binary() | undefined,
                 Ctx :: map()) ->
     {ok, Principal :: term(), Ctx :: map()}
   | {continue, ChallengeData :: binary(), AuthState :: term()}
@@ -62,7 +62,7 @@
 ```
 
 - `broker_auth:enabled_methods/0`：读配置 `mqtt_auth_methods`（默认 `["plain"]`）。
-- `broker_auth:begin/3`、`continue/3`、`reauth/3`：按 method 名分派到对应模块（`broker_auth_<name>`）。
+- `broker_auth:initiate/3`、`continue/3`、`reauth/3`：按 method 名分派到对应模块（`broker_auth_<name>`）。（`initiate` 而非 `begin`，因 `begin` 是 Erlang 保留字。）
 - **未声明 `authentication_method` 的 CONNECT 走现有同步 `authenticate/2` 路径，完全不变**（零回归）。
 
 ### 3.3 首个 method：`broker_auth_plain`（不引入新加密依赖）
@@ -77,7 +77,7 @@ nonce 绑定的 username/password 交换，复用现有用户库：
 ### 3.4 MQ-05：连接层状态机与报文语义
 
 - **CONNECT 带 `authentication_method`**（`handle_connect/2` 的认证分支）：
-  - `broker_auth:begin(Method, AuthData, #{client_id => ..., tenant => ...})`：
+  - `broker_auth:initiate(Method, AuthData, #{client_id => ..., tenant => ...})`：
     - `{ok, Principal, Ctx}` → 走现有成功路径（attach session、CONNACK 0）。
     - `{continue, Challenge, AuthState}` → `#st{auth_state = {Method, AuthState}, auth_method = Method}`，发 **AUTH(0x18 Continue authentication)**，props 含 `authentication_method=Method` + `authentication_data=Challenge`，进入 `awaiting_auth` 子状态。
     - `{error, _}` → `refuse(16#86, D)`（Not authorized）。
