@@ -159,7 +159,13 @@
 - [x] **MQTT 5.0 Request Response Information（MQ-06）**：CONNECT 带 `request_response_information=1` 且配了 `mqtt_response_information` 时，成功 CONNACK 回填响应主题前缀（默认关闭）。
 - [x] **MQTT 5.0 CONNACK 能力回填（MQ-07）**：v5 成功 CONNACK 回填保留/通配/订阅标识/共享订阅可用位；Maximum QoS 按 §3.2.2.3.4 省略（缺省即 QoS 2）。
 - [ ] **QoS2 exactly-once 边界（MQ-08）**：本仓库明确「跨崩溃至少一次」（ADR-012/018），与 fss 的「acked QoS1/2 survives node loss（集群副本）」不同——本仓库是单节点 WAL 保证，非集群副本。文档红线已就位（§3 状态表 + 本表 QoS 行）；剩余是把集群副本下的 exactly-once 承诺写清，属集群副本工作项，非 MQTT 协议缺口。
-- [ ] **P2 背压（慢消费者隔离，MQ-11）**：本仓库只有「停投」无背压；两项目有流控/隔离。待办：评估 per-subscriber 背压。
+- [x] **发布侧重试语义（MQ-09）**：同一条连接对未确认消息只投一次，不挂重传定时器；重发只在重连时发生。这是刻意取舍——慢客户端或丢 PUBACK 时由断线补投而非连接内定时器，语义已选定并有测试覆盖，非缺陷。
+- [x] **in-flight 刷盘窗口（MQ-10）**：`inflight_flush_interval_ms` 默认 100ms，窗口内崩溃可能让**不同消息**复用同一 packet id；`=0` 可压到最小。这是组提交刷盘延迟的权衡，配置可控，已选语义+测试覆盖。
+- [x] **停投而非背压（MQ-11）**：in-flight 默认 64，满了即停投、不通知发布者、不踢慢消费者。当前刻意只做「停投」；per-subscriber 背压/慢消费者隔离列为下方 P2 待办。
+- [x] **超大出站消息丢弃（MQ-12）**：超过客户端 Maximum Packet Size 的 PUBLISH 直接丢弃并计数，不拆包、不改错误码。这是线格式边界的刻意处理，已选语义+测试覆盖。
+- [x] **Will 不落盘（MQ-13）**：遗嘱只在连接进程内存里，broker 重启不补发；mosquitto 默认亦如此。要「进程被 kill 也发遗嘱」则需持久化，当前未做，已选语义+测试覆盖。
+- [x] **离线追赶无优先级（MQ-14）**：积压与新消息按 offset 混在同一序列，深度越大首条越慢；无独立离线队列。这是当前排序语义，已选语义+测试覆盖。
+- [ ] **P2 背压（慢消费者隔离，MQ-11）**：在上方「停投」语义之上再引入流控/隔离；两项目有此能力。待办：评估 per-subscriber 背压。
 
 ### 4.7 测试资产（已在 `protocol-conformance-validation.md` 立项）
 

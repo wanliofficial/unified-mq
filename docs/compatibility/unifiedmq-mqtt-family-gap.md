@@ -57,17 +57,17 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-06 | 已支持 | Request Response Information | CONNECT 带 `request_response_information=1` 且 broker 配了 `mqtt_response_information`（默认 undefined 关）时，成功 CONNACK 回填该值作为响应主题前缀；客户端据此拼 `Response Topic = RI ++ Correlation Data`。请求/响应经既有 topic 路由透传 `response_topic`/`correlation_data`，无特殊路由（2026-11-21 落地于 mq-request-response） | 这是 broker 分配响应主题命名空间的能力，不是消息字段透传 |
 | MQ-07 | 已支持 | CONNACK 能力回填 | v5 CONNACK 在连接成功（RC=0）时回填**四个**静态能力位：retain / wildcard / subscription-identifier / shared-subscription available 均为 1；**不发 `maximum_qos`**（§3.2.2.3.4 只允许 0/1，值 2 是 Protocol Error；缺省即表示最大 QoS 2，支持 QoS 2 靠省略表达，MQTT-3.2.2-9）；由 `mqtt_connack_props_v5` 开关控制（默认开）。Server Keep Alive、Assigned Client Identifier 仍不回（2026-11-21 落地于 mq-auth-connack，同日按规范修正 maximum_qos） | 不回不等于撒谎；空 ClientID 仍直接拒绝，不会分配一个 |
 | MQ-08 | 语义缺口 | QoS 2 跨崩溃 | 崩溃后允许重复，对外明确「至少一次」而非 exactly-once；线协议和跨重连不重复已成立，对外说明已写入 `docs/mqtt-feature-comparison.md`（§3 状态表 + QoS 行 + 已知限制） | 不是 exactly-once。这是设计，不是忘了写 |
-| MQ-09 | 语义缺口 | 没有发布侧重试定时器 | 同一条连接对未确认消息只投一次。重发只发生在重连 | 规范允许发送方重试。慢客户端或丢 PUBACK 时，要断线才补 |
-| MQ-10 | 语义缺口 | in-flight 默认 100ms 才刷盘 | 崩溃可能让**不同消息**复用同一个 packet id。`inflight_flush_interval_ms=0` 可以把窗口压到最小 | 按 packet id 去重的客户端会误伤 |
-| MQ-11 | 语义缺口 | 只有停投，没有背压 | in-flight 默认 64，满了就停。不通知发布者，不踢慢消费者 | 生产上慢订阅者会拖住分区 |
-| MQ-12 | 语义缺口 | 超大出站消息被丢弃 | 超过客户端 Maximum Packet Size 的 PUBLISH 丢弃并计数，不拆、不改为错误码通知发布者 | 订阅端会缺消息 |
-| MQ-13 | 语义缺口 | Will 不落盘 | 只在连接进程内存里。broker 重启不补发遗嘱。mosquitto 默认也这样 | 要「进程被 kill 也发遗嘱」则没做 |
-| MQ-14 | 语义缺口 | 离线追赶无优先级 | 积压和新消息按 offset 混在一个序列里，深度越大首条越慢 | 没有独立离线队列 |
+| MQ-09 | 语义缺口 | 没有发布侧重试定时器 | 同一条连接对未确认消息只投一次。重发只发生在重连 | 规范允许发送方重试。慢客户端或丢 PUBACK 时，要断线才补。对外说明已写入 `docs/mqtt-feature-comparison.md` §4.6 |
+| MQ-10 | 语义缺口 | in-flight 默认 100ms 才刷盘 | 崩溃可能让**不同消息**复用同一个 packet id。`inflight_flush_interval_ms=0` 可以把窗口压到最小 | 按 packet id 去重的客户端会误伤。对外说明已写入 §4.6 |
+| MQ-11 | 语义缺口 | 只有停投，没有背压 | in-flight 默认 64，满了就停。不通知发布者，不踢慢消费者 | 生产上慢订阅者会拖住分区。当前「停投」语义已对外写入 §4.6；per-subscriber 背压仍为待办 |
+| MQ-12 | 语义缺口 | 超大出站消息被丢弃 | 超过客户端 Maximum Packet Size 的 PUBLISH 丢弃并计数，不拆、不改为错误码通知发布者 | 订阅端会缺消息。对外说明已写入 §4.6 |
+| MQ-13 | 语义缺口 | Will 不落盘 | 只在连接进程内存里。broker 重启不补发遗嘱。mosquitto 默认也这样 | 要「进程被 kill 也发遗嘱」则没做。对外说明已写入 §4.6 |
+| MQ-14 | 语义缺口 | 离线追赶无优先级 | 积压和新消息按 offset 混在一个序列里，深度越大首条越慢 | 没有独立离线队列。对外说明已写入 §4.6 |
 | MQ-15 | 未做完 | 共享订阅只在单节点 | `$share` 能建组、竞争消费。没有集群范围的再均衡 | 多节点时每个节点一组，不是一个消费组 |
 | MQ-16 | 未做 | MQTT 3.1 | Protocol Level 3 走 3.1.1 的拒绝帧 `20 02 00 01` | 只保证 3.1.1 和 5.0 子集 |
 | MQ-17 | 产品，不是报文缺口 | 桥接、规则引擎、集群会话副本的故障注入证明、吊销踢人、Prometheus/OTel | `docs/mqtt-feature-comparison.md` 里 `#5`–`#28` 在 2026-11-10 仍是 pending | 对标 fss-mqtt-broker / robustmq 时的差距，不是 3.1.1 互操作的前置条件 |
 
-MQ-01、MQ-02、MQ-03、MQ-04 已全部补齐（MQ-01/02/03 由 `120f1c8`「MQTT 5.0 Will Delay and SUBSCRIBE subscription options」落地；MQ-04 Topic Alias 由后续特性落地）。MQ-05 到 MQ-07 已全部落地（MQ-05 AUTH 与 MQ-07 CONNACK 能力回填由 `mq-auth-connack`，MQ-06 Request Response Information 由 `mq-request-response`）。MQ-08 到 MQ-14 是已经选定的语义，测试也覆盖了，缺的是对外说明，不是一块没写的报文。
+MQ-01、MQ-02、MQ-03、MQ-04 已全部补齐（MQ-01/02/03 由 `120f1c8`「MQTT 5.0 Will Delay and SUBSCRIBE subscription options」落地；MQ-04 Topic Alias 由后续特性落地）。MQ-05 到 MQ-07 已全部落地（MQ-05 AUTH 与 MQ-07 CONNACK 能力回填由 `mq-auth-connack`，MQ-06 Request Response Information 由 `mq-request-response`）。MQ-08 到 MQ-14 是已经选定的语义，测试也覆盖了，对外说明已写入 `docs/mqtt-feature-comparison.md` §4.6（每条标注「刻意取舍/当前语义」，非缺陷），缺的不再是说明，而是一致的产品化取舍。
 
 （2026-11-21 更正：MQ-05 AUTH、MQ-06 Request Response Information、MQ-07 CONNACK 能力回填三项均已落地，见上表；MQTT 5 子集协议特性已全部补齐，剩余范围外项为 MQTT 3.1 与各传输层封装。）
 
