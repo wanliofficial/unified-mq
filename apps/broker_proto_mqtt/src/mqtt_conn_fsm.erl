@@ -87,14 +87,23 @@
              %% S2.5 (ADR-017): the negotiated MQTT level. `undefined' before
              %% CONNECT (decode/1's `auto' is legal for exactly one frame).
              proto_level = undefined :: undefined | 4 | 5,
-             %% MQ-04: the Topic Alias Maximum announced in this connection's
-             %% CONNACK (env `mqtt_topic_alias_maximum'). 0 = feature off; an
-             %% inbound alias is then a 0x94 violation.
+             %% MQ-04: the Topic Alias Maximum the broker ANNOUNCED in this
+             %% connection's CONNACK (env `mqtt_topic_alias_maximum'). It is the
+             %% upper bound for an INBOUND alias the client may send (§3.3.2.3.4
+             %% MQTT-3.3.2-9). 0 = feature off: any inbound alias is 0x94.
              topic_alias_max = 0 :: non_neg_integer(),
-             %% MQ-04: alias<->topic maps. `alias_in' is client-defined (inbound
-             %% resolution, §3.3.2.3.2); `alias_out' is broker-allocated
-             %% (outbound generation, §3.3.3.1). 0 is not a valid alias; both
-             %% spaces start at 1.
+             %% MQ-04 §3.3.2.3.4: the Topic Alias Maximum the CLIENT announced in
+             %% its own CONNECT (property 0x22). It is the upper bound for the
+             %% OUTBOUND aliases the broker sends (MQTT-3.3.2-11): 0 or absent
+             %% means the client never offered one, so the broker sends no alias
+             %% at all. `peer_alias_max' is independent of `topic_alias_max'.
+             peer_alias_max = 0 :: non_neg_integer(),
+             %% MQ-04 §3.3.2.3.4: the alias<->topic maps. `alias_in' is
+             %% client-defined (inbound resolution); `alias_out' is broker-
+             %% allocated (outbound generation). Both are CONNECTION-LIFETIME
+             %% state only (§3.3.2.3.4 MQTT-3.3.2-7: mappings MUST NOT be carried
+             %% forward between Network Connections), so neither is persisted
+             %% into the session blob. 0 is never a valid alias (MQTT-3.3.2-8).
              alias_in = #{} :: #{pos_integer() => binary()},
              alias_out = #{} :: #{binary() => pos_integer()},
              next_alias_out = 1 :: 1..65535,
@@ -425,7 +434,10 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
                 session_expiry = maps:get(session_expiry_interval, Props, 0),
                 receive_maximum = maps:get(receive_maximum, Props, 65535),
                 max_packet_size = maps:get(maximum_packet_size, Props, undefined),
-                topic_alias_max = opt(mqtt_topic_alias_maximum, 0, D0)},
+                topic_alias_max = opt(mqtt_topic_alias_maximum, 0, D0),
+                %% §3.3.2.3.4 MQTT-3.3.2-11: what the client can receive, read off
+                %% the CONNECT property; absent means 0, i.e. no outbound alias.
+                peer_alias_max = maps:get(topic_alias_maximum, Props, 0)},
     %% S12-B (ADR-032 D7): the node-level admission gate, asked before any
     %% per-connection work so an over-capacity CONNECT costs a CONNACK and
     %% nothing else. It sits after `proto_level' is in state because the refusal
@@ -725,16 +737,12 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
            end,
     SubIds = maps:from_list([{F, Id} || {F, Id, _NL, _Rap} <- Subs]),
     SubFlags = maps:from_list([{F, {NL, Rap}} || {F, _Id, NL, Rap} <- Subs]),
-    %% vsn 4 (MQ-04 §3.3.2.3.2): the inbound/outbound alias maps and the outbound
-    %% cursor. An older blob has no `aliases' key, so the connection keeps the
-    %% defaults (empty maps, cursor 1) -- exactly a fresh connection.
-    {AliasIn, AliasOut, NextAlias} =
-        case maps:get(aliases, Blob, undefined) of
-            {AI, AO, NA} when is_list(AI), is_list(AO), is_integer(NA) ->
-                {maps:from_list(AI), maps:from_list(AO), NA};
-            _ ->
-                {#{}, #{}, 1}
-        end,
+    %% Topic Alias maps are deliberately NOT restored: §3.3.2.3.4 MQTT-3.3.2-7
+    %% forbids carrying alias mappings across Network Connections, so a reconnect
+    %% -- even a clean=0 one that restores the rest of the session -- is a fresh
+    %% start for `alias_in' and `alias_out' (empty maps, cursor 1, the record
+    %% defaults). This is why blob/1 needs no alias key and why the blob version
+    %% stays at 3.
     D#st{next_pid = maps:get(next_pid, Blob, 1),
          pending = Pending,
          pending_qos = Qos,
@@ -744,9 +752,9 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
          pending_rev = Rev,
          sub_ids = SubIds,
          sub_flags = SubFlags,
-         alias_in = AliasIn,
-         alias_out = AliasOut,
-         next_alias_out = NextAlias}.
+         alias_in = #{},
+         alias_out = #{},
+         next_alias_out = 1}.
 
 %% The partition notifications this conn needs to wake on (design §5.2). The
 %% subscription set belongs to the queue worker, which monitors us, so an
@@ -766,15 +774,19 @@ subscribe_partitions(D) ->
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain, props = Props},
                #st{proto_level = 5} = D) ->
-    %% v5-only input validation + Topic Alias resolution (§3.3.2.3) before
+    %% v5-only input validation + Topic Alias resolution (§3.3.2.3.4) before
     %% anything is stored:
-    %%   * §3.3.2.3.4: a PUBLISH from the client carries no Subscription
-    %%     Identifier -- that property is server-to-client only (0x82).
-    %%   * §3.3.2.3.2: Topic Alias. The server announces a maximum in CONNACK;
-    %%     0 means off, and any alias use is then a 0x94 violation (zero
-    %%     regression for clients that never send an alias). When on, a non-empty
-    %%     topic name may carry an alias (which registers/overwrites the mapping);
-    %%     an empty topic name MUST be paired with a known alias to be restored.
+    %%   * a PUBLISH from the client carries no Subscription Identifier -- that
+    %%     property is server-to-client only (0x82).
+    %%   * Topic Alias: 0 is never a valid alias (MQTT-3.3.2-8) and a Client MUST
+    %%     NOT send one above the Topic Alias Maximum the server announced in its
+    %%     own CONNACK (MQTT-3.3.2-9) -- either is 0x94 Topic Alias invalid.
+    %%     With `topic_alias_max = 0' the feature is off, so any alias is 0x94
+    %%     (zero regression for clients that never send one).
+    %%   * an empty topic name must resolve through a mapping the client itself
+    %%     registered earlier on THIS connection (§3.3.2.3.4 MQTT-3.3.2-7 forbids
+    %%     carrying mappings across Network Connections); an empty topic with no
+    %%     alias is 0x91 Packet payload invalid (§3.3.2.2).
     %% The resolved real topic goes downstream; the alias itself never rides the
     %% #broker_message.
     Idx = maps:is_key(subscription_identifier, Props),
@@ -783,28 +795,30 @@ handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
     if
         Idx ->
             protocol_error(16#82, "subscription_identifier in a client PUBLISH", D);
-        Max =:= 0, Alias =/= undefined ->
-            %% Feature off but the client used an alias: keep the historical 0x94.
-            protocol_error(16#94, "topic_alias on a connection without "
-                                 "topic_alias_maximum", D);
-        byte_size(Topic) =:= 0, Alias =:= undefined ->
-            %% An empty topic name with no alias cannot be restored (§3.3.2.2:
-            %% the topic must be non-empty); 0x91 Packet payload invalid.
-            protocol_error(16#91, "empty topic without a topic alias", D);
-        byte_size(Topic) =:= 0 ->
+        Alias =/= undefined, not (Alias >= 1 andalso Alias =< Max) ->
+            %% MQTT-3.3.2-8/9: 0, or beyond what we announced -- the client's fault.
+            protocol_error(16#94, "topic_alias not in 1..topic_alias_maximum",
+                           D);
+        Alias =/= undefined, byte_size(Topic) =:= 0 ->
             case maps:find(Alias, D#st.alias_in) of
                 {ok, RealTopic} ->
                     handle_publish_in(QoS, RealTopic, WirePid, Payload, Retain,
                                       maps:remove(topic_alias, Props), D);
                 error ->
-                    protocol_error(16#94, "unknown topic alias", D)
+                    %% The value is in range but never mapped (a real client only
+                    %% sends an empty topic after registering it, so this peer
+                    %% is broken); §3.3.2.3.4 leaves it to the receiver.
+                    protocol_error(16#94, "topic_alias not mapped on this connection",
+                                   D)
             end;
         Alias =/= undefined ->
             %% Non-empty topic + alias: register/overwrite the mapping, dispatch
-            %% on the real topic (§3.3.2.3.2).
+            %% on the real topic (§3.3.2.3.4).
             D1 = D#st{alias_in = maps:put(Alias, Topic, D#st.alias_in)},
             handle_publish_in(QoS, Topic, WirePid, Payload, Retain,
                               maps:remove(topic_alias, Props), D1);
+        byte_size(Topic) =:= 0 ->
+            protocol_error(16#91, "empty topic without a topic alias", D);
         true ->
             handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D)
     end;
@@ -2387,11 +2401,14 @@ publish_bin(QoS, Dup, RetainFlag, Msg, Pid, AliasProps, D) ->
                  payload = Msg#broker_message.payload,
                  props = Props}, D).
 
-%% MQ-04 §3.3.3.1: assign (or reuse) a Topic Alias for `Topic' on this outbound
+%% MQ-04 §3.3.2.3.4: assign (or reuse) a Topic Alias for `Topic' on this outbound
 %% connection. Returns the prop map to merge into the PUBLISH and the state with
-%% `alias_out'/`next_alias_out' advanced. Off for 3.1.1 or a 0 maximum; once the
-%% broker has handed out `topic_alias_max' aliases it stops (no reclaim).
-maybe_alias(Topic, #st{proto_level = 5, topic_alias_max = Max} = D)
+%% `alias_out'/`next_alias_out' advanced. Off for 3.1.1, or when the client
+%% offered no Topic Alias Maximum in its own CONNECT (`peer_alias_max = 0'):
+%% §3.3.2.3.4 MQTT-3.3.2-11 forbids sending an alias above that value, so the
+%% broker sends none at all. Once it has handed out `peer_alias_max' aliases it
+%% stops (no reclaim).
+maybe_alias(Topic, #st{proto_level = 5, peer_alias_max = Max} = D)
   when Max > 0 ->
     case D#st.alias_out of
         #{Topic := Alias} ->
@@ -2511,9 +2528,10 @@ add_trace_headers(Props, Headers) when is_map(Headers) ->
 %% SUBACK; v5 appends the reason code + zero properties so the client's v5
 %% parser sees the shape it expects.
 connack_bin(SP, RC, D) ->
-    %% MQ-04 (§3.2.2.3): a v5 CONNACK carries Topic Alias Maximum when the broker
-    %% honours aliases (> 0). 0 means the feature is off, so the property is
-    %% absent and a client that uses an alias anyway gets 0x94 (handle_publish).
+    %% MQ-04 (§3.1.2.11.5 / §3.3.2.3.4): a v5 CONNACK carries Topic Alias Maximum
+    %% (property 0x22) when the broker honours inbound aliases (> 0). 0 means the
+    %% feature is off, so the property is absent and a client that uses an alias
+    %% -- even one in range -- gets 0x94 (handle_publish).
     Props = case vsn(D) of
                 5 when D#st.topic_alias_max > 0 ->
                     #{topic_alias_maximum => D#st.topic_alias_max};
@@ -2567,29 +2585,20 @@ blob(D) ->
                   || {Pid, Entry} <- maps:to_list(D#st.pending),
                      is_position_entry(Entry)],
     Pids = [Pid || {Pid, _} <- Positional],
-    Base = #{vsn => 4,
-             next_pid => D#st.next_pid,
-             pending => Positional,
-             qos => maps:with(Pids, D#st.pending_qos),
-             released => maps:with(Pids, D#st.released),
-             received => D#st.received,
-             %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
-             %% and §3.8.3.1 options across reconnects, so they ride the blob too.
-             subs => subs_blob(D)},
-    %% vsn 4 (MQ-04 §3.3.2.3.2): the inbound alias<->topic map must survive a
-    %% reconnect within the session, so it rides the blob -- but only for a v5
-    %% connection that actually honours aliases. Otherwise the key is absent and
-    %% an older reader keeps its defaults.
-    case aliases_blob(D) of
-        undefined -> Base;
-        Aliases -> Base#{aliases => Aliases}
-    end.
-
-aliases_blob(#st{proto_level = 5, topic_alias_max = Max} = D) when Max > 0 ->
-    {maps:to_list(D#st.alias_in), maps:to_list(D#st.alias_out),
-     D#st.next_alias_out};
-aliases_blob(_) ->
-    undefined.
+    %% vsn 3: MQ-04 deliberately did NOT bump this. §3.3.2.3.4 forbids carrying
+    %% Topic Alias mappings across Network Connections, so `alias_in' is
+    %% connection-lifetime state and stays in memory only -- a reconnect (even a
+    %% clean=0 one) starts with empty alias maps, which is a fresh connection by
+    %% definition. `alias_out' is likewise never persisted.
+    #{vsn => 3,
+      next_pid => D#st.next_pid,
+      pending => Positional,
+      qos => maps:with(Pids, D#st.pending_qos),
+      released => maps:with(Pids, D#st.released),
+      received => D#st.received,
+      %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
+      %% and §3.8.3.1 options across reconnects, so they ride the blob too.
+      subs => subs_blob(D)}.
 
 subs_blob(#st{sub_ids = Ids, sub_flags = Flags}) ->
     [{F, Id, NL, Rap}
