@@ -53,6 +53,9 @@ all() ->
      publish_reserved_bits_are_rejected,
      connect_flags_follow_the_sn_layout,
      connect_reserved_bits_are_rejected,
+     connect_parses_will_delay,
+     connect_true_will_delay_decodes,
+     connect_will_delay_round_trips,
      will_topic_reserved_bits_are_rejected,
      publish_invalid_topic_id_type_is_rejected,
      subscribe_invalid_topic_id_type_is_rejected,
@@ -81,11 +84,11 @@ roundtrip_gwinfo(_Config) ->
 roundtrip_connect(_Config) ->
     P = #{type => connect, will => true, clean_session => false,
           protocol_id => 1, duration => 60, client_id => <<"sensor-1">>},
-    ?assertEqual({ok, P}, mqtt_sn_codec:decode(mqtt_sn_codec:encode(P))),
+    ?assertEqual({ok, P#{will_delay => 0}}, mqtt_sn_codec:decode(mqtt_sn_codec:encode(P))),
     %% A connect with no will and a clean session is the other common shape.
     P2 = #{type => connect, will => false, clean_session => true,
            protocol_id => 1, duration => 30, client_id => <<"c">>},
-    ?assertEqual({ok, P2}, mqtt_sn_codec:decode(mqtt_sn_codec:encode(P2))).
+    ?assertEqual({ok, P2#{will_delay => 0}}, mqtt_sn_codec:decode(mqtt_sn_codec:encode(P2))).
 
 roundtrip_connack(_Config) ->
     lists:foreach(
@@ -318,15 +321,57 @@ connect_flags_follow_the_sn_layout(_Config) ->
     ClientId = <<"mqtt-sn-tools-1">>,
     Len = 6 + byte_size(ClientId),
     ?assertEqual({ok, #{type => connect, will => false, clean_session => true,
-                        protocol_id => 1, duration => 10,
+                        protocol_id => 1, duration => 10, will_delay => 0,
                         client_id => ClientId}},
                  mqtt_sn_codec:decode(<<Len, 16#04, 16#04, 16#01, 0, 10,
                                        ClientId/binary>>)),
-    %% Will (0x08) and no clean session: the other shape on the wire.
+    %% Will (0x08) and no clean session: v1.2 puts the 2-byte Will Delay
+    %% Interval between Duration and ClientId whenever Will is set (0 = no
+    %% delay), so the frame carries it.
     ?assertEqual({ok, #{type => connect, will => true, clean_session => false,
-                        protocol_id => 1, duration => 5,
+                        protocol_id => 1, duration => 5, will_delay => 0,
                         client_id => <<"c1">>}},
-                 mqtt_sn_codec:decode(<<8, 16#04, 16#08, 16#01, 0, 5, "c1">>)),
+                 mqtt_sn_codec:decode(<<10, 16#04, 16#08, 16#01, 0, 5, 0, 0, "c1">>)),
+    ok.
+
+%% v1.2 will-delay: the 2-byte field appears only between Duration and
+%% ClientId and only when Will is set. Will=false keeps the current shape and
+%% must decode will_delay=>0 without the ClientId being shifted.
+connect_parses_will_delay(_Config) ->
+    ClientId = <<"mqtt-sn-tools-1">>,
+    Len = 6 + byte_size(ClientId),
+    ?assertEqual({ok, #{type => connect, will => false, clean_session => true,
+                        protocol_id => 1, duration => 10, will_delay => 0,
+                        client_id => ClientId}},
+                 mqtt_sn_codec:decode(<<Len, 16#04, 16#04, 16#01, 0, 10,
+                                        ClientId/binary>>)),
+    ok.
+
+connect_true_will_delay_decodes(_Config) ->
+    %% Will=true (0x08), WillDelay=30 between Duration and ClientId.
+    ?assertEqual({ok, #{type => connect, will => true, clean_session => false,
+                        protocol_id => 1, duration => 5, will_delay => 30,
+                        client_id => <<"c1">>}},
+                 mqtt_sn_codec:decode(<<10, 16#04, 16#08, 16#01, 0, 5,
+                                        0, 30, "c1">>)),
+    %% Will=true with WillDelay=0: field present but zero.
+    ?assertEqual({ok, #{type => connect, will => true, clean_session => false,
+                        protocol_id => 1, duration => 5, will_delay => 0,
+                        client_id => <<"c1">>}},
+                 mqtt_sn_codec:decode(<<10, 16#04, 16#08, 16#01, 0, 5,
+                                        0, 0, "c1">>)),
+    ok.
+
+connect_will_delay_round_trips(_Config) ->
+    Map = #{type => connect, will => true, clean_session => true,
+            protocol_id => 1, duration => 5, will_delay => 30,
+            client_id => <<"c1">>},
+    ?assertEqual({ok, Map}, mqtt_sn_codec:decode(mqtt_sn_codec:encode(Map))),
+    %% Will=false encode keeps the current shape (no delay field).
+    Map0 = #{type => connect, will => false, clean_session => true,
+             protocol_id => 1, duration => 10, client_id => <<"c0">>},
+    ?assertEqual({ok, Map0#{will_delay => 0}},
+                 mqtt_sn_codec:decode(mqtt_sn_codec:encode(Map0))),
     ok.
 
 connect_reserved_bits_are_rejected(_Config) ->
@@ -335,7 +380,8 @@ connect_reserved_bits_are_rejected(_Config) ->
     %% sets it anyway is read, not killed -- 0x40 means neither Will nor a
     %% clean session.
     ?assertEqual({ok, #{type => connect, will => false, clean_session => false,
-                        protocol_id => 1, duration => 10, client_id => <<"c1">>}},
+                        protocol_id => 1, duration => 10, will_delay => 0,
+                        client_id => <<"c1">>}},
                  mqtt_sn_codec:decode(<<8, 16#04, 16#40, 1, 0, 10, "c1">>)),
     ?assertMatch({error, {reserved_bits, 16#01}},
                  mqtt_sn_codec:decode(<<8, 16#04, 16#01, 1, 0, 10, "c1">>)),
