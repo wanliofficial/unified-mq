@@ -49,9 +49,9 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 
 | ID | 级别 | 项 | 现在 | 规范或常见 broker |
 |---|---|---|---|---|
-| MQ-01 | 未做完 | Subscription Identifier | SUBSCRIBE 时写进连接状态 `sub_ids`，**没有任何投递路径读取它**。出站 PUBLISH 不带这个属性 | MQTT 5：匹配该订阅的 PUBLISH 必须带上 identifier |
-| MQ-02 | 未做完 | Will Delay | 帧层能解码 `will_delay_interval`。`will_of/1` 只留下 topic/payload/qos/retain，`mqtt_will:publish/3` 在断连时立刻发 | 断开后等待 Will Delay，期间重连则取消 |
-| MQ-03 | 未做完 | SUBSCRIBE 选项 | `mqtt_frame` 只留下 QoS 两个位。`no_local`、`retain_as_published`、`retain_handling` 被丢掉，且不报错 | `retain_handling=2` 不应再补发 retained；`no_local` 不应把本连接的发布投回来 |
+| MQ-01 | 已支持 | Subscription Identifier | SUBSCRIBE 写入连接状态 `sub_ids`；出站 PUBLISH 经 `matching_ids/3` 把每个匹配且未被 no-local 抑制的订阅 identifier 带进 PUBLISH 属性（§3.3.4） | MQTT 5：匹配该订阅的 PUBLISH 带 identifier |
+| MQ-02 | 已支持 | Will Delay | CONNECT 的 `will_delay_interval` 生效：`will_of/1` 保留 `delay`，`publish_will/1` 延迟>0 时停靠 `mqtt_will_server`，重连取消 | 断开后等待 Will Delay，期间重连则取消 |
+| MQ-03 | 已支持 | SUBSCRIBE 选项 | `no_local` / `retain_as_published` / `retain_handling` 全部生效：`sub_flags = {NL, RAP}` 驱动 no-local 抑制与 RAP retain；`retain_handling`（RH）在订阅时刻由 `replay_wanted/3` 决定 retained 补发（RH=0 总补、RH=1 仅新订阅、RH=2 不补） | `retain_handling=2` 不再补发 retained；`no_local` 不把本连接发布投回来 |
 | MQ-04 | 明确未做 | Topic Alias | 编解码有这个属性，连接机不用。CONNACK 也不给 `topic_alias_maximum`，合规客户端本来就不该发 | 可选。现在的做法是「不宣布、不使用」，不是半实现。客户端若强行发空 topic + alias，不会按别名还原 |
 | MQ-05 | 明确未做 | AUTH 增强认证 | 只有 CONNECT 里的 username/password 或 token。没有 AUTH 包，没有 challenge | MQTT 5 AUTH；也没有 OIDC/JWKS |
 | MQ-06 | 明确未做 | Request Response Information | `response_topic` / `correlation_data` 会随消息透传。服务端不实现「客户端请求后，CONNACK 下发 response information」 | 这是 broker 分配响应主题的能力，不是消息字段透传 |
@@ -67,7 +67,7 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-16 | 未做 | MQTT 3.1 | Protocol Level 3 走 3.1.1 的拒绝帧 `20 02 00 01` | 只保证 3.1.1 和 5.0 子集 |
 | MQ-17 | 产品，不是报文缺口 | 桥接、规则引擎、集群会话副本的故障注入证明、吊销踢人、Prometheus/OTel | `docs/mqtt-feature-comparison.md` 里 `#5`–`#28` 在 2026-11-10 仍是 pending | 对标 fss-mqtt-broker / robustmq 时的差距，不是 3.1.1 互操作的前置条件 |
 
-MQ-01、MQ-02、MQ-03 是「代码写了一半或字段被静默丢掉」。MQ-04 到 MQ-07 是范围外，文档已承认，但对外不能说 MQTT 5 做完了。MQ-08 到 MQ-14 是已经选定的语义，测试也覆盖了，缺的是对外说明，不是一块没写的报文。
+MQ-01、MQ-02、MQ-03 已全部补齐（由 `120f1c8`「MQTT 5.0 Will Delay and SUBSCRIBE subscription options」落地）。MQ-04 到 MQ-07 是范围外，文档已承认，但对外不能说 MQTT 5 做完了。MQ-08 到 MQ-14 是已经选定的语义，测试也覆盖了，缺的是对外说明，不是一块没写的报文。
 
 ## 4. MQTT-SN：和另外三条的差异，以及没做完的
 
