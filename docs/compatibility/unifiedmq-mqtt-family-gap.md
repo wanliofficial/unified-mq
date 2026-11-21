@@ -43,9 +43,9 @@ MQTT-WS 已实现子协议 `mqtt` / `mqttv3.1` / `mqttv3.1.1`、任意 path、bi
 
 MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流关闭不等于连接关闭、强制 TLS 1.3。
 
-## 3. 明文 MQTT：没做完的部分
+## 3. 明文 MQTT：没做完 / 明确选择的部分
 
-下面这些在 WebSocket 和 QUIC 上同样没做完。级别按「客户端能不能看出来」而不是按内部 TODO。
+下面这些在 WebSocket 和 QUIC 上同样适用（WS/QUIC 共用 `mqtt_conn_fsm`，行为原样继承）。级别按「客户端能不能看出来」而不是按内部 TODO。标「已支持」的 MQ-01 到 MQ-07 是 MQTT 5 子集的交付记录，保留在此是为了与 MQ-08 之后的范围外/语义选择项对照；MQ-08 到 MQ-14 不是没写完的报文，而是已选定并测试覆盖的语义，只是需对外说明。
 
 | ID | 级别 | 项 | 现在 | 规范或常见 broker |
 |---|---|---|---|---|
@@ -143,8 +143,9 @@ TLS 1.3 是强制的，不是可选项。`tls.enabled` 在这里只表示证书�
 | Retain / Will | 完成；Will 不跨 broker 重启 | 同左 | 同左 | 完成；Will 只有仓内测试 |
 | 持久会话与离线追赶 | 完成 | 同左 | 同左 | 休眠是另一条路径；QoS 0 睡眠即丢 |
 | MQTT 5 子集 | 第 3 节 | 同左 | 同左 | 不适用 |
-| Subscription Identifier 下发 | 没做完 | 同左 | 同左 | 无 |
-| Will Delay | 没做完 | 同左 | 同左 | 无此字段 |
+| Subscription Identifier 下发 | 完成（MQ-01） | 同左 | 同左 | 无 |
+| Will Delay | 完成（MQ-02） | 同左 | 同左 | 无此字段（SN 对齐 3.1 时代） |
+| SUBSCRIBE 选项（no_local / retain_as_published / retain_handling） | 完成（MQ-03） | 同左 | 同左 | 无 |
 | Topic Alias | 已支持（默认关闭，`mqtt_topic_alias_maximum` >0 启用） | 同左 | 同左 | 无 |
 | AUTH | 完成（MQ-05） | 同左 | 同左 | 无 |
 | Request Response | 完成（MQ-06，默认关闭，`mqtt_response_information` 配置后回填） | 同左 | 同左 | 无 |
@@ -155,16 +156,20 @@ TLS 1.3 是强制的，不是可选项。`tls.enabled` 在这里只表示证书�
 
 ## 8. 结论
 
-功能没有「四套都只写了一半」。3.1.1 的发布、订阅、QoS、Retain、Will、会话，在明文、WebSocket、QUIC 上是做完的。MQTT-SN 1.2 的报文和网关语义也做完了主路径。
+功能没有「四套都只写了一半」。3.1.1 的发布、订阅、QoS、Retain、Will、会话，在明文、WebSocket、QUIC 上是做完的。MQTT-SN 1.2 的报文和网关语义也做完了主路径。MQTT 5 子集里 Subscription Identifier 下发、Will Delay、SUBSCRIBE 选项（no_local / retain_as_published / retain_handling）也已补齐（MQ-01/02/03）。
 
-真正没做完、而且会让 MQTT 5 客户端看出来的，是这三件：
+MQ-08 到 MQ-14 这一类不是「没写完的报文」，而是已经选定的语义、测试也覆盖了，只是需要对外说明清楚，避免被当成半成品：
 
-1. Subscription Identifier 记了但不放进 PUBLISH。
-2. Will Delay 解了帧却立刻发遗嘱。
-3. `no_local` / `retain_as_published` / `retain_handling` 被静默忽略。
+- QoS 2 跨崩溃：线协议和跨重连不重复是成立的，对外明确「至少一次」而非 exactly-once（MQ-08）。
+- 发布侧重试：同一连接对未确认消息只投一次，重发只发生在重连；规范允许发送方重试，当前选择不在连接内做重试定时器（MQ-09）。
+- in-flight 默认 100ms 才刷盘：崩溃可能让不同消息复用同一 packet id，`inflight_flush_interval_ms=0` 可压到最小；按 packet id 去重的客户端需知晓（MQ-10）。
+- 只有停投、没有背压通知：in-flight 满了就停，不通知发布者、不踢慢消费者（MQ-11）。
+- 超大出站消息：超过客户端 Maximum Packet Size 的 PUBLISH 丢弃并计数，不拆、不改错误码（MQ-12）。
+- Will 不落盘：只在连接进程内存，broker 重启不补发；要「进程被 kill 也发遗嘱」则没做（MQ-13）。
+- 离线追赶无优先级：积压和新消息按 offset 混在一个序列，没有独立离线队列（MQ-14）。
 
 已经从范围外补上的：AUTH 增强认证（MQ-05）、CONNACK 能力回填（MQ-07）、Topic Alias（MQ-04，默认关闭，`mqtt_topic_alias_maximum` >0 启用）与 Request Response Information（MQ-06，默认关闭，`mqtt_response_information` 配置后回填），AUTH/CONNACK 于 2026-11-21 落地于 `mq-auth-connack`，MQ-06 于同日落地于 `mq-request-response`。
 
 明确列在范围外、还没做的：MQTT 3.1、SN 的 DTLS 和转发器封装、QUIC 的 0-RTT 和多流、WS 的 `permessage-deflate`。
 
-不要把「paho 8/8」理解成 MQTT 5 完整实现。那些用例覆盖的是连接、QoS、Retain、Will 和一条 5.0 往返，没有覆盖上面三件半成品。
+不要把「paho 8/8」理解成 MQTT 5 完整实现。那些用例覆盖的是连接、QoS、Retain、Will 和一条 5.0 往返，没有覆盖上面这些语义选择与范围外能力。
