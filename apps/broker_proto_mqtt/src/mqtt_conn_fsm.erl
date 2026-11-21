@@ -2705,7 +2705,7 @@ connack_bin(SP, RC, D) ->
     %% -- even one in range -- gets 0x94 (handle_publish).
     %% MQ-07: the four static capability bits ride the same CONNACK on RC = 0.
     AliasProps = case vsn(D) of
-                     5 when D#st.topic_alias_max > 0 ->
+                     5 when RC =:= 0, D#st.topic_alias_max > 0 ->
                          #{topic_alias_maximum => D#st.topic_alias_max};
                      _ ->
                          #{}

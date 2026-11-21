@@ -60,6 +60,8 @@ all() ->
      v5_outbound_no_alias_when_client_offers_none,
      v5_outbound_alias_respects_client_maximum,
      v5_outbound_publish_uses_allocated_alias,
+     %% MQ-04: refusal CONNACK carries no alias limit (RC=0 only).
+     v5_connack_omits_topic_alias_maximum_on_refusal,
      v5_connack_capabilities_are_exact,
      v5_connack_capabilities_can_be_disabled,
      %% MQ-06: Request Response Information回填 (gap MQ-06).
@@ -663,6 +665,19 @@ v5_outbound_publish_uses_allocated_alias(_Config) ->
     ?assertEqual(1, maps:get(topic_alias, Got, undefined)),
     {ok, normal} = mqtt_close(Sub),
     {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% MQ-04 (same RC=0 gate as MQ-06/07): a refused CONNACK does not advertise the
+%% broker's inbound alias limit -- the client is not connected, so the property
+%% would be pointless and would perturb the refusal wire shape.
+v5_connack_omits_topic_alias_maximum_on_refusal(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    ok = boot(),
+    {Conn, #connack{return_code = 16#86, props = P}} =
+        mqtt_open_v5(#{client_id => <<"aliasno">>, username => <<"alice">>,
+                       password => <<"wrong">>, props => #{}}),
+    ?assertNot(maps:is_key(topic_alias_maximum, P)),
+    {ok, normal} = mqtt_close(Conn),
     ok.
 
 %% MQ-07: the four capability bits that can be spelled out are exactly the set,
