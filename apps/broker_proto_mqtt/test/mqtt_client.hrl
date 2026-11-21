@@ -236,3 +236,12 @@ mqtt_raw_publish_qos3(Topic, Payload) ->
     Body = <<(byte_size(Topic)):16, Topic/binary, Payload/binary>>,
     %% type 3 with flags 0b0110 (dup=0, qos=3, retain=0)
     <<2#00110110, (byte_size(Body)), Body/binary>>.
+
+%% MQ-04: an MQTT 5 PUBLISH with an empty topic name and NO properties (so no
+%% Topic Alias). The codec refuses to encode this (an empty topic needs an
+%% alias, §3.3.2.2), so a test that exercises the FSM's 0x91 defence has to put
+%% the bytes on the wire itself: fixed header 0x30 (PUBLISH, QoS0), topic length
+%% 0, property length 0, then the payload.
+mqtt_raw_publish_v5_empty_topic(Payload) ->
+    Body = <<0:16, 0, Payload/binary>>,
+    <<16#30, (byte_size(Body)), Body/binary>>.

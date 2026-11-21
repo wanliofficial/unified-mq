@@ -91,6 +91,13 @@
              %% CONNACK (env `mqtt_topic_alias_maximum'). 0 = feature off; an
              %% inbound alias is then a 0x94 violation.
              topic_alias_max = 0 :: non_neg_integer(),
+             %% MQ-04: alias<->topic maps. `alias_in' is client-defined (inbound
+             %% resolution, §3.3.2.3.2); `alias_out' is broker-allocated
+             %% (outbound generation, §3.3.3.1). 0 is not a valid alias; both
+             %% spaces start at 1.
+             alias_in = #{} :: #{pos_integer() => binary()},
+             alias_out = #{} :: #{binary() => pos_integer()},
+             next_alias_out = 1 :: 1..65535,
              session_expiry = 0 :: non_neg_integer(),   %% seconds, v5 only
              receive_maximum = 65535 :: pos_integer(),  %% peer's outbound window
              max_packet_size = undefined :: undefined | pos_integer(),
@@ -745,20 +752,47 @@ subscribe_partitions(D) ->
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain, props = Props},
                #st{proto_level = 5} = D) ->
-    %% v5-only input validation before anything is stored:
+    %% v5-only input validation + Topic Alias resolution (§3.3.2.3) before
+    %% anything is stored:
     %%   * §3.3.2.3.4: a PUBLISH from the client carries no Subscription
     %%     Identifier -- that property is server-to-client only (0x82).
-    %%   * §3.3.2.3.4: Topic Aliases require a Topic Alias Maximum the server
-    %%     announced. This broker announces nothing (0), so any alias use by
-    %%     the client is a violation (0x94).
+    %%   * §3.3.2.3.2: Topic Alias. The server announces a maximum in CONNACK;
+    %%     0 means off, and any alias use is then a 0x94 violation (zero
+    %%     regression for clients that never send an alias). When on, a non-empty
+    %%     topic name may carry an alias (which registers/overwrites the mapping);
+    %%     an empty topic name MUST be paired with a known alias to be restored.
+    %% The resolved real topic goes downstream; the alias itself never rides the
+    %% #broker_message.
     Idx = maps:is_key(subscription_identifier, Props),
-    Alias = maps:is_key(topic_alias, Props),
+    Alias = maps:get(topic_alias, Props, undefined),
+    Max = D#st.topic_alias_max,
     if
-        Idx -> protocol_error(16#82, "subscription_identifier in a client "
-                                   "PUBLISH", D);
-        Alias -> protocol_error(16#94, "topic_alias on a connection without "
-                                     "topic_alias_maximum", D);
-        true -> handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D)
+        Idx ->
+            protocol_error(16#82, "subscription_identifier in a client PUBLISH", D);
+        Max =:= 0, Alias =/= undefined ->
+            %% Feature off but the client used an alias: keep the historical 0x94.
+            protocol_error(16#94, "topic_alias on a connection without "
+                                 "topic_alias_maximum", D);
+        byte_size(Topic) =:= 0, Alias =:= undefined ->
+            %% An empty topic name with no alias cannot be restored (§3.3.2.2:
+            %% the topic must be non-empty); 0x91 Packet payload invalid.
+            protocol_error(16#91, "empty topic without a topic alias", D);
+        byte_size(Topic) =:= 0 ->
+            case maps:find(Alias, D#st.alias_in) of
+                {ok, RealTopic} ->
+                    handle_publish_in(QoS, RealTopic, WirePid, Payload, Retain,
+                                      maps:remove(topic_alias, Props), D);
+                error ->
+                    protocol_error(16#94, "unknown topic alias", D)
+            end;
+        Alias =/= undefined ->
+            %% Non-empty topic + alias: register/overwrite the mapping, dispatch
+            %% on the real topic (§3.3.2.3.2).
+            D1 = D#st{alias_in = maps:put(Alias, Topic, D#st.alias_in)},
+            handle_publish_in(QoS, Topic, WirePid, Payload, Retain,
+                              maps:remove(topic_alias, Props), D1);
+        true ->
+            handle_publish_in(QoS, Topic, WirePid, Payload, Retain, Props, D)
     end;
 handle_publish(#publish{qos = QoS, topic = Topic, packet_id = WirePid,
                         payload = Payload, retain = Retain, props = Props}, D) ->
