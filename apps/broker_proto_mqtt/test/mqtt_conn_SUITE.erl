@@ -54,7 +54,11 @@ all() ->
      v5_publish_with_empty_topic_and_known_alias,
      v5_publish_with_empty_topic_and_unknown_alias_is_protocol_error,
      v5_publish_with_empty_topic_and_no_alias_is_protocol_error,
-     v5_publish_alias_survives_reconnect,
+     v5_publish_with_alias_zero_is_protocol_error,
+     v5_publish_with_alias_above_maximum_is_protocol_error,
+     v5_publish_alias_does_not_survive_reconnect,
+     v5_outbound_no_alias_when_client_offers_none,
+     v5_outbound_alias_respects_client_maximum,
      v5_outbound_publish_uses_allocated_alias,
      v5_connack_capabilities_are_exact,
      v5_connack_capabilities_can_be_disabled,
@@ -121,7 +125,7 @@ all() ->
      puback_for_a_qos2_delivery_does_not_advance_the_cursor,
      reconnect_before_pubrec_resends_a_dup_publish,
      reconnect_after_pubrec_resends_pubrel_only,
-     inflight_blob_is_v4_and_skips_retained_entries,
+     inflight_blob_is_v3_and_skips_retained_entries,
      subscribe_receives_retained_after_suback,
      retained_qos_is_capped_by_the_grant,
      retained_wildcard_delivers_each_topic_in_topic_order,
@@ -497,13 +501,13 @@ v5_publish_with_empty_topic_and_known_alias(_Config) ->
     {ok, normal} = mqtt_close(Pub),
     ok.
 
-%% An empty topic name with an alias the broker never registered is a violation
-%% (0x94), because the real topic is unrecoverable.
+%% An empty topic name with an in-range alias the broker never registered is a
+%% violation (0x94), because the real topic is unrecoverable (§3.3.2.3.4).
 v5_publish_with_empty_topic_and_unknown_alias_is_protocol_error(_Config) ->
     ok = boot(),
     ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
     {Pub, _} = mqtt_open_v5(#{client_id => <<"tu-pub">>, props => #{}}),
-    ok = mqtt_publish_v5(Pub, 1, <<>>, <<"orphan">>, 1, #{topic_alias => 99}),
+    ok = mqtt_publish_v5(Pub, 1, <<>>, <<"orphan">>, 1, #{topic_alias => 5}),
     #disconnect{reason_code = 16#94} = mqtt_recv_v5(csock(Pub)),
     {ok, normal} = mqtt_close(Pub),
     ok.
@@ -521,10 +525,37 @@ v5_publish_with_empty_topic_and_no_alias_is_protocol_error(_Config) ->
     {ok, normal} = mqtt_close(Pub),
     ok.
 
-%% MQ-04 §3.3.2.3.2: the inbound alias->topic map rides the session blob, so a
-%% clean=0 reconnect restores an alias the client registered earlier and still
-%% resolves an empty-topic publish through it.
-v5_publish_alias_survives_reconnect(_Config) ->
+%% MQTT-3.3.2-8: an alias value of 0 is never permitted (§3.3.2.3.4), whatever
+%% the topic looks like. The broker disconnects with 0x94.
+v5_publish_with_alias_zero_is_protocol_error(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"z-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 1, <<"z/real">>, <<"zero">>, 1,
+                         #{topic_alias => 0}),
+    #disconnect{reason_code = 16#94} = mqtt_recv_v5(csock(Pub)),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% MQTT-3.3.2-9: a Client MUST NOT send an alias above the Topic Alias Maximum
+%% the broker announced in CONNACK (here: env max=10, so 11 is out of range).
+%% That is 0x94 regardless of whether the value was ever mapped.
+v5_publish_with_alias_above_maximum_is_protocol_error(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"hi-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 1, <<"hi/real">>, <<"over">>, 1,
+                         #{topic_alias => 11}),
+    #disconnect{reason_code = 16#94} = mqtt_recv_v5(csock(Pub)),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% MQTT-3.3.2-7 (§3.3.2.3.4): Topic Alias mappings exist only within a Network
+%% Connection and MUST NOT be carried forward from one Network Connection to
+%% another. Even a clean=0 reconnect that restores the rest of the session starts
+%% with an empty alias map, so the alias the client registered before dropping is
+%% unknown again -- an empty-topic publish through it is 0x94, not a delivery.
+v5_publish_alias_does_not_survive_reconnect(_Config) ->
     ok = boot(),
     ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 10),
     {Sub, _} = mqtt_open_v5(#{client_id => <<"tr-sub">>, props => #{}}),
@@ -541,16 +572,62 @@ v5_publish_alias_survives_reconnect(_Config) ->
     ok = gen_tcp:close(csock(First)),
     {ok, _} = mqtt_expect_down(mqtt_monitor(#{pid => FirstPid}), FirstPid),
     timer:sleep(200),
-    %% Reconnect clean=0: the alias map is restored from the blob.
+    %% Reconnect clean=0 with the session restored, but the alias map is NOT.
     {Again, _} = mqtt_open_v5(#{client_id => <<"tr-pub">>, clean => false,
                                 props => #{session_expiry_interval => 300}}),
     ok = mqtt_publish_v5(Again, 2, <<>>, <<"after-reconnect">>, 1,
                          #{topic_alias => 1}),
-    #puback{} = mqtt_recv_v5(csock(Again)),
-    #publish{topic = <<"tr/real">>, payload = <<"after-reconnect">>} =
-        mqtt_recv_v5(csock(Sub)),
+    #disconnect{reason_code = 16#94} = mqtt_recv_v5(csock(Again)),
+    %% The subscriber never sees the after-reconnect message: it died at the
+    %% publish. The earlier "reg" delivery from the first connection stands.
     {ok, normal} = mqtt_close(Sub),
     {ok, normal} = mqtt_close(Again),
+    ok.
+
+%% MQTT-3.3.2-11 (§3.3.2.3.4): the broker must not send an outbound alias above
+%% the Topic Alias Maximum the CLIENT advertised in its own CONNECT. A client
+%% that offers none (absent/0) gets no alias on any delivered PUBLISH, even when
+%% the broker's own announced maximum (env) is non-zero.
+v5_outbound_no_alias_when_client_offers_none(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 5),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"oa0-sub">>, props => #{}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"oa0/real">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"oa0-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 2, <<"oa0/real">>, <<"first">>, 1, #{}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{topic = <<"oa0/real">>, payload = <<"first">>} =
+        mqtt_recv_v5(csock(Sub)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Pub),
+    ok.
+
+%% MQTT-3.3.2-11: with the client advertising topic_alias_maximum = 1 in
+%% CONNECT, the broker hands out exactly one alias (1) and then stops -- the
+%% second distinct topic travels with its name and no alias.
+v5_outbound_alias_respects_client_maximum(_Config) ->
+    ok = boot(),
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 5),
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"oam-sub">>,
+                              props => #{topic_alias_maximum => 1}}),
+    ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
+                                      topics = [{<<"oam/a">>, 1}, {<<"oam/b">>, 1}]}),
+    #suback{} = mqtt_recv_v5(csock(Sub)),
+    {Pub, _} = mqtt_open_v5(#{client_id => <<"oam-pub">>, props => #{}}),
+    ok = mqtt_publish_v5(Pub, 2, <<"oam/a">>, <<"first">>, 1, #{}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{topic = <<"oam/a">>, props = P1} = mqtt_recv_v5(csock(Sub)),
+    ?assertEqual(1, maps:get(topic_alias, P1, undefined)),
+    ok = mqtt_publish_v5(Pub, 3, <<"oam/b">>, <<"second">>, 1, #{}),
+    #puback{} = mqtt_recv_v5(csock(Pub)),
+    #publish{topic = <<"oam/b">>, props = P2} = mqtt_recv_v5(csock(Sub)),
+    %% Alias budget exhausted (peer_alias_max = 1): the second topic carries no
+    %% alias, only the name.
+    ?assertNot(maps:is_key(topic_alias, P2)),
+    {ok, normal} = mqtt_close(Sub),
+    {ok, normal} = mqtt_close(Pub),
     ok.
 
 %% MQ-04 §3.3.3.1: the broker assigns an outbound Topic Alias and puts it on a
@@ -559,7 +636,10 @@ v5_publish_alias_survives_reconnect(_Config) ->
 v5_outbound_publish_uses_allocated_alias(_Config) ->
     ok = boot(),
     ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 5),
-    {Sub, _} = mqtt_open_v5(#{client_id => <<"oa-sub">>, props => #{}}),
+    %% The client must advertise its own Topic Alias Maximum in CONNECT for the
+    %% broker to send outbound aliases at all (MQTT-3.3.2-11); 5 here.
+    {Sub, _} = mqtt_open_v5(#{client_id => <<"oa-sub">>,
+                              props => #{topic_alias_maximum => 5}}),
     ok = mqtt_send_v5(Sub, #subscribe{packet_id = 1,
                                       topics = [{<<"oa/real">>, 1}]}),
     #suback{} = mqtt_recv_v5(csock(Sub)),
@@ -1710,7 +1790,7 @@ reconnect_after_pubrec_resends_pubrel_only(_Config) ->
 %% v3 carries the level, the release marks, the inbound set and the §3.8.4
 %% subscription state, and a retained replay (no {Partition, Offset}) is
 %% deliberately absent.
-inflight_blob_is_v4_and_skips_retained_entries(_Config) ->
+inflight_blob_is_v3_and_skips_retained_entries(_Config) ->
     ok = boot(),
     {Conn, _} = mqtt_open_v5(#{client_id => <<"c1">>, props => #{}}),
     %% A Subscription Identifier and No Local / RAP flags are §3.8.4 session
@@ -1728,12 +1808,13 @@ inflight_blob_is_v4_and_skips_retained_entries(_Config) ->
     ok = mqtt_publish_v5(Conn, 11, <<"in/in">>, <<"inbound">>, 2, #{}),
     #pubrec{packet_id = 11} = mqtt_recv_v5(csock(Conn)),
     Blob = wait_inflight(<<"c1">>, fun(B) ->
-                                           maps:get(vsn, B, 0) =:= 4 andalso
+                                           maps:get(vsn, B, 0) =:= 3 andalso
                                            maps:size(maps:get(released, B, #{})) =:= 0
                                    end),
-    %% vsn 4 (MQ-04): Topic Alias state rides the blob, but this connection did
-    %% not enable aliases (topic_alias_maximum is 0), so no `aliases' key exists.
-    #{vsn := 4, pending := Pending, qos := Qos, received := Received} = Blob,
+    %% vsn 3 (unchanged by MQ-04): §3.3.2.3.4 forbids carrying Topic Alias
+    %% mappings across Network Connections, so no alias key is ever written and
+    %% the blob version stays at 3.
+    #{vsn := 3, pending := Pending, qos := Qos, received := Received} = Blob,
     ?assertNot(maps:is_key(aliases, Blob)),
     %% The SUBSCRIBE above rides the blob as §3.8.4 subscription state.
     [{<<"b/#">>, 7, 0, 1}] = maps:get(subs, Blob, []),

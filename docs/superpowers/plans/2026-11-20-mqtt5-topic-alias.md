@@ -87,14 +87,15 @@
 
 **Files**：`src/mqtt_conn_fsm.erl`（`publish_bin/6`）
 
-- [ ] **Step 1（红）**：`all()` 加 `v5_outbound_publish_uses_allocated_alias`：配置
-      `topic_alias_maximum => 5`，订阅方订阅真实 topic，发布方发真实 topic（不带别名），订阅方收到的
-      PUBLISH 属性含 `topic_alias`（首次分配 1）。用直读字节或 `paho` 风格裸帧确认属性存在。
+- [ ] **Step 1（红）**：`all()` 加 `v5_outbound_publish_uses_allocated_alias`：订阅方在 CONNECT 里带
+      `topic_alias_maximum => 5`（`peer_alias_max`，不是 broker 自己的 env），订阅真实 topic，发布方发
+      真实 topic（不带别名），订阅方收到的 PUBLISH 属性含 `topic_alias`（首次分配 1）。用直读字节或
+      `paho` 风格裸帧确认属性存在。
 - [ ] **Step 2（红）**：跑套件确认失败。
-- [ ] **Step 3（绿）**：`publish_bin/6`（`:2304`）在 `vsn(D)=:=5` 且 `topic_alias_max>0` 时调
-      `maybe_alias(Topic, Props, D)`：`alias_out` 命中→加 `topic_alias`；未命中且
-      `next_alias_out =< max`→分配+登记+加；否则原样。注意 will 路径若也走 `publish_bin` 则同样受益
-      （will topic 通常只出现一次，多不命中，无副作用）。
+- [ ] **Step 3（绿）**：`publish_bin/6`/``/7` 在 `vsn(D)=:=5` 且 `peer_alias_max>0` 时调
+      `maybe_alias(Topic, D)`：`alias_out` 命中→加 `topic_alias`；未命中且
+      `next_alias_out =< peer_alias_max`→分配+登记+加；否则原样（`peer_alias_max=0` 时完全不加）。
+      will/retained 路径同样受益（topic 通常只出现一次，多不命中，无副作用）。
 - [ ] **Step 4（绿）**：跑套件绿。
 - [ ] **Step 5**：`git commit`。
 
@@ -104,9 +105,7 @@
 
 - [ ] **Step 1**：启用 Task 2 Step 1 的用例 E（去掉 `[skip]`）。
 - [ ] **Step 2（红）**：跑用例 E 确认失败（当前 blob 不存别名，重连后 alias_in 空）。
-- [ ] **Step 3（绿）**：`blob/1` 加 `aliases => {maps:to_list(alias_in), maps:to_list(alias_out), next_alias_out}`
-      （仅 v5 且 `topic_alias_max>0` 时写入，否则不带该键或写空——与 `subs_blob` 同样门控）；
-      `restore_with/6` 读回 `aliases` 重建三字段（缺省 `#{}`/`#{}`/`1`）。vsn 注释更新为 4。
+- [ ] **Step 3（绿）**：~~`blob/1` 加 `aliases => ...`~~ **已撤销**（2026-11-21，见文末修订记录）：§3.3.2.3.4 MQTT-3.3.2-7 禁止别名映射跨 Network Connection 携带，`blob/1`/`restore_with/6` 不改，vsn 保持 3。
 - [ ] **Step 4（绿）**：跑用例 E 绿。
 - [ ] **Step 5**：`git commit`。
 
@@ -117,15 +116,15 @@
 - [ ] **Step 1**：`config/sys.config.src` 的 `broker_proto_mqtt` env 块加
       `{mqtt_topic_alias_maximum, 0}`，注释「0 = 关闭 Topic Alias（MQTT 5 可选特性，默认关闭以零回归）」。
 - [ ] **Step 2**：dialyzer + xref（0 warning / 无新增 unused-export）。
-- [ ] **Step 3**：`rm -rf _build/test/extras` 后全量 `rebar3 ct`，确认 1579 基线 +8 = 1587、零回归。
-- [ ] **Step 4**：`protocol-compatibility.md` §4.11 MQTT 5 行 + capability 表：Topic Alias「明确未做」→「已支持」
-      （机制：CONNACK 宣布 maximum，入站/出站别名，随会话持久化）；`gap` 文档 MQ-04 行改「已支持」+ 机制。
+- [ ] **Step 3**：`rm -rf _build/test/extras` 后全量 `rebar3 ct`，确认 1579 基线 +12 = 1591、零回归。
+- [ ] **Step 4**：`protocol-compatibility.md` §4.2/§4.25 MQTT 5 行：Topic Alias「明确未做」→「已支持（默认关闭）」
+      （机制：CONNACK 宣布 maximum，入站解析；出站别名上限取自客户端 CONNECT 的 `topic_alias_maximum`；别名表仅限本次网络连接，不跨连接持久化）；`gap` 文档 MQ-04 行改「已支持」+ 同机制。
 - [ ] **Step 5**：`git commit`。
 
 ## Task 6：merge 回 main + 清理
 
 - [ ] **Step 1**：在 main 上 `git fetch` + 确认与 origin 同步；`git merge --no-ff mqtt5-topic-alias`。
-- [ ] **Step 2**：main 上复跑全量 `rebar3 ct`（1587）+ dialyzer，确认合并后无回归。
+- [ ] **Step 2**：main 上复跑全量 `rebar3 ct`（1591）+ dialyzer，确认合并后无回归。
 - [ ] **Step 3**：移会话回主仓，平台 `worktree_remove`（force）清理，删分支。
 - [ ] **Step 4**：询问用户是否推送 origin。
 
@@ -140,3 +139,27 @@
   实现时统一并注释。
 - `restore_blob`/`restore_with` 已有 vsn 门控读 `subs`；别名持久化照同款，vsn 升 4，旧 blob 读空表。
 - 出站别名用尽即停发（不回收），`next_alias_out` 单调至 `topic_alias_max`。
+
+---
+
+## 修订记录
+
+### 2026-11-21：Task 3/4 按 MQTT-5.0 §3.3.2.3.4 规范原文修正
+
+Task 0–2、Task 5 的配置/文档部分按原计划执行完毕。Task 3（出站别名生成）与 Task 4
+（别名表持久化）实现后，对照 OASIS MQTT-5.0 正式文本核对，发现原稿两处与规范相悖，
+经用户批准后修正（详见配套 spec 文末「修订记录」，此处只列执行侧差异）：
+
+1. **Task 4 撤销**：规范要求别名映射不得跨 Network Connection 携带（MQTT-3.3.2-7，
+   MUST NOT），原稿要求的 blob 持久化（vsn 4）属于违规。已把 `blob/1`/`restore_blob`
+   改回 vsn 3、不写别名键；`Task 4 Step 1-5` 不再执行，`v5_publish_alias_survives_reconnect`
+   用例改为 `v5_publish_alias_does_not_survive_reconnect`（断言重连后旧别名失效 → 0x94）。
+2. **Task 3 改用 `peer_alias_max`**：出站别名上限应取客户端 CONNECT 的
+   `topic_alias_maximum`（MQTT-3.3.2-11），不是本端宣布的 `topic_alias_max`。新增
+   `#st.peer_alias_max`，`maybe_alias/2` 改用它；`Task 3 Step 3` 描述随之修正。
+3. Task 2 追加值域校验（MQTT-3.3.2-8/-9）：alias 0 或超上限一律先判 0x94，再查映射，
+   与「未登记别名」区分开。
+
+全量 `rebar3 ct` 结果：1579 基线 +12（§4 列的 12 例）= **1591，零回归**；
+dialyzer/xref/compile 均 0 warning。Task 5 Step 3 的期望总数相应改为 1591，
+Task 6 Step 2 的复跑总数同步。
