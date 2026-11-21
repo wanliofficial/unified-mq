@@ -202,6 +202,9 @@
         mqtt_max_qos => 2,
         max_keepalive_ms => 60000}
     ]},
+    {mqtt_auth_methods, [<<"plain">>]},
+    {mqtt_auth_timeout_ms, 30000},
+    {mqtt_connack_props_v5, true},
     {pull_page_limit, 32},
     {max_inflight, 64},
     {pull_poll_interval_ms, 1000},

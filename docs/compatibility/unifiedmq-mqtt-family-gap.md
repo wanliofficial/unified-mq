@@ -53,9 +53,9 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-02 | 已支持 | Will Delay | CONNECT 的 `will_delay_interval` 生效：`will_of/1` 保留 `delay`，`publish_will/1` 延迟>0 时停靠 `mqtt_will_server`，重连取消 | 断开后等待 Will Delay，期间重连则取消 |
 | MQ-03 | 已支持 | SUBSCRIBE 选项 | `no_local` / `retain_as_published` / `retain_handling` 全部生效：`sub_flags = {NL, RAP}` 驱动 no-local 抑制与 RAP retain；`retain_handling`（RH）在订阅时刻由 `replay_wanted/3` 决定 retained 补发（RH=0 总补、RH=1 仅新订阅、RH=2 不补） | `retain_handling=2` 不再补发 retained；`no_local` 不把本连接发布投回来 |
 | MQ-04 | 明确未做 | Topic Alias | 编解码有这个属性，连接机不用。CONNACK 也不给 `topic_alias_maximum`，合规客户端本来就不该发 | 可选。现在的做法是「不宣布、不使用」，不是半实现。客户端若强行发空 topic + alias，不会按别名还原 |
-| MQ-05 | 明确未做 | AUTH 增强认证 | 只有 CONNECT 里的 username/password 或 token。没有 AUTH 包，没有 challenge | MQTT 5 AUTH；也没有 OIDC/JWKS |
+| MQ-05 | 已支持 | AUTH 增强认证 | AUTH 包（type 15，仅 v5）与 challenge/response：`broker_auth` 框架按 `mqtt_auth_methods` 派发到 `broker_auth_<name>`，内置 `plain` 方法做 nonce 绑定的用户名/密码校验并复用既有用户库；会话内 re-auth 成功回 AUTH `0x00`，失败回 DISCONNECT `0x9C`（2026-11-21 落地于 mq-auth-connack） | MQTT 5 AUTH；也没有 OIDC/JWKS |
 | MQ-06 | 明确未做 | Request Response Information | `response_topic` / `correlation_data` 会随消息透传。服务端不实现「客户端请求后，CONNACK 下发 response information」 | 这是 broker 分配响应主题的能力，不是消息字段透传 |
-| MQ-07 | 明确未做 | CONNACK 能力回填 | 不回 Server Keep Alive、Assigned Client Identifier、Maximum QoS、Retain/Wildcard/Shared/Subscription Identifier Available | 不回不等于撒谎；空 ClientID 仍直接拒绝，不会分配一个 |
+| MQ-07 | 已支持 | CONNACK 能力回填 | v5 CONNACK 在连接成功（RC=0）时回填五个静态能力位：`maximum_qos=2`，retain / wildcard / subscription-identifier / shared-subscription available 均为 1；由 `mqtt_connack_props_v5` 开关控制（默认开）。Server Keep Alive、Assigned Client Identifier 仍不回（2026-11-21 落地于 mq-auth-connack） | 不回不等于撒谎；空 ClientID 仍直接拒绝，不会分配一个 |
 | MQ-08 | 语义缺口 | QoS 2 跨崩溃 | 崩溃后允许重复，对外必须说至少一次。线协议和跨重连不重复是成立的 | 不是 exactly-once。这是设计，不是忘了写 |
 | MQ-09 | 语义缺口 | 没有发布侧重试定时器 | 同一条连接对未确认消息只投一次。重发只发生在重连 | 规范允许发送方重试。慢客户端或丢 PUBACK 时，要断线才补 |
 | MQ-10 | 语义缺口 | in-flight 默认 100ms 才刷盘 | 崩溃可能让**不同消息**复用同一个 packet id。`inflight_flush_interval_ms=0` 可以把窗口压到最小 | 按 packet id 去重的客户端会误伤 |
@@ -68,6 +68,8 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-17 | 产品，不是报文缺口 | 桥接、规则引擎、集群会话副本的故障注入证明、吊销踢人、Prometheus/OTel | `docs/mqtt-feature-comparison.md` 里 `#5`–`#28` 在 2026-11-10 仍是 pending | 对标 fss-mqtt-broker / robustmq 时的差距，不是 3.1.1 互操作的前置条件 |
 
 MQ-01、MQ-02、MQ-03 已全部补齐（由 `120f1c8`「MQTT 5.0 Will Delay and SUBSCRIBE subscription options」落地）。MQ-04 到 MQ-07 是范围外，文档已承认，但对外不能说 MQTT 5 做完了。MQ-08 到 MQ-14 是已经选定的语义，测试也覆盖了，缺的是对外说明，不是一块没写的报文。
+
+（2026-11-21 更正：MQ-05 AUTH 与 MQ-07 CONNACK 能力回填已落地于 `mq-auth-connack`，见上表；范围外只剩 MQ-04 Topic Alias 和 MQ-06 Request Response Information。）
 
 ## 4. MQTT-SN：和另外三条的差异，以及没做完的
 
@@ -143,7 +145,7 @@ TLS 1.3 是强制的，不是可选项。`tls.enabled` 在这里只表示证书�
 | MQTT 5 子集 | 第 3 节 | 同左 | 同左 | 不适用 |
 | Subscription Identifier 下发 | 没做完 | 同左 | 同左 | 无 |
 | Will Delay | 没做完 | 同左 | 同左 | 无此字段 |
-| Topic Alias / AUTH | 未做 | 同左 | 同左 | 无 |
+| Topic Alias / AUTH | 未做 / 完成（MQ-05） | 同左 | 同左 | 无 |
 | 共享订阅 | 单节点 | 同左 | 同左 | 无 `$share` |
 | 用户名密码 | 有 | 有 | 有 | 协议没有；要求认证则拒绝启动 |
 | TLS | 可选 | wss 可选 | 强制 TLS 1.3 | 无，DTLS 未做 |
@@ -159,6 +161,8 @@ TLS 1.3 是强制的，不是可选项。`tls.enabled` 在这里只表示证书�
 2. Will Delay 解了帧却立刻发遗嘱。
 3. `no_local` / `retain_as_published` / `retain_handling` 被静默忽略。
 
-明确列在范围外、还没做的：Topic Alias、AUTH、CONNACK 能力回填、Request Response Information、MQTT 3.1、SN 的 DTLS 和转发器封装、QUIC 的 0-RTT 和多流、WS 的 `permessage-deflate`。
+已经从范围外补上的：AUTH 增强认证（MQ-05）与 CONNACK 能力回填（MQ-07），2026-11-21 落地于 `mq-auth-connack`。
+
+明确列在范围外、还没做的：Topic Alias（MQ-04，进行中）、Request Response Information（MQ-06）、MQTT 3.1、SN 的 DTLS 和转发器封装、QUIC 的 0-RTT 和多流、WS 的 `permessage-deflate`。
 
 不要把「paho 8/8」理解成 MQTT 5 完整实现。那些用例覆盖的是连接、QoS、Retain、Will 和一条 5.0 往返，没有覆盖上面三件半成品。

@@ -10,6 +10,14 @@
             %% release config (config/sys.config.src) supplies a listener. T12's
             %% listener suite supplies its own ephemeral port.
             listeners, []},
+           %% MQ-05 (ADR-017 §17.x): enhanced-auth framework. `mqtt_auth_methods'
+           %% names the enabled broker_auth_<name> modules; a CONNECT naming a
+           %% method not in this list is refused. `mqtt_auth_timeout_ms' is the
+           %% challenge/response handshake deadline.
+           {mqtt_auth_methods, [<<"plain">>]},
+           {mqtt_auth_timeout_ms, 30000},
+           %% MQ-07: advertise the five static capability bits on a v5 CONNACK.
+           {mqtt_connack_props_v5, true},
            {pull_page_limit, 32},
            {max_inflight, 64},
            {pull_poll_interval_ms, 1000},
