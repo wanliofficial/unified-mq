@@ -29,7 +29,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/4, publish_stateless/2]).
+-export([start_link/4, publish_stateless/2, publish_will_now/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -67,6 +67,8 @@
     received = #{} :: map(),
     next_id = 1 :: pos_integer(),
     will :: undefined | {binary(), binary(), 0..2, boolean()},
+    %% v1.2 5.4.4: Will Delay Interval in seconds from CONNECT; 0 = no delay.
+    will_delay = 0 :: non_neg_integer(),
     will_stage = none :: none | want_topic | want_msg,
     asleep = false :: boolean(),
     counted = false :: boolean(),
@@ -272,12 +274,14 @@ handle_packet(Packet, St) ->
 %%%_* CONNECT + Will --------------------------------------------------------
 
 on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
-             clean_session := Clean, duration := Duration, will := Will}, St) ->
+             clean_session := Clean, duration := Duration, will := Will,
+             will_delay := WillDelay}, St) ->
     case ProtocolId of
         1 ->
             case admit(St) of
                 {ok, St0} ->
-                    on_connect_sn(ClientId, Clean, Duration, Will, St0);
+                    on_connect_sn(ClientId, Clean, Duration, Will,
+                                  WillDelay, St0);
                 {error, St0} ->
                     %% §6.2: CONNACK's return code is the whole refusal vocabulary
                     %% here, and 3 is "rejected: not supported" -- the closest
@@ -292,7 +296,7 @@ on_connect(#{client_id := ClientId, protocol_id := ProtocolId,
                                        return_code => ?RC_NOT_SUPPORTED})}
     end.
 
-on_connect_sn(ClientId, Clean, Duration, Will, St) ->
+on_connect_sn(ClientId, Clean, Duration, Will, WillDelay, St) ->
     MaxDuration = maps:get(max_duration_s, St#st.cfg),
     Dur = min(Duration, MaxDuration),
     Persist = not Clean,
@@ -313,6 +317,7 @@ on_connect_sn(ClientId, Clean, Duration, Will, St) ->
            end,
     Counted = broker_metrics:connection_opened(),
     St1 = St#st{client_id = ClientId, clean = Clean, duration = Dur,
+                will_delay = WillDelay,
                 subs = Subs,
                 %% A fresh CONNECT clears the topic table: ids handed out
                 %% in a previous session are not something a client may
@@ -321,6 +326,10 @@ on_connect_sn(ClientId, Clean, Duration, Will, St) ->
                 topics = #{},
                 counted = Counted},
     gen_server:cast(St#st.listener, {sn_bind, self(), ClientId}),
+    %% v1.2 will-delay: a reconnect cancels any pending deferred Will for this
+    %% client id (deterministic cancel path; spec 2.3). Sent regardless of
+    %% whether this CONNECT carries a Will -- reconnecting is the cancel signal.
+    gen_server:cast(St#st.listener, {sn_cancel_deferred_will, ClientId}),
     case Will of
         true ->
             %% The Will exchange runs *before* CONNACK: a client must not
@@ -416,13 +425,41 @@ on_will_msg_upd(#{payload := Payload}, St) ->
 
 publish_will(#st{will = undefined}) ->
     ok;
-publish_will(#st{will = {Topic, Payload, QoS, Retain}} = St) ->
-    case store_publish(Topic, Payload, QoS, Retain, St) of
+publish_will(#st{will_delay = 0} = St) ->
+    %% No delay: fire now, exactly as before.
+    do_publish_will(St);
+publish_will(#st{will = {_Topic, _Payload, _QoS, _Retain} = Will,
+                 will_delay = DelayS, client_id = ClientId,
+                 tenant = Tenant} = St) when DelayS > 0 ->
+    %% v1.2 will-delay: hand off to the listener, which holds the Will for
+    %% DelayS seconds and cancels it if the client reconnects. This process is
+    %% about to die, so it cannot arm the timer itself.
+    gen_server:cast(St#st.listener,
+                    {sn_deferred_will, ClientId, Will, DelayS, Tenant}),
+    ok.
+
+%% Fire a Will immediately (no delay). Shared by publish_will/1.
+do_publish_will(#st{will = {Topic, Payload, QoS, Retain}} = St) ->
+    case store_publish(Topic, Payload, QoS, Retain, St#st.tenant) of
         ok ->
             broker_metrics:inc(will_published);
         {error, Reason} ->
             logger:warning("mqtt_sn could not publish will for ~p: ~p",
                            [St#st.client_id, Reason])
+    end,
+    ok.
+
+%% @doc Publish a Will four-tuple under an explicit tenant. Used by the MQTT-SN
+%% listener to fire a deferred Will whose delay elapsed (spec 2.5): same path
+%% and metric as publish_will/1, but the listener is not a #st{} holder.
+-spec publish_will_now({binary(), binary(), 0..2, boolean()}, binary()) -> ok.
+publish_will_now({Topic, Payload, QoS, Retain}, Tenant) ->
+    case store_publish(Topic, Payload, QoS, Retain, Tenant) of
+        ok ->
+            broker_metrics:inc(will_published);
+        {error, Reason} ->
+            logger:warning("mqtt_sn could not publish deferred will: ~p",
+                           [Reason])
     end,
     ok.
 
@@ -471,7 +508,7 @@ do_publish(Topic, Payload, 2, MsgId, _Type, _Ref, Retain,
             %% completes the handshake exactly once.
             {noreply, reply(St, #{type => pubrec, msg_id => MsgId})};
         false ->
-            case store_publish(Topic, Payload, 2, Retain, St) of
+            case store_publish(Topic, Payload, 2, Retain, St#st.tenant) of
                 ok ->
                     St1 = St#st{received = maps:put(MsgId, true, Received)},
                     {noreply, reply(St1, #{type => pubrec, msg_id => MsgId})};
@@ -483,7 +520,7 @@ do_publish(Topic, Payload, 2, MsgId, _Type, _Ref, Retain,
             end
     end;
 do_publish(Topic, Payload, QoS, MsgId, Type, Ref, Retain, St) ->
-    case store_publish(Topic, Payload, QoS, Retain, St) of
+    case store_publish(Topic, Payload, QoS, Retain, St#st.tenant) of
         ok ->
             {noreply, ack_uplink(QoS, MsgId, Type, Ref, St)};
         {error, Reason} ->
@@ -1063,8 +1100,8 @@ ack_skip(Ref, Partition, Offset, St) ->
 
 %%%_* Publish path (shared by PUBLISH and the Will) -------------------------
 
-store_publish(Topic, Payload, QoS, Retain, St) ->
-    Msg = new_message(St#st.tenant, Topic, Payload, QoS, Retain),
+store_publish(Topic, Payload, QoS, Retain, Tenant) ->
+    Msg = new_message(Tenant, Topic, Payload, QoS, Retain),
     publish_routed(Msg, QoS, Retain).
 
 publish_routed(Msg0, QoS, Retain) ->

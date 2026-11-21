@@ -81,7 +81,12 @@
     %% address clients listen on for gateway advertisements; it is NOT this
     %% listener's own port in general (a gateway behind a port mapper, or a
     %% test that binds an ephemeral client socket, must say where to send).
-    advertise_port = 1884 :: inet:port_number()
+    advertise_port = 1884 :: inet:port_number(),
+    %% v1.2 will-delay: ClientID -> {Will, DelayS, AtMs, Tenant}. Held after a
+    %% session dies with will_delay>0; published when DelayS elapses unless the
+    %% client reconnects first. AtMs is the listener's own monotonic clock.
+    deferred_wills = #{} :: map(),
+    deferred_will_timer = undefined :: reference() | undefined
 }).
 
 %%%_* API -------------------------------------------------------------------
@@ -279,6 +284,22 @@ handle_cast({sn_wake, Pid}, St) ->
 %% owns every socket in either transport, so one cast is the whole protocol.
 handle_cast({sn_send, Endpoint, Data}, St) ->
     {noreply, send_to(Endpoint, Data, St)};
+handle_cast({sn_deferred_will, ClientID, Will, DelayS, Tenant},
+            #st{deferred_wills = DW} = St) ->
+    AtMs = erlang:monotonic_time(millisecond),
+    DW1 = maps:put(ClientID, {Will, DelayS, AtMs, Tenant}, DW),
+    {noreply, arm_deferred_will_timer(St#st{deferred_wills = DW1})};
+handle_cast({sn_cancel_deferred_will, ClientID},
+            #st{deferred_wills = DW} = St) ->
+    case maps:take(ClientID, DW) of
+        {_, DW1} ->
+            %% Drop the cancelled entry, cancel any armed timer, then re-arm to
+            %% the new nearest deadline (or none if the table is now empty).
+            St1 = cancel_deferred_will_timer(St#st{deferred_wills = DW1}),
+            {noreply, arm_deferred_will_timer(St1)};
+        error ->
+            {noreply, St}
+    end;
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -333,6 +354,9 @@ handle_info({'EXIT', Acceptor, Reason}, #st{dtls_acceptor = Acceptor} = St) ->
     {stop, {dtls_acceptor_died, Reason}, St};
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, St) ->
     {noreply, forget(Pid, St)};
+handle_info({timeout, Ref, deferred_will_due},
+            #st{deferred_will_timer = Ref} = St) ->
+    {noreply, scan_deferred_wills(St)};
 handle_info(advertise_tick, St) ->
     _ = send_advertise(St),
     {noreply, arm_advertise(St)};
@@ -532,6 +556,71 @@ forget(Pid, St) ->
                                         false -> St#st.asleep end};
         error ->
             St
+    end.
+
+%%%_* Deferred Will (v1.2 will-delay) ---------------------------------------
+
+%% Fire the Will for every entry whose delay has elapsed, cancel those whose
+%% client has a live session (reconnected), and re-arm for the rest. A live
+%% session is keyed in `clients'; the conn's CONNECT-time cancel cast is the
+%% primary cancel path, this scan is the expiry path.
+scan_deferred_wills(#st{deferred_wills = DW} = St) ->
+    Now = erlang:monotonic_time(millisecond),
+    St1 = maps:fold(
+            fun(ClientID, {Will, DelayS, AtMs, Tenant}, Acc) ->
+                    case (Now - AtMs) >= DelayS * 1000 of
+                        false ->
+                            Acc;  %% not due yet
+                        true ->
+                            case maps:is_key(ClientID, Acc#st.clients) of
+                                true ->
+                                    %% Reconnected within the window: cancel.
+                                    Acc#st{deferred_wills =
+                                           maps:remove(ClientID,
+                                                       Acc#st.deferred_wills)};
+                                false ->
+                                    ok = mqtt_sn_conn:publish_will_now(Will, Tenant),
+                                    Acc#st{deferred_wills =
+                                           maps:remove(ClientID,
+                                                       Acc#st.deferred_wills)}
+                            end
+                    end
+            end, St, DW),
+    %% The timer that fired is now stale; reset the ref before re-arming or the
+    %% "already armed" guard below would refuse to arm the next deadline.
+    arm_deferred_will_timer(St1#st{deferred_will_timer = undefined}).
+
+%% Arm a single timer to the nearest deadline. No-op if the table is empty or a
+%% timer is already armed (the earliest deadline triggers the scan and re-arms).
+arm_deferred_will_timer(#st{deferred_wills = DW,
+                            deferred_will_timer = undefined} = St) ->
+    case nearest_due_ms(DW, erlang:monotonic_time(millisecond)) of
+        undefined ->
+            St;
+        DueMs ->
+            St#st{deferred_will_timer =
+                          erlang:start_timer(DueMs, self(), deferred_will_due)}
+    end;
+arm_deferred_will_timer(St) ->
+    St.
+
+cancel_deferred_will_timer(#st{deferred_will_timer = undefined} = St) ->
+    St;
+cancel_deferred_will_timer(#st{deferred_will_timer = TRef} = St) ->
+    _ = erlang:cancel_timer(TRef),
+    St#st{deferred_will_timer = undefined}.
+
+%% Milliseconds until the earliest deadline in the table.
+nearest_due_ms(DW, Now) ->
+    Due = maps:fold(
+            fun(_ClientID, {_Will, DelayS, AtMs, _Tenant}, Acc) ->
+                    Deadline = AtMs + DelayS * 1000,
+                    min(Deadline, Acc)
+            end, infinity, DW),
+    case Due of
+        infinity -> undefined;
+        _ when Due =< Now -> 0;
+        _ -> Due - Now
     end.
 
 %%%_* ADVERTISE -------------------------------------------------------------

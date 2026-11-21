@@ -97,22 +97,44 @@ decode_body(<<?GWINFO, GwId:8>>) ->
 decode_body(<<?GWINFO, GwId:8, GwAdd/binary>>) ->
     {ok, #{type => gwinfo, gw_id => GwId, gw_add => GwAdd}};
 decode_body(<<?CONNECT, Flags:8, ProtocolId:8, Duration:16, ClientId/binary>>)
-  when byte_size(ClientId) > 0 ->
+  when byte_size(ClientId) > 0, Flags band 8 =:= 0 ->
+    %% Will=false: no Will Delay Interval field (Duration directly precedes
+    %% ClientId). The `Flags band 8 =:= 0' guard (Will bit clear) is REQUIRED:
+    %% without it this clause would also match a Will=true frame and swallow
+    %% the first 2 ClientId bytes as if they were the (absent) Will Delay
+    %% field.
+    %%
     %% MQTT-SN 1.2 §5.4.4: Will is bit 3 and CleanSession bit 2. The byte has
     %% the PUBLISH flag layout above them (DUP, QoS, Retain), which CONNECT
     %% does not use but which a client may leave at zero; only the two bottom
-    %% bits are reserved. Reading Will/CleanSession out of bits 7/6 -- the
-    %% MQTT 3.1.1 CONNECT layout -- silently rejects every conforming client,
-    %% which is exactly what the first run of `mqtt-sn-tools' did.
+    %% bits are reserved.
     case reserved(Flags, 2#00000011) of
         true ->
             {error, {reserved_bits, Flags}};
         false ->
             {ok, #{type => connect,
-                   will => bit(Flags, 3),
+                   will => false,
                    clean_session => bit(Flags, 2),
                    protocol_id => ProtocolId,
                    duration => Duration,
+                   will_delay => 0,
+                   client_id => ClientId}}
+    end;
+decode_body(<<?CONNECT, Flags:8, ProtocolId:8, Duration:16, WillDelay:16,
+              ClientId/binary>>)
+  when byte_size(ClientId) > 0, Flags band 8 =/= 0 ->
+    %% Will=true (v1.2 §5.4.4): the Will Delay Interval (seconds) sits between
+    %% Duration and ClientId. 0 means no delay.
+    case reserved(Flags, 2#00000011) of
+        true ->
+            {error, {reserved_bits, Flags}};
+        false ->
+            {ok, #{type => connect,
+                   will => true,
+                   clean_session => bit(Flags, 2),
+                   protocol_id => ProtocolId,
+                   duration => Duration,
+                   will_delay => WillDelay,
                    client_id => ClientId}}
     end;
 decode_body(<<?CONNECT, _/binary>>) ->
@@ -265,8 +287,15 @@ encode_body(gwinfo, #{gw_id := GwId} = P) ->
 encode_body(connect, P) ->
     Flags = flag(bit_of(maps:get(will, P, 0)), 3)
         bor flag(bit_of(maps:get(clean_session, P, 0)), 2),
+    %% v1.2 §5.4.4: the Will Delay Interval (2 bytes) is present exactly when
+    %% the Will flag is set, so encode must insert it for Will=true even when
+    %% it is 0 -- otherwise encode/decode would disagree on the Will=true shape.
+    Body = case maps:get(will, P, 0) of
+               true -> <<(maps:get(will_delay, P, 0)):16>>;
+               _    -> <<>>
+           end,
     <<?CONNECT, Flags:8, (maps:get(protocol_id, P, 1)):8,
-      (maps:get(duration, P, 0)):16, (maps:get(client_id, P))/binary>>;
+      (maps:get(duration, P, 0)):16, Body/binary, (maps:get(client_id, P))/binary>>;
 encode_body(connack, #{return_code := RC}) ->
     <<?CONNACK, RC:8>>;
 encode_body(willtopicreq, _P) ->

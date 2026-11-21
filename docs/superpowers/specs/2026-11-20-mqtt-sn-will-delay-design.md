@@ -59,16 +59,15 @@ decode_body(<<?CONNECT, Flags:8, ProtocolId:8, Duration:16, WillDelay:16,
 ```
 
 - `will => false` 的 map 现多一个 `will_delay => 0`（缺省），保持向后兼容（消费者用 `maps:get(will_delay, M, 0)`）。
-- encode 对称：`encode_body(connect, ...)` 当 `will=true` 且 `will_delay>0` 时插入该 2 字节；否则维持现形状（Will=false 或 delay=0 都不插）：
+- encode 对称：`encode_body(connect, ...)` **当 `will=true` 时必插**该 2 字节（值缺省 0）；Will=false 时不插。注意不是"delay>0 才插"——否则 Will=true 且 delay=0 的 map 编码成无字段形状，与 decode 的"Will=true 必有字段"矛盾、round-trip 断裂。
 
 ```erlang
 encode_body(connect, #{client_id := ClientId} = P) ->
     Flags = flag(bit_of(maps:get(will, P, 0)), 3)
             bor flag(bit_of(maps:get(clean_session, P, 0)), 2),
-    Delay = maps:get(will_delay, P, 0),
-    Body = case {maps:get(will, P, 0), Delay > 0} of
-               {true, true} -> <<Delay:16>>;   %% Will=true + delay>0: insert field
-               _            -> <<>>             %% else: no field (current shape)
+    Body = case maps:get(will, P, 0) of
+               true -> <<(maps:get(will_delay, P, 0)):16>>;  %% Will=true: always
+               _    -> <<>>                                   %% Will=false: never
            end,
     <<?CONNECT, Flags:8, (maps:get(protocol_id, P, 1)):8,
       (maps:get(duration, P, 0)):16, Body/binary, ClientId/binary>>;
@@ -76,7 +75,7 @@ encode_body(connect, #{client_id := ClientId} = P) ->
 
 encode 改动必须与 decode 对称，否则 round-trip 断；测试覆盖（验收项 4）。
 
-> 注意：两个 `decode_body` 子句**靠 `bit(Flags,3)` 守卫区分**——第一个只匹配 Will=false（无字段），第二个只匹配 Will=true（带 2 字节 WillDelay）。顺序无关紧要，因为守卫互斥。encode 与 round-trip 测试据此固定。
+> 注意：两个 `decode_body` 子句**靠 `Flags band 8` 守卫区分**（Will 位）——第一个（`band 8 =:= 0`）只匹配 Will=false（无字段），第二个（`band 8 =/= 0`）只匹配 Will=true（带 2 字节 WillDelay）。`bit/2` 是用户函数，不能进 guard，故用 `band`。encode 与 round-trip 测试据此固定。
 
 ### 2.2 conn：异常断开时把 will 上交 listener（而非立即发）
 
