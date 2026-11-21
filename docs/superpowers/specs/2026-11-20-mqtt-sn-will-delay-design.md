@@ -14,7 +14,7 @@
 | codec 测试向量 | 现有真实 `mqtt-sn-tools` wire 形状：`<<Len,16#04,Flags,ProtoId, 0,Duration, ClientId>>` —— Duration 后**直接是 ClientId，无 Will Delay 字段**（因这些用例 Will=false） | `mqtt_sn_codec_SUITE.erl:318-324` |
 | conn 发布 | `publish_will/1` 在 `terminate/2` 里**同步立即发**遗嘱（`abnormal(Reason)` 为真即发） | `mqtt_sn_conn.erl:144-148, 417-427` |
 | will 状态 | `#st.will = {Topic,Payload,QoS,Retain}`（或 undefined），进程死即丢 | `mqtt_sn_conn.erl:419` |
-| listener | 已持有 asleep/sleep 表、有 1s `refill` tick、outlives conn 进程；`sn_sleep`/`sn_sleep_granted` 已是 conn↔listener 异步上交的先例 | `mqtt_sn_listener.erl:256-273, 386-387` |
+| listener | 已持有 asleep/sleep 表、outlives conn 进程；`sn_sleep`/`sn_sleep_granted` 已是 conn↔listener 异步上交的先例。**listener 无周期 tick**（只有可选的 `advertise_tick`），故延迟 will 到期扫描需 listener 自身起一个 `erlang:start_timer`（镜像 conn 的 keepalive/sleep timer 惯用法） | `mqtt_sn_listener.erl:261-275, 749-754(参考);` conn timer 惯用法 `mqtt_sn_conn.erl:749-760` |
 
 **关键 wire-compat 事实**：MQTT-SN v1.2 §5.4.4 —— Will Delay Interval（2 字节，秒）**仅当 Will 标志置位时**才出现在 Duration 与 ClientId 之间；Will=false 时不存在该字段（= 现有测试向量的形状）。Will Delay Interval=0 表示无延迟。**解析必须按 Will 标志条件化**，否则破坏每个 Will=false 客户端（正是上次 MQTT-SN CONNECT 解码踩过的坑）。
 
@@ -80,31 +80,54 @@ encode 改动必须与 decode 对称，否则 round-trip 断；测试覆盖（�
 
 ### 2.2 conn：异常断开时把 will 上交 listener（而非立即发）
 
-`publish_will/1` 的调用点 `terminate/2`：当 `will_delay > 0` 且 will 存在时，**不立即发**，改为 `gen_server:cast(listener, {sn_deferred_will, self(), Will, DeadlineMs})` 后让进程正常结束（detach）。`will_delay = 0`（或无 will）维持现状立即发。
+`publish_will/1` 的调用点 `terminate/2`（`mqtt_sn_conn.erl:146`）：当 `abnormal(Reason)` 为真时调 `publish_will(St)`。改 `publish_will/1` 内部分流：若 `St#st.will_delay > 0` 且 will 存在 → **不立即发**，改 `gen_server:cast(St#st.listener, {sn_deferred_will, St#st.client_id, Will, St#st.will_delay, St#st.tenant})` 后返回（进程照常结束、detach）。`will_delay = 0`（或无 will）维持现状：立即 `store_publish`。
 
-- `DeadlineMs` = `erlang:monotonic_time(millisecond) + will_delay*1000`。但 monotonic 在 listener 进程才有意义 —— 改由 listener 收到消息时以**自己的**时钟记 `ReceivedAtMs`，deadline 存相对秒数 `will_delay`，避免跨进程时钟混用。
+- 不传绝对 deadline（monotonic 跨进程无意义），只传相对秒数 `St#st.will_delay`；由 listener 收到消息时以**自己的**时钟记 `AtMs`，deadline = `AtMs + DelayS*1000`。
 - conn 的 `#st{}` 需带 `will_delay`（从 CONNECT 解析，存 connect 时一并写入，见 §2.4）。
+- **tenant 随 will 一起上交**（listener 发布到期 will 时需要它构造 message；conn 的 `St#st.tenant` 即来源）。
 
-### 2.3 listener：延迟 will 表 + tick 扫描 + 重连取消
+### 2.3 listener：延迟 will 表 + 自臂 timer 到期 + 重连取消
 
-- 新表 `#st.deferred_wills = #{}`：`ClientID -> {Will, DelayS, AtMs}`（AtMs = listener 记的到达时刻）。**按 ClientID 键** —— 重连即同 ClientID，天然是取消键。
-- `handle_cast({sn_deferred_will, Pid, Will, DelayS}, St)`：登记 `ClientID`（需从 Pid 取 client_id —— 改 conn 上交时直接带 ClientID，见 §2.2 修正：`{sn_deferred_will, ClientID, Will, DelayS}`），`AtMs = monotonic`。若该 ClientID 已有 pending will，覆盖（最新遗嘱为准，符合"重连后新遗嘱取代"）。
-- 在已有 1s `refill` tick 里加一步 `scan_deferred_wills/1`：对每个 `ClientID -> {Will, DelayS, AtMs}`，若 `monotonic - AtMs >= DelayS*1000`：
-  - 若 `ClientID` 现在有一个**活着的 session**（在 asleep/active 表里）—— 说明已重连，**取消**（不发，删表项）。
-  - 否则 —— 到期且未重连，**发布** will（走与 `publish_will` 同一条 `store_publish` 路径）并删表项。
-- **重连取消的另一触发点**：CONNECT 成功建立 session 时（conn 上线），`gen_server:cast(listener, {sn_cancelled_deferred_will, ClientID})`（或 conn 在 connect 里直接删 listener 表项）。放在 conn 的 CONNECT 处理里删表项最直接（重连即到）。
+listener **无周期 tick**（只有可选 `advertise_tick`），故延迟 will 到期不靠轮询，而靠 listener 自身一个 `erlang:start_timer` —— 镜像 conn 的 keepalive/sleep timer 惯用法（`erlang:start_timer(Ms, self(), deferred_will_due)` + `handle_info({timeout, Ref, deferred_will_due}, ...)`）。
 
-> 选用"conn 在 CONNECT 时删 deferred 表项"作为取消主路径（确定性、即时），tick 扫描只负责到期的"未重连者发布"。两者都按 ClientID 键，逻辑单一。
+- 新表 `#st.deferred_wills = #{}`：`ClientID -> {Will, DelayS, AtMs, Tenant}`（AtMs = listener 记的到达时刻）。**按 ClientID 键** —— 重连即同 ClientID，天然是取消键。
+- 新 timer 引用 `#st.deferred_will_timer = undefined | reference()`。
+- `handle_cast({sn_deferred_will, ClientID, Will, DelayS, Tenant}, St)`：
+  - 登记 `ClientID -> {Will, DelayS, erlang:monotonic_time(millisecond), Tenant}`（覆盖旧项：最新遗嘱为准）；
+  - 调 `arm_deferred_will_timer/1`：扫描表取**最近的 deadline**，若 `deferred_will_timer` 未 armed 则 `erlang:start_timer(DueMs, self(), deferred_will_due)`（已 armed 则不动 —— 早于新项的旧 timer 仍会先触发，扫描时一并处理）。
+- `handle_info({timeout, Ref, deferred_will_due}, #st{deferred_will_timer = Ref} = St)`：
+  - `Now = monotonic`，对每个 `ClientID -> {Will, DelayS, AtMs, Tenant}`：
+    - 若 `Now - AtMs >= DelayS*1000`（到期）：
+      - 若 `ClientID` 现在有一个**活着的 session**（在 `clients` 表里且 pid 活着 / 在 asleep 表里）—— 说明已重连，**取消**（不发，删表项）；
+      - 否则 —— 到期且未重连，**发布** will（调 `mqtt_sn_conn:publish_will_now(Will, Tenant)`）并删表项；
+    - 未到期的留着；
+  - 删表项后若表非空则 `arm_deferred_will_timer/1` 续臂到下一个最近 deadline，否则 `deferred_will_timer = undefined`。
+- **重连取消的主路径**：conn 在 CONNECT 成功建立 session 时（`on_connect_sn` 里 `sn_bind` 之后）即 `gen_server:cast(listener, {sn_cancel_deferred_will, ClientID})`，listener 删表项并按需续臂 timer。确定性、即时，不依赖 timer 恰好扫到。
 
-### 2.4 conn 状态带 will_delay
+### 2.4 conn 状态带 will_delay + 重连取消
 
 - `#st{}` 加字段 `will_delay = 0 :: non_neg_integer()`。
-- CONNECT 处理（`on_connect`/`finish_connect` 一带，`mqtt_sn_conn.erl:275, 315, 384` 等）从解码 map `will_delay` 写入 `St#st{will_delay = ...}`。
-- 重连时若新 CONNECT 无 will 或 will_delay=0，conn 在建立 session 时即向 listener 发取消（清掉旧的 pending deferred will）。
+- CONNECT 处理：`on_connect/2` 的解构 pattern 加入 `will_delay := WillDelay`，传入 `on_connect_sn`；后者在构造 `St1`（`mqtt_sn_conn.erl:315`）时写入 `will_delay = WillDelay`。`will_delay` 有缺省 0，旧 CONNECT map（无该键）经 `maps:get(will_delay, M, 0)` 兼容。
+- **重连取消**：`on_connect_sn/5` 在 `gen_server:cast(... {sn_bind, ...})`（`:323`）之后，追加 `gen_server:cast(St#st.listener, {sn_cancel_deferred_will, ClientId})` —— 不论本次 CONNECT 带不带 will，重连即清掉该 ClientID 旧的 pending deferred will（确定性取消主路径，见 §2.3）。
 
 ### 2.5 publish 路径复用
 
-listener 发布到期 will 时，复用现有 `store_publish(Topic,Payload,QoS,Retain, ...)`（`publish_will` 现在调的就是它，`mqtt_sn_conn.erl:420`）。listener 不直接持有该函数的私有性 —— 提取一个 `publish_will_now/1` 或在 listener 里调用 `broker_router` 的发布路径。**确认**：`store_publish/5` 是 `mqtt_sn_conn` 内部函数。方案：把"发一个 will 三元组/四元组"提取为 `mqtt_sn_conn` 的导出 `publish_will_now({Topic,Payload,QoS,Retain})`，listener 调用它；或 listener 直接走 `broker_router:destination` 发布。**取前者**（复用 conn 已验证的发布语义、指标 `will_published`），让 listener 在到期分支调用 `mqtt_sn_conn:publish_will_now(Will)`。
+listener 发布到期 will 时，复用 conn 已验证的发布语义（`store_publish/5` → `publish_routed/3`，含 `broker_event:apply_policy`、retain、指标 `will_published`）。`store_publish/5` 是 `mqtt_sn_conn` 私有函数且依赖 `St#st.tenant`，故把"发一个 will 四元组 + tenant"提取为 `mqtt_sn_conn` 的**导出**函数：
+
+```erlang
+%% 供 listener 发布到期 deferred will 复用：与 publish_will/1 同一条路径。
+-spec publish_will_now({binary(), binary(), 0..2, boolean()}, binary()) -> ok.
+publish_will_now({Topic, Payload, QoS, Retain}, Tenant) ->
+    case store_publish(Topic, Payload, QoS, Retain, Tenant) of
+        ok -> broker_metrics:inc(will_published), ok;
+        {error, Reason} ->
+            logger:warning("mqtt_sn could not publish deferred will: ~p", [Reason]),
+            ok
+    end.
+```
+
+- 为支持上式，把 `store_publish/5` 改为 `store_publish(Topic,Payload,QoS,Retain,Tenant)`（直接用传入 Tenant 取代 `St#st.tenant`）；`publish_will/1` 现调用点随之改为 `store_publish(Topic,Payload,QoS,Retain, St#st.tenant)`。
+- listener 到期分支调 `mqtt_sn_conn:publish_will_now(Will, Tenant)`（Will/Tenant 来自 deferred_wills 表项）。**取此方案而非 listener 自走 broker_router**：避免在 listener 重造发布/指标语义。
 
 ---
 
@@ -116,14 +139,14 @@ listener 发布到期 will 时，复用现有 `store_publish(Topic,Payload,QoS,R
 | Will=false 客户端的 wire 形状改动 | 维持 Duration→ClientId 直接相连（现有向量），零回归 |
 | 跨节点延迟 will | MQTT-SN 前端单节点（与其它 MQTT-SN 限制一致），延迟 will 不跨节点 |
 | Will 更新（WILLMSGUPD）对已登记 deferred will 的影响 | 后续增量；本设计只覆盖 CONNECT 时登记的 will |
-| 精确到亚秒 | Will Delay Interval 单位是秒，tick 1s 粒度足够 |
+| 精确到亚秒 | Will Delay Interval 单位是秒，秒级语义足够；timer 精度到毫秒但实际语义仍为秒 |
 
 ---
 
 ## 4. 留痕（本设计不解决）
 
-- 延迟 will 的扫描粒度是 listener 的 1s tick，故实际发布时刻在 `[deadline, deadline+1s)` 区间 —— 秒级语义内可接受，文档说明。
-- 若 listener 进程重启，pending deferred will 表清空（与 asleep 表同，重启即空）—— 文档如实声明。
+- 延迟 will 的到期由 listener 自臂的 `deferred_will_due` timer 驱动，扫描发生在每次 timer 触发时；timer 精确到最近一个 deadline，故实际发布时刻在 `deadline` 之后、下一次扫描（=该 deadline）时刻 —— 秒级语义内可接受，文档说明。
+- 若 listener 进程重启，pending deferred will 表与 timer 一并清空（与 asleep 表同，重启即空）—— 文档如实声明。
 
 ---
 
@@ -146,7 +169,8 @@ listener 发布到期 will 时，复用现有 `store_publish(Topic,Payload,QoS,R
 
 ## 6. 风险
 
-- **wire-compat（高影响）**：codec 双子句必须加守卫 `bit(Flags,3)`，否则 Will=false 帧被第二个子句/WillDelay 误吞。验收项 1、4 守护。
+- **wire-compat（高影响）**：codec 双子句必须加守卫 `bit(Flags,3)=:=false/true`，否则 Will=false 帧被误吞或 WillDelay 错配。验收项 1、4 守护。
 - **跨进程时钟**：deadline 用 listener 自己的 monotonic，不用 conn 的（§2.3）。验收项 7/8 守护。
-- **取消时机**：以 conn CONNECT 时删 listener deferred 表项为主路径（确定性），避免依赖 tick 恰好扫到重连。验收项 8 守护。
-- **发布路径复用**：提取 `publish_will_now/1` 为导出，listener 复用 conn 已验证的发布 + 指标，避免在 listener 重造发布语义。
+- **取消时机**：以 conn CONNECT 时发 `{sn_cancel_deferred_will, ClientID}` 删 listener 表项为主路径（确定性），不依赖 timer 恰好扫到重连。验收项 8 守护。
+- **发布路径复用**：提取 `publish_will_now/2`（will 四元组 + tenant）为导出，listener 复用 conn 已验证的发布 + 指标，避免在 listener 重造发布语义。
+- **timer 生命周期**：`deferred_will_timer` 必须随表项清空/续臂而 cancel+重起，避免 stale timer 触发误扫；`handle_info` 子句以 `#st{deferred_will_timer = Ref}` 守卫确保只认当前 timer。
