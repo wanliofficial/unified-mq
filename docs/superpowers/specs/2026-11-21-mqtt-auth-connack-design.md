@@ -31,16 +31,16 @@
 
 1. codec 无需改动：`#connack{props = #{}}` 已在记录里，`encode_v5/1` 已编码 props，v5 解码已读 props。
 2. `mqtt_conn_fsm:connack_bin/3`：**唯一改动点**——当 `vsn(D) =:= 5` 且配置 `mqtt_connack_props_v5`（默认 `true`）时，props 加：
-   - `maximum_qos => 2`
    - `retain_available => 1`
    - `wildcard_subscription_available => 1`
    - `subscription_identifier_available => 1`
    - `shared_subscription_available => 1`
+   - **不发 `maximum_qos`**：§3.2.2.3.4 只允许该属性取值 0 或 1，值 2 是 Protocol Error；缺省即表示最大 QoS 2，所以本 broker 支持 QoS 2 是靠省略表达的（MQTT-3.2.2-9）。
    - 否则 props 恒 `# {}`。
 3. **不做** Server Keep Alive、Assigned Client Identifier（本期范围外，缺口文档已列）。
 4. **零回归**：3.1.1（vsn 4）CONNACK 字节与改动前逐字节一致——props 仅在 vsn=5 加。
 
-> 五个能力位属性 id（codec 已就绪）：`maximum_qos`=0x24、`retain_available`=0x25、`wildcard_subscription_available`=0x28、`subscription_identifier_available`=0x29、`shared_subscription_available`=0x2A。
+> 四个能力位属性 id（codec 已就绪）：`retain_available`=0x25、`wildcard_subscription_available`=0x28、`subscription_identifier_available`=0x29、`shared_subscription_available`=0x2A。`maximum_qos`=0x24 的 codec 支持保留，但 broker 不发它（见上文）。
 
 ### 3.2 MQ-05：auth-method 框架（可插拔）
 
@@ -123,8 +123,9 @@ nonce 绑定的 username/password 交换，复用现有用户库：
 在 `apps/broker_proto_mqtt/test/mqtt_conn_SUITE.erl`（全 `port => 0`）增：
 
 MQ-07：
-1. `v5_connack_advertises_capabilities`：v5 CONNACK props 含 `maximum_qos=2` + 四个 available=1。
-2. `v3_connack_has_no_capability_props`：3.1.1 CONNACK 字节与基线一致（无新增属性）。
+1. `v5_connack_capabilities_are_exact`：v5 CONNACK props 恰为四个 `available=1`，且**不含** `maximum_qos`（§3.2.2.3.4；支持 QoS 2 靠省略表达）。
+2. `v5_connack_capabilities_can_be_disabled`：`mqtt_connack_props_v5=false` 时 v5 CONNACK props 为空。
+3. `v3_connack_has_no_capability_props`：3.1.1 CONNACK 字节与基线一致（无新增属性）。
 
 MQ-05：
 3. `auth_challenge_continues_then_succeeds`：CONNECT 带 method → 收 AUTH 0x18 + challenge → 回正确 response → CONNACK 成功、principal 正确。
@@ -133,3 +134,15 @@ MQ-05：
 6. `auth_reauth_success_returns_auth_success`：established 会话中发 AUTH re-auth 成功 → 回 AUTH 0x00。
 7. `auth_reauth_failure_disconnects_0x9c`：re-auth 失败 → DISCONNECT 0x9C。
 8. `auth_plain_connect_without_method_unchanged`：不带 method 的 CONNECT 走现有同步路径，零回归。
+
+## 8. 修订记录
+
+### 2026-11-21：MQ-07 去掉 `maximum_qos` 回填（§3.2.2.3.4 / MQTT-3.2.2-9）
+
+原稿 §3.1 要求 v5 CONNACK 回填 `maximum_qos => 2`。对照 OASIS MQTT-5.0 正式文本核对后确认这是规范缺陷：
+
+> "36 (0x24) Byte, Identifier of the Maximum QoS. Followed by a Byte with a value of either 0 or 1. It is a Protocol Error to include Maximum QoS more than once, or to have a value other than 0 or 1. If the Maximum QoS is absent, the Client uses a Maximum QoS of 2."
+
+即：该属性只允许 0 或 1，值 2 是 **Protocol Error**；而「缺省即最大 QoS 2」意味着**支持 QoS 2 的 broker 必须省略该属性**（MQTT-3.2.2-9 只要求不支持 QoS 1/2 的服务器发它）。原实现会向合规客户端发出非法 CONNACK。
+
+修正：`connack_capability_props/2` 删去 `maximum_qos => 2`，保留四个 `*_available => 1`（这四个取值 0/1、缺省为 1，显式发 1 合法）。测试 `v5_connack_capabilities_are_exact` 改为断言四个属性 + `maximum_qos` 缺席 + `maps:size(P) =:= 4`；`connect_mqtt5_is_accepted` 同步。`mqtt_frame` 的 `maximum_qos` 编解码保留（其它 v5 场景可用），只是 broker 不再发。其余设计（RC=0 才回填、`mqtt_connack_props_v5` 开关、3.1.1 字节不变、Server Keep Alive / Assigned Client Identifier 范围外）不变。
