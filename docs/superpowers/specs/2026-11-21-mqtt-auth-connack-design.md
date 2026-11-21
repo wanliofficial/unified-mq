@@ -19,8 +19,8 @@
 
 ## 2. 现状（已核实，非猜测）
 
-- `mqtt_frame.erl`：`#connack{}` 记录只有 `session_present` + `return_code`，**无 props**；`p_connack/2`（`:376`）解码只读这两项，不读 properties。encoder 侧的 `prop_bin/2`（`:1236` 起）已能编码任意 props map（覆盖 0x24 Maximum QoS、0x25 Retain Available、0x28 Wildcard Available、0x29 Subscription Identifier Available、0x5C Shared Sub Available；另有 0x15/0x16 authentication_method/data）。
-- codec 已能解 CONNECT 上的 `authentication_method`(0x15) / `authentication_data`(0x16)（`mqtt_frame.erl:762-763`），但**没有 AUTH 包**（control type 0x0F），`#connack{}` 无 props。
+- `mqtt_frame.erl`：CONNACK 的 v5 编解码**已就绪**——`#connack{}` 记录已有 `props = #{}` 字段，`encode_v5/1`（`:1067`）已编码 props，`do_parse_body(2,0,...,5)`（`:150`）已解码 props。缺的只是 `connack(SP, RC)` 便捷构造器（`:1281`）不带 props——但 FSM 走 `enc(#connack{...}, D)` → `encode_v5`，只要 `connack_bin/3` 填了 props 就会输出。**因此 MQ-07 不需要改 codec**。
+- codec 已能解 CONNECT 上的 `authentication_method`(0x15) / `authentication_data`(0x16)（`mqtt_frame.erl:762-763`），但**没有 AUTH 包**（control type 0x0F）。
 - `mqtt_conn_fsm.erl`：`connack_bin/3`（`:2423`）恒 `enc(#connack{session_present=SP, return_code=RC}, D)`。`authenticate/2`（CONNECT 内）是**纯同步**调 `broker_security:authenticate(User, Pass)` → principal，无 challenge、无 AUTH 包处理。
 - `broker_security.erl`：导出 `authenticate/2`、`authorize/2`、`tenant_id/1`、`mqttsn_psk_for_identity/1`；是同步凭据存储，**无 challenge/异步 API**。不改动它。
 - 失败码：v5 CONNACK 拒绝用 `refuse/2`（reason code 0x86 = Not authorized 已有）。
@@ -29,18 +29,16 @@
 
 ### 3.1 MQ-07：CONNACK 能力回填
 
-1. `#connack{}` 记录加 `props = #{} :: map()`。
-2. codec `p_connack/2`：解码 SP + RC 后，把剩余字节解析为 properties（复用现有 `read_props/1`；空则 `# {}`）。
-3. codec encode：`#connack{}` 已走通用 `enc/2`，props 由 `prop_bin/2` 编码，无需改 encoder 主体。
-4. `mqtt_conn_fsm:connack_bin/3`：当 `vsn(D) =:= 5` 且配置 `mqtt_connack_props_v5`（默认 `true`）时，props 加：
+1. codec 无需改动：`#connack{props = #{}}` 已在记录里，`encode_v5/1` 已编码 props，v5 解码已读 props。
+2. `mqtt_conn_fsm:connack_bin/3`：**唯一改动点**——当 `vsn(D) =:= 5` 且配置 `mqtt_connack_props_v5`（默认 `true`）时，props 加：
    - `maximum_qos => 2`
    - `retain_available => 1`
    - `wildcard_subscription_available => 1`
    - `subscription_identifier_available => 1`
    - `shared_subscription_available => 1`
    - 否则 props 恒 `# {}`。
-5. **不做** Server Keep Alive、Assigned Client Identifier（本期范围外，缺口文档已列）。
-6. **零回归**：3.1.1（vsn 4）CONNACK 字节与改动前逐字节一致——props 仅在 vsn=5 加。
+3. **不做** Server Keep Alive、Assigned Client Identifier（本期范围外，缺口文档已列）。
+4. **零回归**：3.1.1（vsn 4）CONNACK 字节与改动前逐字节一致——props 仅在 vsn=5 加。
 
 > 五个能力位属性 id（codec 已就绪）：`maximum_qos`=0x24、`retain_available`=0x25、`wildcard_subscription_available`=0x28、`subscription_identifier_available`=0x29、`shared_subscription_available`=0x2A。
 
