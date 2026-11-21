@@ -205,6 +205,9 @@
     {mqtt_auth_methods, [<<"plain">>]},
     {mqtt_auth_timeout_ms, 30000},
     {mqtt_connack_props_v5, true},
+    %% MQ-06: prefix handed back as response_information when a v5 CONNECT sets
+    %% request_response_information. undefined = off. UTF-8 binary string.
+    {mqtt_response_information, undefined},
     {pull_page_limit, 32},
     {max_inflight, 64},
     {pull_poll_interval_ms, 1000},

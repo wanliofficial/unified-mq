@@ -18,6 +18,10 @@
            {mqtt_auth_timeout_ms, 30000},
            %% MQ-07: advertise the five static capability bits on a v5 CONNACK.
            {mqtt_connack_props_v5, true},
+           %% MQ-06: prefix handed back as response_information when a v5 CONNECT
+           %% sets request_response_information. undefined = feature off (no
+           %% property emitted). Must be a UTF-8 binary string.
+           {mqtt_response_information, undefined},
            {pull_page_limit, 32},
            {max_inflight, 64},
            {pull_poll_interval_ms, 1000},
