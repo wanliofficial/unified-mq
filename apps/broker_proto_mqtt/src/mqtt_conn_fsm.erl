@@ -117,7 +117,14 @@
              auth_deadline = undefined,    %% {Ref, TRef} | undefined
              %% MQ-05: the CONNECT that started the handshake, stashed so the
              %% attach tail (connect_success/2) can run after it completes.
-             auth_connect = undefined :: undefined | #connect{}}).
+             auth_connect = undefined :: undefined | #connect{},
+             %% MQ-06 (spec §3.1): the client asked for request/response info
+             %% (CONNECT flag) and the broker has a configured Response
+             %% Information to hand back. Both must hold for the CONNACK to
+             %% carry response_information. `undefined' = not requested or not
+             %% configured (no property emitted, zero regression).
+             response_info_requested = false :: boolean(),
+             response_information = undefined :: undefined | binary()}).
 
 %%%_* API ---------------------------------------------------------------------
 
@@ -454,7 +461,10 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
                 session_expiry = maps:get(session_expiry_interval, Props, 0),
                 receive_maximum = maps:get(receive_maximum, Props, 65535),
                 max_packet_size = maps:get(maximum_packet_size, Props, undefined),
-                topic_alias_max = opt(mqtt_topic_alias_maximum, 0, D0)},
+                topic_alias_max = opt(mqtt_topic_alias_maximum, 0, D0),
+                response_info_requested =
+                    maps:get(request_response_information, Props, 0) =:= 1,
+                response_information = opt(mqtt_response_information, undefined, D0)},
     %% S12-B (ADR-032 D7): the node-level admission gate, asked before any
     %% per-connection work so an over-capacity CONNECT costs a CONNACK and
     %% nothing else. It sits after `proto_level' is in state because the refusal
@@ -2678,7 +2688,22 @@ connack_bin(SP, RC, D) ->
                      _ ->
                          #{}
                  end,
-    Props = maps:merge(connack_capability_props(RC, D), AliasProps),
+    %% MQ-06 (§3.1.2.7.6): a v5 CONNECT that sets request_response_information=1
+    %% gets the broker's assigned Response Information back, so it can build a
+    %% response_topic = RI ++ correlation_data. Only on a successful connect
+    %% (RC = 0, like the capability bits) and only when both the client asked and
+    %% the broker has a value configured; otherwise absent (zero regression).
+    ResponseInfoProps =
+        case vsn(D) of
+            5 when D#st.response_info_requested,
+                  D#st.response_information =/= undefined ->
+                #{response_information => D#st.response_information};
+            _ ->
+                #{}
+        end,
+    Props = maps:merge(maps:merge(connack_capability_props(RC, D),
+                                  AliasProps),
+                        ResponseInfoProps),
     enc(#connack{session_present = SP, return_code = RC, props = Props}, D).
 
 suback_bin(Pid, Codes, D) ->

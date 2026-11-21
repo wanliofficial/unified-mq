@@ -58,6 +58,12 @@ all() ->
      v5_outbound_publish_uses_allocated_alias,
      v5_connack_capabilities_are_exact,
      v5_connack_capabilities_can_be_disabled,
+     %% MQ-06: Request Response Information回填 (gap MQ-06).
+     v5_request_response_info_is_returned_when_requested,
+     v5_request_response_info_absent_when_not_requested,
+     v5_request_response_info_off_by_default,
+     v5_request_response_roundtrip,
+     v5_request_response_info_absent_on_refusal,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
      connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
      %% MQ-05: the enhanced-auth framework and its first method, `plain'.
@@ -213,6 +219,9 @@ init_per_testcase(Case, Config) ->
     %% MQ-04: Topic Alias is off unless a case opts in. Reset it here so a case
     %% that enabled it cannot poison the next one (the same J10 rule as above).
     ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 0),
+    %% MQ-06: Request Response Information is off unless a case opts in. Reset it
+    %% here so a case that enabled it cannot poison the next one.
+    ok = application:set_env(broker_proto_mqtt, mqtt_response_information, undefined),
     ok = application:set_env(broker_proto_mqtt, max_qos2_state_per_session, 100),
     %% S2-E knobs (ADR-015): every case starts from the production defaults, and
     %% a case that needs another posture re-sets them before boot/0.
@@ -596,6 +605,90 @@ v5_connack_capabilities_can_be_disabled(_Config) ->
         mqtt_open_v5(#{client_id => <<"v5nocap">>, props => #{}}),
     ?assertEqual(#{}, P),
     {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-06: CONNECT requests request/response info + broker configured -> CONNACK
+%% carries the assigned Response Information prefix.
+v5_request_response_info_is_returned_when_requested(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_response_information,
+                             <<"mqtt-response/">>),
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"rrq">>,
+                       props => #{request_response_information => 1}}),
+    ?assertEqual(<<"mqtt-response/">>, maps:get(response_information, P)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-06: client did not request it -> no response_information (zero regression).
+v5_request_response_info_absent_when_not_requested(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_response_information,
+                             <<"mqtt-response/">>),
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"rrno">>, props => #{}}),
+    ?assertNot(maps:is_key(response_information, P)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-06: broker not configured (default undefined) -> nothing returned even if
+%% the client asked.
+v5_request_response_info_off_by_default(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"rrodef">>,
+                       props => #{request_response_information => 1}}),
+    ?assertNot(maps:is_key(response_information, P)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-06: a refused CONNECT (bad password) carries no response_information -- the
+%% property rides only on a successful (RC=0) CONNACK.
+v5_request_response_info_absent_on_refusal(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_response_information,
+                             <<"mqtt-response/">>),
+    ok = boot(),
+    {Conn, #connack{return_code = 16#86}} =
+        mqtt_open_v5(#{client_id => <<"rrbad">>, username => <<"alice">>,
+                       password => <<"wrong">>,
+                       props => #{request_response_information => 1}}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-06 end-to-end: requester asks for response info, gets the prefix from
+%% CONNACK, publishes a request whose response_topic = RI ++ correlation; the
+%% responder subscribed to that topic gets the request (with response_topic +
+%% correlation_data intact) and replies on the same topic; the requester gets the
+%% reply. Proves the request/response loop closes over the existing topic routing.
+v5_request_response_roundtrip(_Config) ->
+    RI = <<"mqtt-response/">>,
+    ok = application:set_env(broker_proto_mqtt, mqtt_response_information, RI),
+    ok = boot(),
+    {Requester, #connack{props = ConnProps}} =
+        mqtt_open_v5(#{client_id => <<"rrReq">>,
+                       props => #{request_response_information => 1}}),
+    ?assertEqual(RI, maps:get(response_information, ConnProps)),
+    Correlation = <<1, 2, 3>>,
+    RespTopic = <<RI/binary, "c-", Correlation/binary>>,
+    {Responder, _} = mqtt_open_v5(#{client_id => <<"rrResp">>, props => #{}}),
+    #suback{return_codes = [1]} =
+        mqtt_subscribe_v5(Responder, 1, [{RespTopic, 1}], #{}),
+    mqtt_publish_v5(Requester, 3, RespTopic, <<"request">>, 1,
+                    #{response_topic => RespTopic,
+                      correlation_data => Correlation}),
+    #puback{packet_id = 3} = mqtt_recv_v5(csock(Requester)),
+    %% responder gets the request with its response_topic + correlation_data
+    #publish{topic = RespTopic, payload = <<"request">>, props = ReqProps} =
+        mqtt_recv_v5(csock(Responder)),
+    ?assertEqual(RespTopic, maps:get(response_topic, ReqProps)),
+    ?assertEqual(Correlation, maps:get(correlation_data, ReqProps)),
+    %% responder replies on the same topic; the requester (subscribed) gets it
+    _ = mqtt_subscribe_v5(Requester, 1, [{RespTopic, 1}], #{}),
+    mqtt_publish_v5(Responder, 4, RespTopic, <<"response">>, 1, #{}),
+    #puback{} = mqtt_recv_v5(csock(Responder)),
+    #publish{payload = <<"response">>} = mqtt_recv_v5(csock(Requester)),
+    {ok, normal} = mqtt_close(Requester),
+    {ok, normal} = mqtt_close(Responder),
     ok.
 
 connect_mqtt5_unknown_level_gets_the_v5_refusal(_Config) ->
