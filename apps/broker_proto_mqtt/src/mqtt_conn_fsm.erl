@@ -2420,8 +2420,28 @@ add_trace_headers(Props, Headers) when is_map(Headers) ->
 %% S2.5 direct builds. 3.1.1 keeps the historical two-byte PUBACK / three-byte
 %% SUBACK; v5 appends the reason code + zero properties so the client's v5
 %% parser sees the shape it expects.
+%% MQ-07 (spec §3.1): the five static capability bits a v5 CONNACK advertises.
+%% They are unconditionally true of this broker, so advertising them costs
+%% nothing and lets a compliant client stop asking. Gated on a config switch so
+%% an operator can retreat to "silent" without a code change. Advertised only on
+%% a successful connect (RC = 0): a refused client never subscribes, so the bits
+%% are pointless on a refusal and would perturb the existing refusal wire shape.
+%% 3.1.1 never reaches here (vsn/1 = 4), so its CONNACK bytes are untouched.
+connack_capability_props(0, #st{proto_level = 5} = D) ->
+    case opt(mqtt_connack_props_v5, true, D) of
+        true ->
+            #{maximum_qos => 2,
+              retain_available => 1,
+              wildcard_subscription_available => 1,
+              subscription_identifier_available => 1,
+              shared_subscription_available => 1};
+        _ -> #{}
+    end;
+connack_capability_props(_, _) -> #{}.
+
 connack_bin(SP, RC, D) ->
-    enc(#connack{session_present = SP, return_code = RC}, D).
+    Props = connack_capability_props(RC, D),
+    enc(#connack{session_present = SP, return_code = RC, props = Props}, D).
 
 suback_bin(Pid, Codes, D) ->
     enc(#suback{packet_id = Pid, return_codes = Codes}, D).

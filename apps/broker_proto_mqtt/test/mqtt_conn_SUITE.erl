@@ -48,6 +48,8 @@ all() ->
      connect_with_bad_password_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
+     v5_connack_capabilities_are_exact,
+     v5_connack_capabilities_can_be_disabled,
      connect_mqtt5_unknown_level_gets_the_v5_refusal,
      connect_mqtt5_with_empty_client_id_gets_the_v5_refusal,
      v5_publish_properties_reach_the_subscriber,
@@ -180,6 +182,7 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_security, limits,
                              #{max_connections => infinity}),
     ok = application:set_env(broker_proto_mqtt, pull_page_limit, 32),
+    ok = application:set_env(broker_proto_mqtt, mqtt_connack_props_v5, true),
     ok = application:set_env(broker_proto_mqtt, max_inflight, 64),
     ok = application:set_env(broker_proto_mqtt, pull_poll_interval_ms, 1000),
     ok = application:set_env(broker_proto_mqtt, inflight_snapshot_ms, 20),
@@ -358,8 +361,37 @@ connect_mqtt5_is_accepted(_Config) ->
               user_properties => [{<<"who">>, <<"test">>}]},
     {Conn, #connack{session_present = 0, return_code = 0, props = AckProps}} =
         mqtt_open_v5(#{client_id => <<"v5c">>, props => Props}),
-    ?assertEqual(#{}, AckProps),
+    %% MQ-07: a v5 CONNACK advertises the broker's static capabilities.
+    ?assertEqual(#{maximum_qos => 2,
+                  retain_available => 1,
+                  wildcard_subscription_available => 1,
+                  subscription_identifier_available => 1,
+                  shared_subscription_available => 1}, AckProps),
     #ping{kind = resp} = mqtt_ping(Conn),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-07: the five capability bits are exactly the set, no more no less.
+v5_connack_capabilities_are_exact(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"v5cap">>, props => #{}}),
+    ?assertEqual(2, maps:get(maximum_qos, P)),
+    ?assertEqual(1, maps:get(retain_available, P)),
+    ?assertEqual(1, maps:get(wildcard_subscription_available, P)),
+    ?assertEqual(1, maps:get(subscription_identifier_available, P)),
+    ?assertEqual(1, maps:get(shared_subscription_available, P)),
+    ?assertEqual(5, maps:size(P)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% MQ-07: with the switch off, v5 CONNACK carries no capability props.
+v5_connack_capabilities_can_be_disabled(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_connack_props_v5, false),
+    ok = boot(),
+    {Conn, #connack{return_code = 0, props = P}} =
+        mqtt_open_v5(#{client_id => <<"v5nocap">>, props => #{}}),
+    ?assertEqual(#{}, P),
     {ok, normal} = mqtt_close(Conn),
     ok.
 
