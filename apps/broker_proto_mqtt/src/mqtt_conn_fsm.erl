@@ -103,7 +103,10 @@
              %% deadline of the handshake. `undefined' outside a handshake.
              auth_method = undefined :: undefined | binary(),
              auth_state = undefined :: undefined | term(),
-             auth_deadline = undefined :: undefined | integer()}).
+             auth_deadline = undefined :: undefined | integer(),
+             %% MQ-05: the CONNECT that started the handshake, stashed so the
+             %% attach tail (connect_success/2) can run after it completes.
+             auth_connect = undefined}).
 
 %%%_* API ---------------------------------------------------------------------
 
@@ -277,22 +280,24 @@ event({ka_t, Ref}, _StateName, #st{ka_ref = {Ref, _}} = D) ->
     {stop, normal, D#st{ka_ref = undefined}};
 event({ka_t, _Stale}, StateName, D) ->
     {state, StateName, D};
+%% MQ-05: the handshake deadline elapsed without the client answering the
+%% challenge. Drop the connection -- a client stuck mid-handshake is not served.
+event({auth_t, Ref}, _StateName, #st{auth_deadline = {Ref, _}} = D) ->
+    log(warning, "auth handshake timed out (client_id=~p)", [D#st.client_id]),
+    {stop, normal, D#st{auth_deadline = undefined}};
+event({auth_t, _Stale}, StateName, D) ->
+    {state, StateName, D};
 event(#connect{} = C, awaiting_connect, D) ->
     handle_connect(C, D);
-%% MQ-05 Task-4 stub: the challenge is out, so the peer's AUTH response is the
-%% only frame that moves the handshake. Task 5 replaces this with the full
-%% continuation (multi-round exchanges, the handshake deadline, re-auth).
-event(#auth{props = Props}, awaiting_auth, D = #st{auth_method = Method}) ->
-    Resp = maps:get(authentication_data, Props, undefined),
-    case broker_auth:continue(Method, D#st.auth_state, Resp) of
-        {ok, Principal, _Ctx2} ->
-            D1 = D#st{principal = Principal,
-                      tenant_id = broker_security:tenant_id(Principal),
-                      auth_method = undefined, auth_state = undefined},
-            {state, connected, send_frame(connack_bin(0, 0, D1), D1)};
-        {error, _} ->
-            refuse(16#86, D)
-    end;
+%% A response to our outstanding challenge: continue the handshake. One
+%% successful round consumes the handshake (AuthState is then dropped).
+event(#auth{} = A, awaiting_auth, #st{auth_method = Method,
+                                      auth_state = AuthState} = D0) ->
+    handle_auth_response(A, Method, AuthState, D0);
+%% §3.15: re-authentication on an established connection. Success -> AUTH 0x00;
+%% failure -> DISCONNECT 0x9C (Not authorized), then close.
+event(#auth{props = Props}, connected, D) ->
+    handle_reauth(Props, D);
 event(#publish{qos = QoS, topic = Topic}, connected, #st{max_qos = Max} = D)
   when QoS > Max ->
     %% §3.3.4 + E12: close, no ack. On a session whose effective max is 0 or 1
@@ -480,13 +485,56 @@ handle_auth_method(#connect{props = Props} = C, #st{proto_level = 5} = D0) ->
                     connect_success(C, D1);
                 {continue, Challenge, AuthState} ->
                     send_auth_continue(Method, Challenge,
-                                       D0#st{auth_method = Method, auth_state = AuthState});
+                                       D0#st{auth_method = Method,
+                                             auth_state = AuthState,
+                                             auth_connect = C});
                 {error, _} ->
                     refuse(16#86, D0)   %% Not authorized
             end
     end;
 handle_auth_method(_C, D0) ->
     authenticate(_C, D0).
+
+%% The client's answer to our outstanding challenge. One successful round runs
+%% the same attach tail as a synchronous CONNECT (CONNACK + session); a further
+%% challenge re-sends AUTH 0x18 (multi-round); failure refuses 0x86.
+handle_auth_response(#auth{props = Props}, Method, AuthState, D0) ->
+    RespData = maps:get(authentication_data, Props, undefined),
+    case broker_auth:continue(Method, AuthState, RespData) of
+        {ok, Principal, _Ctx2} ->
+            D1 = D0#st{auth_method = undefined, auth_state = undefined,
+                       auth_deadline = cancel_auth(D0#st.auth_deadline),
+                       max_qos = effective_max_qos(opt(mqtt_max_qos, 1, D0)),
+                       principal = Principal,
+                       tenant_id = broker_security:tenant_id(Principal)},
+            %% The handshake is done; the CONNECT that started it is still in
+            %% force, so run the same attach tail as a normal CONNECT.
+            connect_success(D0#st.auth_connect, D1);
+        {continue, Challenge2, AuthState2} ->
+            send_auth_continue(Method, Challenge2,
+                               D0#st{auth_state = AuthState2});
+        {error, _} ->
+            refuse(16#86, D0)
+    end.
+
+%% In-session re-auth (§3.15): success replies AUTH 0x00, failure DISCONNECT
+%% 0x9C. An AUTH with no method is a tolerated no-op.
+handle_reauth(Props, D) ->
+    case maps:get(authentication_method, Props, undefined) of
+        undefined ->
+            {state, connected, D};
+        Method when is_binary(Method) ->
+            Data = maps:get(authentication_data, Props, undefined),
+            Ctx = #{client_id => D#st.client_id, proto_level => D#st.proto_level},
+            case broker_auth:reauth(Method, Ctx, Data) of
+                {ok, _Ctx2} ->
+                    {state, connected,
+                     send_frame(enc(#auth{reason_code = 0,
+                                         props = #{authentication_method => Method}}, D), D)};
+                {error, _} ->
+                    protocol_error(16#9C, "re-authentication failed", D)
+            end
+    end.
 
 %% The context handed to an auth method: enough for it to derive the principal's
 %% tenant and to log, without leaking the socket.
@@ -502,9 +550,18 @@ send_auth_continue(Method, Challenge, #st{proto_level = 5} = D) ->
     D1 = send_frame(enc(#auth{reason_code = 16#18, props = AProps}, D), D),
     {state, awaiting_auth, arm_auth_timeout(D1)}.
 
-%% Task-4 stub: real timeout arming is Task 5's (mqtt_auth_timeout_ms).
+%% MQ-05: the enhanced-auth handshake gets its own deadline, separate from the
+%% keepalive (which is not armed until the session is live). On expiry the
+%% connection is dropped -- a client that never answers the challenge is stuck.
+arm_auth_timeout(#st{auth_deadline = undefined} = D) ->
+    Ms = opt(mqtt_auth_timeout_ms, 30000, D),
+    Ref = make_ref(),
+    D#st{auth_deadline = {Ref, erlang:send_after(Ms, self(), {auth_t, Ref})}};
 arm_auth_timeout(D) ->
     D.
+
+cancel_auth(undefined) -> undefined;
+cancel_auth({_Ref, TRef}) -> _ = erlang:cancel_timer(TRef), undefined.
 
 %% The success tail shared by the synchronous path and the one-shot method path.
 %% Extracted verbatim from the old `{ok, D1} ->' branch of handle_connect/2.

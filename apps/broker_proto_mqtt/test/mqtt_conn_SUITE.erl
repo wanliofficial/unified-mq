@@ -59,6 +59,13 @@ all() ->
      %% MQ-05: a CONNECT naming a method is routed through the framework.
      connect_with_auth_method_gets_challenge,
      connect_without_auth_method_unchanged,
+     %% MQ-05: the full AUTH challenge/response state machine (gap MQ-05).
+     auth_challenge_continues_then_succeeds,
+     auth_wrong_password_is_not_authorized,
+     auth_unknown_nonce_is_not_authorized,
+     auth_reauth_success_returns_auth_success,
+     auth_reauth_failure_disconnects_0x9c,
+     auth_timeout_disconnects,
      v5_publish_properties_reach_the_subscriber,
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
@@ -480,6 +487,84 @@ connect_without_auth_method_unchanged(_Config) ->
     ok = boot(),
     {Conn, #connack{return_code = 0}} =
         mqtt_open_v5(#{client_id => <<"noauth">>, props => #{}}),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A v5 CONNECT with an auth method: the challenge is answered, the handshake
+%% completes, and the session is live (can subscribe). Proves the attach tail ran.
+auth_challenge_continues_then_succeeds(_Config) ->
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18, props = #{authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authok">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => term_to_binary({<<"alice">>, Challenge, <<"pw">>})}}),
+    {ok, #connack{return_code = 0}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    ?assertMatch({ok, #{online := true}},
+                 broker_subscription:session(<<"authok">>)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% Wrong password at the challenge -> refused (0x86) at the CONNECT stage.
+auth_wrong_password_is_not_authorized(_Config) ->
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18, props = #{authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authbad">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => term_to_binary({<<"alice">>, Challenge, <<"wrong">>})}}),
+    {ok, #connack{return_code = 16#86}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A response naming a nonce we never issued -> refused (0x86).
+auth_unknown_nonce_is_not_authorized(_Config) ->
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18}} =
+        mqtt_open_v5(#{client_id => <<"authnonce">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => term_to_binary({<<"alice">>, <<"bogus">>, <<"pw">>})}}),
+    {ok, #connack{return_code = 16#86}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% In-session re-auth success -> AUTH 0x00 back.
+auth_reauth_success_returns_auth_success(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"reauthok">>, username => <<"alice">>,
+                      password => <<"pw">>}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 0,
+        props = #{authentication_method => <<"plain">>,
+                  authentication_data => term_to_binary({<<"alice">>, <<"pw">>})}}),
+    {ok, #auth{reason_code = 0}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% In-session re-auth failure -> DISCONNECT 0x9C.
+auth_reauth_failure_disconnects_0x9c(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"reauthbad">>, username => <<"alice">>,
+                      password => <<"pw">>}),
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 0,
+        props = #{authentication_method => <<"plain">>,
+                  authentication_data => term_to_binary({<<"alice">>, <<"wrong">>})}}),
+    {ok, #disconnect{reason_code = 16#9C}} = {ok, mqtt_recv_v5(mqtt_sock(Conn))},
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% Handshake deadline fires and the connection drops (client never answers).
+auth_timeout_disconnects(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_auth_timeout_ms, 100),
+    ok = boot(),
+    {Conn, #auth{reason_code = 16#18}} =
+        mqtt_open_v5(#{client_id => <<"authto">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    %% The challenge arrived (consumed by mqtt_open_v5); the client never
+    %% answers, so the handshake deadline drops the connection on its own.
+    {ok, _} = mqtt_expect_down(mqtt_monitor(Conn), cpid(Conn)),
     {ok, normal} = mqtt_close(Conn),
     ok.
 
@@ -2135,6 +2220,10 @@ open(Knobs) ->
 
 csock(#{sock := Sock}) -> Sock.
 cpid(#{pid := Pid}) -> Pid.
+
+%% The socket half of a Conn map, spelled out for the AUTH cases (which read the
+%% challenge / answer frames off the raw socket rather than going through a verb).
+mqtt_sock(Conn) -> maps:get(sock, Conn).
 
 %% sub/4 answers the single granted code; subscribed/3 answers the SubRef the
 %% cursor assertions need (the same {ClientId, Filter} the Router holds, K2).
