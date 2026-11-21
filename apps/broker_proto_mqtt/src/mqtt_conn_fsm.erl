@@ -96,7 +96,14 @@
              sub_flags = #{} :: #{binary() => {0 | 1, 0 | 1}},
              %% ref -> real filter, so a QoS 0 push (which names refs, not
              %% filters) can apply No Local exactly instead of guessing.
-             sub_refs = #{} :: #{term() => binary()}}).
+             sub_refs = #{} :: #{term() => binary()},
+             %% MQ-05 (spec §3.4): enhanced-auth handshake state. While in the
+             %% `awaiting_auth' substate these hold the method + the opaque
+             %% per-method AuthState returned by broker_auth:initiate/3, plus the
+             %% deadline of the handshake. `undefined' outside a handshake.
+             auth_method = undefined :: undefined | binary(),
+             auth_state = undefined :: undefined | term(),
+             auth_deadline = undefined :: undefined | integer()}).
 
 %%%_* API ---------------------------------------------------------------------
 
@@ -115,6 +122,9 @@ init({Socket, Opts}) ->
 %% `connected'; entering it is the first moment a session can lose a wakeup.
 handle_event(enter, _Old, awaiting_owner, D) -> {keep_state, D, []};
 handle_event(enter, _Old, awaiting_connect, D) -> {keep_state, D, []};
+%% MQ-05: entering the substate is a no-op for the timers; the AUTH round trip
+%% itself is driven by the peer's next frame.
+handle_event(enter, _Old, awaiting_auth, D) -> {keep_state, D, []};
 handle_event(enter, _Old, connected, D) ->
     {keep_state, arm_poll(connected, ka_arm(connected, D)), []};
 
@@ -269,6 +279,20 @@ event({ka_t, _Stale}, StateName, D) ->
     {state, StateName, D};
 event(#connect{} = C, awaiting_connect, D) ->
     handle_connect(C, D);
+%% MQ-05 Task-4 stub: the challenge is out, so the peer's AUTH response is the
+%% only frame that moves the handshake. Task 5 replaces this with the full
+%% continuation (multi-round exchanges, the handshake deadline, re-auth).
+event(#auth{props = Props}, awaiting_auth, D = #st{auth_method = Method}) ->
+    Resp = maps:get(authentication_data, Props, undefined),
+    case broker_auth:continue(Method, D#st.auth_state, Resp) of
+        {ok, Principal, _Ctx2} ->
+            D1 = D#st{principal = Principal,
+                      tenant_id = broker_security:tenant_id(Principal),
+                      auth_method = undefined, auth_state = undefined},
+            {state, connected, send_frame(connack_bin(0, 0, D1), D1)};
+        {error, _} ->
+            refuse(16#86, D)
+    end;
 event(#publish{qos = QoS, topic = Topic}, connected, #st{max_qos = Max} = D)
   when QoS > Max ->
     %% §3.3.4 + E12: close, no ack. On a session whose effective max is 0 or 1
@@ -420,63 +444,120 @@ handle_connect(#connect{proto_level = Level} = C, D0) ->
     %% 0x89 "Server busy" in v5.
     case admit(D0a) of
         {ok, D0b} ->
-            case authenticate(C, D0b) of
+            case handle_auth_method(C, D0b) of
                 {error, Code, D} ->
                     refuse(Code, D);
                 {ok, D1} ->
-                    %% §3.1.3.2.2: a new Network Connection for this ClientID cancels a
-                    %% Will that is waiting out its Will Delay Interval. That is now
-                    %% done by the generation bump in `attach_session/4' (which calls
-                    %% `mqtt_will_server:adopt/1' after `broker_subscription:attach/3'),
-                    %% so a parked Will from an older generation is invalidated by
-                    %% generation, not just cleared.
-                    %% ADR-018 §18.1: the Will is connection state, held in memory only
-                    %% (never persisted, never republished after a broker restart).
-                    D1a = D1#st{will = will_of(C)},
-                    Clean = C#connect.clean_session =:= 1,
-                    %% S2.5: MQTT 5 separates "discard the old session now" (Clean
-                    %% Start) from "keep the new one after disconnect" (Session Expiry
-                    %% Interval). 3.1.1 ties both to clean_session.
-                    Persist = case Level of
-                                  5 -> maps:get(session_expiry_interval, Props, 0) > 0;
-                                  _ -> not Clean
-                              end,
-                    %% session_present describes the session the client is about to get
-                    %% back, so it has to be read before the clean-session teardown.
-                    SP = session_present(Clean, C#connect.client_id),
-                    D2 = attach_session(C#connect.client_id, Clean, Persist, D1a),
-                    D3 = case Clean of
-                             true -> clean_session_teardown(D2);
-                             false -> restore_blob(D2)
-                         end,
-                    case subscribe_partitions(D3) of
-                        {ok, D4} ->
-                            D5 = count_connection(D4),
-                            log(info, "session up: client_id=~p principal=~p "
-                                      "level=~p clean=~p session_present=~p "
-                                      "max_qos=~p keepalive_ms=~p",
-                                [C#connect.client_id, D5#st.principal, Level, Clean, SP,
-                                 D5#st.max_qos, D5#st.keepalive_ms]),
-                            %% E7/R7: the connect-time round is what serves a
-                            %% reconnecting session its backlog and its DUP
-                            %% resends -- leaving it to the poll tick would make
-                            %% a catch-up arrive up to pull_poll_interval_ms late
-                            %% even though we know, right here, that the session
-                            %% may have unread state.
-                            %%
-                            %% ADR-012 §12.3 / ADR-018 §18.3 R3: a restored QoS 2
-                            %% entry that had already been PUBREC'd resumes with
-                            %% PUBREL and must NOT be re-PUBLISHed. Doing it before
-                            %% the round also keeps the two from racing for the same
-                            %% packet id.
-                            schedule_round(resend_released(
-                                             send_frame(connack_bin(SP, 0, D5), D5)));
-                        {error, Reason} ->
-                            {stop, {partition_subscribe_failed, Reason}, D3}
-                    end
+                    connect_success(C, D1);
+                %% MQ-05: a challenge was just sent, so the connection is now in
+                %% `awaiting_auth' and the event matrix owns the next step.
+                {state, _Next, _D1} = Awaiting ->
+                    Awaiting
             end;
         {error, Code, D0b} ->
             refuse(Code, D0b)
+    end.
+
+%% MQ-05 (spec §3.4): a v5 CONNECT naming an authentication_method is routed to
+%% the enhanced-auth framework instead of the synchronous username/password
+%% path. initiate/3 either resolves straight away (-> the same success tail as the
+%% synchronous path) or issues a challenge (-> send AUTH 0x18, enter the
+%% awaiting_auth substate). A CONNECT with no method never reaches here.
+handle_auth_method(#connect{props = Props} = C, #st{proto_level = 5} = D0) ->
+    case maps:get(authentication_method, Props, undefined) of
+        undefined ->
+            authenticate(C, D0);
+        Method when is_binary(Method) ->
+            Ctx = auth_ctx(C, D0),
+            case broker_auth:initiate(Method, maps:get(authentication_data, Props, undefined), Ctx) of
+                {ok, Principal, _Ctx2} ->
+                    %% The method resolved in one round: run the normal success
+                    %% tail with the principal it produced.
+                    D1 = D0#st{max_qos = effective_max_qos(opt(mqtt_max_qos, 1, D0)),
+                               keepalive_ms = clamp_keepalive(C#connect.keep_alive, D0),
+                               principal = Principal,
+                               tenant_id = broker_security:tenant_id(Principal)},
+                    connect_success(C, D1);
+                {continue, Challenge, AuthState} ->
+                    send_auth_continue(Method, Challenge,
+                                       D0#st{auth_method = Method, auth_state = AuthState});
+                {error, _} ->
+                    refuse(16#86, D0)   %% Not authorized
+            end
+    end;
+handle_auth_method(_C, D0) ->
+    authenticate(_C, D0).
+
+%% The context handed to an auth method: enough for it to derive the principal's
+%% tenant and to log, without leaking the socket.
+auth_ctx(#connect{client_id = ClientId}, #st{proto_level = Level}) ->
+    #{client_id => ClientId, proto_level => Level}.
+
+%% AUTH 0x18 (Continue authentication) carrying the method + the challenge.
+%% The event matrix speaks `{state, StateName, D}', so that is the shape here --
+%% `transport_data/3' turns it into the `next_state' the callback needs.
+send_auth_continue(Method, Challenge, #st{proto_level = 5} = D) ->
+    AProps = #{authentication_method => Method,
+               authentication_data => Challenge},
+    D1 = send_frame(enc(#auth{reason_code = 16#18, props = AProps}, D), D),
+    {state, awaiting_auth, arm_auth_timeout(D1)}.
+
+%% Task-4 stub: real timeout arming is Task 5's (mqtt_auth_timeout_ms).
+arm_auth_timeout(D) ->
+    D.
+
+%% The success tail shared by the synchronous path and the one-shot method path.
+%% Extracted verbatim from the old `{ok, D1} ->' branch of handle_connect/2.
+connect_success(#connect{clean_session = Clean0} = C, D1) ->
+    Clean = Clean0 =:= 1,
+    %% §3.1.3.2.2: a new Network Connection for this ClientID cancels a
+    %% Will that is waiting out its Will Delay Interval. That is now
+    %% done by the generation bump in `attach_session/4' (which calls
+    %% `mqtt_will_server:adopt/1' after `broker_subscription:attach/3'),
+    %% so a parked Will from an older generation is invalidated by
+    %% generation, not just cleared.
+    %% ADR-018 §18.1: the Will is connection state, held in memory only
+    %% (never persisted, never republished after a broker restart).
+    D1a = D1#st{will = will_of(C)},
+    %% S2.5: MQTT 5 separates "discard the old session now" (Clean
+    %% Start) from "keep the new one after disconnect" (Session Expiry
+    %% Interval). 3.1.1 ties both to clean_session.
+    Persist = case C#connect.proto_level of
+                  5 -> maps:get(session_expiry_interval, C#connect.props, 0) > 0;
+                  _ -> not Clean
+              end,
+    %% session_present describes the session the client is about to get
+    %% back, so it has to be read before the clean-session teardown.
+    SP = session_present(Clean, C#connect.client_id),
+    D2 = attach_session(C#connect.client_id, Clean, Persist, D1a),
+    D3 = case Clean of
+             true -> clean_session_teardown(D2);
+             false -> restore_blob(D2)
+         end,
+    case subscribe_partitions(D3) of
+        {ok, D4} ->
+            D5 = count_connection(D4),
+            log(info, "session up: client_id=~p principal=~p "
+                      "level=~p clean=~p session_present=~p "
+                      "max_qos=~p keepalive_ms=~p",
+                [C#connect.client_id, D5#st.principal, C#connect.proto_level,
+                 Clean, SP, D5#st.max_qos, D5#st.keepalive_ms]),
+            %% E7/R7: the connect-time round is what serves a
+            %% reconnecting session its backlog and its DUP
+            %% resends -- leaving it to the poll tick would make
+            %% a catch-up arrive up to pull_poll_interval_ms late
+            %% even though we know, right here, that the session
+            %% may have unread state.
+            %%
+            %% ADR-012 §12.3 / ADR-018 §18.3 R3: a restored QoS 2
+            %% entry that had already been PUBREC'd resumes with
+            %% PUBREL and must NOT be re-PUBLISHed. Doing it before
+            %% the round also keeps the two from racing for the same
+            %% packet id.
+            schedule_round(resend_released(
+                             send_frame(connack_bin(SP, 0, D5), D5)));
+        {error, Reason} ->
+            {stop, {partition_subscribe_failed, Reason}, D3}
     end.
 
 %% S12-B (ADR-032 D7): ask the node-level gate and keep the lease in state.
@@ -2612,11 +2693,13 @@ refuse_code(Code, _) -> Code.
 %% Only the codes this build can actually refuse with are listed: dialyzer
 %% proves the caller set is exactly 1|2|3|4, so a wider table would be dead code
 %% that never runs when a new refusal is added. Add the clause at the same time
-%% as the new `refuse/2' call.
+%% as the new `refuse/2' call. The enhanced-auth refusal (MQ-05) is already a v5
+%% reason code, so it maps to itself.
 v5_refuse(1) -> 16#84;   %% Unsupported Protocol Version
 v5_refuse(2) -> 16#85;   %% Client Identifier not valid
 v5_refuse(3) -> 16#89;   %% Server busy (S12-B: node-level admission gate)
-v5_refuse(4) -> 16#86.   %% Bad User Name or Password
+v5_refuse(4) -> 16#86;   %% Bad User Name or Password
+v5_refuse(16#86) -> 16#86.   %% Bad User Name or Password (MQ-05: already v5-native)
 
 %% The keepalive deadline measures the PEER's silence (§3.1.2.10: the server's
 %% timeout is 1.5x the negotiated keepalive), so only bytes from the socket

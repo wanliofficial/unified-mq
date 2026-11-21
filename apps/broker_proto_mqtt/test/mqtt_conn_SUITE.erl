@@ -56,6 +56,9 @@ all() ->
      auth_plain_begin_continue_ok,
      auth_plain_wrong_password,
      auth_plain_unknown_nonce,
+     %% MQ-05: a CONNECT naming a method is routed through the framework.
+     connect_with_auth_method_gets_challenge,
+     connect_without_auth_method_unchanged,
      v5_publish_properties_reach_the_subscriber,
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
@@ -455,6 +458,29 @@ auth_plain_unknown_nonce(_Config) ->
     %% A response naming a nonce we never issued for this handshake.
     Resp = term_to_binary({<<"alice">>, <<"bogus-nonce">>, <<"pw">>}),
     {error, unauthorized} = broker_auth:continue(<<"plain">>, AuthState, Resp),
+    ok.
+
+%% A v5 CONNECT naming an auth method gets an AUTH 0x18 (Continue authentication)
+%% with the method + a binary challenge, instead of an immediate CONNACK.
+connect_with_auth_method_gets_challenge(_Config) ->
+    ok = boot(),
+    %% mqtt_open_v5 sends the CONNECT and returns the FIRST frame back. For a
+    %% method-named CONNECT that frame is the AUTH 0x18 challenge, not a CONNACK.
+    {Conn, #auth{reason_code = 16#18,
+                  props = #{authentication_method := <<"plain">>,
+                            authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authc">>,
+                      props => #{authentication_method => <<"plain">>}}),
+    ?assert(is_binary(Challenge)),
+    {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A CONNECT without an auth method is unaffected: it still gets a CONNACK.
+connect_without_auth_method_unchanged(_Config) ->
+    ok = boot(),
+    {Conn, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"noauth">>, props => #{}}),
+    {ok, normal} = mqtt_close(Conn),
     ok.
 
 connect_wrong_protocol_level_is_refused_1(_Config) ->
