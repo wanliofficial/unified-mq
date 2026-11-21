@@ -86,6 +86,9 @@ all() ->
      auth_reauth_success_returns_auth_success,
      auth_reauth_failure_disconnects_0x9c,
      auth_timeout_disconnects,
+     %% MQ-05: a method that challenges twice exercises the AUTH state machine's
+     %% second {continue, ...} arm (re-send AUTH 0x18, not the CONNACK tail).
+     auth_multi_round_challenge_continues_twice,
      v5_publish_properties_reach_the_subscriber,
      v5_puback_without_a_matching_subscription_is_0x10,
      v5_shared_subscription_delivers_to_one_member,
@@ -185,6 +188,12 @@ init_per_suite(Config) ->
     _ = application:load(broker_security),
     _ = application:load(broker_event),
     _ = application:load(broker_proto_mqtt),
+    %% The test-only `broker_auth_multi' method must be loadable under that
+    %% exact name before `broker_auth' can dispatch to it
+    %% (`list_to_atom("broker_auth_" ++ Name)'). rebar3's ct compiles it into
+    %% the test profile; assert it is there so a future build change that drops
+    %% it fails loudly at suite setup rather than as an opaque dispatch error.
+    {module, broker_auth_multi} = code:ensure_loaded(broker_auth_multi),
     Config.
 
 end_per_suite(_Config) ->
@@ -950,6 +959,36 @@ auth_timeout_disconnects(_Config) ->
     %% answers, so the handshake deadline drops the connection on its own.
     {ok, _} = mqtt_expect_down(mqtt_monitor(Conn), cpid(Conn)),
     {ok, normal} = mqtt_close(Conn),
+    ok.
+
+%% A method that challenges twice drives the AUTH state machine through its
+%% second `{continue, ...}' arm: the broker re-sends AUTH 0x18 (challenge 2)
+%% rather than answering the CONNACK attach tail, and only completes the
+%% handshake after the client answers the second challenge.
+auth_multi_round_challenge_continues_twice(_Config) ->
+    ok = application:set_env(broker_proto_mqtt, mqtt_auth_methods,
+                             [<<"plain">>, <<"multi">>]),
+    ok = boot(),
+    %% CONNECT names `multi' -> the broker issues challenge 1 (AUTH 0x18).
+    {Conn, #auth{reason_code = 16#18, props = P1}} =
+        mqtt_open_v5(#{client_id => <<"authmulti">>,
+                       props => #{authentication_method => <<"multi">>}}),
+    ?assertEqual(<<1>>, maps:get(authentication_data, P1)),
+    %% Answer challenge 1 -> the broker re-issues AUTH 0x18 (challenge 2),
+    %% NOT a CONNACK. This is the arm no shipped method ever reached.
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => <<1>>}}),
+    {Conn, #auth{reason_code = 16#18, props = P2}} =
+        {Conn, mqtt_recv_v5(csock(Conn))},
+    ?assertEqual(<<2>>, maps:get(authentication_data, P2)),
+    %% Answer challenge 2 -> the handshake completes and the session is live.
+    ok = mqtt_send_v5(Conn, #auth{reason_code = 16#18,
+        props = #{authentication_data => <<2>>}}),
+    {ok, #connack{return_code = 0}} = {ok, mqtt_recv_v5(csock(Conn))},
+    ?assertMatch({ok, #{online := true}},
+                 broker_subscription:session(<<"authmulti">>)),
+    {ok, normal} = mqtt_close(Conn),
+    ok = application:set_env(broker_proto_mqtt, mqtt_auth_methods, [<<"plain">>]),
     ok.
 
 connect_wrong_protocol_level_is_refused_1(_Config) ->
