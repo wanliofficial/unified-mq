@@ -725,6 +725,16 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
            end,
     SubIds = maps:from_list([{F, Id} || {F, Id, _NL, _Rap} <- Subs]),
     SubFlags = maps:from_list([{F, {NL, Rap}} || {F, _Id, NL, Rap} <- Subs]),
+    %% vsn 4 (MQ-04 §3.3.2.3.2): the inbound/outbound alias maps and the outbound
+    %% cursor. An older blob has no `aliases' key, so the connection keeps the
+    %% defaults (empty maps, cursor 1) -- exactly a fresh connection.
+    {AliasIn, AliasOut, NextAlias} =
+        case maps:get(aliases, Blob, undefined) of
+            {AI, AO, NA} when is_list(AI), is_list(AO), is_integer(NA) ->
+                {maps:from_list(AI), maps:from_list(AO), NA};
+            _ ->
+                {#{}, #{}, 1}
+        end,
     D#st{next_pid = maps:get(next_pid, Blob, 1),
          pending = Pending,
          pending_qos = Qos,
@@ -733,7 +743,10 @@ restore_with(Pending, Qos, Released, Received, Blob, D) ->
          received = Received,
          pending_rev = Rev,
          sub_ids = SubIds,
-         sub_flags = SubFlags}.
+         sub_flags = SubFlags,
+         alias_in = AliasIn,
+         alias_out = AliasOut,
+         next_alias_out = NextAlias}.
 
 %% The partition notifications this conn needs to wake on (design §5.2). The
 %% subscription set belongs to the queue worker, which monitors us, so an
@@ -2554,15 +2567,29 @@ blob(D) ->
                   || {Pid, Entry} <- maps:to_list(D#st.pending),
                      is_position_entry(Entry)],
     Pids = [Pid || {Pid, _} <- Positional],
-    #{vsn => 3,
-      next_pid => D#st.next_pid,
-      pending => Positional,
-      qos => maps:with(Pids, D#st.pending_qos),
-      released => maps:with(Pids, D#st.released),
-      received => D#st.received,
-      %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
-      %% and §3.8.3.1 options across reconnects, so they ride the blob too.
-      subs => subs_blob(D)}.
+    Base = #{vsn => 4,
+             next_pid => D#st.next_pid,
+             pending => Positional,
+             qos => maps:with(Pids, D#st.pending_qos),
+             released => maps:with(Pids, D#st.released),
+             received => D#st.received,
+             %% §3.8.4 (MQTT-3.8.4-3): a session keeps its Subscription Identifiers
+             %% and §3.8.3.1 options across reconnects, so they ride the blob too.
+             subs => subs_blob(D)},
+    %% vsn 4 (MQ-04 §3.3.2.3.2): the inbound alias<->topic map must survive a
+    %% reconnect within the session, so it rides the blob -- but only for a v5
+    %% connection that actually honours aliases. Otherwise the key is absent and
+    %% an older reader keeps its defaults.
+    case aliases_blob(D) of
+        undefined -> Base;
+        Aliases -> Base#{aliases => Aliases}
+    end.
+
+aliases_blob(#st{proto_level = 5, topic_alias_max = Max} = D) when Max > 0 ->
+    {maps:to_list(D#st.alias_in), maps:to_list(D#st.alias_out),
+     D#st.next_alias_out};
+aliases_blob(_) ->
+    undefined.
 
 subs_blob(#st{sub_ids = Ids, sub_flags = Flags}) ->
     [{F, Id, NL, Rap}

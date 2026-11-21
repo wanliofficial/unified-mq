@@ -105,7 +105,7 @@ all() ->
      puback_for_a_qos2_delivery_does_not_advance_the_cursor,
      reconnect_before_pubrec_resends_a_dup_publish,
      reconnect_after_pubrec_resends_pubrel_only,
-     inflight_blob_is_v3_and_skips_retained_entries,
+     inflight_blob_is_v4_and_skips_retained_entries,
      subscribe_receives_retained_after_suback,
      retained_qos_is_capped_by_the_grant,
      retained_wildcard_delivers_each_topic_in_topic_order,
@@ -193,6 +193,9 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_proto_mqtt, inflight_snapshot_ms, 20),
     ok = application:set_env(broker_proto_mqtt, max_keepalive_ms, 60000),
     ok = application:set_env(broker_proto_mqtt, mqtt_max_qos, 2),
+    %% MQ-04: Topic Alias is off unless a case opts in. Reset it here so a case
+    %% that enabled it cannot poison the next one (the same J10 rule as above).
+    ok = application:set_env(broker_proto_mqtt, mqtt_topic_alias_maximum, 0),
     ok = application:set_env(broker_proto_mqtt, max_qos2_state_per_session, 100),
     %% S2-E knobs (ADR-015): every case starts from the production defaults, and
     %% a case that needs another posture re-sets them before boot/0.
@@ -505,17 +508,18 @@ v5_publish_alias_survives_reconnect(_Config) ->
                                       topics = [{<<"tr/real">>, 1}]}),
     #suback{} = mqtt_recv_v5(csock(Sub)),
     %% First connection: register alias 1 -> tr/real, then drop abnormally.
-    {First, FPid} = mqtt_open_v5(#{client_id => <<"tr-pub">>,
-                                   props => #{}, clean => false}),
+    {First, _} = mqtt_open_v5(#{client_id => <<"tr-pub">>, clean => false,
+                                props => #{session_expiry_interval => 300}}),
     ok = mqtt_publish_v5(First, 1, <<"tr/real">>, <<"reg">>, 1, #{topic_alias => 1}),
     #puback{} = mqtt_recv_v5(csock(First)),
     #publish{payload = <<"reg">>} = mqtt_recv_v5(csock(Sub)),
+    FirstPid = cpid(First),
     ok = gen_tcp:close(csock(First)),
-    ok = mqtt_expect_down(mqtt_monitor(#{pid => FPid}), FPid),
+    {ok, _} = mqtt_expect_down(mqtt_monitor(#{pid => FirstPid}), FirstPid),
     timer:sleep(200),
     %% Reconnect clean=0: the alias map is restored from the blob.
-    {Again, _} = mqtt_open_v5(#{client_id => <<"tr-pub">>,
-                                props => #{}, clean => false}),
+    {Again, _} = mqtt_open_v5(#{client_id => <<"tr-pub">>, clean => false,
+                                props => #{session_expiry_interval => 300}}),
     ok = mqtt_publish_v5(Again, 2, <<>>, <<"after-reconnect">>, 1,
                          #{topic_alias => 1}),
     #puback{} = mqtt_recv_v5(csock(Again)),
@@ -1527,7 +1531,7 @@ reconnect_after_pubrec_resends_pubrel_only(_Config) ->
 %% v3 carries the level, the release marks, the inbound set and the §3.8.4
 %% subscription state, and a retained replay (no {Partition, Offset}) is
 %% deliberately absent.
-inflight_blob_is_v3_and_skips_retained_entries(_Config) ->
+inflight_blob_is_v4_and_skips_retained_entries(_Config) ->
     ok = boot(),
     {Conn, _} = mqtt_open_v5(#{client_id => <<"c1">>, props => #{}}),
     %% A Subscription Identifier and No Local / RAP flags are §3.8.4 session
@@ -1545,10 +1549,13 @@ inflight_blob_is_v3_and_skips_retained_entries(_Config) ->
     ok = mqtt_publish_v5(Conn, 11, <<"in/in">>, <<"inbound">>, 2, #{}),
     #pubrec{packet_id = 11} = mqtt_recv_v5(csock(Conn)),
     Blob = wait_inflight(<<"c1">>, fun(B) ->
-                                           maps:get(vsn, B, 0) =:= 3 andalso
+                                           maps:get(vsn, B, 0) =:= 4 andalso
                                            maps:size(maps:get(released, B, #{})) =:= 0
                                    end),
-    #{vsn := 3, pending := Pending, qos := Qos, received := Received} = Blob,
+    %% vsn 4 (MQ-04): Topic Alias state rides the blob, but this connection did
+    %% not enable aliases (topic_alias_maximum is 0), so no `aliases' key exists.
+    #{vsn := 4, pending := Pending, qos := Qos, received := Received} = Blob,
+    ?assertNot(maps:is_key(aliases, Blob)),
     %% The SUBSCRIBE above rides the blob as §3.8.4 subscription state.
     [{<<"b/#">>, 7, 0, 1}] = maps:get(subs, Blob, []),
     %% One positional entry: the delivery owed a PUBACK. Its offset is the
