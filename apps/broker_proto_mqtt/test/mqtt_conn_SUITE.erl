@@ -728,10 +728,11 @@ v5_request_response_info_absent_on_refusal(_Config) ->
     ok = application:set_env(broker_proto_mqtt, mqtt_response_information,
                              <<"mqtt-response/">>),
     ok = boot(),
-    {Conn, #connack{return_code = 16#86}} =
+    {Conn, #connack{return_code = 16#86, props = P}} =
         mqtt_open_v5(#{client_id => <<"rrbad">>, username => <<"alice">>,
                        password => <<"wrong">>,
                        props => #{request_response_information => 1}}),
+    ?assertNot(maps:is_key(response_information, P)),
     {ok, normal} = mqtt_close(Conn),
     ok.
 

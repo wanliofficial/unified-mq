@@ -2713,7 +2713,8 @@ connack_bin(SP, RC, D) ->
     %% the broker has a value configured; otherwise absent (zero regression).
     ResponseInfoProps =
         case vsn(D) of
-            5 when D#st.response_info_requested,
+            5 when RC =:= 0,
+                  D#st.response_info_requested,
                   D#st.response_information =/= undefined ->
                 #{response_information => D#st.response_information};
             _ ->
