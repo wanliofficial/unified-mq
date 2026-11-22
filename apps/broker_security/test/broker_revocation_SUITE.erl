@@ -11,12 +11,28 @@
 -compile([export_all, nowarn_export_all]).
 
 all() ->
-    [revoke_makes_principal_revoked,
+    [registry_is_live_after_app_start,
+     revoke_makes_principal_revoked,
      clear_lifts_the_revocation,
      revoke_with_ttl_expires_and_lifts,
      revoke_without_ttl_is_permanent,
      unknown_principal_is_not_revoked,
      register_and_unregister_are_total].
+
+%% `registry_is_live_after_app_start' 断言 registry 随应用一起起来：app master 在
+%% sup 之前建表、gen_server 作为 sup child 运行。其余用例只关心对外动词语义，不
+%% 依赖应用是否启动（每个 `init_per_testcase' 都幂等建表），所以这一条单独验证
+%% 生命周期接线，其余六条与 `broker_admission_SUITE' 同构。
+init_per_suite(Config) ->
+    %% 这一条用例要 `whereis(broker_revocation)' 是 pid，而 gen_server 只由
+    %% supervisor 启动、supervisor 只由应用启动，所以整个 suite 显式拉起
+    %% `broker_security' 应用（其余用例不依赖它，但无害：建表幂等）。
+    {ok, _} = application:ensure_all_started(broker_security),
+    Config.
+
+end_per_suite(_Config) ->
+    ok = application:stop(broker_security),
+    ok.
 
 init_per_testcase(_Case, Config) ->
     ok = broker_revocation:init(),
@@ -26,6 +42,15 @@ init_per_testcase(_Case, Config) ->
 end_per_testcase(_Case, _Config) ->
     ok = broker_revocation:reset(),
     ok.
+
+%% 注册表随应用一起起来：表已存在（app master 在 sup 前 init），且 registry
+%% 进程在跑。这条单独验证生命周期接线，独立于其余六个动词语义用例。
+registry_is_live_after_app_start(_Config) ->
+    %% 表必须已存在（app master 在 sup 前 init），且 registry 进程在跑。
+    true = is_pid(whereis(broker_revocation)),
+    ok = broker_revocation:revoke(<<"carol">>, undefined),
+    true = broker_revocation:revoked(<<"carol">>),
+    ok = broker_revocation:clear(<<"carol">>).
 
 %% 吊销一个 principal 后，它命中、别人不命中。
 revoke_makes_principal_revoked(_Config) ->
