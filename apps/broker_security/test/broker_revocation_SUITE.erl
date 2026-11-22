@@ -1,7 +1,8 @@
 %% @doc 吊销注册表（MQ-17 #10）单元用例：revoke / clear / revoked 三个动词，
 %% 以及 TTL 到期自动解除与永久两种生命周期。
 %%
-%% 注册表是 `broker_admission' 那套 ETS 模式的同构体：热路径 `revoked/1' 在调用方
+%% 注册表沿用 `broker_admission' 的 ETS 路子（仅建表时机与读写位置相同，
+%% admission 是纯模块，此模块另有 gen_server）：热路径 `revoked/1' 在调用方
 %% 进程本地按表名直读，不进 gen_server。用例只断言对外语义——吊销使 principal 命中、
 %% clear 解除、TTL 到期自动抬起、无 TTL 永久、未注册者默认不吊销——不关心内部表
 %% 结构。`init_per_testcase' 调 `init/0'（**复用**已存在的表，不重建）后紧跟
@@ -22,17 +23,25 @@ all() ->
 %% `registry_is_live_after_app_start' 断言 registry 随应用一起起来：app master 在
 %% sup 之前建表、gen_server 作为 sup child 运行。其余用例只关心对外动词语义，不
 %% 依赖应用是否启动（每个 `init_per_testcase' 都幂等建表），所以这一条单独验证
-%% 生命周期接线，其余六条与 `broker_admission_SUITE' 同构。
+%% 生命周期接线，其余六条与 `broker_admission_SUITE' 的用例姿态一致。
+%%
+%% 启停按**所有权**平衡：只停自己起来的 app。`broker_security' 被约 15 个应用
+%% 依赖，若在别的套件已经拉起它（或有依赖它的 app 在跑）时无条件 `stop'，会把节点
+%% 留在 `{rejected, not_started}' 状态污染后续套件；且重复停会 badmatch。捕获
+%% "进来时是否已在跑"，只有 `false -> true' 的那次才归我们停。
 init_per_suite(Config) ->
     %% 这一条用例要 `whereis(broker_revocation)' 是 pid，而 gen_server 只由
-    %% supervisor 启动、supervisor 只由应用启动，所以整个 suite 显式拉起
-    %% `broker_security' 应用（其余用例不依赖它，但无害：建表幂等）。
+    %% supervisor 启动、supervisor 只由应用启动，所以整个 suite 需要应用在跑；
+    %% 其余用例不依赖它，但无害（建表幂等）。
+    WasRunning = lists:keymember(broker_security, 1, application:which_applications()),
     {ok, _} = application:ensure_all_started(broker_security),
-    Config.
+    [{stop_on_exit, not WasRunning} | Config].
 
-end_per_suite(_Config) ->
-    ok = application:stop(broker_security),
-    ok.
+end_per_suite(Config) ->
+    case proplists:get_value(stop_on_exit, Config) of
+        true -> ok = application:stop(broker_security);
+        false -> ok
+    end.
 
 init_per_testcase(_Case, Config) ->
     ok = broker_revocation:init(),
