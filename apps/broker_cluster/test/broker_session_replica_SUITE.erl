@@ -113,7 +113,7 @@ end_per_testcase(_Case, Config) ->
 %% Holder 侧轮询副本游标水位 ReplicatedBefore，断言 After >= ReplicatedBefore——
 %% 不断言硬编码 offset。
 session_survives_owner_crash(Config) ->
-    [Owner, Holder, Third] = Nodes = peer_nodes(Config),
+    [Owner, Holder, _Third] = Nodes = peer_nodes(Config),
     ClientId = <<"surv">>,
     Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
     P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
@@ -160,7 +160,6 @@ session_survives_owner_crash(Config) ->
     ?assertMatch([#{sub_ref := SubRef}], maps:get(subs, Session)),
     {ok, After} = rpc(Holder, ?MODULE, do_cursor, [SubRef, Q]),
     ?assert(After >= ReplicatedBefore),
-    _ = Third,
     ok.
 
 %% 用例 2（与用例 1 配对的**反面**证明）：复制**关闭**时，Owner 上建的订阅绝不
