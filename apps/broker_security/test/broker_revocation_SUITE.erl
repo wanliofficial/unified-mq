@@ -18,7 +18,8 @@ all() ->
      revoke_with_ttl_expires_and_lifts,
      revoke_without_ttl_is_permanent,
      unknown_principal_is_not_revoked,
-     register_and_unregister_are_total].
+     register_and_unregister_are_total,
+     security_facade_delegates].
 
 %% `registry_is_live_after_app_start' 断言 registry 随应用一起起来：app master 在
 %% sup 之前建表、gen_server 作为 sup child 运行。其余用例只关心对外动词语义，不
@@ -100,3 +101,13 @@ register_and_unregister_are_total(_Config) ->
     ok = broker_revocation:unregister_session(undefined, self()),
     ok = broker_revocation:register_session(<<"alice">>, not_a_pid),
     ok = broker_revocation:unregister_session(<<"alice">>, not_a_pid).
+
+%% `broker_security' 的门面转发：安全语汇（认证/授权/吊销）集中在同一模块，
+%% 调用方不必知道 `broker_revocation' 的存在。这里只断言转发后的对外语义与
+%% 直接调用一致，不重复测 TTL 等细节。
+security_facade_delegates(_Config) ->
+    false = broker_security:revoked(<<"dave">>),
+    ok = broker_security:revoke(<<"dave">>, undefined),
+    true = broker_security:revoked(<<"dave">>),
+    ok = broker_security:clear_revocation(<<"dave">>),
+    false = broker_security:revoked(<<"dave">>).
