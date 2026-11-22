@@ -185,9 +185,12 @@ apply_replica({unsubscribe, _ClientId, SubRef}) ->
     true = ets:delete(?ENTITIES, SubRef),
     lists:foreach(fun({{S, P}, _Row}) -> true = ets:delete(?CURSORS, {S, P}) end,
                   ets:match_object(?CURSORS, {{SubRef, '_'}, '_'})),
-    %% `unsubscribe' 只带一个 ClientId，但 `?MEMBERS' 的第二索引按 `{ClientId, SubRef}'
-    %% 建；直接按 SubRef 扫掉全部成员指针，exclusive（恰好一个消费者）和 shared
-    %% group（多个）都一次清干净，不依赖 `consumers' 字段是否还在。
+    %% `unsubscribe' Op 只为「完整 / exclusive 会话拆除」生成（Plan 1 Task 4）：
+    %% 此刻这个 SubRef 已无剩余消费者。部分 shared-group 退订（`leave/2' 仍保留
+    %% entity 及其余消费者）绝不能作为 `{unsubscribe,...}' 复制出去——否则副本会
+    %% 误把整组清掉。Task 4 必须让共享部分退订要么不复制、要么改用另一个 Op。
+    %% 因此这里按 SubRef 整体扫描成员/cursor 指针，今天等价于删除那唯一一个消费者，
+    %% 也不依赖 `consumers' 字段是否还在。
     lists:foreach(fun({{C, S}}) -> true = ets:delete(?MEMBERS, {C, S}) end,
                   ets:match_object(?MEMBERS, {{'_', SubRef}})),
     ok;

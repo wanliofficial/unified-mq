@@ -63,6 +63,7 @@ init_per_testcase(_, Config) -> Config.
 end_per_testcase(_, _) -> ok.
 
 all() -> [apply_replica_subscribe_idempotent,
+          apply_replica_unsubscribe_clears,
           apply_replica_inflight,
           apply_replica_cursor].
 
@@ -78,12 +79,36 @@ apply_replica_subscribe_idempotent(_Config) ->
     ?assertMatch([{{<<"c2">>, SubRef}}], ets:lookup(broker_subscription_members, {<<"c2">>, SubRef})).
 
 apply_replica_inflight(_Config) ->
-    ok = broker_subscription_worker:apply_replica({inflight, <<"c1">>, #{42 => ack}}),
+    Op = {inflight, <<"c1">>, #{42 => ack}},
+    ok = broker_subscription_worker:apply_replica(Op),
+    ok = broker_subscription_worker:apply_replica(Op),
     ?assertMatch([{<<"c1">>, #{42 := ack}}],
                  ets:lookup(broker_subscription_inflight, <<"c1">>)).
 
 apply_replica_cursor(_Config) ->
     SubRef = make_ref(),
     Row = #{low => 5, high => 10},
-    ok = broker_subscription_worker:apply_replica({cursor, SubRef, 3, Row}),
+    Op = {cursor, SubRef, 3, Row},
+    ok = broker_subscription_worker:apply_replica(Op),
+    ok = broker_subscription_worker:apply_replica(Op),
     ?assertMatch([{{SubRef, 3}, _}], ets:lookup(broker_subscription_cursors, {SubRef, 3})).
+
+%% MQ-17 Plan 1 Task 2 review: the `unsubscribe' Op cleanup must actually wipe every
+%% derived row. Seed the full state first -- a `{subscribe,...}' Op (writes ENTITIES
+%% + MEMBERS) and a `{cursor, SubRef, P, Row}' Op (seeds a cursor row) -- then apply
+%% `{unsubscribe, ClientId, SubRef}'. The Op names only the ClientId and SubRef, so
+%% the cleanup sequence (delete entity, scan-and-delete cursor rows by SubRef,
+%% scan-and-delete member pointers by SubRef) is what leaves all three tables empty.
+%% This also documents the assumption the cleanup relies on (see the worker's
+%% `unsubscribe' clause): a shared partial leave must never reach this Op.
+apply_replica_unsubscribe_clears(_Config) ->
+    SubRef = make_ref(),
+    Info = #{kind => exclusive, key => <<"t/1">>, filter => <<"t/1">>,
+             qos => 1, consumers => [<<"c1">>]},
+    ok = broker_subscription_worker:apply_replica({subscribe, <<"c1">>, SubRef, Info}),
+    Row = #{low => 5, high => 10},
+    ok = broker_subscription_worker:apply_replica({cursor, SubRef, 3, Row}),
+    ok = broker_subscription_worker:apply_replica({unsubscribe, <<"c1">>, SubRef}),
+    ?assertEqual([], ets:lookup(broker_subscription_entities, SubRef)),
+    ?assertEqual([], ets:lookup(broker_subscription_members, {<<"c1">>, SubRef})),
+    ?assertEqual([], ets:match_object(broker_subscription_cursors, {{SubRef, '_'}, '_'})).
