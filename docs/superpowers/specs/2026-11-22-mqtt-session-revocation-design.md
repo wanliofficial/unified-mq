@@ -76,7 +76,9 @@ CONNECT 热路径**直接**调 `broker_security:revoked/1`（或在 conn FSM 内
 经既有 `authorize/2` 门控（`:313-315`）：
 
 - `POST /api/v1/revoke` — body `{principal, ttl_ms?}` → `broker_security:revoke/2` → 返回 `{status, evicted}`（`evicted` = 被驱逐的活动连接数）。
+  - **（2026-11-22 实现记录）** 实际返回 `#{status => revoked, principal => P}`，**无**驱逐计数：`broker_revocation:evict/1` 逐 pid 发 `mqtt_evict` 后返回 `ok`，且驱逐是异步的（连接自收消息后自行关闭），此刻的计数既不可得也不代表已完成驱逐。按计划（Task 6）`status => revoked` 实现，此处以计划为准。
 - `DELETE /api/v1/revoke/:principal`（或 `POST /api/v1/revoke/clear`，实现时取既有风格一致者）→ `broker_security:clear_revocation/1`。
+  - **（2026-11-22 实现记录）** 取 `DELETE /api/v1/revoke/:principal`；路径段先经 `uri_string:percent_decode/1` 解码再查表（admin listener 交出的是原始请求目标，未解码会把 `user%40example.com` 当成另一个 principal）。
 - 更新端点文档头（`:9-21` 区块）补两行。
 
 ## 4. 数据流
@@ -113,3 +115,4 @@ CONNECT 热路径**直接**调 `broker_security:revoked/1`（或在 conn FSM 内
 - **集群范围吊销的扇出**（`#5`/`#6` 拥有集群复制）：本特性为**节点本地**，与 `broker_security` 其余运行时状态（admission、drain）一致。集群扇出列为后续。
 - **MQTT-SN 会话吊销**：`mqtt_sn_conn` 不共用 `mqtt_conn_fsm`，列为后续单独一刀。
 - **按租户吊销 / 按 client_id 吊销**：本期仅 principal 粒度。
+- **非 MQTT 协议的吊销执行**（2026-11-22 实现时明确）：吊销的**拒绝重连**检查只接在 `mqtt_conn_fsm` 的两处（`authenticate/2` 的 CONNECT 拒绝、`connect_success/2` 的登记后复查）。WS / NATS / AMQP / Kafka / Pulsar / WebRTC / A2A / MCP 走 `broker_security:authenticate/2`、`authenticate_conn/1`，二者**都不查**吊销表，因此同一 principal 在这些协议上的活动连接不会被驱逐、重连也不会被拒。要让吊销全协议生效，须把检查下沉到统一认证入口（`authenticate/2` / `authenticate_conn/1`）——但那会让 `broker_security` 的认证热路径依赖注册表，属后续独立评估。

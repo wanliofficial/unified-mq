@@ -15,6 +15,13 @@ start(_Type, _Args) ->
     case broker_security_tls:validate() of
         ok ->
             ok = broker_admission:init(),
+            %% S12-B: revocation 注册表仿 admission 的**建表时机**（两者只在
+            %% 这一点同构：admission 是纯模块，revocation 另有 gen_server）——
+            %% 两张 named 表在 sup 之前由 app master 建好，使任何前端（连接
+            %% 进程）在注册表进程存在之前也能读到 `revoked/1'，不会 fail-open。
+            %% gen_server 自身只跑 TTL 扫描与死 pid 回收，作为 sup child 与
+            %% 应用同生命周期启停。
+            ok = broker_revocation:init(),
             broker_security_sup:start_link();
         {error, Reason} ->
             {error, Reason}

@@ -117,6 +117,8 @@
 | 4.7 测试资产 | `#27`–`#28` | P1×2 | 全部 pending |
 | **合计** | **`#5`–`#28`（24 项）** | **P0×5 P1×10 P2×9** | **24 pending** |
 
+> **进展（2026-11-22）**：4.2 的 `#10 吊销实时驱逐活动会话` 已结案（实现说明见下方 4.2 该条），因此 4.2 不再是「全部 pending」——3 个 P0 中已结 1 项。上表其余行仍是 2026-11-10 当日快照，状态以任务板为准。
+
 ### 4.1 集群、复制与会话高可用
 
 - [ ] **P0 集群级 durable session 复制（2–7 副本，quorum）**：fss 默认 2 副本且 Acked 消息可幸存节点丢失；本仓库有 `replicated_commit` 但**未证明**跨节点会话/消息在 SIGKILL 下零丢失。待办：定义并测「节点丢失后 durable 消息与订阅集合不丢」的 harness（对标 fss 的 SIGKILL/partition harness）。
@@ -127,7 +129,7 @@
 ### 4.2 认证、授权与安全治理
 
 - [ ] **P0 OIDC / JWKS 客户端认证**：fss/robustmq 均有；本仓库仅 user_pass/token，无 OIDC。待办：在 `broker_security` 增加 JWKS discovery + JWT 验证形态，纳入统一身份表。
-- [ ] **P0 吊销实时驱逐活动会话**：fss 有；本仓库无 revocation 机制。待办：定义 token/user 吊销后已连接会话的驱逐路径。
+- [x] **P0 吊销实时驱逐活动会话**（2026-11-22 已完成）：按 principal 吊销身份，broker 立即发 DISCONNECT 驱逐该用户全部活动连接（抑制 Will），并在吊销期内拒绝其重连；支持可选 TTL，默认永久直到显式清除。实现见 `broker_revocation` 注册表 + `broker_security:revoke/2` 门面 + admin `POST /api/v1/revoke`、`DELETE /api/v1/revoke/:principal`；设计见 `docs/superpowers/specs/2026-11-22-mqtt-session-revocation-design.md`。**范围**：吊销执行只接在 MQTT 连接路径（`mqtt_conn_fsm`），其余协议的统一认证入口（`authenticate/2`、`authenticate_conn/1`）暂不查吊销表；状态为节点本地，粒度仅 principal。
 - [ ] **P1 deny-by-default ACL 默认姿态**：本仓库 ACL 默认 `allow`（legacy）；需明确「新部署默认 deny，无匹配即拒」的推荐配置与文档，避免误配放行。
 - [ ] **P1 TLS 1.3 / mTLS 专项**：本仓库有可选 TLS 但未声明 1.3/mTLS 与证书双向校验；补协议级测试与文档。
 - [ ] **P0 防篡改审计日志（签名/哈希链）**：`security.md` §8 已列未实现；fss 有 hash-chained audit。待办：审计日志签名/VEX 化。

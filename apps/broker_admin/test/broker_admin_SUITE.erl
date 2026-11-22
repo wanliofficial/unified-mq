@@ -33,6 +33,8 @@ all() ->
      cluster_members_rejects_wrong_method,
      cluster_members_validates_the_request,
      cluster_members_without_cluster_app_returns_503,
+     revoke_endpoint_revokes_and_clears,
+     revoke_endpoint_validates_the_request,
      node_view_reports_state_and_connections,
      node_view_reports_dist_tls_without_leaking_keys,
      insecure_bind_with_empty_token_refuses_to_start].
@@ -529,6 +531,102 @@ cluster_members_without_cluster_app_returns_503(Config) ->
         request_json(post, "/api/v1/cluster/members", [],
                      #{<<"action">> => <<"join">>, <<"node">> => Self}, Config),
     ok.
+
+%%%_* Principal revocation (MQ-17 #10) -------------------------------------
+
+%% A POST revokes a principal (optionally with a TTL); the matching DELETE
+%% clears the revocation. Both are token-protected like every other `/api/'
+%% route, so the case sets the configured token and presents it as a Bearer.
+revoke_endpoint_revokes_and_clears(Config) ->
+    application:set_env(broker_admin, token, ?TOKEN),
+    try
+        {200, #{<<"status">> := <<"revoked">>}} =
+            request_json(post, "/api/v1/revoke",
+                         [{<<"authorization">>, <<"Bearer ", ?TOKEN/binary>>}],
+                         #{<<"principal">> => <<"alice">>}, Config),
+        true = broker_security:revoked(<<"alice">>),
+        {200, #{<<"status">> := <<"cleared">>}} =
+            request(delete, "/api/v1/revoke/alice",
+                    [{<<"authorization">>, <<"Bearer ", ?TOKEN/binary>>}], Config),
+        false = broker_security:revoked(<<"alice">>)
+    after
+        %% A mid-case failure must not leak a revoked `alice' into the shared CT
+        %% node: init_per_testcase does not reset revocation state.
+        _ = broker_security:clear_revocation(<<"alice">>)
+    end.
+
+%% The body parser pins every rejection arm with a precise 400, and the TTL arm
+%% is proven to actually revoke (not just to accept the input). None of the
+%% rejected requests may change state.
+revoke_endpoint_validates_the_request(Config) ->
+    application:set_env(broker_admin, token, ?TOKEN),
+    Auth = [{<<"authorization">>, <<"Bearer ", ?TOKEN/binary>>}],
+    try
+        %% Happy path with an explicit TTL: the revocation really lands.
+        {200, #{<<"status">> := <<"revoked">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"principal">> => <<"alice">>,
+                           <<"ttl_ms">> => 600000}, Config),
+        true = broker_security:revoked(<<"alice">>),
+        false = broker_security:revoked(<<"bob">>),
+        %% Clear the happy-path revocation so the 400 arms below can assert that
+        %% a rejected request revokes *nothing* (alice must stay false).
+        ok = broker_security:clear_revocation(<<"alice">>),
+
+        %% ttl_ms that is not a non-negative integer is a 400, and revokes
+        %% nothing (here neither alice nor bob).
+        {400, #{<<"error">> := <<"invalid_ttl_ms">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"principal">> => <<"alice">>,
+                           <<"ttl_ms">> => -1}, Config),
+        false = broker_security:revoked(<<"alice">>),
+        {400, #{<<"error">> := <<"invalid_ttl_ms">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"principal">> => <<"alice">>,
+                           <<"ttl_ms">> => <<"soon">>}, Config),
+        false = broker_security:revoked(<<"alice">>),
+
+        %% A missing principal is a 400.
+        {400, #{<<"error">> := <<"body_must_have_principal">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"ttl_ms">> => 1000}, Config),
+
+        %% A non-string principal is a 400.
+        {400, #{<<"error">> := <<"principal_must_be_a_string">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"principal">> => 42}, Config),
+
+        %% A malformed percent-escape in the DELETE path segment is a 400, not a
+        %% listener 500: a client typo must not crash the shared node.
+        {400, #{<<"error">> := <<"invalid_principal_encoding">>}} =
+            request_raw(delete, "/api/v1/revoke/%ZZ", Auth, <<>>, Config),
+        %% The server survived the throw: a subsequent normal request still works.
+        {200, #{<<"status">> := <<"ok">>}} =
+            request(get, "/healthz", [], Config),
+
+        %% The positive decode path: a principal with an escapable byte must be
+        %% clearable. The listener hands over the raw request target, so
+        %% `user@example.com' arrives as `user%40example.com'; without decoding
+        %% this would clear the ESCAPED key and leave the real revocation behind.
+        {200, #{<<"status">> := <<"revoked">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"principal">> => <<"user@example.com">>}, Config),
+        true = broker_security:revoked(<<"user@example.com">>),
+        {200, #{<<"status">> := <<"cleared">>,
+                <<"principal">> := <<"user@example.com">>}} =
+            request(delete, "/api/v1/revoke/user%40example.com", Auth, Config),
+        false = broker_security:revoked(<<"user@example.com">>),
+        %% The escaped form must never have been the key that got written.
+        false = broker_security:revoked(<<"user%40example.com">>),
+
+        %% An empty body is a 400, never a silent no-op revoke.
+        {400, #{<<"error">> := <<"body_required">>}} =
+            request_raw(post, "/api/v1/revoke", Auth, <<>>, Config),
+        false = broker_security:revoked(<<"alice">>)
+    after
+        _ = broker_security:clear_revocation(<<"alice">>),
+        _ = broker_security:clear_revocation(<<"user@example.com">>)
+    end.
 
 node_view_reports_state_and_connections(Config) ->
     start_probe(Config),

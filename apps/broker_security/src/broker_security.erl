@@ -25,7 +25,8 @@
 -export([authenticate/2, authorize/2, tenant_id/1, mqttsn_psk_for_identity/1,
          authorized/2, acl_rules/0, redacted_config/0,
          authenticate_conn/1, auth_required/1, default_tenant/0,
-         long_term_key/2, psk_for_identity/1]).
+         long_term_key/2, psk_for_identity/1,
+         revoke/2, clear_revocation/1, revoked/1]).
 
 -export_type([principal/0, request/0, credential/0, conn_identity/0]).
 
@@ -94,6 +95,24 @@ tenant_id(Principal) ->
 -spec acl_rules() -> allow | [map()] | term().
 acl_rules() ->
     application:get_env(broker_security, acl, allow).
+
+%%%_* Revocation facade -----------------------------------------------------
+
+%% @doc MQ-17 #10: 吊销 `Principal' 并驱逐其活动连接。TTL 为 `undefined'
+%% 表示永久。转发 `broker_revocation'，保持安全语汇集中在本模块。
+-spec revoke(principal(), non_neg_integer() | undefined) -> ok.
+revoke(Principal, TTL) ->
+    broker_revocation:revoke(Principal, TTL).
+
+%% @doc 解除 `Principal' 的吊销。转发 `broker_revocation'。
+-spec clear_revocation(principal()) -> ok.
+clear_revocation(Principal) ->
+    broker_revocation:clear(Principal).
+
+%% @doc `Principal' 当前是否被吊销。转发 `broker_revocation'。
+-spec revoked(principal()) -> boolean().
+revoked(Principal) ->
+    broker_revocation:revoked(Principal).
 
 %%%_* Protocol connections --------------------------------------------------
 

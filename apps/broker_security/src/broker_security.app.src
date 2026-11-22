@@ -1,7 +1,7 @@
 {application, broker_security, [
     {description, "Authentication, ACL, tenant isolation, TLS config and resource limits (S6)"},
     {vsn, "0.1.0"},
-    {registered, []},
+    {registered, [broker_security_sup, broker_revocation]},
     {mod, {broker_security_app, []}},
     {applications, [kernel, stdlib, sasl, ssl, broker_core]},
     {env, []}
