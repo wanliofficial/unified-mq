@@ -20,7 +20,10 @@ partition_of(ClientId, Count) when is_binary(ClientId), is_integer(Count), Count
 %% 兜底陈旧写入（spec §5）。
 -spec session_partition_count() -> pos_integer().
 session_partition_count() ->
-    application:get_env(broker_cluster, session_partition_count, 4).
+    case application:get_env(broker_cluster, session_partition_count) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> 4
+    end.
 
 %% @doc 本节点上某会话分区的 owner（本地 cache 读，无元数据 → not_found）。
 -spec session_owner(partition()) -> {ok, node()} | not_found.
