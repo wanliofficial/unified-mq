@@ -258,6 +258,6 @@ QoS -1 是否受支持以工具实际行为为准，不支持则该行从第三�
 
 | 项 | 阶段 |
 |---|---|
-| MQTT-SN over DTLS | 后续待办（设计 §1.2） |
+| MQTT-SN over DTLS | **已完成**（2026-11-17：`mqtt_sn_dtls_acceptor.erl`、`broker_security:mqttsn_psk_for_identity/1`）；原记「后续待办」 |
 | MQTT-SN 串口桥 / 转发到外部 Broker | 不做（设计 §1.2） |
 | `broker_proto_mqtt_quic` | **S8-D** |

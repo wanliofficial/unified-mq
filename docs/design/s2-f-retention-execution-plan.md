@@ -1,6 +1,6 @@
 # S2-F 执行计划：retention、段 GC 与慢消费者守卫
 
-- **状态**：**进行中**。决策见 [ADR-014](../adr/014-retention-and-segment-gc.md)（S2 M0 冻结）与本计划 §2 的实现期解释（完成后写入 ADR-014 §14.7）。
+- **状态**：**已完成**（原记录为「进行中」，2026-11-22 核对时已全部落地：`wal_gc.erl`、`wal_writer:truncate/2` 整段 GC、`broker_queue:retention_status/0`、`sys.config` 的 `retention` 段均已存在并通过全量回归）。决策见 [ADR-014](../adr/014-retention-and-segment-gc.md)（S2 M0 冻结）与本计划 §2 的实现期解释。
 - **对应**：`docs/design/s2-single-node-kernel.md` §4.6 / §5（M4）；roadmap §4.1（消息生命周期 / retention）
 - **估算**：5 人日（T-F0 ~ T-F6）
 - **退出条件**：段删除边界可机械断言（只删整段、活跃段不删、慢消费者钉住时零删除、`committed` 不足时零删除）；删除后 `read_from(truncate_before - 1)` 从 `truncate_before` 起返回；恢复不把已删段当损坏、也不把缺失段当已删；`retention_status/0` 与 4 个指标可观测；全量回归零 FAILED。
