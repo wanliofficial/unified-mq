@@ -604,12 +604,28 @@ revoke_endpoint_validates_the_request(Config) ->
         {200, #{<<"status">> := <<"ok">>}} =
             request(get, "/healthz", [], Config),
 
+        %% The positive decode path: a principal with an escapable byte must be
+        %% clearable. The listener hands over the raw request target, so
+        %% `user@example.com' arrives as `user%40example.com'; without decoding
+        %% this would clear the ESCAPED key and leave the real revocation behind.
+        {200, #{<<"status">> := <<"revoked">>}} =
+            request_json(post, "/api/v1/revoke", Auth,
+                         #{<<"principal">> => <<"user@example.com">>}, Config),
+        true = broker_security:revoked(<<"user@example.com">>),
+        {200, #{<<"status">> := <<"cleared">>,
+                <<"principal">> := <<"user@example.com">>}} =
+            request(delete, "/api/v1/revoke/user%40example.com", Auth, Config),
+        false = broker_security:revoked(<<"user@example.com">>),
+        %% The escaped form must never have been the key that got written.
+        false = broker_security:revoked(<<"user%40example.com">>),
+
         %% An empty body is a 400, never a silent no-op revoke.
         {400, #{<<"error">> := <<"body_required">>}} =
             request_raw(post, "/api/v1/revoke", Auth, <<>>, Config),
         false = broker_security:revoked(<<"alice">>)
     after
-        _ = broker_security:clear_revocation(<<"alice">>)
+        _ = broker_security:clear_revocation(<<"alice">>),
+        _ = broker_security:clear_revocation(<<"user@example.com">>)
     end.
 
 node_view_reports_state_and_connections(Config) ->
