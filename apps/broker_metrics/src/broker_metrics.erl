@@ -434,4 +434,11 @@ key_specs() ->
      %% S12-D+ (spec 2026-11-22-session-state-replication §5): 会话状态复制到
      %% 副本的延迟与失败计数。仿 cluster_replication_latency_us / _failed，闭集冻结。
      {cluster_session_replication_latency_us, histogram},
-     {cluster_session_replication_failed, counter}].
+     {cluster_session_replication_failed, counter},
+     %% Plan 2（spec 2026-11-22-session-state-replication-plan2 §10）：接管侧
+     %% 冻结键。ADR-016 §16.2 禁止高基数标签，故 spec 的「按 result 分标签」
+     %% 落地为**一结果一键**（闭集）。claim 的成功/失败各 inc 一个。
+     {cluster_session_takeover_ok, counter},
+     {cluster_session_takeover_stale_epoch, counter},
+     {cluster_session_takeover_no_replica, counter},
+     {cluster_session_takeover_not_found, counter}].

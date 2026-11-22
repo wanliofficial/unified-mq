@@ -2,7 +2,7 @@
     {description, "Metadata Raft ownership, epoch fencing and replicated commit"},
     {vsn, "0.1.0"},
     {registered, [broker_cluster_sup, broker_cluster_cache,
-                  broker_cluster_meta_ctl]},
+                  broker_cluster_meta_ctl, broker_cluster_nodedown_mon]},
     {mod, {broker_cluster_app, []}},
     {applications, [kernel, stdlib, sasl, crypto, public_key, broker_core,
                     broker_metrics, broker_meta, ra]},
@@ -30,6 +30,10 @@
            %% note: even when on, the installed hook is fire-and-forget (always
            %% `ok'); true majority-durable subscribe/unsubscribe is Plan 2.
            {session_replication, false},
+           %% Plan 2 (spec §5): 固定会话分区空间的大小。`partition_of/2' 用它
+           %% 把 ClientId 散列到 `0..C-1'。与 broker_rebalance 的动态元数据分区
+           %% 独立；变更会使会话重新散列，由 epoch fencing 兜底。默认 4。
+           {session_partition_count, 4},
            %% One hop budget for a forwarded call; the caller's protocol
            %% adapter already has its own timeout, so this only bounds the rpc.
            {cross_node_timeout_ms, 2000},

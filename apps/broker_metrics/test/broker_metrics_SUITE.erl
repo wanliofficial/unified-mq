@@ -28,7 +28,8 @@ all() ->
      reset_clears,
      no_high_cardinality_keys,
      report_line_is_single,
-     session_replication_keys_registered].
+     session_replication_keys_registered,
+     session_takeover_keys_registered].
 
 -define(KEYS,
         [connections_current, connections_peak, auth_failures,
@@ -59,7 +60,11 @@ all() ->
          mqtt_sn_sleep_denied, mqtt_sn_keepalive_timeout, mqtt_sn_asleep,
          %% S12-D+ (spec 2026-11-22-session-state-replication §5): 会话状态复制到
          %% 副本的延迟与失败计数，置于列表末尾以匹配 key_specs/0 顺序。
-         cluster_session_replication_latency_us, cluster_session_replication_failed]).
+         cluster_session_replication_latency_us, cluster_session_replication_failed,
+         %% Plan 2 (spec 2026-11-22-session-state-replication-plan2-design §10):
+         %% 接管侧四键，一结果一键（ADR-016 禁标签）。
+         cluster_session_takeover_ok, cluster_session_takeover_stale_epoch,
+         cluster_session_takeover_no_replica, cluster_session_takeover_not_found]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.
@@ -117,6 +122,22 @@ session_replication_keys_registered(_Config) ->
     ?assertEqual(histogram,
                  maps:get(cluster_session_replication_latency_us,
                           broker_metrics:key_types())).
+
+%% Plan 2 (spec 2026-11-22-session-state-replication-plan2-design §10): the
+%% takeover keys are frozen counters, one per claim outcome -- not a labelled
+%% metric (ADR-016 §16.2 bans high cardinality, so each `result' the spec
+%% mentioned becomes its own key).
+session_takeover_keys_registered(_Config) ->
+    ok = broker_metrics:init(),
+    Keys = broker_metrics:keys(),
+    Types = broker_metrics:key_types(),
+    lists:foreach(
+      fun(K) ->
+              ?assert(lists:member(K, Keys)),
+              ?assertEqual(counter, maps:get(K, Types))
+      end,
+      [cluster_session_takeover_ok, cluster_session_takeover_stale_epoch,
+       cluster_session_takeover_no_replica, cluster_session_takeover_not_found]).
 
 %%%_* Write path -----------------------------------------------------------
 

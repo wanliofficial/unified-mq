@@ -10,7 +10,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([start/0, stop/0]).
--export([assign/4, migrate/4, finish_migration/2, remove/1]).
+-export([assign/4, migrate/4, finish_migration/2, remove/1, claim/3]).
 -export([join/1, join/2, leave/1, leave/2]).
 -export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
          partition_view/0]).
@@ -57,6 +57,44 @@ remove(Partition) ->
                 not_found -> 1
             end,
     command({remove, Partition, Epoch}).
+
+%% @doc Plan 2 (spec §4): 持连副本节点认领会话分区所有权。经 ra 串行 apply，
+%% 返回新 epoch。守卫（持副本 / epoch 单调）在 meta_machine 内，此处薄包装。
+%%
+%% 接管结果按**结果分类**计入冻结键（ADR-016 §16.2：禁止高基数标签，故一结果
+%% 一键）。不在此 inc `cluster_owner_changes`——`command/1' 已对任何 `{ok, N}'
+%% 成功回包计一次，重复计会双算。
+-spec claim(non_neg_integer(), node(), non_neg_integer()) ->
+          {ok, non_neg_integer()} | {error, term()}.
+claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
+                                   is_integer(Epoch) ->
+    Result = command({claim, Partition, Node, Epoch}),
+    _ = try inc_takeover(Result) catch _:_ -> ok end,
+    Result.
+
+%% 把 claim 结果映射到对应冻结键。错误形状以 meta_machine:claim/6 为准：
+%% `{error, {not_a_replica, _}}' / `{error, {stale_epoch, _, _}}' /
+%% `{error, not_found}'（spec §11 写作 `no_replica'，实现为 `not_a_replica'，
+%% 见 plan2-notes 的偏差记录）。
+%%
+%% 末尾的 catch-all **有意不计任何键**（不新增冻结键）。它接的是传输层失败：
+%% `{error, no_quorum}'、`{error, {metadata_unavailable, _}}'、`{error, noproc}'
+%% 等，这些都不是「某一次接管」的结局：
+%%   * `{error, no_quorum}' 已由 `cluster_no_quorum' 计数——它在
+%%     `broker_cluster_meta:no_quorum/0' 里 inc，此处再计会双算；
+%%   * 其余形状（`metadata_unavailable' / `noproc' / 应用未起）说明元数据库
+%%     本身不可用，是退化状态而非接管特定事件；按结果计键只会把「集群挂了」
+%%     伪装成「接管失败」，混淆真正的运维信号。
+inc_takeover({ok, _}) ->
+    broker_metrics:inc(cluster_session_takeover_ok);
+inc_takeover({error, {stale_epoch, _, _}}) ->
+    broker_metrics:inc(cluster_session_takeover_stale_epoch);
+inc_takeover({error, {not_a_replica, _}}) ->
+    broker_metrics:inc(cluster_session_takeover_no_replica);
+inc_takeover({error, not_found}) ->
+    broker_metrics:inc(cluster_session_takeover_not_found);
+inc_takeover(_Other) ->
+    ok.
 
 %%%_* Online membership change (ADR-033) ----------------------------------
 %%
@@ -230,16 +268,19 @@ install_cross_node_hooks() ->
 %% the caller. This comment exists so future readers don't read the dead
 %% `{error,_}' branches below the call sites as if they enforced durability.
 install_session_hook() ->
-    case application:get_env(broker_cluster, session_replication, false) of
-        true ->
-            persistent_term:put(
-              {broker_subscription_worker, session_replicator},
-              fun(Op) -> broker_cluster_session_rep:replicate_session_of(Op) end),
-            ok;
-        _ ->
-            _ = persistent_term:erase({broker_subscription_worker, session_replicator}),
-            ok
-    end.
+    Result = case application:get_env(broker_cluster, session_replication, false) of
+                 true ->
+                     persistent_term:put(
+                       {broker_subscription_worker, session_replicator},
+                       fun(Op) -> broker_cluster_session_rep:replicate_session_of(Op) end),
+                     ok;
+                 _ ->
+                     _ = persistent_term:erase({broker_subscription_worker, session_replicator}),
+                     ok
+             end,
+    %% Plan 2: 开关切换后让 nodedown 监视进程重挂（无进程时安全 no-op）。
+    _ = broker_cluster_nodedown_mon:rearm(),
+    Result.
 
 %% @doc ADR-034 D4: broadcast a QoS0 message to the other members. Each member
 %% re-routes it against its own index (`broker_subscription:dispatch_qos0/1'), so

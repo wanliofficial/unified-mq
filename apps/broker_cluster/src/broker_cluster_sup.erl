@@ -22,5 +22,13 @@ init([]) ->
              shutdown => 10000,
              type => worker,
              modules => [broker_cluster_meta]},
+    %% Plan 2 T4 补强：崩溃发现监视进程，session_replication 开启时挂成员监视，
+    %% 收到 {nodedown,O} 触发迁移。开关关闭时休眠（不监视，I2 退化）。
+    Mon = #{id => broker_cluster_nodedown_mon,
+            start => {broker_cluster_nodedown_mon, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [broker_cluster_nodedown_mon]},
     {ok, {#{strategy => one_for_one, intensity => 5, period => 10},
-          [Cache, Meta]}}.
+          [Cache, Meta, Mon]}}.

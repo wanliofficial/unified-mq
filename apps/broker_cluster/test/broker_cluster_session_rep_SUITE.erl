@@ -45,10 +45,20 @@ end_per_suite(_Config) ->
     _ = application:stop(broker_storage),
     ok.
 
-init_per_testcase(_, Config) -> Config.
-end_per_testcase(_, _) -> ok.
+init_per_testcase(_Case, Config) ->
+    _ = application:load(broker_cluster),
+    ok = application:set_env(broker_cluster, session_partition_count, 4),
+    case broker_cluster_cache:start_link() of
+        {ok, Cache} -> unlink(Cache);
+        {error, {already_started, _}} -> ok
+    end,
+    Config.
+end_per_testcase(_Case, _Config) ->
+    _ = try gen_server:stop(broker_cluster_cache) catch _:_ -> ok end,
+    ok.
 
-all() -> [single_node_is_ok, no_replicas_is_ok, remote_apply_ok, majority_failure_counts_acks].
+all() -> [single_node_is_ok, no_replicas_is_ok, remote_apply_ok, majority_failure_counts_acks,
+          targeted_routes_to_session_partition_only].
 
 %% Hermetic: the initiator's trivial majority cases, no cluster metadata needed.
 single_node_is_ok(_Config) ->
@@ -85,3 +95,32 @@ majority_failure_counts_acks(_Config) ->
                 application:set_env(broker_cluster, replicate_timeout_ms, T)
         end
     end.
+
+%% Plan 2 债#1 修复验证：纯路由决策。对 subscribe 命中该 ClientId 实际散列到的
+%% 会话分区的副本集；对 cursor 走 broadcast 兜底。用 targeted_plan/1 直接断言，
+%% 不依赖 dist/时序。
+targeted_routes_to_session_partition_only(_Config) ->
+    Count = broker_cluster_session_owner:session_partition_count(),
+    %% <<"tgt">> 实际散列到的分区（不硬编码，避免与实现/默认值耦合）。
+    P = broker_cluster_session_owner:partition_of(<<"tgt">>, Count),
+    %% 一个与 P 不同的分区，放一套可区分的副本集，证明路由确实只取 P。
+    POther = (P + 1) rem Count,
+    Distinguishable = [node(), 'plan2_t2_remote@nohost'],
+    ok = broker_cluster_cache:put(P, #{partition => P, owner => node(),
+                                        epoch => 1, replicas => Distinguishable,
+                                        state => active, index => 1}),
+    ok = broker_cluster_cache:put(POther, #{partition => POther, owner => node(),
+                                        epoch => 1, replicas => [node(), 'other@nohost'],
+                                        state => active, index => 1}),
+    %% subscribe：命中 P 的副本集（可区分）。
+    ?assertEqual({targeted, P, Distinguishable},
+                 broker_cluster_session_rep:targeted_plan(
+                   {subscribe, <<"tgt">>, {s,1}, #{}})),
+    %% cursor：无 ClientId，走 broadcast 兜底。
+    ?assertEqual(broadcast,
+                 broker_cluster_session_rep:targeted_plan(
+                   {cursor, {s,1}, 0, {row,1}})),
+    %% 未知 Op：降级 broadcast（不崩溃、不丢）。
+    ?assertEqual(broadcast,
+                 broker_cluster_session_rep:targeted_plan({weird_op, x})),
+    ok.
