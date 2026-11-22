@@ -80,7 +80,7 @@ erase_hook() ->
 all() -> [subscribe_without_hook_unchanged,
           subscribe_syncs_with_hook,
           subscribe_fails_when_hook_errors,
-          inflight_syncs_with_hook,
+          inflight_replicates_async_with_hook,
           unsubscribe_replicates_without_failing,
           unsubscribe_still_ok_when_hook_errors,
           cursor_flush_replicates_async_with_hook,
@@ -92,9 +92,9 @@ all() -> [subscribe_without_hook_unchanged,
 %% MQ-17 Plan 1 Task 4: the initiator side consults the `session_replicator'
 %% hook in the CALLER's process (the conn_fsm), never inside the worker's
 %% gen_server. Absent hook (the default) must leave the single-node path
-%% byte-identical (不变量 I2); a present hook makes subscribe/inflight/unsubscribe
+%% byte-identical (不变量 I2). A present hook makes subscribe/unsubscribe
 %% replicate synchronously (§3.4 多数派 ack 后才回 ACK) and the cursor flush tick
-%% replicate asynchronously.
+%% and inflight replicate asynchronously (fire-and-forget, result ignored).
 
 %% The key lives under the *worker's* module atom, not this suite's.
 -define(HOOK, {broker_subscription_worker, session_replicator}).
@@ -146,15 +146,17 @@ subscribe_fails_when_hook_errors(_Config) ->
         ok = broker_subscription_worker:unsubscribe(<<"cz">>, <<"t/z">>)
     end.
 
-%% inflight replicates synchronously too.
-inflight_syncs_with_hook(_Config) ->
+%% Inflight replication is fire-and-forget (§3.4): the hook runs in a spawned
+%% detached process, so the Op arrives in the mailbox asynchronously and
+%% `inflight/2' still answers `ok' regardless.
+inflight_replicates_async_with_hook(_Config) ->
     erase_hook(),
     Self = self(),
-    persistent_term:put(?HOOK, fun(Op) -> Self ! {replicated, Op}, ok end),
+    persistent_term:put(?HOOK, fun(Op) -> Self ! {replicated_inflight, Op}, ok end),
     try
         ok = broker_subscription_worker:inflight(<<"cw">>, #{42 => ack}),
         receive
-            {replicated, {inflight, <<"cw">>, #{42 := ack}}} -> ok
+            {replicated_inflight, {inflight, <<"cw">>, #{42 := ack}}} -> ok
         after 1000 ->
                 exit(no_inflight_replication)
         end

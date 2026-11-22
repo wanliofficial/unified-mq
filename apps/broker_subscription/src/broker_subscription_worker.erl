@@ -160,7 +160,16 @@ retry(SubRef, PartitionId, Offset, Consumer) ->
 
 inflight(ClientId, Term) ->
     case gen_server:call(?MODULE, {inflight, ClientId, Term}) of
-        ok -> maybe_replicate_inflight(ClientId, Term);
+        %% MQ-17 §3.4: inflight replication is ASYNC (fire-and-forget), like the
+        %% cursor flush. The conn_fsm fires `inflight/2' on a ~20 ms cadence and
+        %% ignores its result, so replication is NOT gated on any SUBACK -- a sync
+        %% call would only couple connection latency to follower health with no
+        %% correctness benefit. The local commit (the gen_server call above) is
+        %% the authoritative write; the async replica cannot fail the caller, so
+        %% `inflight/2' answers `ok' unconditionally after that commit.
+        ok ->
+            _ = maybe_replicate_inflight(ClientId, Term),
+            ok;
         Other -> Other
     end.
 
@@ -210,20 +219,53 @@ replicate_cursor_async(SubRef) ->
 %% One `{cursor,...}' Op per row of the flushed subscription. Isolated in its
 %% own function (rather than a comprehension) so the row's SubRef/P are new
 %% bindings and the hook call's `catch' is `try ... catch' (warnings_as_errors).
+%%
+%% The ENTIRE body is wrapped in `try ... catch' (not just `Fun(Op)'): during
+%% shutdown the replica process may run after `?CURSORS' is gone, and an
+%% uncaught error here would emit a crash report from a fire-and-forget process.
+%% The whole thing is best-effort -- cursors only move forward and the replica's
+%% per-key writes are idempotent, so it may legally receive a cursor slightly
+%% ahead of the just-fsync'd disk state; dropping it loses nothing that the next
+%% tick won't resend.
 replicate_cursors_once(SubRef, Fun) ->
-    Rows = ets:match_object(?CURSORS, {{SubRef, '_'}, '_'}),
-    lists:foreach(
-      fun({{_SubRef, PartitionId}, Row}) ->
-              _ = try Fun({cursor, SubRef, PartitionId, Row})
-                  catch _:_ -> ok
-                  end,
-              ok
-      end, Rows),
-    ok.
+    try
+        Rows = ets:match_object(?CURSORS, {{SubRef, '_'}, '_'}),
+        lists:foreach(
+          fun({{_SubRef, PartitionId}, Row}) ->
+                  _ = try Fun({cursor, SubRef, PartitionId, Row})
+                      catch _:_ -> ok
+                      end,
+                  ok
+          end, Rows),
+        ok
+    catch
+        _:_ -> ok
+    end.
 
-%% The subscribe/inflight/unsubscribe replication is gated on hook presence
-%% *before* touching the tables, so the absent-hook path stays zero-overhead:
-%% no `ets:lookup', no extra match, no spawn -- exactly today's behaviour.
+%% Fire-and-forget inflight replication (MQ-17 §3.4): parallel to
+%% `replicate_cursor_async/1'. No hook -> no spawn at all (I2). The detached
+%% process swallows every error -- replication failure is only counted, never
+%% propagated (unlike subscribe/unsubscribe, which stay SYNC because the caller
+%% gates a SUBACK on them).
+-spec replicate_inflight_async(session_op()) -> ok.
+replicate_inflight_async(Op) ->
+    case session_replicator() of
+        undefined ->
+            ok;
+        Fun ->
+            _ = spawn(fun() ->
+                      try Fun(Op)
+                      catch _:_ -> ok
+                      end
+                  end),
+            ok
+    end.
+
+%% The subscribe/unsubscribe replication is gated on hook presence *before%
+%% touching the tables, so the absent-hook path stays zero-overhead: no
+%% `ets:lookup', no extra match, no spawn -- exactly today's behaviour. Inflight
+%% is fire-and-forget (see `replicate_inflight_async/1'); it has no table to read
+%% here, so its gate lives in the helper and likewise spawns nothing when absent.
 maybe_replicate_subscribe(ClientId, SubRef) ->
     case session_replicator() of
         undefined -> ok;
@@ -234,11 +276,11 @@ maybe_replicate_subscribe(ClientId, SubRef) ->
             end
     end.
 
+%% Inflight replication is fire-and-forget (§3.4): no hook -> no spawn (I2),
+%% otherwise one detached process applies the Op. Failure is never propagated --
+%% the caller already got its `ok' (see `inflight/2').
 maybe_replicate_inflight(ClientId, Term) ->
-    case session_replicator() of
-        undefined -> ok;
-        _ -> replicate_sync({inflight, ClientId, Term})
-    end.
+    replicate_inflight_async({inflight, ClientId, Term}).
 
 %% The local removal already happened and cannot be rolled back, so a hook error
 %% here only warns -- the caller still gets `ok' (see unsubscribe's contract).
