@@ -46,6 +46,8 @@
 all() ->
     [connect_anonymous_is_granted_with_session_present_zero,
      connect_with_bad_password_is_refused_4,
+     %% MQ-17 #10: a revoked principal cannot reconnect.
+     connect_for_a_revoked_principal_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
      connect_mqtt5_is_accepted,
      %% MQ-16: MQTT 3.1 (Protocol Level 3 / "MQIsdp") end-to-end.
@@ -404,6 +406,20 @@ connect_with_bad_password_is_refused_4(_Config) ->
     {ok, normal} = mqtt_close(Conn2),
     {ok, normal} = mqtt_close(Conn3),
     ok.
+
+%% MQ-17 #10: revocation refuses the NEXT CONNECT of that principal. The code is
+%% 4 on purpose -- the same byte as a bad password -- so the refusal does not
+%% reveal that it was the revocation registry, not the credentials, that said no.
+connect_for_a_revoked_principal_is_refused_4(_Config) ->
+    ok = boot(),
+    ok = broker_security:clear_revocation(<<"alice">>),
+    ok = broker_security:revoke(<<"alice">>, undefined),
+    {Conn, Connack} = mqtt_open(#{client_id => <<"c1">>,
+                                  username => <<"alice">>,
+                                  password => <<"pw">>}),
+    #connack{return_code = 4} = Connack,
+    {ok, _} = mqtt_close(Conn),
+    ok = broker_security:clear_revocation(<<"alice">>).
 
 connect_with_empty_client_id_is_refused_2(_Config) ->
     ok = boot(),

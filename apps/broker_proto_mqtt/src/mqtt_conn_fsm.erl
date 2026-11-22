@@ -741,17 +741,28 @@ authenticate(#connect{keep_alive = KA, username = User, password = Pass}, D) ->
             %% password"; 0x04 covers both.
             {error, 4, D};
         Pr ->
-            case broker_security:authorize(Pr, {connect, D#st.client_id}) of
-                allow ->
-                    {ok, D#st{max_qos = MaxQos,
-                              keepalive_ms = clamp_keepalive(KA, D),
-                              principal = Pr,
-                              tenant_id = broker_security:tenant_id(Pr)}};
-                deny ->
+            %% MQ-17 #10: a revoked principal is refused the same way a wrong
+            %% password is (rc 4 / v5 0x86), so the revocation state does not
+            %% leak to the client.
+            case broker_security:revoked(Pr) of
+                true ->
                     broker_metrics:inc(auth_failures),
-                    log(warning, "connect not authorized for client_id=~p",
+                    log(warning, "connect refused: principal revoked client_id=~p",
                         [D#st.client_id]),
-                    {error, 5, D}
+                    {error, 4, D};
+                false ->
+                    case broker_security:authorize(Pr, {connect, D#st.client_id}) of
+                        allow ->
+                            {ok, D#st{max_qos = MaxQos,
+                                      keepalive_ms = clamp_keepalive(KA, D),
+                                      principal = Pr,
+                                      tenant_id = broker_security:tenant_id(Pr)}};
+                        deny ->
+                            broker_metrics:inc(auth_failures),
+                            log(warning, "connect not authorized for client_id=~p",
+                                [D#st.client_id]),
+                            {error, 5, D}
+                    end
             end
     end.
 
