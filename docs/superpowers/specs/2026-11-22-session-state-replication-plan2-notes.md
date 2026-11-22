@@ -139,6 +139,7 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 | `broker_metrics_SUITE`（含新增 `session_takeover_keys_registered`） | 16 | 全绿 |
 | `broker_cluster_meta_SUITE`（claim 四用例） | 4 | 全绿 |
 | `mqtt_conn_fsm_takeover_SUITE` | 3 | 全绿 |
+| `broker_session_replica_SUITE`（含新增 `takeover_outcome_counters`，锁四键映射） | 6 | 全绿 |
 | `broker_cluster_session_rep_SUITE` + `_nodedown_SUITE` + `_session_owner_SUITE` | 12 | 全绿 |
 
 `rebar3 compile` 干净（warnings-as-errors，无告警）。
