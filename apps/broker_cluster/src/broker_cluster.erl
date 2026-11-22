@@ -76,6 +76,15 @@ claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
 %% `{error, {not_a_replica, _}}' / `{error, {stale_epoch, _, _}}' /
 %% `{error, not_found}'（spec §11 写作 `no_replica'，实现为 `not_a_replica'，
 %% 见 plan2-notes 的偏差记录）。
+%%
+%% 末尾的 catch-all **有意不计任何键**（不新增冻结键）。它接的是传输层失败：
+%% `{error, no_quorum}'、`{error, {metadata_unavailable, _}}'、`{error, noproc}'
+%% 等，这些都不是「某一次接管」的结局：
+%%   * `{error, no_quorum}' 已由 `cluster_no_quorum' 计数——它在
+%%     `broker_cluster_meta:no_quorum/0' 里 inc，此处再计会双算；
+%%   * 其余形状（`metadata_unavailable' / `noproc' / 应用未起）说明元数据库
+%%     本身不可用，是退化状态而非接管特定事件；按结果计键只会把「集群挂了」
+%%     伪装成「接管失败」，混淆真正的运维信号。
 inc_takeover({ok, _}) ->
     broker_metrics:inc(cluster_session_takeover_ok);
 inc_takeover({error, {stale_epoch, _, _}}) ->

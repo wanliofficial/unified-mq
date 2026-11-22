@@ -145,7 +145,10 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 
 ### 5.3 全量 CT 状态（未在本 Task 重跑）
 
-全量基线为 **1663**（Plan 1 交付时，2026-11-22），Plan 2 在此基础上新增本记录的用例。已知**与 Plan 2 无关**的失败：`broker_proto_mcp/test/mcp_dispatch_SUITE.erl` 为未跟踪 WIP、编译不过；`kafka_group_SUITE:session_timeout_sweeps_dead_member` 是既有 `wait_for` bug。本 Task **没有**重跑全量 CT，以上为历史记录，不构成新证据。
+全量基线为 **1663**（Plan 1 交付时，2026-11-22），Plan 2 在此基础上新增本记录的用例。本 Task **没有**重跑全量 CT，以下为历史记录的修正，不构成新证据：
+
+- `broker_proto_mcp/test/mcp_dispatch_SUITE.erl`：历史记录称其「未跟踪 WIP、编译不过」。**在本分支该文件不存在**（`git ls-files | grep mcp_dispatch` 只有 `src/mcp_dispatch.erl`，测试目录只有 `mcp_listener_SUITE` / `mcp_route_SUITE` / `mcp_stdio_SUITE`），因此它**不是**本分支的失败来源，只是历史记录留下的旧条目。
+- `kafka_group_SUITE:session_timeout_sweeps_dead_member`：历史记录称其为既有 `wait_for` 缺陷。本 Task 实测复核：该套件其余 13 用例全绿，唯 `all()` 末位的这一例跑 240s 仍未出结果。原因是 `wait_for(Fun, 2000|4000)` 的第二个参数是**迭代次数**而非毫秒，每次 `timer:sleep(150)`，故实际预算是 300s / 600s 量级——**历史结论仍成立**，是既有缺陷、与 Plan 2 无关，未在本 Task 修复。
 
 ## 6. 关联
 

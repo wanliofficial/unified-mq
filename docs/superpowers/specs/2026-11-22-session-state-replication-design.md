@@ -129,4 +129,9 @@ API：`replicate_session(Partition, Op) -> ok | {error, term()}`。
 
 ## 8. Plan 2 实现期批注（2026-11-22）
 
-【2026-11-22】§3.5 与 §4 数据流中「ra 候选排序内持连优先」的设想，已在 Plan 2 brainstorming 修订为：**ra 按副本固定序选新 owner（不感知连接）→ 持连副本节点观察 `{nodedown, O}` 后向 ra 提交 `{claim, P, N, Epoch}` 事后认领**。理由：连接存活信息不进 ra 排序，避免把节点级 liveness 拉回集群元数据；ra 串行 apply 仍保证全局唯一 owner，连接判断留在本地 conn_fsm。Plan 1 的复制管线不受影响。详见 [Plan 2 设计](2026-11-22-session-state-replication-plan2-design.md) §4 与 §6。
+【2026-11-22】§3.5 与 §4 数据流中「ra 候选排序内持连优先」的设想，已在 Plan 2 brainstorming 修订为**两条互不依赖的路径**，ra **不**做任何候选排序或副本序选择——它只负责把命令串行 apply：
+
+1. **持连节点事后认领（claim，主路径）**：持连副本节点观察 `{nodedown, O}` 后向 ra 提交 `{claim, P, N, Epoch}`，把 owner 改成自己。此路径**没有任何副本序偏好**——谁持连、谁先提交，谁就拿到所有权；判据只有 epoch 单调 + `N` 必须在 `replicas` 集内（`broker_cluster_meta_machine:claim/6` 的两条守卫），连接判断留在本地 conn_fsm。
+2. **主动迁移（migrate，兜底路径）**：`broker_cluster_nodedown:pick_new_owner/2` 在**本地**按副本固定序取第一个存活副本作新 owner（epoch+1），再提交既有的 `{migrate, ...}` 命令。
+
+理由：连接存活信息不进 ra 排序，避免把节点级 liveness 拉回集群元数据；两条路径都经 ra 串行 apply，故仍保证全局唯一 owner（同 §7 I3 语义，claim 侧再收紧为「必须在副本集内」）。Plan 1 的复制管线不受影响。详见 [Plan 2 设计](2026-11-22-session-state-replication-plan2-design.md) §4 与 §6。

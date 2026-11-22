@@ -24,6 +24,10 @@
 %%      epoch 写入被 fencing 拒；其它旧副本亦然；新 owner 接受当前 epoch。
 %%   5. `single_node_unchanged' —— 开关关闭（I2）时无 session-replicator 钩子，
 %%      逐字节同今日。
+%% 第 6 个用例 `takeover_outcome_counters' 不属 spec §9 的五个故障注入用例，
+%% 而是**把 claim 结果 → 冻结键的映射锁死**：四种 claim 结局各走一遍真实
+%% `broker_cluster:claim/3'，逐个断言对应计数键 +1、其余三键不动。没有它，把
+%% 两个键的映射写反（如 `not_a_replica' 计到 `stale_epoch'）所有套件都不会红。
 %%
 %% 范围声明：本套件在 **会话平面身份**（subs 集 + 游标）这一可观测层证明接管，并
 %% **不** 触及 MQTT wire 层的「零重连」——那需要真实 broker 客户端连接在 Holder 上
@@ -51,7 +55,8 @@ all() ->
      subscribe_not_lost_on_crash,
      inflight_dedup_preserved,
      stale_owner_fenced,
-     single_node_unchanged].
+     single_node_unchanged,
+     takeover_outcome_counters].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -283,6 +288,89 @@ single_node_unchanged(Config) ->
     ?assertEqual(undefined,
                  rpc(N1, persistent_term, get,
                      [{broker_subscription_worker, session_replicator}, undefined])),
+    ok.
+
+%% 用例 6（映射锁）：claim 的**四种结局**各走一遍真实 `broker_cluster:claim/3`，
+%% 断言「一个结局只加自己那个冻结键」。这是唯一一条锁住 shape→键映射的测试：
+%% 把 `not_a_replica' 与 `stale_epoch' 两个键写反，前 5 个用例全绿，只有这里会红。
+%%
+%% 四步都在 **Holder** 上发起（`inc_takeover/1' 在 `claim/3' 的调用节点执行），故
+%% 四键都读 Holder 的 `broker_metrics:snapshot/0'。每步不重置，只断言这一步的
+%% **增量正好 +1 且其余三键不动**——顺序无关，且比 `>= 1' 更紧（漏计/双计都能抓到）。
+takeover_outcome_counters(Config) ->
+    [Owner, Holder, _Third] = Nodes = peer_nodes(Config),
+    %% 指标必须真的在这个 peer 上初始化过，否则 snapshot/0 会回落到全零的
+    %% `zeros()'，让下面的断言变成「永远读到 0」的假绿。
+    ok = ensure_metrics(Nodes),
+    ok = rpc(Holder, broker_metrics, reset, []),
+    P = 0,
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+    S0 = takeover_counters(Holder),
+    ?assertEqual([0, 0, 0, 0], [maps:get(K, S0) || K <- takeover_keys()]),
+    %% 一个不在副本集里的节点原子（任意生造即可，只要不在 Nodes 里）。
+    Stranger = list_to_atom("stranger@" ++ atom_to_list(node())),
+    false = lists:member(Stranger, Nodes),
+    %% 1) ok：Holder 是副本、epoch 2 > 1 → 接管成功。
+    {ok, 2} = rpc(Holder, broker_cluster, claim, [P, Holder, 2]),
+    S1 = assert_takeover_step(Holder, cluster_session_takeover_ok, S0),
+    %% 2) stale_epoch：同 epoch 再提一次 → 单调守卫拒绝。
+    {error, {stale_epoch, 2, 2}} = rpc(Holder, broker_cluster, claim, [P, Holder, 2]),
+    S2 = assert_takeover_step(Holder, cluster_session_takeover_stale_epoch, S1),
+    %% 3) not_a_replica：epoch 够新，但 Stranger 不在 replicas 集里。
+    {error, {not_a_replica, Stranger}} =
+        rpc(Holder, broker_cluster, claim, [P, Stranger, 9]),
+    S3 = assert_takeover_step(Holder, cluster_session_takeover_no_replica, S2),
+    %% 4) not_found：分区从未 assign。
+    {error, not_found} = rpc(Holder, broker_cluster, claim, [999, Holder, 2]),
+    S4 = assert_takeover_step(Holder, cluster_session_takeover_not_found, S3),
+    %% 终态：四键各 1 次，一个不多一个不少。
+    ?assertEqual([1, 1, 1, 1], [maps:get(K, S4) || K <- takeover_keys()]),
+    ok.
+
+%% 断言 `Key' 相对 `Before' 恰好 +1，其余三个接管键零变动；成功时返回新快照，
+%% 供下一步当 `Before'。
+assert_takeover_step(Peer, Key, Before) ->
+    After = takeover_counters(Peer),
+    ?assertEqual({Key, maps:get(Key, Before) + 1},
+                 {Key, maps:get(Key, After)}),
+    Others = [K || K <- takeover_keys(), K =/= Key],
+    ?assertEqual([{K, maps:get(K, Before)} || K <- Others],
+                 [{K, maps:get(K, After)} || K <- Others]),
+    After.
+
+takeover_keys() ->
+    [cluster_session_takeover_ok, cluster_session_takeover_stale_epoch,
+     cluster_session_takeover_no_replica, cluster_session_takeover_not_found].
+
+%% 只取四个接管键（peer 上的快照含全部冻结键）。
+takeover_counters(Peer) ->
+    Snap = rpc(Peer, broker_metrics, snapshot, []),
+    maps:with(takeover_keys(), Snap).
+
+%% 每一台都要真的 init 过 `broker_metrics'：`persistent_term' 里没有状态 = 没
+%% init，此时 `snapshot/0' 返回全零的 `zeros()'，断言会假绿。`boot_data_plane/0'
+%% 经 `broker_storage' → `broker_metrics' 的 app 依赖把它起起来了；这里不信任
+%% 「应该起了」，显式验证，缺了就补 init。
+ensure_metrics(Nodes) ->
+    lists:foreach(
+      fun(N) ->
+              %% 实测（本 Task 验证）：peer 的 `boot_data_plane/0' 经
+              %% `broker_storage' → `broker_metrics' 的 app 依赖已经把指标
+              %% init 好，三台 peer 的 `persistent_term' 状态都非空。故这条
+              %% 分支正常不会走到——留着是为了让「指标没起」变成显式补救，
+              %% 而不是悄悄回落到全零快照、让下面的断言假绿。
+              case rpc(N, persistent_term, get, [{broker_metrics, state}, undefined]) of
+                  undefined -> ok = rpc(N, broker_metrics, init, []);
+                  _ -> ok
+              end
+      end, Nodes),
+    lists:foreach(
+      fun(N) ->
+              Snap = takeover_counters(N),
+              ?assertEqual(lists:sort(takeover_keys()), lists:sort(maps:keys(Snap))),
+              lists:foreach(fun(K) -> ?assert(is_integer(maps:get(K, Snap))) end,
+                            takeover_keys())
+      end, Nodes),
     ok.
 
 %%%_* Cluster helpers + do_* session wrappers --------------------------------
