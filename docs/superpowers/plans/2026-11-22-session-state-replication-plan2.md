@@ -737,163 +737,42 @@ git commit -m "feat(broker_proto_mqtt): conn_fsm owner monitor + claim-on-nodedo
 
 ## Task 6: broker_session_replica_SUITE — 五用例故障注入
 
-新增 dist-CT,覆盖 spec §9 五用例:kill owner 后连接在 N 的客户端续传、订阅不丢、inflight 去重、旧 owner fencing、单机退化。沿用 `broker_cluster_session_rep_dist_SUITE` 的 peer 范式。
+新增 dist-CT,覆盖 spec §9 五用例:kill owner 后连接在 N 的客户端续传、订阅不丢、inflight 去重、旧 owner fencing、单机退化。
 
 **Files:**
 - Create: `apps/broker_cluster/test/broker_session_replica_SUITE.erl`
 
-- [ ] **Step 1: 写套件骨架 + 用例 5(单机退化,先绿一个)**
+> **实现说明(实测修正,与草稿的差异)**:草稿提议用 `broker_subscription_worker:cursor/4` 直接写游标、再 `broker_cluster:claim/3`。这**不可行**:`claim/3` 经 `broker_cluster_meta:command/1` → `ra:process_command/3` 走真 ra,分区必须先存在于机器状态;只往 `broker_cluster_cache` 写 owner 会让机器 `partitions` 为空,`claim` 返回 `{error, not_found}`。`cursor/4` 这个 API 根本不存在。故本套件改为**起真实 3 节点 ra 组**:`broker_cluster:assign/4` 写机器状态、`stop_peer/2` 真 kill owner、`broker_cluster:claim/3` 经 ra 选举后接管。
 
-创建 `apps/broker_cluster/test/broker_session_replica_SUITE.erl`:
+**Steps**
 
-```erlang
-%% @doc MQ-17 Plan 2：透明故障接管故障注入证明（spec §9 五用例）。
-%% 三真实 peer 节点共享 broker_cluster_cache 镜像。kill owner O 后，连接在 N
-%% 的客户端从本地副本续传。手法沿用 broker_cluster_session_rep_dist_SUITE 的
-%% peer:start_link + 直接 cache put（不依赖 ra 真正选举，单元级可控 owner/epoch）。
--module(broker_session_replica_SUITE).
--compile([export_all, nowarn_export_all]).
--include_lib("common_test/include/ct.hrl").
--include_lib("stdlib/include/assert.hrl").
+- [ ] **Step 1: 写套件(骨架 + peer 脚手架)**
 
--define(NODES, 3).
--define(PARTITIONS, 3).
+  沿用 `broker_cluster_session_rep_dist_SUITE` 的 `start_peers/2`(peer 名前缀 `s9d_`、`prepare_peer/1` 起 ra+cache、`boot_data_plane/0` 起 storage/queue/router/subscription + `install_hooks/0`)与 `broker_cluster_dist_SUITE` 的 `start_meta/1`、`form_cluster`、`stop_peer/2`、`retry/3`、`wait_until/2`、`rpc/4`。`init_per_suite` 以 `unifiedmq_s9ct` 起短名分布式。`init_per_testcase` 起 3 peer → `form_cluster_h/1`(每台挂元数据服,真 ra 组)→ 三台 `session_replication=true`、`boot_data_plane/0`。`all()` 五用例。
 
-all() -> [single_node_unchanged].
+- [ ] **Step 2: 五用例(实测修正了三处草稿假设)**
 
-init_per_suite(Config) ->
-    case node() of
-        nonode@nohost ->
-            case net_kernel:start([unifiedmq_s9ct, shortnames]) of
-                {ok, _} -> [{started_net, true} | Config];
-                {error, Reason} -> ct:fail({cannot_start_distribution, Reason})
-            end;
-        _ -> [{started_net, false} | Config]
-    end.
-end_per_suite(Config) ->
-    case ?config(started_net, Config) of
-        true -> _ = net_kernel:stop(), ok;
-        _ -> ok
-    end.
+  1. `session_survives_owner_crash`:Holder 订阅 → 读初始游标水位 `C0` → ack `C0` 使水位前移到 `Before`(`> C0`) → kill Owner → Holder `claim` epoch 2 → `authorize_append` 可写、`session/1` 订阅集不变、`After >= Before`(游标不回退)。
+  2. `subscribe_not_lost_on_crash`:kill 一个非 owner 副本后,订阅实体行仍是完整单行。
+  3. `inflight_dedup_preserved`:QoS2 `inflight` blob 建立后 kill Owner,接管节点 `session/1` 的 `inflight` 原样恢复。
+  4. `stale_owner_fenced`:Holder `claim` epoch 2 后,旧 owner(仍在线)以 epoch 1 写被 `{error, {fenced, _}}` 拒;另一存活旧副本以 epoch 2 亦被拒;新 owner 接受当前 epoch。
+  5. `single_node_unchanged`:开关关闭时无 `session_replicator` 钩子(I2 回归保护)。
 
-init_per_testcase(Case, Config) ->
-    Peers = start_peers(Case, Config),
-    Nodes = [maps:get(node, P) || P <- Peers],
-    [Owner, Holder, _Third] = Nodes,
-    ok = rpc(Holder, application, set_env, [broker_cluster, members, Nodes]),
-    ok = rpc(Owner, application, set_env, [broker_cluster, members, Nodes]),
-    ok = rpc(Holder, application, set_env, [broker_cluster, session_replication, true]),
-    [{peers, Peers}, {nodes, Nodes}, {owner, Owner}, {holder, Holder} | Config].
-end_per_testcase(_Case, Config) ->
-    stop_peers(?config(peers, Config)), ok.
+  **三处对草稿的实测修正(均为测试假设错误,产品行为正确)**:
+  - 游标语义:`broker_subscription:cursor/2` 返回**连续前缀水位**(`broker_cursor:next_read/1` = `offset`);`advance_plain/2` 对水位之上的 offset 只入 `pending`、**不前移**水位,只有 ack 到当前连续位才级联前移。故草稿的 `ack(…,5) → 游标 6` 不成立,改为「读 `C0` → ack `C0` → 断言 `Before > C0` 且 `After >= Before`」。
+  - `session/1` 的 `subs` 是订阅 **map** 列表(`#{sub_ref := SubRef, ...}`),非裸 SubRef 列表,断言用 `?assertMatch([#{sub_ref := SubRef}], ...)`。
+  - 会话分区空间(`session_partition_count`,所有权维度)与队列分区空间(`broker_subscription` 游标维度)是两套独立编号;用例 1 演示游标时用真实队列分区 `hd(broker_queue:partition_ids())`,而非会话分区号。
 
-%% 用例 5（回归保护）：无 session_replicator 钩子时逐字节同今日。
-single_node_unchanged(Config) ->
-    Owner = ?config(owner, Config),
-    ok = rpc(Owner, application, set_env, [broker_cluster, session_replication, false]),
-    ok = rpc(Owner, broker_cluster, install_hooks, []),
-    ?assertEqual(undefined,
-                 rpc(Owner, persistent_term, get,
-                     [{broker_subscription_worker, session_replicator}, undefined])),
-    ok.
-```
-
-- [ ] **Step 2: 跑用例 5 确认绿**
-
-Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_cluster/test/broker_session_replica_SUITE.erl`
-Expected: PASS — `single_node_unchanged` 绿。
-
-- [ ] **Step 3: 加 peer 脚手架(start_peers / prepare_peer / start_data_plane / set_owner)**
-
-把 `broker_cluster_session_rep_dist_SUITE.erl:140-263` 的 `start_peers/stop_peers/peer_name/is_code_dir/sanitise/prepare_peer/start_data_plane/set_owner/wait_until/rpc` 整段**复制**进本套件(把 suite 名 `s6d_` 改为 `s9d_` 避免节点名冲突),并把 `all()` 扩为:
-
-```erlang
-all() -> [session_survives_owner_crash,
-          subscribe_not_lost_on_crash,
-          inflight_dedup_preserved,
-          stale_owner_fenced,
-          single_node_unchanged].
-```
-
-- [ ] **Step 4: 加用例 1(session_survives_owner_crash)**
-
-在 `all()` 用例 5 之前插入:
-
-```erlang
-%% 用例 1：连接在 Holder 的客户端订阅、收消息建游标；kill owner；断言连接在
-%% Holder 的「客户端」未重连却续收新消息、游标不回退已确认位。这里以「本地副本
-%% 在 claim 后续传」为可测判据：claim 后 Holder 是该会话分区 owner 且 session/1
-%% 仍返回订阅集 + 游标。
-session_survives_owner_crash(Config) ->
-    Owner = ?config(owner, Config),
-    Holder = ?config(holder, Config),
-    %% 客户端连 Holder，订阅（Owner 是初始 owner，Holder 是副本）。
-    {ok, SubRef} = rpc(Holder, broker_subscription_worker, subscribe,
-                       [<<"surv">>, <<"t/surv">>, 1]),
-    %% 在 Holder 本地建游标（模拟已收消息）。
-    ok = rpc(Holder, broker_subscription_worker, cursor,
-             [SubRef, 0, 5, {row, 5}]),
-    %% kill owner：从 Holder 视角 owner 消失。
-    ok = rpc(Holder, ?MODULE, set_owner, [0, Holder, ?config(nodes, Config)]),
-    %% Holder 提交 claim 把它变 owner。
-    {ok, _Epoch} = rpc(Holder, broker_cluster, claim, [0, Holder, 2]),
-    %% 续传判据：本地 session/1 仍返回订阅集 + 游标，客户端从未重连。
-    {ok, Session} = rpc(Holder, broker_subscription, session, [<<"surv">>]),
-    ?assertEqual([SubRef], maps:get(subs, Session)),
-    ?assertMatch([{SubRef, _}], maps:get(inflight, Session)),
-    ok.
-```
-
-> **说明**:`cursor/4` 的精确签名以 `broker_subscription_worker` 实际 API 为准——Step 5 编译时核对(见下方 Step 5 校验),必要时改用实际写入游标的导出函数。
-
-- [ ] **Step 5: 加用例 2/3/4**
-
-```erlang
-%% 用例 2：多数派 ack 前 kill 一半副本——订阅要么完整存在要么整体不存在。
-subscribe_not_lost_on_crash(Config) ->
-    Holder = ?config(holder, Config),
-    {ok, SubRef} = rpc(Holder, broker_subscription_worker, subscribe,
-                       [<<"snl">>, <<"t/snl">>, 1]),
-    ok = wait_until(fun() ->
-        rpc(Holder, ets, lookup, [broker_subscription_entities, SubRef]) =/= []
-    end),
-    %% 订阅在单一写入者本地是原子的：要么整行在、要么整行不在，无半截行。
-    ?assertMatch([{SubRef, _}],
-                 rpc(Holder, ets, lookup, [broker_subscription_entities, SubRef])),
-    ok.
-
-%% 用例 3：QoS2 inflight 建立后 kill owner；接管节点 inflight 恢复、重复投递去重。
-inflight_dedup_preserved(Config) ->
-    Holder = ?config(holder, Config),
-    {ok, _SubRef} = rpc(Holder, broker_subscription_worker, subscribe,
-                        [<<"dedup">>, <<"t/dedup">>, 2]),
-    Blob = #{vsn => 3, pending => [{1, a}], session_expires_at => undefined},
-    ok = rpc(Holder, broker_subscription_worker, inflight, [<<"dedup">>, Blob]),
-    {ok, Session} = rpc(Holder, broker_subscription, session, [<<"dedup">>]),
-    ?assertMatch(#{pending := [{1, a}]}, maps:get(inflight, Session)),
-    ok.
-
-%% 用例 4：O 重上线后尝试写旧会话——被纪元 fencing 拒。
-stale_owner_fenced(Config) ->
-    Holder = ?config(holder, Config),
-    ok = rpc(Holder, ?MODULE, set_owner, [0, Holder, ?config(nodes, Config)]),
-    {ok, 2} = rpc(Holder, broker_cluster, claim, [0, Holder, 2]),
-    %% 旧 owner（epoch 1）尝试以陈旧 epoch append：被 authorize_append 拒。
-    ?assertEqual({error, {fenced, _}},
-                 rpc(Holder, broker_cluster, authorize_append, [0, 1])),
-    ok.
-```
-
-- [ ] **Step 6: 跑全套确认五用例绿**
+- [ ] **Step 3: 跑全套**
 
 Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_cluster/test/broker_session_replica_SUITE.erl`
 Expected: PASS — 5 用例全绿。
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 4: 提交**
 
 ```bash
-git add apps/broker_cluster/test/broker_session_replica_SUITE.erl
-git commit -m "test(broker_cluster): session replica failover fault-injection suite, 5 cases (Plan 2 T6)"
+git add apps/broker_cluster/test/broker_session_replica_SUITE.erl docs/superpowers/plans/2026-11-22-session-state-replication-plan2.md
+git commit -m "test(broker_cluster): real-ra failover fault-injection suite, 5 cases (Plan 2 T6)"
 ```
 
 ---
