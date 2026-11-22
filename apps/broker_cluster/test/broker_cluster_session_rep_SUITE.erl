@@ -45,10 +45,17 @@ end_per_suite(_Config) ->
     _ = application:stop(broker_storage),
     ok.
 
-init_per_testcase(_, Config) -> Config.
-end_per_testcase(_, _) -> ok.
+init_per_testcase(_Case, Config) ->
+    _ = application:load(broker_cluster),
+    {ok, Cache} = broker_cluster_cache:start_link(),
+    unlink(Cache),
+    Config.
+end_per_testcase(_Case, _Config) ->
+    _ = try gen_server:stop(broker_cluster_cache) catch _:_ -> ok end,
+    ok.
 
-all() -> [single_node_is_ok, no_replicas_is_ok, remote_apply_ok, majority_failure_counts_acks].
+all() -> [single_node_is_ok, no_replicas_is_ok, remote_apply_ok, majority_failure_counts_acks,
+          targeted_routes_to_session_partition_only].
 
 %% Hermetic: the initiator's trivial majority cases, no cluster metadata needed.
 single_node_is_ok(_Config) ->
@@ -85,3 +92,18 @@ majority_failure_counts_acks(_Config) ->
                 application:set_env(broker_cluster, replicate_timeout_ms, T)
         end
     end.
+
+%% Plan 2 债#1 修复验证：复制只发往该会话分区的副本集，不再广播所有分区。
+targeted_routes_to_session_partition_only(_Config) ->
+    ok = broker_cluster_cache:put(0, #{partition => 0, owner => node(),
+                                        epoch => 1, replicas => [node()],
+                                        state => active, index => 1}),
+    ok = broker_cluster_cache:put(1, #{partition => 1, owner => node(),
+                                        epoch => 1, replicas => [node()],
+                                        state => active, index => 1}),
+    %% 对 subscribe 走定向、对 cursor 走广播，均不崩溃且返回 ok。
+    ok = broker_cluster_session_rep:replicate_session_targeted(
+           {subscribe, <<"tgt">>, {s,1}, #{}}),
+    ok = broker_cluster_session_rep:replicate_session_targeted(
+           {cursor, {s,1}, 0, {row,1}}),
+    ok.
