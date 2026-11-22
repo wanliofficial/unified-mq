@@ -121,7 +121,7 @@
 
 ### 4.1 集群、复制与会话高可用
 
-- [ ] **P0 集群级 durable session 复制（2–7 副本，quorum）**：fss 默认 2 副本且 Acked 消息可幸存节点丢失；本仓库有 `replicated_commit` 但**未证明**跨节点会话/消息在 SIGKILL 下零丢失。待办：定义并测「节点丢失后 durable 消息与订阅集合不丢」的 harness（对标 fss 的 SIGKILL/partition harness）。
+- [ ] **P0 集群级 durable session 复制（2–7 副本，quorum）**：fss 默认 2 副本且 Acked 消息可幸存节点丢失；本仓库有 `replicated_commit` 但**未证明**跨节点会话/消息在 SIGKILL 下零丢失。待办：定义并测「节点丢失后 durable 消息与订阅集合不丢」的 harness（对标 fss 的 SIGKILL/partition harness）。**进展（2026-11-22）**：会话状态复制管线（订阅/inflight/游标 → 副本本地表）已在 Plan 1 落地，默认关闭（`broker_cluster, session_replication=false`）；SIGKILL/分区故障注入 harness 与透明接管仍待 Plan 2。
 - [ ] **P1 跨节点共享订阅（$share cluster-wide）**：当前 `$share` 在单节点语义内；需扩展到集群级消费组分发。
 - [ ] **P1 站点桥接（bridge）**：两项目均有；本仓库无 bridge 能力。待办：评估是否纳入 S7 之后路线。
 - [ ] **P2 集群扩容零会话丢失**：fss 实测 3→5→8 join 保住会话（其 8→12 有缺陷 #1218，可作反面教材）；本仓库需补 join/leave 的会话与消息不丢证明。
