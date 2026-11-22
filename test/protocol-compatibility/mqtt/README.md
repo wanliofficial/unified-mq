@@ -58,7 +58,8 @@ directions.
 | Case | What it proves |
 |---|---|
 | `paho311-full` | CONNECT (clean, keepalive=1, credentials), SUBSCRIBE, QoS1 PUBLISH, PUBACK in **both** directions, PINGREQ/PINGRESP (keepalive timer), DISCONNECT; all frames byte-identical; CONNACK `20020000`, SUBACK `9003000101` |
-| `paho-v5-connect` | **S2.5 (ADR-017)**: a real paho MQTT 5 client connects successfully. CONNACK is v5-framed (`2003000000`: 3-byte remaining length, zero properties) and the client reads reason `0x00`. The S1-era `paho-v5-refused` assertion (`0x87`) is obsolete |
+| `paho-v5-connect` | **S2.5 (ADR-017)**: a real paho MQTT 5 client connects successfully and reads reason `0x00`. CONNACK is v5-framed with the MQ-07 capability property block (`200b00000825012a0129012801`: variable-byte length, Session Present 0, reason 0, then the four `available` bits). The S1-era `paho-v5-refused` assertion (`0x87`) is obsolete |
+| `paho-v31` | **MQ-16**: a real paho `MQTTv31` client (`MQIsdp` / Level 3) connects, subscribes, publishes QoS1 and receives the loopback. CONNACK is `20 02 00 00` (Reserved byte 0 — 3.1 has no Session Present), so paho reports `session_present=False` |
 | `paho-qos2` | **S2-C**: full QoS2 both ways. Inbound: paho drives PUBLISH→PUBREC→PUBREL→PUBCOMP and returns only on PUBCOMP. Outbound: the subscriber receives at QoS2, so paho runs the receiver half (PUBREC / PUBREL / PUBCOMP) against us. Every frame byte-identical |
 | `paho-retain` | **S2-C**: stored on publish, replayed to a later subscriber with `retain=1`, forwarded live with `retain=0`, and an empty-payload `retain=1` publish clears it (a fresh subscriber then gets nothing) |
 | `paho-will` | **S2-C**: Will published after an abnormal TCP close, at its configured QoS, with the configured payload |

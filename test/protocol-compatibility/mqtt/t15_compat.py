@@ -15,6 +15,8 @@ Clients:
 Cases:
   paho311-full       CONNECT(+creds)/SUBSCRIBE/PUBLISH qos1/PUBACK/PINGREQ/
                      PINGRESP/DISCONNECT, every client frame byte-identical
+  paho-v31           MQTT 3.1 CONNECT ("MQIsdp"/Level 3) accepted (MQ-16);
+                     CONNACK Reserved byte 0, QoS1 loopback delivered
   paho-v5-connect    MQTT 5 CONNECT accepted (S2.5): v5 CONNACK 0x00
   paho-qos2          full QoS2 in both directions (S2-C, ADR-018 §18.3)
   paho-retain        retain stored on subscribe, retain=0 on forward,
@@ -65,7 +67,7 @@ DATA_IN_CONTAINER = "/var/lib/unified-mq"
 OTP_ROOT = Path("/home/wanli/Development/otp-28.3.1/bin")
 ANALYZER_SRC = MQTT_DIR / "t15_capture.erl"
 
-CASES = ["paho311-full", "paho-v5-connect", "paho-qos2", "paho-retain",
+CASES = ["paho311-full", "paho-v31", "paho-v5-connect", "paho-qos2", "paho-retain",
          "paho-will", "paho-will-skipped", "paho-bad-filter", "mosq-pubsub",
          "mosq-qos2", "mosq-v5-pubsub"]
 
@@ -118,20 +120,27 @@ def render_config():
     # keep pointing at the dev host.
     data_pat = re.compile(r'\{data_dir,\s*"([^"]*)"\}')
 
-    def map_data_dir(match):
+    def map_data_dir(match, key="data_dir"):
         host = Path(match.group(1))
         try:
             rel = host.relative_to(ROOT / "data")
         except ValueError:
             raise RuntimeError(
-                f"sys.config render: data_dir {host} is not under {ROOT / 'data'}")
+                f"sys.config render: {key} {host} is not under {ROOT / 'data'}")
         target = DATA_IN_CONTAINER if str(rel) == "." else str(
             Path(DATA_IN_CONTAINER) / rel)
-        return '{data_dir, "%s"}' % target
+        return '{%s, "%s"}' % (key, target)
 
-    text, n = data_pat.subn(map_data_dir, text)
+    text, n = data_pat.subn(lambda m: map_data_dir(m, "data_dir"), text)
     if n != 5:
         raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
+    # JetStream keeps the same J8 discipline but its own env key. Rewrite it
+    # through the identical mapper so it lands on the bind mount too (a
+    # relative default would be resolved against the read-only release root).
+    text, n = re.subn(r'\{js_data_dir,\s*"([^"]*)"\}',
+                      lambda m: map_data_dir(m, "js_data_dir"), text)
+    if n != 1:
+        raise RuntimeError(f"sys.config render: js_data_dir matched {n}, expected 1")
     # The admin backup directory is the sixth on-disk path; mount it too so a
     # backup created in the container lands on the bind-mounted data volume.
     text, n = re.subn(r'\{backup_dir,\s*"[^"]*"\}',
@@ -576,6 +585,32 @@ def case_paho311_full():
             "delivered_qos": msg.qos, "payload": msg.payload.decode()}
 
 
+def case_paho_v31():
+    """MQ-16: a real paho client speaking MQTT 3.1 (`MQIsdp` / Level 3).
+
+    The S1-era posture refused Level 3 with `20 02 00 01`. MQ-16 accepts it:
+    CONNECT, SUBSCRIBE, QoS1 PUBLISH and the loopback delivery all run over the
+    3.1 wire shape. 3.1 has no Session Present flag, so the CONNACK's first
+    byte is 0 and paho reports session_present=False even on a resumed session.
+    """
+    c = Client("t15-paho-v31", clean=True, keepalive=1,
+               protocol=mqtt.MQTTv31)
+    sp = c.connect()
+    assert_ok(sp is False, "3.1 CONNACK has no Session Present bit (byte is 0)")
+    sub_mid = c.subscribe("t15/paho31/#", qos=1)
+    pub_mid = c.publish("t15/paho31/a", b"hello-31", qos=1)
+    msg = c.next_message(10.0)
+    assert_ok(msg is not None and msg.payload == b"hello-31",
+              f"no 3.1 loopback delivery: {msg!r}")
+    assert_ok(msg.qos == 1, f"delivered qos={msg.qos}")
+    # keepalive=1: stay silent long enough for paho to send PINGREQ.
+    time.sleep(2.6)
+    c.close()
+    return {"protocol": "MQTTv31", "sub_mid": sub_mid, "pub_mid": pub_mid,
+            "session_present": sp, "delivered_qos": msg.qos,
+            "payload": msg.payload.decode()}
+
+
 def case_paho_v5_connect():
     """S2.5 (ADR-017): a v5 CONNECT is accepted, not refused.
 
@@ -785,6 +820,7 @@ def case_mosq_v5_pubsub():
 
 CASE_FUNCS = {
     "paho311-full": case_paho311_full,
+    "paho-v31": case_paho_v31,
     "paho-v5-connect": case_paho_v5_connect,
     "paho-qos2": case_paho_qos2,
     "paho-retain": case_paho_retain,
@@ -855,19 +891,35 @@ def check_paho_v5(name, evidence, cap):
     connect = next((e for e in frames(cap, "c2s", "connect")), None)
     assert_ok(connect and connect["info"]["proto_level"] == "5",
               f"CONNECT proto_level {connect['info'] if connect else None} != 5")
-    # S2.5 answers a v5 CONNECT with a v5-framed CONNACK (3-byte remaining
-    # length, zero properties). The analyzer is a 3.1.1 decoder, so depending
-    # on where it stops the bytes may surface as a frame, an error or a
-    # partial tail; assert on the raw prefix seen in any of them.
-    assert_ok(any(h.startswith("20030000") for h in s2c_hexes(cap)),
+    # S2.5 answers a v5 CONNECT with a v5-framed CONNACK. MQ-07 added a
+    # capability property block on RC=0, so the body is no longer the empty
+    # `00 00` it was when this check was written: the wire is now
+    # `20 <len> 00 00 <props>`, where <len> is a v5 variable-byte length.
+    # Compare the v5 parse of each captured response instead of the old
+    # literal `20030000` prefix, which only ever matched the property-less
+    # shape.
+    ok = next((h for h in s2c_hexes(cap) if _is_v5_connack_ok(h)), None)
+    assert_ok(ok is not None,
               f"no v5 CONNACK success captured: {s2c_hexes(cap)}")
 
 
-def check_mosq_v5(name, evidence, cap):
-    assert_ok(evidence["pub_rc"] == 0,
-              f"mosquitto MQTT5 publish failed: {evidence['stderr']}")
-    assert_ok(any(h.startswith("20030000") for h in s2c_hexes(cap)),
-              f"no v5 CONNACK success captured: {s2c_hexes(cap)}")
+def _is_v5_connack_ok(hexstr):
+    """True for a v5 CONNACK (0x20) with reason code 0 and a zero-length
+    Session Present byte, whatever property block follows."""
+    raw = bytes.fromhex(hexstr)
+    if len(raw) < 3 or raw[0] != 0x20:
+        return False
+    # Variable-byte remaining length (v5): at most 4 bytes.
+    length, shift, i = 0, 0, 1
+    while i < len(raw) and i <= 4:
+        byte = raw[i]
+        length |= (byte & 0x7F) << shift
+        shift += 7
+        i += 1
+        if not byte & 0x80:
+            break
+    return (i + 2 <= len(raw) and raw[i] & 0xFE == 0
+            and raw[i + 1] == 0x00 and length > 0)
 
 
 def _publishes(cap, direction, topic_prefix):
@@ -1012,12 +1064,39 @@ def check_mosq_v5(name, evidence, cap):
               f"mosquitto MQTT5 publish failed: {evidence['stderr']}")
     s2c = [e["hex"] for e in events_of(cap, "s2c", "error")]
     s2c += [e["hex"] for e in events_of(cap, "s2c", "partial")]
-    assert_ok(any(h.startswith("20030000") for h in s2c),
+    s2c += s2c_hexes(cap)
+    assert_ok(any(_is_v5_connack_ok(h) for h in s2c),
               f"no v5 CONNACK success captured: {s2c}")
+
+
+def check_paho_v31(name, evidence, cap):
+    """MQ-16: the captured 3.1 CONNECT really carries MQIsdp / Level 3, and the
+    CONNACK's Reserved byte stays 0 (no Session Present) even though 3.1.1
+    would set it on a resumed session."""
+    connect = next((e for e in frames(cap, "c2s", "connect")), None)
+    assert_ok(connect is not None, f"no CONNECT captured: {cap}")
+    assert_ok(connect["info"]["proto_level"] == "3",
+              f"CONNECT proto_level {connect['info']['proto_level']} != 3")
+    assert_ok(b64text(connect["info"]["client"]) == b"t15-paho-v31",
+              "CONNECT client_id mismatch")
+    # The protocol name is not in the record, so assert it on the raw bytes:
+    # fixed header (0x10 + 1-byte remaining length), then "MQIsdp" with its
+    # 0006 length prefix followed by level 03.
+    assert_ok(connect["hex"][4:].startswith("00064d514973647003"),
+              f"CONNECT does not start with MQIsdp/3: {connect['hex'][:40]}")
+    # 3.1 CONNACK: 2-byte body, Reserved byte 0, rc 0.
+    connack = next((e for e in frames(cap, "s2c", "connack")), None)
+    assert_ok(connack is not None, "no CONNACK captured")
+    assert_ok(connack["hex"] == "20020000",
+              f"3.1 CONNACK bytes {connack['hex']} != 20020000 (Reserved must be 0)")
+    assert_ok(connack["info"]["session_present"] == "0",
+              f"3.1 CONNACK session_present {connack['info']['session_present']} != 0")
+    assert_ok(evidence["delivered_qos"] == 1, "loopback not delivered at QoS1")
 
 
 CHECKS = {
     "paho311-full": check_paho311,
+    "paho-v31": check_paho_v31,
     "paho-v5-connect": check_paho_v5,
     "paho-qos2": check_paho_qos2,
     "paho-retain": check_paho_retain,
