@@ -41,9 +41,9 @@ handle_cast(_Msg, St) -> {noreply, St}.
 
 handle_info({nodedown, Node}, #{handler := H, monitored := Mon} = St) ->
     _ = try H(Node) catch _:_ -> ok end,
-    %% 配对累积的 monitor_node(true)：计数归零，避免泄漏。monitor_node/2 的 true
-    %% 是引用计数的——只从 map 里删而不 demonitor，节点每次 down/up 都会净 +1，
-    %% 下次 down 就会收到多条 {nodedown,_}，on_nodedown/1 被重复触发。
+    %% 配对 monitor_node(true) 的引用计数：显式 demonitor 归零。注意 ERTS 在
+    %% handle_nodedown 时本就会清理该节点的 monitor 项，所以这里主要是显式的
+    %% 「挂/撤成对」卫生（防御未来语义变化），而非修复一个可观测的泄漏。
     unmonitor_node(Node),
     {noreply, St#{monitored := maps:remove(Node, Mon)}};
 handle_info({nodeup, _Node}, St) ->
