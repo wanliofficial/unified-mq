@@ -49,8 +49,6 @@ spikes/*/.data/
 /backups/
 
 # T14 harness scratch: rendered sys.config/vm.args, crash-test data, reports
-/tools/docker/data/
-/tools/docker/run/
 /tools/docker/__pycache__/
 /tools/docker/powerloss.img
 /tools/docker/powerloss-mount/
@@ -61,38 +59,32 @@ spikes/*/.data/
 # S2-I benchmark driver scratch
 /tools/bench/__pycache__/
 
-# T15 harness scratch: broker data volume, captures, reports, analyzer beam
-/test/protocol-compatibility/mqtt/data/
-/test/protocol-compatibility/mqtt/run/
+# Harness run artefacts (broker data volume, captures, reports, analyzer beams)
+# all live under `_build/t15/<proto>/', covered by the global `_build/' rule
+# above. They used to sit in the source tree, which broke `rebar3 ct' for
+# anyone who ran a harness first (`cp -RpL test/' dies on the mode-0400
+# `.erlang.cookie' the containers leave behind).
+
+# T15 harness scratch: __pycache__ only (artefacts moved to _build/t15/mqtt)
 /test/protocol-compatibility/mqtt/__pycache__/
 
 # S8-B MQTT-over-WS harness scratch: broker data volume, boot-module beam, reports
-/test/protocol-compatibility/mqtt_ws/data/
-/test/protocol-compatibility/mqtt_ws/run/
 /test/protocol-compatibility/mqtt_ws/_build/
 /test/protocol-compatibility/mqtt_ws/__pycache__/
 
 # S8-C MQTT-SN harness scratch: broker data volume, boot-module beam, reports
-/test/protocol-compatibility/mqtt_sn/data/
-/test/protocol-compatibility/mqtt_sn/run/
 /test/protocol-compatibility/mqtt_sn/_build/
 /test/protocol-compatibility/mqtt_sn/__pycache__/
 
 # S5 WS harness scratch: broker data volume, boot-module beam, reports
-/test/protocol-compatibility/ws/data/
-/test/protocol-compatibility/ws/run/
 /test/protocol-compatibility/ws/_build/
 /test/protocol-compatibility/ws/__pycache__/
 
 # S5 NATS harness scratch: broker data volume, Go binary, boot-module beam, reports
-/test/protocol-compatibility/nats/data/
-/test/protocol-compatibility/nats/run/
 /test/protocol-compatibility/nats/_build/
 /test/protocol-compatibility/nats/__pycache__/
 
 # S5 AMQP harness scratch: broker data volume, Go binary, boot-module beam, reports
-/test/protocol-compatibility/amqp/data/
-/test/protocol-compatibility/amqp/run/
 /test/protocol-compatibility/amqp/_build/
 /test/protocol-compatibility/amqp/__pycache__/
 
@@ -108,15 +100,11 @@ spikes/*/.data/
 /test/protocol-compatibility/s9f/**/node.err
 
 # S5 Kafka harness scratch: broker data volume, compiled classes, boot-module beam, reports
-/test/protocol-compatibility/kafka/data/
-/test/protocol-compatibility/kafka/run/
 /test/protocol-compatibility/kafka/_build/
 /test/protocol-compatibility/kafka/__pycache__/
 /test/protocol-compatibility/kafka/classes/
 
 # S5 Pulsar harness scratch: broker data volume, compiled classes, boot-module beam, reports
-/test/protocol-compatibility/pulsar/data/
-/test/protocol-compatibility/pulsar/run/
 /test/protocol-compatibility/pulsar/_build/
 /test/protocol-compatibility/pulsar/__pycache__/
 /test/protocol-compatibility/pulsar/classes/

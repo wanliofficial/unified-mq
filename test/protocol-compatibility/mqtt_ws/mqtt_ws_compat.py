@@ -55,8 +55,11 @@ from paho.mqtt.enums import CallbackAPIVersion
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-DATA = HERE / "data"
-RUN = HERE / "run"
+# Run artefacts live under _build/, never in the source tree: `rebar3 ct`
+# copies test/ with `cp -RpL`, so a leftover mode-0400 `.erlang.cookie`
+# here would abort the whole CT run for everyone who ran this harness.
+RUN = ROOT / "_build" / "t15" / "mqtt_ws" / "run"
+DATA = ROOT / "_build" / "t15" / "mqtt_ws" / "data"
 BUILD = HERE / "_build"
 
 TOPIC_ROOT = "compat/ws"

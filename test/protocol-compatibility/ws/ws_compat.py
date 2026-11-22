@@ -50,7 +50,10 @@ from pathlib import Path
 import websocket  # websocket-client 1.x
 
 ROOT = Path(__file__).resolve().parents[3]
-DATA = ROOT / "test" / "protocol-compatibility" / "ws" / "data"
+# Run artefacts live under _build/, never in the source tree: `rebar3 ct`
+# copies test/ with `cp -RpL`, so a leftover mode-0400 `.erlang.cookie` here
+# would abort the whole CT run for everyone who ran this harness.
+DATA = ROOT / "_build" / "t15" / "ws" / "data"
 ESCRIPT = ROOT / "test" / "protocol-compatibility" / "ws" / "start_broker.escript"
 
 # Opcode of the broker's binary delivery frame (3 = "message").

@@ -51,8 +51,11 @@ import paho.mqtt.client as mqtt
 
 ROOT = Path(__file__).resolve().parents[3]
 MQTT_DIR = Path(__file__).resolve().parent
-RUN = MQTT_DIR / "run"
-DATA = MQTT_DIR / "data"
+# Run artefacts live under _build/, never in the source tree: `rebar3 ct`
+# copies test/ with `cp -RpL`, so a leftover mode-0400 `.erlang.cookie` here
+# would abort the whole CT run for everyone who ran this harness.
+RUN = ROOT / "_build" / "t15" / "mqtt" / "run"
+DATA = ROOT / "_build" / "t15" / "mqtt" / "data"
 EBIN = RUN / "ebin"
 CAPTURES = RUN / "captures"
 RELEASE = ROOT / "_build" / "t14" / "rel" / "unified_mq"

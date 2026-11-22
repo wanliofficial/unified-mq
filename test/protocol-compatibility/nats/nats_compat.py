@@ -44,8 +44,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 HERE = ROOT / "test" / "protocol-compatibility" / "nats"
-DATA = HERE / "data"
-RUN = HERE / "run"
+# Run artefacts live under _build/, never in the source tree: `rebar3 ct`
+# copies test/ with `cp -RpL`, so a leftover mode-0400 `.erlang.cookie`
+# here would abort the whole CT run for everyone who ran this harness.
+RUN = ROOT / "_build" / "t15" / "nats" / "run"
+DATA = ROOT / "_build" / "t15" / "nats" / "data"
 TOKEN = "compat-secret"
 GO = os.environ.get("GO_BIN", "/home/wanli/Development/go1.26.10/bin/go")
 

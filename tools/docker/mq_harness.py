@@ -38,8 +38,9 @@ import paho.mqtt.client as mqtt
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKER = ROOT / "tools" / "docker"
-DATA = DOCKER / "data"
-RUN = DOCKER / "run"
+# Run artefacts live under _build/, never in the source tree.
+DATA = ROOT / "_build" / "t15" / "docker" / "data"
+RUN = ROOT / "_build" / "t15" / "docker" / "run"
 RELEASE = ROOT / "_build" / "t14" / "rel" / "unified_mq"
 CONTAINER = "unified-mq-s1-broker"
 IMAGE = "erlang:28.3.1.0"
