@@ -194,8 +194,9 @@ replicate_sync(Op) ->
 
 %% Fire-and-forget cursor replication (the ONLY site that may block: the flush
 %% tick inside the worker). No hook -> no spawn at all (I2: the flush tick does
-%% not pay for replication on a single node). When a hook exists the per-row Op
-%% is spawned so the worker's tick never waits on a replica round-trip.
+%% not pay for replication on a single node). When a hook exists it spawns one
+%% process per flushed subscription (which iterates the SubRef's cursor rows),
+%% so the worker's tick never waits on a replica round-trip.
 -spec replicate_cursor_async(term()) -> ok.
 replicate_cursor_async(SubRef) ->
     case session_replicator() of
@@ -1017,8 +1018,9 @@ flush_sub_cursors(SubRef, State) ->
             case broker_subscription_files:write_cursors(SubRef, cursors_body(SubRef)) of
                 ok ->
                     %% MQ-17 §3.4: cursors replicate ASYNC, from inside the worker
-                    %% (the only site that may run in it). The helper spawns per
-                    %% row so the flush tick never waits on a replica round-trip.
+                    %% (the only site that may run in it). The helper spawns one
+                    %% process per flushed subscription (iterating the SubRef's
+                    %% cursor rows) so the flush tick never waits on a round-trip.
                     _ = replicate_cursor_async(SubRef),
                     State#{cursor_dirty := maps:remove(SubRef, Dirty)};
                 {error, _Reason} ->

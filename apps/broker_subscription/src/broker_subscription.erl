@@ -196,7 +196,7 @@ retry(SubRef, PartitionId, Offset, Consumer) ->
 %% in-flight set, §5.3 tier 3). This layer never inspects it -- that is R7's
 %% point: the recovery answer may be stale, which means duplicates, which MQTT
 %% 3.1.1 §4.1 already allows. Still keyed by client (ADR-019 §19.3).
--spec inflight(binary(), term()) -> ok.
+-spec inflight(binary(), term()) -> ok | {error, term()}.
 inflight(ClientId, Term) ->
     broker_subscription_worker:inflight(ClientId, Term).
 
