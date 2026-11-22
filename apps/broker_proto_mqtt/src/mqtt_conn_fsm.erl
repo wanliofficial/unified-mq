@@ -33,7 +33,7 @@
 -module(mqtt_conn_fsm).
 -behaviour(gen_statem).
 
--export([start_link/2, claims_to_make/3]).
+-export([start_link/2, takeover_target/2]).
 -export([init/1, callback_mode/0, handle_event/4, terminate/3, code_change/4]).
 
 -include("mqtt_frame.hrl").
@@ -199,32 +199,52 @@ handle_event(_Et, Content, awaiting_owner, D) ->
     {keep_state, D};
 
 %% Plan 2 §6: owner 节点死亡且正是本会话的 owner → claim 该分区（本节点持连），
-%% 然后重读本地 session 就地续传（无新 CONNECT/CONNACK）。仅在 session_replication
-%% 开、且 owner_node 匹配本死亡节点时动作；否则透传给后续子句（不吞普通事件）。
+%% 就地续传（无新 CONNECT/CONNACK）。仅在 session_replication 开、且 owner_node
+%% 匹配本死亡节点时动作；否则透传给后续子句（不吞普通事件）。
 %%
-%% 必须放在 S8 catch-all 之前：`erlang:monitor_node/2' 投递的 `{nodedown,Node}' 是
-%% 普通 info 消息（`handle_event_function' 下 EventType = info），否则会落入
-%% transport:decode_msg/2 的 `other' 分支被当成未知事件记录。guard `Node =/= undefined'
-%% 且 `#st{owner_node = Node}' 保证只拦本会话 owner 的那次 nodedown。
+%% 必须放在 S8 catch-all 之前：`erlang:monitor_node/2' 投递的 `{nodedown,Node}' /
+%% `{nodeup,Node}' 是普通 info 消息（`handle_event_function' 下 EventType = info），
+%% 否则会落入 transport:decode_msg/2 的 `other' 分支被当成未知事件记录。
+%% guard `#st{owner_node = Node}' 且 `Node =/= undefined' 保证只拦本会话 owner
+%% 的那次 nodedown；body 内再用 takeover_target/2 显式断言该意图（可单测）。
 handle_event(_Et, {nodedown, Node}, _StateName,
              #st{owner_node = Node, owner_part = P, client_id = ClientId} = D)
   when Node =/= undefined, is_integer(P) ->
+    true = takeover_target(D#st.owner_node, Node),
     case application:get_env(broker_cluster, session_replication, false) of
         true ->
-            _ = try
-                    Epoch = case broker_cluster:epoch(P) of
-                                {ok, E} when is_integer(E) -> E + 1;
-                                _ -> 1
-                            end,
-                    _ = broker_cluster:claim(P, node(), Epoch),
-                    %% 本节点成为新 owner，本地已有副本：重读 session 以确保仍 attached。
-                    _ = broker_subscription:session(ClientId),
-                    ok
-                catch _:_ -> ok end,
-            {keep_state, D#st{owner_node = node()}};
+            %% owner 节点死亡：本节点持连，抢占该分区所有权。owner 死亡是集群事件，
+            %% 本地 attachment（?ATTACHMENTS，本 pid）与本地 worker 未死，无需 re-attach；
+            %% claim 成功后生产者不再被 authorize_append fence，加上周期 poll tick
+            %% （arm_poll，约 1s 兜底）拉取积压，投递自行恢复。
+            Epoch = try case broker_cluster:epoch(P) of
+                            {ok, E} when is_integer(E) -> E + 1;
+                            _ -> 1
+                        end
+                    catch _:_ -> 1 end,
+            try broker_cluster:claim(P, node(), Epoch) of
+                {ok, _} ->
+                    log(info, "takeover: claimed partition ~p for ~p",
+                        [P, ClientId]),
+                    {keep_state, D#st{owner_node = node()}};
+                Other ->
+                    %% claim 失败（stale_epoch / no_replica / 应用不可达）：保持连接
+                    %% （透明性优先），记录告警，不乐观翻 owner_node。
+                    log(warning, "takeover claim failed for partition ~p: ~p",
+                        [P, Other]),
+                    {keep_state, D}
+            catch
+                _:_ -> %% claim 抛出（应用不可达 / 内部错误）：同上，保持连接。
+                    log(warning, "takeover claim raised for partition ~p", [P]),
+                    {keep_state, D}
+            end;
         _ ->
             {keep_state, D}
     end;
+%% Plan 2 §6: owner flap 恢复时的 `{nodeup,_}' 噪声必须吞掉（no-op）——不重新装
+%% monitor、不做 re-attach（那需要一次全新 CONNECT）。严格放在 catch-all 之前。
+handle_event(_Et, {nodeup, _Node}, _StateName, D) ->
+    {keep_state, D};
 
 %% S8: before the state matrix sees an event, the transport gets a look at it.
 %% `{tcp,...}' / `{ssl,...}' / `{quic,...}' are transport-shaped, and each
@@ -942,22 +962,13 @@ maybe_monitor_owner(ClientId, D) ->
             D
     end.
 
-%% @doc 纯逻辑（Plan 2 §4 步骤 3 的局部判断，连接信息不进 ra）：给定 owner 视图
-%% `#{ClientId => {Partition, Owner}}`、死亡节点 DeadNode、本节点持连集合
-%% HeldClients，返回需 claim 的 `[{ClientId, Partition}]`。条件：Owner =:= DeadNode
-%% 且 ClientId 在本节点持连集合内（持连才可能本地有该会话副本）。
--spec claims_to_make(#{binary() => {non_neg_integer(), node()}}, node(),
-                     [binary()]) -> [{binary(), non_neg_integer()}].
-claims_to_make(View, DeadNode, HeldClients) ->
-    Held = sets:from_list(HeldClients),
-    maps:fold(
-      fun(ClientId, {Partition, Owner}, Acc) when Owner =:= DeadNode ->
-              case sets:is_element(ClientId, Held) of
-                  true -> [{ClientId, Partition} | Acc];
-                  false -> Acc
-              end;
-         (_ClientId, _Pair, Acc) -> Acc
-      end, [], View).
+%% @doc 纯判定：owner 死亡事件是否属于本连接、且可发起 claim。本 conn_fsm 一个连接
+%% 只持一个会话（一个 owner_part/owner_node），故只需比对记录的 owner 与死亡节点。
+%% 与 nodedown 子句的 guard `#st{owner_node = Node}' 同义，提到 body 里作为可单测的
+%% 显式意图断言（`true = takeover_target(D#st.owner_node, Node)'）。
+-spec takeover_target(node() | undefined, node()) -> boolean().
+takeover_target(OwnerNode, NodedownNode) ->
+    OwnerNode =/= undefined andalso OwnerNode =:= NodedownNode.
 
 clean_session_teardown(D) ->
     %% ADR-019 §19.2: an exclusive subscription is *removed*, a group membership
@@ -3135,7 +3146,19 @@ terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
     end,
     _ = D#st.socket =/= undefined
         andalso (try (D#st.transport):close(D#st.socket) catch _:_ -> ok end),
+    %% Plan 2 §6: 配对拆除 maybe_monitor_owner/3 装的 owner monitor（纯防御性/文档性，
+    %% VM 本会清理；显式 demonitor 让 install/uninstall 成对可见）。
+    demonitor_owner(D#st.owner_node),
     ok.
+
+%% Plan 2 §6: owner_node 是真实远端节点时拆除 monitor。undefined / node()（本机
+%% owner，本就未 monitor）为 no-op。crash-tolerant：进程退出时任何 BIF 都不该失败。
+demonitor_owner(undefined) -> ok;
+demonitor_owner(Node) when Node =:= node() -> ok;
+demonitor_owner(Node) when is_atom(Node) ->
+    _ = try erlang:monitor_node(Node, false) catch _:_ -> ok end,
+    ok;
+demonitor_owner(_) -> ok.
 
 publish_will(mqtt_disconnect, _D) ->
     ok;
