@@ -73,6 +73,8 @@ Plan 1 只交付**会话状态复制管线**：订阅 / inflight / 游标作为�
 
 多节点 dist SUITE 用 `peer:start_link` 起真节点、共享同一 ownership 视图（partition 0 owner=N2、副本含 N1），是 Plan 1 端到端的硬证据：**开启后会话 Op 确实到达副本本地表，关闭后不到达**。
 
+**全量基线（2026-11-22）**：`rebar3 ct` 全绿 **1663/1663**（含 Plan 1 新增的 11 + 4 + 2 个用例）。全量首跑曾暴露一个仅在套件顺序下触发的测试缺陷：`broker_cluster_session_rep_SUITE:majority_failure_counts_acks` 用 `application:get_env/2` 保存 `replicate_timeout_ms`，但该函数返回 `{ok, V}` 而非裸值；当 `broker_cluster_SUITE` 先行把该 env 设为 300 时，`after` 分支的 `case` 撞上 `{ok, 300}` 崩溃。已改用 3 元 `get_env/3` 修复（commit `17ac675`），单套件与全量顺序均复验通过。
+
 ## 3. Plan 1 / Plan 2 边界（诚实记录）
 
 > 以下为 Plan 1 的已知边界，**非缺陷**，是 Plan 1 可独立交付、为 Plan 2 铺路的正确切口。
