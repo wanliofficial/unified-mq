@@ -6,14 +6,20 @@
 %% `broker_cluster:assign/4' / `claim/3' / `authorize_append/2` 都是穿过
 %% `ra:process_command/3` 的真 ra 命令，分区必须先存在于机器状态里。
 %%
-%% 套件证明 spec §9 五用例（会话状态在 owner 崩溃后存活）：
+%% 套件证明 spec §9 五用例（会话状态在 owner 崩溃后存活）。**配对设计**：用例 1 与
+%% 用例 2 是一对正反证明——用例 1 证明「复制开启时，订阅在 owner 崩溃后**存在**于
+%% 副本（Holder）」，用例 2 证明「复制**关闭**时，订阅**不**出现在副本、kill owner 后
+%% Holder 上 `session/1' 诚实返回 `{error, not_found}'（无陈旧幽灵）」。两用例都不可
+%% 被「复制删掉仍通过」的退化测试蒙混。
 %%
-%%   1. `session_survives_owner_crash' —— kill owner 后，连在 Holder 的客户端其
-%%      本地会话视图（订阅集 + 游标）保持不变，游标不回退；Holder 提 claim 成为
-%%      新 owner 后可写。
-%%   2. `subscribe_not_lost_on_crash' —— kill 一个非 owner 副本后，订阅实体行仍是
-%%      完整的单行（无半截行）。
-%%   3. `inflight_dedup_preserved' —— QoS2 in-flight blob 在 kill owner 后原样恢复。
+%%   1. `session_survives_owner_crash' —— 会话分区属 Owner；订阅在** doomed Owner**
+%%      上建立，复制**落到 Holder 的本地副本表**后才 kill Owner；Holder 提 claim 成
+%%      新 owner 后其本地会话视图（订阅集 + 游标）保持不变，游标不回退；可写。
+%%   2. `subscribe_not_lost_on_crash' —— **复制关闭**下，Owner 上建的订阅**绝不**出现
+%%      在 Holder（无幽灵）；kill Owner 后 Holder 上 `session/1' 返回 `{error, not_found}'。
+%%   3. `inflight_dedup_preserved' —— QoS2 in-flight blob 在** doomed Owner** 上建立，
+%%      复制**落到 Holder 的本地副本 inflight 表**后才 kill Owner；接管节点 inflight
+%%      原样恢复、无重复行。
 %%   4. `stale_owner_fenced' —— 所有权被 claim 抢走后，旧 owner（仍在线）以陈旧
 %%      epoch 写入被 fencing 拒；其它旧副本亦然；新 owner 接受当前 epoch。
 %%   5. `single_node_unchanged' —— 开关关闭（I2）时无 session-replicator 钩子，
@@ -94,73 +100,146 @@ end_per_testcase(_Case, Config) ->
 
 %%%_* Cases ----------------------------------------------------------------
 
-%% 用例 1：会话分区属 Owner；客户端会话状态在 Holder（持连节点）。kill Owner 后
-%% Holder 提 claim 成为新 owner；本地会话视图（订阅集 + 游标）保持，游标不回退。
+%% 用例 1（与用例 2 配对的**正面**证明）：会话分区属 Owner；订阅**在 doomed Owner**
+%% 上建立**，复制**先落到 Holder 的本地副本表**（`wait_until' 轮询 `?ENTITIES' +
+%% `?MEMBERS' 非空——此即复制断言），之后才 kill Owner；Holder 提 claim 成为新 owner
+%% 后其本地会话视图（订阅集 + 游标）保持不变、游标不回退，且可写。
 %%
 %% 游标语义（实测 broker_cursor:advance_plain/2 + next_read/1）：游标是**连续前缀
 %% 水位**（next_read = offset）。对水位之上的 offset 调 ack 只把它塞进 `pending'，
 %% **不**前移水位；只有 ack 到当前连续位才级联前移。故这里先读初始水位 C0，再 ack
 %% C0 使水位真正前移到 Before（> C0），接管后断言 After >= Before（不回退），
-%% 而非草稿假定的「ack(…,5) → 游标 6」。
+%% 而非草稿假定的「ack(…,5) → 游标 6」。游标行经复制异步落到 Holder，故接管前先在
+%% Holder 侧轮询副本游标水位 ReplicatedBefore，断言 After >= ReplicatedBefore——
+%% 不断言硬编码 offset。
 session_survives_owner_crash(Config) ->
-    [Owner, Holder, Third] = peer_nodes(Config),
-    Nodes = peer_nodes(Config),
+    [Owner, Holder, Third] = Nodes = peer_nodes(Config),
     ClientId = <<"surv">>,
     Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
     P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
     {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
-    {ok, SubRef} = rpc(Holder, ?MODULE, do_subscribe, [ClientId, <<"t/surv">>, 1]),
+    %% 会话写在 **doomed Owner** 上——它才是该会话分区的 owner，复制才有意义。
+    {ok, SubRef} = rpc(Owner, ?MODULE, do_subscribe, [ClientId, <<"t/surv">>, 1]),
+    %% === 复制断言（proof of replication）===
+    %% 在 kill 之前先等 Op 真正**落到 Holder 的本地副本表**。这一步是整套证明的
+    %% 关键：若复制被删成 no-op，Holder 的这两张表永远为空，下面的 wait_until 会
+    %% 超时失败，用例当场红——而非退化成「一直持有数据的节点没死」。
+    %% 这两张表正是 broker_subscription_worker:apply_replica({subscribe,...}) 写入的：
+    %% `?ENTITIES' 一条 {SubRef,Info} + `?MEMBERS' 每个消费者一条 {{ClientId,SubRef}}。
+    wait_until(
+      fun() ->
+              rpc(Holder, ?MODULE, replica_has_sub, [ClientId, SubRef]) =:= true
+      end),
     %% 游标是 **队列分区** 维度（订阅覆盖每个队列分区），与会话分区 P（所有权维度）
     %% 是两套独立编号，故这里取一个真实存在的队列分区 Q 来演示游标，而非会话分区 P。
-    [Q | _] = rpc(Holder, broker_queue, partition_ids, []),
-    %% 读初始水位，再 ack 该连续位使水位真正前移。
-    {ok, C0} = rpc(Holder, ?MODULE, do_cursor, [SubRef, Q]),
-    ok = rpc(Holder, ?MODULE, do_ack, [SubRef, Q, C0, ClientId]),
-    {ok, Before} = rpc(Holder, ?MODULE, do_cursor, [SubRef, Q]),
+    [Q | _] = rpc(Owner, broker_queue, partition_ids, []),
+    %% 读初始水位，再 ack 该连续位使水位真正前移（仍在 Owner 上）。
+    {ok, C0} = rpc(Owner, ?MODULE, do_cursor, [SubRef, Q]),
+    ok = rpc(Owner, ?MODULE, do_ack, [SubRef, Q, C0, ClientId]),
+    {ok, Before} = rpc(Owner, ?MODULE, do_cursor, [SubRef, Q]),
     ?assert(Before > C0),
+    %% 游标行也经复制异步落到 Holder（apply_replica({cursor,...}) 写 `?CURSORS'
+    %% {{SubRef,Q},Row}）。等它落定并记下 Holder 侧的副本水位 ReplicatedBefore，
+    %% 接管后断言 After >= ReplicatedBefore——不断言硬编码 offset，只断言不回退。
+    {ok, ReplicatedBefore} =
+        wait_until_cursor(
+          fun() ->
+                  case rpc(Holder, ?MODULE, replica_cursor_next_read, [SubRef, Q]) of
+                      not_found -> false;
+                      N when is_integer(N) -> {ok, N}
+                  end
+          end),
     %% 真 kill owner 节点（多数派仍在：Holder + Third）。
     ok = stop_peer(Config, Owner),
     %% Holder 提 claim（epoch 2）。ra 需先完成 leader 选举，故重试。
     {ok, 2} = retry(fun() -> rpc(Holder, broker_cluster, claim, [P, Holder, 2]) end,
                     30, 500),
-    %% 新 owner 可写；会话视图不变，游标不回退。
+    %% 新 owner 可写；会话视图不变，游标不回退（从 Holder 的副本恢复而来）。
     ok = rpc(Holder, broker_cluster, authorize_append, [P, 2]),
     {ok, Session} = rpc(Holder, ?MODULE, do_session, [ClientId]),
     ?assertMatch([#{sub_ref := SubRef}], maps:get(subs, Session)),
     {ok, After} = rpc(Holder, ?MODULE, do_cursor, [SubRef, Q]),
-    ?assert(After >= Before),
+    ?assert(After >= ReplicatedBefore),
     _ = Third,
     ok.
 
-%% 用例 2：kill 一个非 owner 副本后，订阅行仍是完整的单行（无半截行）。
+%% 用例 2（与用例 1 配对的**反面**证明）：复制**关闭**时，Owner 上建的订阅绝不
+%% 出现在 Holder——无陈旧幽灵。kill Owner 后 Holder 的 `session/1' 诚实返回
+%% `{error, not_found}'。若有人误把复制重新打开，下面的 `ets:lookup' 断言会抓到
+%% Holder 上的实体行，用例变红。
+%%
+%% **跨用例状态泄漏**：本用例在**同一组 peer**上把 `session_replication' 置为 false
+%% 并 `install_hooks()'，结束时**必须**恢复 true + `install_hooks()'——`all()' 顺序里
+%% 它排第 2，其后的用例 3/4/5 都依赖复制开启的钩子。故恢复动作显式放在末尾；又因
+%% 本用例结尾 kill 掉 Owner，恢复对死节点会 nodedown，故经 `restore_repl/1' 容错。
 subscribe_not_lost_on_crash(Config) ->
-    [Owner, Holder, Third] = peer_nodes(Config),
-    Nodes = peer_nodes(Config),
+    [Owner, Holder, Third] = Nodes = peer_nodes(Config),
     ClientId = <<"snl">>,
-    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
-    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
-    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
-    {ok, SubRef} = rpc(Holder, ?MODULE, do_subscribe, [ClientId, <<"t/snl">>, 1]),
-    ok = stop_peer(Config, Third),
-    %% 实体行要么整行在、要么整行不在。
-    ?assertMatch([{SubRef, _}],
-                 rpc(Holder, ets, lookup, [broker_subscription_entities, SubRef])),
-    {ok, Session} = rpc(Holder, ?MODULE, do_session, [ClientId]),
-    ?assertMatch([#{sub_ref := SubRef}], maps:get(subs, Session)),
-    _ = Owner,
+    HookKey = {broker_subscription_worker, session_replicator},
+    %% 复制关闭：init_per_testcase 装的是开启态。三台都关钩子。
+    ok = rpc(Owner, application, set_env, [broker_cluster, session_replication, false]),
+    ok = rpc(Owner, broker_cluster, install_hooks, []),
+    ok = rpc(Holder, application, set_env, [broker_cluster, session_replication, false]),
+    ok = rpc(Holder, broker_cluster, install_hooks, []),
+    ok = rpc(Third, application, set_env, [broker_cluster, session_replication, false]),
+    ok = rpc(Third, broker_cluster, install_hooks, []),
+    %% 钩子确实被抹掉（install_session_hook 在 false 时 erase）。这是 absence 的判据。
+    ?assertEqual(undefined, rpc(Owner, persistent_term, get, [HookKey, undefined])),
+    try
+        Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+        P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+        {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+        %% 订阅仍建在 owner（Owner）上。
+        {ok, SubRef} = rpc(Owner, ?MODULE, do_subscribe, [ClientId, <<"t/snl">>, 1]),
+        %% 给任何「本不该发生的异步复制」一个落地的窗口。
+        timer:sleep(500),
+        %% 复制已关：Holder 的实体表必须为空（无幽灵行）。
+        ?assertEqual([], rpc(Holder, ets, lookup, [broker_subscription_entities, SubRef])),
+        %% kill owner 后，Holder 上从未有过该会话——诚实的缺席。
+        ok = stop_peer(Config, Owner),
+        ?assertEqual({error, not_found}, rpc(Holder, ?MODULE, do_session, [ClientId])),
+        ok
+    after
+        %% 恢复复制开启，避免污染后续用例（见用例头注释）。Owner 已被 kill，
+        %% restore_repl/1 对死节点静默跳过。
+        restore_repl(Owner),
+        restore_repl(Holder),
+        restore_repl(Third),
+        ok
+    end.
+
+%% 容错恢复：节点已死（如本用例 kill 掉的 Owner）时静默跳过，绝不让 after 块把
+%% 用例标红。
+restore_repl(Node) ->
+    try rpc(Node, application, set_env, [broker_cluster, session_replication, true])
+    catch _:_ -> ok end,
+    try rpc(Node, broker_cluster, install_hooks, [])
+    catch _:_ -> ok end,
     ok.
 
 %% 用例 3：QoS2 会话 in-flight 建立后 kill owner；接管节点 inflight 原样恢复、无重复行。
 inflight_dedup_preserved(Config) ->
-    [Owner, Holder, _Third] = peer_nodes(Config),
-    Nodes = peer_nodes(Config),
+    [Owner, Holder, _Third] = Nodes = peer_nodes(Config),
     ClientId = <<"dedup">>,
     Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
     P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
     {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
-    {ok, _SubRef} = rpc(Holder, ?MODULE, do_subscribe, [ClientId, <<"t/dedup">>, 2]),
+    %% 订阅与 inflight 都建在 doomed Owner 上。
+    {ok, _SubRef} = rpc(Owner, ?MODULE, do_subscribe, [ClientId, <<"t/dedup">>, 2]),
     Blob = #{vsn => 3, pending => [{1, a}], session_expires_at => undefined},
-    ok = rpc(Holder, ?MODULE, do_inflight, [ClientId, Blob]),
+    ok = rpc(Owner, ?MODULE, do_inflight, [ClientId, Blob]),
+    %% === 复制断言（proof of replication）===
+    %% inflight 复制是 fire-and-forget（replicate_inflight_async spawn），不等
+    %% ack。kill 前先等 Blob 真正落到 Holder 的 `?INFLIGHT' 本地表
+    %% （apply_replica({inflight,...}) 写 {ClientId,Term}）。复制若成 no-op，
+    %% 这里永远等不到，用例当场红。
+    wait_until(
+      fun() ->
+              case rpc(Holder, ets, lookup, [broker_subscription_inflight, ClientId]) of
+                  [{_, Blob}] -> true;
+                  _ -> false
+              end
+      end),
     ok = stop_peer(Config, Owner),
     {ok, 2} = retry(fun() -> rpc(Holder, broker_cluster, claim, [P, Holder, 2]) end,
                     30, 500),
@@ -170,8 +249,7 @@ inflight_dedup_preserved(Config) ->
 
 %% 用例 4：所有权被 claim 抢走后，旧 owner 用陈旧 epoch 写入被 fencing 拒。
 stale_owner_fenced(Config) ->
-    [Owner, Holder, Third] = peer_nodes(Config),
-    Nodes = peer_nodes(Config),
+    [Owner, Holder, Third] = Nodes = peer_nodes(Config),
     ClientId = <<"fence">>,
     Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
     P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
@@ -208,7 +286,14 @@ single_node_unchanged(Config) ->
                      [{broker_subscription_worker, session_replicator}, undefined])),
     ok.
 
-%%%_* Cluster / peer-side helpers (run on the test node) ------------------
+%%%_* Cluster helpers + do_* session wrappers --------------------------------
+%%
+%% `form_cluster_h/1' runs on the TEST node (it rpc's into each peer to hang the
+%% metadata server). The rest of this section are thin wrappers that run ON THE
+%% PEER via rpc: `assign_partition/4' and `boot_data_plane/0' execute in the peer's
+%% process, and the `do_*' session wrappers (`do_subscribe/3', `do_ack/4',
+%% `do_cursor/2', `do_session/1', `do_inflight/2') call `broker_subscription' in the
+%% peer whose ETS tables they read/write.
 
 %% 每台挂元数据服，组成一个真正的 ra 组。
 form_cluster_h(Nodes) ->
@@ -254,6 +339,27 @@ do_session(ClientId) ->
     broker_subscription:session(ClientId).
 do_inflight(ClientId, Term) ->
     broker_subscription:inflight(ClientId, Term).
+
+%%%_* Replication-proof peer-side readers (run on the peer) ----------------
+%%
+%% 这三者在 peer 上跑，读的是该 peer **本地**的会话表——它们正是
+%% broker_subscription_worker:apply_replica/1 的写入目标，故「非空」即「复制确实
+%% 发生了」的硬证据。
+
+%% Holder 本地是否已有该订阅的实体行 + 成员行（apply_replica({subscribe,...})
+%% 一次写两张表：`?ENTITIES' 一条 {SubRef,Info}、`?MEMBERS' 每个消费者一条）。
+replica_has_sub(ClientId, SubRef) ->
+    HasEntity = ets:lookup(broker_subscription_entities, SubRef) =/= [],
+    HasMember = ets:lookup(broker_subscription_members, {ClientId, SubRef}) =/= [],
+    HasEntity andalso HasMember.
+
+%% Holder 本地副本游标水位（apply_replica({cursor,...}) 写 `?CURSORS'
+%% {{SubRef,Q},Row}）。无该行为 `not_found'。
+replica_cursor_next_read(SubRef, Q) ->
+    case ets:lookup(broker_subscription_cursors, {SubRef, Q}) of
+        [{_, Row}] -> broker_cursor:next_read(Row);
+        [] -> not_found
+    end.
 
 %%%_* Peers ----------------------------------------------------------------
 
@@ -315,6 +421,8 @@ prepare_peer(DataDir) ->
     _ = application:load(broker_cluster),
     ok = application:set_env(broker_cluster, data_dir, DataDir),
     ok = application:set_env(broker_cluster, members, []),
+    ok = application:set_env(broker_cluster, quorum_timeout_ms, 3000),
+    ok = application:set_env(broker_cluster, replicate_timeout_ms, 1000),
     ok = filelib:ensure_dir(filename:join(DataDir, "x")),
     {ok, _} = application:ensure_all_started(ra),
     application:set_env(ra, data_dir, filename:absname(DataDir)),
@@ -339,6 +447,20 @@ start_meta(Members) ->
 %%%_* Helpers --------------------------------------------------------------
 
 wait_until(Pred) -> wait_until(Pred, 20000, 100).
+
+%% 轮询一个返回 `{ok, V} | false' 的谓词，成功时返回 `{ok, V}'；否则超时失败。
+%% 用于复制断言里需要「等到值出现并取回它」的场景（如副本游标水位）。
+wait_until_cursor(Fun) ->
+    wait_until_cursor(Fun, 20000, 100).
+
+wait_until_cursor(_Fun, 0, _Step) -> ct:fail({timeout, cursor_replication});
+wait_until_cursor(Fun, Wait, Step) ->
+    try Fun() of
+        {ok, _} = Ok -> Ok;
+        _ -> timer:sleep(Step), wait_until_cursor(Fun, Wait - Step, Step)
+    catch
+        _:_ -> timer:sleep(Step), wait_until_cursor(Fun, Wait - Step, Step)
+    end.
 
 wait_until(_Pred, 0, _Step) -> ct:fail({timeout, ?MODULE});
 wait_until(Pred, Wait, Step) ->

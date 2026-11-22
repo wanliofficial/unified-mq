@@ -763,6 +763,8 @@ git commit -m "feat(broker_proto_mqtt): conn_fsm owner monitor + claim-on-nodedo
   - `session/1` 的 `subs` 是订阅 **map** 列表(`#{sub_ref := SubRef, ...}`),非裸 SubRef 列表,断言用 `?assertMatch([#{sub_ref := SubRef}], ...)`。
   - 会话分区空间(`session_partition_count`,所有权维度)与队列分区空间(`broker_subscription` 游标维度)是两套独立编号;用例 1 演示游标时用真实队列分区 `hd(broker_queue:partition_ids())`,而非会话分区号。
 
+   > **设计转向说明**:草稿原意是「不依赖 ra 真正选举,单元级可控 owner/epoch」(用 cache-only stub 直接指定 owner,换取确定性接管时序)。实现**刻意放弃**这一确定性,改用**真实 3 节点 ra 组**:因为 `claim/3` 是一条穿过 `ra:process_command/3` 的真 ra 命令,只有真 ra 才能串行化「谁是当前 owner」并在 owner 崩溃后完成 leader 选举;cache-only 的 stub 无法证明接管语义(谁被踢出、谁被选入、epoch 如何单调递增),那正是本套件要验的东西。
+
 - [ ] **Step 3: 跑全套**
 
 Run: `rm -rf _build/test/extras && rebar3 ct --suite=apps/broker_cluster/test/broker_session_replica_SUITE.erl`
