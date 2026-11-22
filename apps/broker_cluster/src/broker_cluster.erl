@@ -238,16 +238,19 @@ install_cross_node_hooks() ->
 %% the caller. This comment exists so future readers don't read the dead
 %% `{error,_}' branches below the call sites as if they enforced durability.
 install_session_hook() ->
-    case application:get_env(broker_cluster, session_replication, false) of
-        true ->
-            persistent_term:put(
-              {broker_subscription_worker, session_replicator},
-              fun(Op) -> broker_cluster_session_rep:replicate_session_of(Op) end),
-            ok;
-        _ ->
-            _ = persistent_term:erase({broker_subscription_worker, session_replicator}),
-            ok
-    end.
+    Result = case application:get_env(broker_cluster, session_replication, false) of
+                 true ->
+                     persistent_term:put(
+                       {broker_subscription_worker, session_replicator},
+                       fun(Op) -> broker_cluster_session_rep:replicate_session_of(Op) end),
+                     ok;
+                 _ ->
+                     _ = persistent_term:erase({broker_subscription_worker, session_replicator}),
+                     ok
+             end,
+    %% Plan 2: 开关切换后让 nodedown 监视进程重挂（无进程时安全 no-op）。
+    _ = broker_cluster_nodedown_mon:rearm(),
+    Result.
 
 %% @doc ADR-034 D4: broadcast a QoS0 message to the other members. Each member
 %% re-routes it against its own index (`broker_subscription:dispatch_qos0/1'), so

@@ -34,22 +34,25 @@ pick_new_owner(Partition, DeadNode) ->
 %% fire-and-forget：迁移提交失败（无 quorum）不崩溃，等下次重试或恢复。
 -spec on_nodedown(node()) -> ok.
 on_nodedown(DeadNode) ->
-    _ = try
-        View = broker_cluster:partition_view(),
-        maps:foreach(
-          fun(Partition, #{owner := Owner}) when Owner =:= DeadNode ->
-                  case pick_new_owner(Partition, DeadNode) of
-                      {ok, NewOwner, Epoch} ->
-                          _ = broker_cluster:migrate(
-                                Partition, DeadNode, NewOwner, Epoch),
-                          ok;
-                      _ ->
+    _ = try broker_cluster:partition_view() of
+            View when is_map(View) ->
+                maps:foreach(
+                  fun(Partition, Meta) ->
+                          _ = try
+                                  case Meta of
+                                      #{owner := Owner} when Owner =:= DeadNode ->
+                                          case pick_new_owner(Partition, DeadNode) of
+                                              {ok, NewOwner, Epoch} ->
+                                                  _ = broker_cluster:migrate(
+                                                        Partition, DeadNode,
+                                                        NewOwner, Epoch),
+                                                  ok;
+                                              _ -> ok
+                                          end;
+                                      _ -> ok
+                                  end
+                              catch _:_ -> ok end,
                           ok
-                  end;
-             (_Partition, _Meta) ->
-                  ok
-          end, View)
-    catch
-        _:_ -> ok
-    end,
+                  end, View)
+        catch _:_ -> ok end,
     ok.

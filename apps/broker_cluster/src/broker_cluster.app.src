@@ -2,7 +2,7 @@
     {description, "Metadata Raft ownership, epoch fencing and replicated commit"},
     {vsn, "0.1.0"},
     {registered, [broker_cluster_sup, broker_cluster_cache,
-                  broker_cluster_meta_ctl]},
+                  broker_cluster_meta_ctl, broker_cluster_nodedown_mon]},
     {mod, {broker_cluster_app, []}},
     {applications, [kernel, stdlib, sasl, crypto, public_key, broker_core,
                     broker_metrics, broker_meta, ra]},
