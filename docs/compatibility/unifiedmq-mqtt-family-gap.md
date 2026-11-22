@@ -65,7 +65,7 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-14 | 语义缺口 | 离线追赶无优先级 | 积压和新消息按 offset 混在一个序列里，深度越大首条越慢 | 没有独立离线队列。对外说明已写入 §4.6 |
 | MQ-15 | 未做完 | 共享订阅只在单节点 | `$share` 能建组、竞争消费。没有集群范围的再均衡 | 多节点时每个节点一组，不是一个消费组 |
 | MQ-16 | 已支持（2026-11-22）| MQTT 3.1 | Protocol Name `MQIsdp`、Level 3 的 CONNECT 被接受；3.1 的 ClientID 1–23、Will UTF-8、Remaining-Length 优先凭据、CONNACK 首字节恒 0 均按 3.1 原文实现；3.1.1/5.0 仅放宽 username-without-password（MQTT-3.1.2-22） | 设计见 `docs/superpowers/specs/2026-11-21-mqtt31-design.md` |
-| MQ-17 | 产品，不是报文缺口 | 桥接、规则引擎、集群会话副本的故障注入证明、吊销踢人、Prometheus/OTel | `docs/mqtt-feature-comparison.md` 里 `#5`–`#28` 在 2026-11-10 仍是 pending | 对标 fss-mqtt-broker / robustmq 时的差距，不是 3.1.1 互操作的前置条件 |
+| MQ-17 | 产品，不是报文缺口 | 桥接、规则引擎、集群会话副本的故障注入证明、~~吊销踢人~~（2026-11-22 已完成：按 principal 吊销 + 驱逐其全部活动会话，见 `docs/superpowers/specs/2026-11-22-mqtt-session-revocation-design.md`）、Prometheus/OTel | `docs/mqtt-feature-comparison.md` 里 `#5`–`#28` 在 2026-11-10 仍是 pending | 对标 fss-mqtt-broker / robustmq 时的差距，不是 3.1.1 互操作的前置条件 |
 
 MQ-01、MQ-02、MQ-03、MQ-04 已全部补齐（MQ-01/02/03 由 `120f1c8`「MQTT 5.0 Will Delay and SUBSCRIBE subscription options」落地；MQ-04 Topic Alias 由后续特性落地）。MQ-05 到 MQ-07 已全部落地（MQ-05 AUTH 与 MQ-07 CONNACK 能力回填由 `mq-auth-connack`，MQ-06 Request Response Information 由 `mq-request-response`）。MQ-08 到 MQ-14 是已经选定的语义，测试也覆盖了，对外说明已写入 `docs/mqtt-feature-comparison.md` §4.6（每条标注「刻意取舍/当前语义」，非缺陷），缺的不再是说明，而是一致的产品化取舍。
 

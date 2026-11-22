@@ -588,6 +588,8 @@ Authorization: Bearer <token>
 | GET | `/api/v1/backups` | 备份清单（名称、字节、mtime） |
 | POST | `/api/v1/backup` | 创建一次热备份 |
 | POST | `/api/v1/tls/reload` | 清 `ssl` PEM 缓存，轮换证书 |
+| POST | `/api/v1/revoke` | 吊销 principal（body `principal`、可选 `ttl_ms`），立即驱逐其全部活动连接 |
+| DELETE | `/api/v1/revoke/:principal` | 解除吊销，允许该 principal 重连 |
 
 `/readyz` 检查的 app：`broker_storage`、`broker_router`、`broker_queue`、`broker_subscription`、`broker_event`、`broker_security`。`broker_metrics` 与 `broker_admin` 故意不在其中：指标/管理面故障不应把 broker 摘出负载均衡。**判定口径是「已 started」而非「已 loaded」**：一个崩溃但未 unload 的 app 不会被算成就绪（S12-A 修复）。
 
@@ -624,6 +626,30 @@ curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
      -X POST http://127.0.0.1:8090/api/v1/backup
 ```
+
+#### 吊销（revocation）
+
+`POST /api/v1/revoke` 按 **principal（用户名）** 吊销身份。写入吊销后，broker 立即向该 principal 的**全部活动连接**发送 DISCONNECT 并关闭；关闭按正常断开的语义处理，**遗嘱（Will）不会发布**。吊销期内该 principal 的重连在 CONNECT 阶段被拒（rc 4 / v5 `0x86`），与「用户名或密码错误」不可区分，因此不会向客户端泄露吊销状态。
+
+```bash
+# 永久吊销，直到显式清除
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"principal":"alice"}' \
+     http://127.0.0.1:8090/api/v1/revoke
+# 带 TTL 的吊销（毫秒；到期自动失效）
+curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"principal":"alice","ttl_ms":600000}' \
+     http://127.0.0.1:8090/api/v1/revoke
+# 解除吊销
+curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+     http://127.0.0.1:8090/api/v1/revoke/alice
+```
+
+- `ttl_ms` 省略即**永久**吊销；给出时必须是非负整数。非法 JSON、缺 `principal`、`principal` 非字符串、`ttl_ms` 类型错误一律 **400**，且不改变吊销状态。
+- 驱逐对**已建立的连接**立即生效；`DELETE` 只解除吊销、**不会**把已被驱逐的客户端接回来（重连由客户端发起）。
+- **覆盖范围**：本特性是**节点本地**的，与 admission、drain 一致——集群内需在各节点分别调用；按租户/按 client_id 吊销、MQTT-SN 会话吊销不在本期范围。
+- **协议覆盖**：吊销的**拒绝重连**检查接在 MQTT 连接状态机（`mqtt_conn_fsm`）里；WS / NATS / AMQP / Kafka / Pulsar / WebRTC / A2A / MCP 仍走 `broker_security:authenticate/2`、`authenticate_conn/1`，**目前不查吊销表**——同一 principal 在这些协议上的连接不会被驱逐，重连也不会被拒。要全协议生效需要把检查下沉到统一认证入口，属后续工作。
+- 驱逐时 v5 连接收到 reason code `0x87`（Not authorized），3.1.1/3.1 收到不带原因码的 DISCONNECT。
 
 ---
 
