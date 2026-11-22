@@ -144,12 +144,21 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 
 `rebar3 compile` 干净（warnings-as-errors，无告警）。
 
-### 5.3 全量 CT 状态（未在本 Task 重跑）
+### 5.3 已知无关失败（历史记录复核）
 
-全量基线为 **1663**（Plan 1 交付时，2026-11-22），Plan 2 在此基础上新增本记录的用例。本 Task **没有**重跑全量 CT，以下为历史记录的修正，不构成新证据：
+全量基线为 **1663**（Plan 1 交付时，2026-11-22），Plan 2 在此基础上新增用例（实跑见 §5.4）。以下两条为历史记录的复核修正：
 
 - `broker_proto_mcp/test/mcp_dispatch_SUITE.erl`：历史记录称其「未跟踪 WIP、编译不过」。**在本分支该文件不存在**（`git ls-files | grep mcp_dispatch` 只有 `src/mcp_dispatch.erl`，测试目录只有 `mcp_listener_SUITE` / `mcp_route_SUITE` / `mcp_stdio_SUITE`），因此它**不是**本分支的失败来源，只是历史记录留下的旧条目。
 - `kafka_group_SUITE:session_timeout_sweeps_dead_member`：历史记录称其为既有 `wait_for` 缺陷。本 Task 实测复核：该套件其余 13 用例全绿，唯 `all()` 末位的这一例跑 240s 仍未出结果。原因是 `wait_for(Fun, 2000|4000)` 的第二个参数是**迭代次数**而非毫秒，每次 `timer:sleep(150)`，故实际预算是 300s / 600s 量级——**历史结论仍成立**，是既有缺陷、与 Plan 2 无关，未在本 Task 修复。
+
+### 5.4 全量 CT 实跑（2026-11-23 追加）
+
+2026-11-23 在 Plan 2 分支上实跑全量 `rebar3 ct`（OTP 29.1.2，先 `rm -rf _build/test/extras _build/test/logs`）：
+
+- **1729 passed, 1 failed**（1663 基线 + Plan 2 新增 66 例）。
+- 唯一失败 `mqtt_conn_SUITE:error_in_suite`，**不是产品缺陷**：`mqtt_conn_fsm_claim_SUITE` 已在 Task 5 review 中被 `git rm`，但 rebar3 把测试源码复制进 `_build/test/lib/broker_proto_mqtt/test/`，旧副本残留导致 CT 扫描时加载失败。清掉该残留后再跑 `mqtt_conn_SUITE` → **131/131 全绿**。
+  > **构建缓存陷阱（给后来者）**：删改测试套件后，仅 `rm -rf _build/test/extras` **不够**——rebar3 还会在 `_build/test/lib/<app>/test/` 保留一份旧源码副本。彻底的办法是 `rm -rf _build/test` 或至少删掉该目录下的残留文件，否则 CT 会报 `error_in_suite`（"cannot be compiled or loaded"），看起来像测试真的挂了。
+- `kafka_group_SUITE:session_timeout_sweeps_dead_member` 仍在全量中出现（既有缺陷，见上）。
 
 ## 6. 关联
 
