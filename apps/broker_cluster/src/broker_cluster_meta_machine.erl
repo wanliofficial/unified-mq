@@ -55,6 +55,8 @@ apply(#{index := Index}, Command, #{partitions := Ps} = State) ->
                 error ->
                     {State, {error, not_found}, []}
             end;
+        {claim, P, Node, Epoch} ->
+            claim(P, Node, Epoch, Index, Ps, State);
         {get, P} ->
             case maps:find(P, Ps) of
                 {ok, M} -> {State, {ok, M}, []};
@@ -91,6 +93,28 @@ assign(P, Owner, Replicas, Epoch, Phase, Index, Ps, State) ->
                   state => Phase, index => Index},
             broker_cluster_cache:put(P, M),
             {State#{partitions := Ps#{P => M}}, {ok, Epoch}, []}
+    end.
+
+%% Plan 2 (spec §4): 持连副本节点认领分区所有权。两条守卫：
+%%   1. epoch 单调（同 assign / finish_migration 的 E < Epoch 守卫）——防乱序/陈旧 claim；
+%%   2. Node 必须已在 replicas 集中（ADR-034 D7 在会话分区落地）——迁移目标必须
+%%      已持副本，否则拒绝。ra 串行 apply 保证全局唯一 owner。
+claim(P, Node, Epoch, Index, Ps, State) ->
+    case maps:find(P, Ps) of
+        {ok, #{epoch := E} = M} when E < Epoch ->
+            case lists:member(Node, maps:get(replicas, M, [])) of
+                true ->
+                    M1 = M#{owner => Node, epoch => Epoch, state => active,
+                            index => Index},
+                    broker_cluster_cache:put(P, M1),
+                    {State#{partitions := Ps#{P => M1}}, {ok, Epoch}, []};
+                false ->
+                    {State, {error, {not_a_replica, Node}}, []}
+            end;
+        {ok, #{epoch := E}} ->
+            {State, {error, {stale_epoch, E, Epoch}}, []};
+        error ->
+            {State, {error, not_found}, []}
     end.
 
 replicas_of(P, Ps) ->
