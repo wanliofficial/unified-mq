@@ -308,15 +308,7 @@ with_task(_Other, _TaskId, _ContextId) ->
     #{}.
 
 new_id() ->
-    url_base64(crypto:strong_rand_bytes(16)).
-
-url_base64(Bin) ->
-    Encoded = base64:encode(Bin),
-    iolist_to_binary([url_char(B) || <<B/integer>> <= Encoded, B =/= $=]).
-
-url_char($+) -> $-;
-url_char($/) -> $_;
-url_char(B) -> B.
+    broker_core_encoding:base64url(crypto:strong_rand_bytes(16)).
 
 timeout() ->
     application:get_env(broker_proto_a2a, task_timeout_ms, 30000).

@@ -250,7 +250,7 @@ validate_shapes(Card) ->
 -spec etag(integer(), map()) -> binary().
 etag(Version, Card) ->
     Digest = crypto:hash(sha256, iolist_to_binary(json:encode(Card))),
-    Hash = base64url(binary:part(Digest, 0, 12)),
+    Hash = broker_core_encoding:base64url(binary:part(Digest, 0, 12)),
     <<"\"", (integer_to_binary(Version))/binary, "-", Hash/binary, "\"">>.
 
 %% @doc `If-None-Match' comparison. Handles a comma-separated list, the `W/'
@@ -358,11 +358,3 @@ key(K) when is_list(K) -> unicode:characters_to_binary(K).
 
 trim(Bin) when is_binary(Bin) ->
     string:trim(Bin, both, " \t").
-
-base64url(Bin) ->
-    Encoded = base64:encode(Bin),
-    iolist_to_binary([url_char(B) || <<B/integer>> <= Encoded, B =/= $=]).
-
-url_char($+) -> $-;
-url_char($/) -> $_;
-url_char(B) -> B.

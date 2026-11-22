@@ -370,12 +370,4 @@ refused_reason(elicitation) -> <<"elicitation is not supported">>.
 %%%_* Ids ------------------------------------------------------------------
 
 token() ->
-    base64url(crypto:strong_rand_bytes(16)).
-
-base64url(Bin) ->
-    Encoded = base64:encode(Bin),
-    iolist_to_binary([url_char(B) || <<B/integer>> <= Encoded, B =/= $=]).
-
-url_char($+) -> $-;
-url_char($/) -> $_;
-url_char(B) -> B.
+    broker_core_encoding:base64url(crypto:strong_rand_bytes(16)).

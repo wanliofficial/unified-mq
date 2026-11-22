@@ -135,12 +135,4 @@ context_id(ContextId) when is_binary(ContextId), ContextId =/= <<>> -> ContextId
 context_id(_Other) -> new_id().
 
 new_id() ->
-    url_base64(crypto:strong_rand_bytes(16)).
-
-url_base64(Bin) ->
-    Encoded = base64:encode(Bin),
-    iolist_to_binary([url_char(B) || <<B/integer>> <= Encoded, B =/= $=]).
-
-url_char($+) -> $-;
-url_char($/) -> $_;
-url_char(B) -> B.
+    broker_core_encoding:base64url(crypto:strong_rand_bytes(16)).

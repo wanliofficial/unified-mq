@@ -428,7 +428,7 @@ create_push_config(#{tenant_id := Tenant, task_id := TaskId, url := Url,
 config_id_for(Tenant, TaskId, Url) ->
     Digest = crypto:hash(sha256, <<Tenant/binary, 0, TaskId/binary, 0,
                                     Url/binary>>),
-    base64url(binary:part(Digest, 0, 9)).
+    broker_core_encoding:base64url(binary:part(Digest, 0, 9)).
 
 get_push_config(Tenant, TaskId, ConfigId) ->
     case broker_meta:get_push_config(Tenant, TaskId, ConfigId) of
@@ -472,14 +472,6 @@ push_config_wire(#{tenant_id := Tenant, task_id := TaskId, config_id := ConfigId
         <<>> -> Base;
         S -> Base#{<<"authentication">> => #{<<"scheme">> => S}}
     end.
-
-base64url(Bin) ->
-    Encoded = base64:encode(Bin),
-    iolist_to_binary([url_char(B) || <<B/integer>> <= Encoded, B =/= $=]).
-
-url_char($+) -> $-;
-url_char($/) -> $_;
-url_char(B) -> B.
 
 %% @doc Validate the parts of `SendMessageRequest' this stage promises to
 %% understand. Everything else in the proto (configuration, push config,
