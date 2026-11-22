@@ -69,15 +69,19 @@ replicate_session_of(Op) ->
 replicate_session_best_effort(Op) ->
     try broker_cluster:partition_view() of
         View ->
-            maps:fold(
-              fun(Partition, Meta, ok) ->
+            %% `maps:foreach/2' is a side-effecting iteration: its fun is arity-2
+            %% `fun(K, V)' and receives NO accumulator (unlike `maps:fold/3'). The
+            %% partition key is passed straight through as the partition id to
+            %% `replicate_session/3', matching what the previous fold did.
+            maps:foreach(
+              fun(Partition, Meta) ->
                       case Meta of
                           #{replicas := Rs} when is_list(Rs) ->
                               _ = replicate_session(Partition, Op, Rs),
                               ok;
                           _ -> ok
                       end
-              end, ok, View)
+              end, View)
     catch
         _:_ -> ok
     end,

@@ -24,6 +24,12 @@
            %% owner plus `replicated_commit' (ADR-034 D7), otherwise assign /
            %% migrate are refused before they reach the log.
            {cross_node_delivery, false},
+           %% Session replication (spec §3.5 / I2): default `false'. Off means the
+           %% {broker_subscription_worker, session_replicator} hook is not
+           %% installed, so subscribe/unsubscribe/cursor stay single-node. Plan 1
+           %% note: even when on, the installed hook is fire-and-forget (always
+           %% `ok'); true majority-durable subscribe/unsubscribe is Plan 2.
+           {session_replication, false},
            %% One hop budget for a forwarded call; the caller's protocol
            %% adapter already has its own timeout, so this only bounds the rpc.
            {cross_node_timeout_ms, 2000},

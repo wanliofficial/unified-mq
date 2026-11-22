@@ -209,6 +209,26 @@ install_cross_node_hooks() ->
 %% session ops to replicas. OFF by default -> no hook installed, broker
 %% subscription paths are byte-for-byte single-node. The hook is fire-and-forget
 %% (spawns) so it never blocks the conn_fsm / worker callers.
+%%
+%% PLAN 1 SYNC-CONTRACT DEGRADATION (semantic debt, do not mistake for a live
+%% guarantee): the hook body installed here is
+%% `broker_cluster_session_rep:replicate_session_of/1', which is
+%% FIRE-AND-FORGET and ALWAYS returns `ok' (it spawns a detached best-effort
+%% broadcast and returns immediately, without inspecting replica acks). As a
+%% consequence the worker's SYNC majority-ack error branches are effectively
+%% INERT in Plan 1:
+%%   * `broker_subscription_worker:replicate_sync/1' returning `{error,_}' -- the
+%%     SUBACK can never actually fail on account of an unreachable replica, and
+%%   * `maybe_replicate_unsubscribe/2's' warning -- never fires, because no error
+%%     result ever propagates back.
+%% So subscribe/unsubscribe are NOT actually majority-durable yet: the op is
+%% best-effort broadcast to every replica set in the metadata mirror, with
+%% idempotent per-key overwrites on the receive side. Restoring a real
+%% synchronous majority-ack result (so a SUBACK genuinely fails when a replica
+%% can't be reached) is a PLAN 2 task that requires the session->partition
+%% routing map to target the right replica set and surface the ack verdict to
+%% the caller. This comment exists so future readers don't read the dead
+%% `{error,_}' branches below the call sites as if they enforced durability.
 install_session_hook() ->
     case application:get_env(broker_cluster, session_replication, false) of
         true ->
