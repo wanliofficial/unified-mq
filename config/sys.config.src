@@ -496,7 +496,13 @@
         max_connections => 1024}
     ]},
     {max_payload, 1048576},
-    {shared_poll_ms, 100}
+    {shared_poll_ms, 100},
+    %% NATS-JS: JetStream stream/consumer metadata. Absolute and OUTSIDE the
+    %% release tree (J8) -- the built-in default "data/jetstream" is relative
+    %% to the node CWD, so a release whose root has no `data/` directory
+    %% (read-only image, fresh container) aborts boot with a badmatch enoent
+    %% from filelib:ensure_dir/1.
+    {js_data_dir, "/home/wanli/workspace/unified-mq/data/jetstream"}
   ]},
 
   {broker_meta, [

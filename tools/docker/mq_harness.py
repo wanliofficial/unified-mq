@@ -155,6 +155,23 @@ def substitute_data_dirs(text):
     text, n = data_pat.subn(map_data_dir, text)
     if n != 5:
         raise RuntimeError(f"sys.config render: data_dir matched {n}, expected 5")
+    # JetStream's metadata dir is a separate env key under the same J8 rule.
+    # Without this rewrite a release booted from a read-only/fresh root dies in
+    # nats_jetstream:init/1 on the relative default ("data/jetstream").
+    js_pat = re.compile(r'\{js_data_dir,\s*"([^"]*)"\}')
+
+    def map_js_data_dir(match):
+        host = Path(match.group(1))
+        try:
+            rel = host.relative_to(ROOT / "data")
+        except ValueError:
+            raise RuntimeError(
+                f"sys.config render: js_data_dir {host} is not under {ROOT / 'data'}")
+        return '{js_data_dir, "%s"}' % str(Path(DATA_IN_CONTAINER) / rel)
+
+    text, n = js_pat.subn(map_js_data_dir, text)
+    if n != 1:
+        raise RuntimeError(f"sys.config render: js_data_dir matched {n}, expected 1")
     backup_pat = re.compile(r'\{backup_dir,\s*"[^"]*"\}')
     text, nb = backup_pat.subn(
         '{backup_dir, "%s"}' % (Path(DATA_IN_CONTAINER) / "backups"), text)
