@@ -2,11 +2,27 @@
 %% and the batched flush tiers of §5.3.
 %%
 %% The shape mirrors what J4 froze for `broker_queue_store' and 【F3】 froze for
-%% the Router index: five `protected' ETS tables owned by this one process --
-%% every other process reads them lock-free (that is `cursor/2', `subscriptions/1',
+%% the Router index: tables owned by this one process -- every other
+%% process reads them lock-free (that is `cursor/2', `subscriptions/1',
 %% `dispatch/2', `role/2' in the facade), and only state *changes* are gen_server
 %% calls here. A consumer's cursor read must not serialize behind a flush tick
 %% that is fsyncing somebody else's file.
+%%
+%% MQ-17 (session replication) splits those tables' write access instead of
+%% leaving them uniformly `protected': `?ENTITIES', `?MEMBERS', `?CURSORS' and
+%% `?INFLIGHT' are `public' because `apply_replica/1' -- the receive side of
+%% replication -- runs in the rpc caller's process on a follower node, never in
+%% this gen_server, so a `protected' table would make every replica write a
+%% `badarg'. The same tradeoff `broker_storage_memory_store' and
+%% `broker_cluster_cache' already accepted, for the same reason. What keeps it
+%% honest is that replica ops are per-key overwrites that only ever land on a
+%% node that is *not* the session's owner (invariant I1); a duplicate delivery
+%% is therefore idempotent, not a lost update.
+%%
+%% `?ATTACHMENTS' stays `protected': it maps a ClientId to a *local* connection
+%% pid plus its monitor ref, which is exactly the thing that cannot cross a node
+%% boundary, and no session Op writes it. Widening it would only let a foreign
+%% process install a pid the eviction guard then trusts (K10).
 %%
 %% ADR-019 changed three things about this process:
 %%
@@ -48,7 +64,8 @@
 -export([start_link/0,
          subscribe/3, subscribe/4, join/5, join/6, join/7, unsubscribe/2,
          leave/2, ack/4, claim/4, release/4, retry/4,
-         inflight/2, attach/3, detach/2]).
+         inflight/2, attach/3, detach/2,
+         apply_replica/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -57,6 +74,23 @@
 -define(CURSORS, broker_subscription_cursors).
 -define(ATTACHMENTS, broker_subscription_attachments).
 -define(INFLIGHT, broker_subscription_inflight).
+
+%% MQ-17 §3.3: the replication wire protocol. A session Op is a self-contained
+%% description of one mutation, so a replica can apply it without a live
+%% connection, a Router or any of the ownership state the writer consults.
+%% `Info' is exactly the `?ENTITIES' row (it carries the `consumers' list, which
+%% is why `subscribe' needs no separate member op); `Row' is a cursor row as
+%% `broker_cursor' produces it.
+-type session_op() ::
+    {subscribe, ClientId :: binary(), SubRef :: term(), Info :: map()}
+  | {unsubscribe, ClientId :: binary(), SubRef :: term()}
+  | {inflight, ClientId :: binary(), Term :: term()}
+  | {cursor, SubRef :: term(), PartitionId :: term(), Row :: term()}.
+
+%% Exported so the initiator side (Task 3, the node that owns the session) can
+%% build the same Op values it hands to `apply_replica/1' without restating the
+%% tuple shape.
+-export_type([session_op/0]).
 
 %%%_* Client API -----------------------------------------------------------
 
@@ -122,6 +156,47 @@ attach(ClientId, Pid, Persist) ->
 
 detach(ClientId, Pid) ->
     gen_server:call(?MODULE, {detach, ClientId, Pid}).
+
+%% @doc 接收侧（spec §3.3 / 不变量 I1）：副本本地应用一个会话 Op。仿
+%% `broker_queue:append_replica'——不跑所有权守卫、不通知订阅者、不注册 Router，
+%% 纯写本地 ETS，覆盖写幂等（跨节点 rpc 可能重复投递）。
+%%
+%% 这是**唯一**一处刻意不经 `gen_server' 的写入：Task 3 的发起侧以
+%% `rpc:call(Node, ?MODULE, apply_replica, [Op])' 投递，本函数在 rpc 调用者的进程里
+%% 执行，而不是在这个 worker 里。它之所以成立，是因为四张会话表是 `public'
+%% （见 `create_tables/0'），且每个 Op 只覆盖整键（invariant I1：Op 只落在非 owner
+%% 节点，两个写者不会同时写同一行）。
+%%
+%% 磁盘与 Router 都不在这里动：副本不权威（`.subs'/`.cursors' 由本节点 worker 自管），
+%% 也不服务读者（不注册 Router 就没有 dispatch 路由到副本的 SubRef）。
+-spec apply_replica(session_op()) -> ok.
+apply_replica({subscribe, ClientId, SubRef, Info}) ->
+    %% `Info' 携带 `consumers'，所以订阅 Op 一次就把第二索引铺好：entity owns the
+    %% list, `?MEMBERS' only points (ADR-019).
+    true = ets:insert(?ENTITIES, {SubRef, Info}),
+    lists:foreach(
+      fun(C) -> true = ets:insert(?MEMBERS, {{C, SubRef}}) end,
+      maps:get(consumers, Info, [])),
+    _ = ClientId,
+    ok;
+apply_replica({unsubscribe, _ClientId, SubRef}) ->
+    %% 与 `remove_local/1' 同序：先删 entity 再删 cursor 行，最后清第二索引。
+    %% 节点已无 owner、也不服务读者，这里的顺序只为与本地拆除路径保持一致。
+    true = ets:delete(?ENTITIES, SubRef),
+    lists:foreach(fun({{S, P}, _Row}) -> true = ets:delete(?CURSORS, {S, P}) end,
+                  ets:match_object(?CURSORS, {{SubRef, '_'}, '_'})),
+    %% `unsubscribe' 只带一个 ClientId，但 `?MEMBERS' 的第二索引按 `{ClientId, SubRef}'
+    %% 建；直接按 SubRef 扫掉全部成员指针，exclusive（恰好一个消费者）和 shared
+    %% group（多个）都一次清干净，不依赖 `consumers' 字段是否还在。
+    lists:foreach(fun({{C, S}}) -> true = ets:delete(?MEMBERS, {C, S}) end,
+                  ets:match_object(?MEMBERS, {{'_', SubRef}})),
+    ok;
+apply_replica({inflight, ClientId, Term}) ->
+    true = ets:insert(?INFLIGHT, {ClientId, Term}),
+    ok;
+apply_replica({cursor, SubRef, PartitionId, Row}) ->
+    true = ets:insert(?CURSORS, {{SubRef, PartitionId}, Row}),
+    ok.
 
 %%%_* gen_server -----------------------------------------------------------
 
@@ -1313,11 +1388,24 @@ entities_of(ClientId) ->
 %%%_* Tables, timers ------------------------------------------------------------
 
 create_tables() ->
-    lists:foreach(fun create_protected_table/1,
-                  [?ENTITIES, ?MEMBERS, ?CURSORS, ?ATTACHMENTS, ?INFLIGHT]).
+    %% MQ-17 §3.3: the four session tables are `public' because `apply_replica/1'
+    %% is executed by whichever process called `rpc:call/4' on this node -- a
+    %% fresh process, not this gen_server -- and a `protected' table would turn
+    %% every replica write into a `badarg'. Replica ops only ever land on a
+    %% non-owner node (invariant I1) and only overwrite a whole key, so the
+    %% widened write access cannot interleave two writers on one row; it is the
+    %% same shape `broker_storage_memory_store' and `broker_cluster_cache' use.
+    %%
+    %% `?ATTACHMENTS' is deliberately NOT widened: it holds a local connection
+    %% pid + its monitor ref (the K10 eviction guard's evidence), nothing in the
+    %% session Op protocol writes it, and a public table would let a foreign
+    %% process install a pid the guard then trusts.
+    lists:foreach(fun(Name) -> create_table(Name, public) end,
+                  [?ENTITIES, ?MEMBERS, ?CURSORS, ?INFLIGHT]),
+    create_table(?ATTACHMENTS, protected).
 
-create_protected_table(Name) ->
-    _ = ets:new(Name, [named_table, set, protected, {read_concurrency, true}]).
+create_table(Name, Access) ->
+    _ = ets:new(Name, [named_table, set, Access, {read_concurrency, true}]).
 
 rearm(cursor_tick, State = #{cursor_interval := Ms}) when Ms > 0 ->
     _ = erlang:send_after(Ms, self(), cursor_tick),
