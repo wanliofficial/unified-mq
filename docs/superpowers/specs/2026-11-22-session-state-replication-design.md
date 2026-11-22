@@ -124,3 +124,9 @@ API：`replicate_session(Partition, Op) -> ok | {error, term()}`。
 - **I2**：默认关闭时，会话路径与今日单机**逐字节一致**（无钩子 = 无复制调用）。
 - **I3**：迁移目标必须已持有该会话副本（扩展 ADR-034 D7 约束到会话状态）。
 - **I4**：客户端在 owner 崩溃 + 接管期间**无新 CONNECT / 无 CONNACK**（透明性的可验证判据）。
+
+---
+
+## 8. Plan 2 实现期批注（2026-11-22）
+
+【2026-11-22】§3.5 与 §4 数据流中「ra 候选排序内持连优先」的设想，已在 Plan 2 brainstorming 修订为：**ra 按副本固定序选新 owner（不感知连接）→ 持连副本节点观察 `{nodedown, O}` 后向 ra 提交 `{claim, P, N, Epoch}` 事后认领**。理由：连接存活信息不进 ra 排序，避免把节点级 liveness 拉回集群元数据；ra 串行 apply 仍保证全局唯一 owner，连接判断留在本地 conn_fsm。Plan 1 的复制管线不受影响。详见 [Plan 2 设计](2026-11-22-session-state-replication-plan2-design.md) §4 与 §6。

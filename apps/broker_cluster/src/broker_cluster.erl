@@ -60,11 +60,32 @@ remove(Partition) ->
 
 %% @doc Plan 2 (spec §4): 持连副本节点认领会话分区所有权。经 ra 串行 apply，
 %% 返回新 epoch。守卫（持副本 / epoch 单调）在 meta_machine 内，此处薄包装。
+%%
+%% 接管结果按**结果分类**计入冻结键（ADR-016 §16.2：禁止高基数标签，故一结果
+%% 一键）。不在此 inc `cluster_owner_changes`——`command/1' 已对任何 `{ok, N}'
+%% 成功回包计一次，重复计会双算。
 -spec claim(non_neg_integer(), node(), non_neg_integer()) ->
           {ok, non_neg_integer()} | {error, term()}.
 claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
                                    is_integer(Epoch) ->
-    command({claim, Partition, Node, Epoch}).
+    Result = command({claim, Partition, Node, Epoch}),
+    _ = try inc_takeover(Result) catch _:_ -> ok end,
+    Result.
+
+%% 把 claim 结果映射到对应冻结键。错误形状以 meta_machine:claim/6 为准：
+%% `{error, {not_a_replica, _}}' / `{error, {stale_epoch, _, _}}' /
+%% `{error, not_found}'（spec §11 写作 `no_replica'，实现为 `not_a_replica'，
+%% 见 plan2-notes 的偏差记录）。
+inc_takeover({ok, _}) ->
+    broker_metrics:inc(cluster_session_takeover_ok);
+inc_takeover({error, {stale_epoch, _, _}}) ->
+    broker_metrics:inc(cluster_session_takeover_stale_epoch);
+inc_takeover({error, {not_a_replica, _}}) ->
+    broker_metrics:inc(cluster_session_takeover_no_replica);
+inc_takeover({error, not_found}) ->
+    broker_metrics:inc(cluster_session_takeover_not_found);
+inc_takeover(_Other) ->
+    ok.
 
 %%%_* Online membership change (ADR-033) ----------------------------------
 %%
