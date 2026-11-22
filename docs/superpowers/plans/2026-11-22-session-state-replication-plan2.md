@@ -576,6 +576,14 @@ git commit -m "feat(broker_cluster): add nodedown member monitor and migration t
 
 conn_fsm 持 `(ClientId → 分区 → owner)` 视图 + `monitor_node` owner;收到 `{nodedown, O}` 时对「owner=O 且本节点持连且持副本」的会话提交 claim,成功后重读本地 `session/1` 复用 `attach/3` 续传。`session_replication` 开关关闭时不装 monitor、不 claim(逐字节退化)。
 
+> **实现说明(实际做法,与下文草稿步骤的差异)**:下文 Step 1-3 的草稿设计了「`#st{owner_view, monitored_owners}` 批量视图 + `claims_to_make/3` + `mqtt_conn_fsm_claim_SUITE`」。**实际实现放弃了批量模型**:一个 conn_fsm 只服务一条连接、只持一个会话,故只需 `owner_part` / `owner_node` 一对字段,批量视图是多余状态;`claims_to_make/3` 与其测试套件已在 review 中删除(勿复活)。实际落地为:
+> - `maybe_monitor_owner/2` — attach 后按会话分区读 owner,`monitor_node` 之(owner 即本节点则不装),整段 try/catch 降级;
+> - `{nodedown, Owner}` 子句**结果感知** — `broker_cluster:claim/3` 返回 `{ok,_}` 才翻 `owner_node` 到本节点并记 info;`{error,_}` 或抛异常只 warning、**不乐观翻转**,连接保持;
+> - `takeover_target/2`(已导出、生产调用、可单测)— 取代 `claims_to_make/3`,纯判定「这次 nodedown 是否属于本连接」;
+> - `terminate/3` 显式 demonitor 配对;`{nodeup,_}` 空转(不重装、不 re-attach,否则违背透明性)。
+>
+> 端到端由 `broker_session_replica_SUITE`(Task 6)覆盖。下文草稿步骤仅作历史设计记录。
+
 **Files:**
 - Modify: `apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl`(attach_session/4 + 新增 monitor/nodedown 处理)
 - Test: `apps/broker_proto_mqtt/test/mqtt_conn_fsm_claim_SUITE.erl`(新建,单元驱动 monitor 注册/清理逻辑)
@@ -753,7 +761,7 @@ git commit -m "feat(broker_proto_mqtt): conn_fsm owner monitor + claim-on-nodedo
 - [ ] **Step 2: 五用例(实测修正了三处草稿假设)**
 
   1. `session_survives_owner_crash`:Holder 订阅 → 读初始游标水位 `C0` → ack `C0` 使水位前移到 `Before`(`> C0`) → kill Owner → Holder `claim` epoch 2 → `authorize_append` 可写、`session/1` 订阅集不变、`After >= Before`(游标不回退)。
-  2. `subscribe_not_lost_on_crash`:kill 一个非 owner 副本后,订阅实体行仍是完整单行。
+  2. `subscribe_not_lost_on_crash`:**反面证明**(review 后改写,原草稿只断言幸存者的 ETS 行完整,属恒真、无鉴别力)。复制关闭时 Owner 上建的订阅不得出现在 Holder(`entities` 查空),kill Owner 后 Holder 的 `session/1` 诚实返回 `{error, not_found}`——无陈旧幽灵。与用例 1 配对:1 证「复制使其在」,2 证「不复制则不在」。
   3. `inflight_dedup_preserved`:QoS2 `inflight` blob 建立后 kill Owner,接管节点 `session/1` 的 `inflight` 原样恢复。
   4. `stale_owner_fenced`:Holder `claim` epoch 2 后,旧 owner(仍在线)以 epoch 1 写被 `{error, {fenced, _}}` 拒;另一存活旧副本以 epoch 2 亦被拒;新 owner 接受当前 epoch。
   5. `single_node_unchanged`:开关关闭时无 `session_replicator` 钩子(I2 回归保护)。
@@ -790,31 +798,37 @@ git commit -m "test(broker_cluster): real-ra failover fault-injection suite, 5 c
 
 - [ ] **Step 1: 注册指标冻结键**
 
-在 `broker_cluster.erl` 的 `claim/3`(Task 3)成功分支改为带指标:
+> **实现说明(实测修正,与草稿的差异)**:草稿提议 `broker_metrics:inc(cluster_session_takeover_total)` 带 `result` 标签、并在 `claim/3` 里同时 inc `cluster_owner_changes`。这**两处都错**:① ADR-016 §16.2 冻结键集是扁平 atom 列表、**禁止高基数标签**,spec §10 的「按 result 分标签」只能落地为**一结果一键**;② `command/1` 已对任何 `{ok, N}` 回包 inc 一次 `cluster_owner_changes`,`claim/3` 走同一条 `command/1`,再 inc 会**双算**一次接管。故实际实现为四个闭集键(`cluster_session_takeover_ok` / `_stale_epoch` / `_no_replica` / `_not_found`),`claim/3` 只按**代码返回形状**分类 inc,不碰 `cluster_owner_changes`。
 
-把 `command({claim, Partition, Node, Epoch})` 调用前后包一层,`command/1` 已对 `cluster_owner_changes` inc(`broker_cluster.erl:88`)。在 `claim/3` 内改为:
+在 `broker_metrics` 的 `key_specs/0` 末尾(紧随 `{cluster_session_replication_failed, counter}`)追加四个 counter 键;`broker_metrics_SUITE` 的 `-define(KEYS,...)` 同步按**相同顺序**追加(否则 `keys_are_stable` 的精确比对会红),并加用例 `session_takeover_keys_registered` 断言四键均为 counter。
+
+`broker_cluster:claim/3` 改为:
 
 ```erlang
 claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
                                    is_integer(Epoch) ->
     Result = command({claim, Partition, Node, Epoch}),
-    _ = try
-            case Result of
-                {ok, _} ->
-                    broker_metrics:inc(cluster_session_takeover_total),
-                    broker_metrics:inc(cluster_owner_changes);
-                {error, _} ->
-                    broker_metrics:inc(cluster_session_takeover_total)
-            end
-        catch _:_ -> ok end,
+    _ = try inc_takeover(Result) catch _:_ -> ok end,
     Result.
+
+%% 私有，不导出。形状以 meta_machine:claim/6 为准。
+inc_takeover({ok, _}) -> broker_metrics:inc(cluster_session_takeover_ok);
+inc_takeover({error, {stale_epoch, _, _}}) ->
+    broker_metrics:inc(cluster_session_takeover_stale_epoch);
+inc_takeover({error, {not_a_replica, _}}) ->
+    broker_metrics:inc(cluster_session_takeover_no_replica);
+inc_takeover({error, not_found}) ->
+    broker_metrics:inc(cluster_session_takeover_not_found);
+inc_takeover(_Other) -> ok.   %% 传输层失败（no_quorum 已由 cluster_no_quorum 计）
 ```
 
-> 若 `broker_metrics:inc/1` 对新键 `cluster_session_takeover_total` 报错(未注册),在 `broker_metrics` 的 init 注册处补该键(参照 Plan 1 注册 `cluster_session_replication_latency_us` 的位置)。先编译确认是否需要:Run `export PATH="$HOME/Development/otp-29.1.2/lib/erlang/bin:$PATH" && rebar3 compile`,若报错则定位 broker_metrics init 加键。
+> **已删除/否决的草案做法**（勿复活）:`cluster_session_takeover_total`（标签式）、在 `claim/3` 内 `inc(cluster_owner_changes)`（双算）。另:spec §10 建议的 `cluster_session_takeover_latency_us` 本次**未实现**,已在 plan2-notes 偏差记录中如实标注。
 
-- [ ] **Step 2: 给 Plan 1 spec §7 追加带日期批注**
+- [ ] **Step 2: 给 Plan 1 spec 追加带日期批注**
 
 在 `docs/superpowers/specs/2026-11-22-session-state-replication-design.md` 文件**末尾**追加(不改既有正文):
+
+> **实现说明**:草稿把修订表述为「ra 按副本固定序选新 owner」——**误述**,`ra` 不做任何选主。实际是两条互不依赖的路径:① 持连节点观察 `{nodedown, O}` 后提交 `{claim, P, N, Epoch}` 事后认领(主路径,无副本序偏好);② `broker_cluster_nodedown:pick_new_owner/2` 在**本地**按副本固定序选存活副本再提交 `{migrate,...}`(兜底)。批注正文按此改写。
 
 ```markdown
 
@@ -822,7 +836,12 @@ claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
 
 ## 8. Plan 2 实现期批注（2026-11-22）
 
-【2026-11-22】§3.5 及 §4 数据流的「ra 候选排序内持连优先」已在 Plan 2 brainstorming 修订为「ra 按副本固定序选新 owner（不感知连接）→ 持连副本节点观察 {nodedown} 后向 ra 提交 {claim,...} 事后认领」。理由：连接存活信息不进 ra 排序，避免把节点级 liveness 拉回集群元数据；ra 串行 apply 仍保证唯一 owner，连接判断留在本地 conn_fsm。Plan 1 复制管线不受影响。详见 [Plan 2 设计](2026-11-22-session-state-replication-plan2-design.md) §4。
+【2026-11-22】§3.5 及 §4 数据流的「ra 候选排序内持连优先」已在 Plan 2 brainstorming 修订为**两条互不依赖的路径**，ra **不**做任何候选排序或副本序选择，只负责把命令串行 apply：
+
+1. **持连节点事后认领（claim，主路径）**：持连副本节点观察 `{nodedown, O}` 后向 ra 提交 `{claim, P, N, Epoch}`，把 owner 改成自己。此路径**没有任何副本序偏好**——谁持连、谁先提交，谁就拿到所有权；判据只有 epoch 单调 + `N` 必须在 `replicas` 集内（`broker_cluster_meta_machine:claim/6` 的两条守卫），连接判断留在本地 conn_fsm。
+2. **主动迁移（migrate，兜底路径）**：`broker_cluster_nodedown:pick_new_owner/2` 在**本地**按副本固定序取第一个存活副本作新 owner（epoch+1），再提交既有的 `{migrate, ...}` 命令。
+
+理由：连接存活信息不进 ra 排序，避免把节点级 liveness 拉回集群元数据；两条路径都经 ra 串行 apply，故仍保证全局唯一 owner。Plan 1 复制管线不受影响。详见 [Plan 2 设计](2026-11-22-session-state-replication-plan2-design.md) §4 与 §6。
 ```
 
 - [ ] **Step 3: 写 plan2-notes**
@@ -843,8 +862,8 @@ claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
 - **会话→分区映射**：`broker_cluster_session_owner:partition_of/2`（`phash2`，固定 `session_partition_count`），还 Plan 1 债 #1。
 - **复制路由**：`replicate_session_best_effort/1` 从「广播所有副本集」改为「该会话分区副本集」。
 - **claim 命令**：`broker_cluster_meta_machine` 新增 `{claim, P, Node, Epoch}`，epoch 单调 + `is_member(Node, Replicas)`（ADR-034 D7）双守卫。
-- **崩溃发现**：`broker_cluster_nodedown` monitor 成员，`{nodedown, O}` → 对已分配分区提交 `{migrate,...}`（epoch+1，存活副本序选新 owner）。
-- **conn_fsm**：owner 视图 + `monitor_node` + `{nodedown}` → `claims_to_make/3` 提交 claim + 重读本地 `session/1` 续传；开关关时不装 monitor（I2）。
+- **崩溃发现**：`broker_cluster_nodedown` 的 `pick_new_owner/2` 在**本地**按副本固定序选存活副本（epoch+1），`on_nodedown/1` 逐分区提交 `{migrate,...}`（每分区独立 try）；真正的 `monitor_node` 由 sup 启动的 `broker_cluster_nodedown_mon` 承担（`session_replication` 门控、`{nodeup,_}` 重挂、nodedown 显式 demonitor）。
+- **conn_fsm**：`maybe_monitor_owner/2` 在 attach 后按会话分区装 `monitor_node`；`{nodedown, Owner}` 子句**结果感知**——`claim` 成功才翻 `owner_node`，失败只 warning 不翻转；判定收敛为 `takeover_target/2`（per-connection 单 `owner_part`/`owner_node`，**无批量模型**）；`terminate/3` 显式 demonitor；开关关时不装 monitor（I2）。
 
 ## 缺口表（Plan 2 边界债）
 
@@ -866,14 +885,15 @@ claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
 
 ## 验证
 
-- 全量 CT：1663 基线 + Plan 2 新增用例全绿（不含已知无关失败）。
+- 各 Task 的守门套件（`broker_metrics_SUITE` 16、`broker_cluster_meta_SUITE` 4、`mqtt_conn_fsm_takeover_SUITE` 3、`broker_session_replica_SUITE` 6、`broker_cluster_session_{rep,nodedown,session_owner}_SUITE` 12）全绿。
+- 全量 CT 基线为 **1663**（Plan 1 交付时）。本 Task 记录不声称已重跑全量;真跑结果见实施会话。
 - 提交：见各 Task commit。
 ```
 
 - [ ] **Step 4: 全量验证**
 
 Run: `export PATH="$HOME/Development/otp-29.1.2/lib/erlang/bin:$PATH" && rm -rf _build/test/extras && rebar3 ct`
-Expected: 全绿(已知无关失败除外:`broker_proto_mcp/test/mcp_dispatch_SUITE.erl` WIP、`kafka_group_SUITE:session_timeout_sweeps_dead_member` 既有 bug)。
+Expected: 全绿。若出现已知无关失败，需与 Plan 2 变更无因果关系（如实记录，不掩盖）。
 
 - [ ] **Step 5: 提交**
 
@@ -900,9 +920,9 @@ git commit -m "docs+metrics(broker_cluster): Plan 2 takeover metrics, spec annot
 - spec §11 边界(claim 持副本/多节点竞争/幂等) → Task 3(持副本守卫)、Task 6(用例 4 fencing)。✓
 - spec §12 未决点 → plan2-notes 缺口表记录。✓
 
-**2. Placeholder 扫描**:无 TBD/TODO/「类似 Task N」。Task 6 Step 4 的 `cursor/4` 标注「以实际 API 为准,Step 5 编译核对」——这是真实的待核对点(游标写入函数签名),非占位;执行者编译时据实修正。
+**2. Placeholder 扫描**:无 TBD/TODO。Task 6 原草案的 `cursor/4` 为**不存在的 API**,已在实测中证伪并改写为真实 `broker_subscription:cursor/2`;Task 7 草案的 `cluster_session_takeover_total`(标签式)与 `claim/3` 内重复 inc `cluster_owner_changes`(双算)亦已证伪并改写。执行者以改写后的段落为准。
 
-**3. 类型一致性**:`partition_of/2`(binary(), pos_integer())→ partition() 全程一致;`claim/3`(Partition, Node, Epoch)→ {ok,Epoch}|{error,_} 在 Task 3 定义、Task 5/6 调用一致;`session_owner/1` Task 1 定义、Task 5 调用一致;`claims_to_make/3`(View, DeadNode, Held) Task 5 定义+测试一致。✓
+**3. 类型一致性**:`partition_of/2`(binary(), pos_integer())→ partition() 全程一致;`claim/3`(Partition, Node, Epoch)→ {ok,Epoch}|{error,_} 在 Task 3 定义、Task 5/6 调用一致;`session_owner/1` Task 1 定义、Task 5 调用一致。~~`claims_to_make/3`~~ 已在 Task 5 review 删除(per-connection 单 owner 模型足够),判定收敛为 `takeover_target/2`(Task 5 定义+测试一致)。✓
 
 **4. 风险点(执行者注意)**:
 - Task 2 Step 3 的 `replicate_session_broadcast_all/0` 有个 `Op` 作用域 bug(原 fun 无 Op 参数),计划内已标注修正为 `replicate_session_broadcast_all(Op)` —— 执行者务必按计划内修正版落地。
