@@ -13,7 +13,7 @@
 -export([assign/4, migrate/4, finish_migration/2, remove/1, claim/3]).
 -export([join/1, join/2, leave/1, leave/2]).
 -export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
-         partition_view/0, session_owner/1]).
+         partition_view/0]).
 -export([authorize_append/2, guard_append/3, token/1]).
 -export([replicate/2, install_hooks/0, uninstall_hooks/0]).
 %% S12-D (ADR-034): installed as `persistent_term' hooks, never called by
@@ -112,12 +112,6 @@ epoch_or_zero(Partition) ->
     end.
 
 snapshot() -> broker_cluster_cache:all().
-
-%% @doc 本节点上某会话分区的 owner（本地 cache 读）。无元数据 → not_found。
-%% conn_fsm 据此 + monitor_node 决定何时 claim（spec §6）。
--spec session_owner(non_neg_integer()) -> {ok, node()} | not_found.
-session_owner(Partition) ->
-    broker_cluster_session_owner:session_owner(Partition).
 
 %% @doc The ownership view keyed by partition -- what a rebalancer needs, since
 %% a move must name its partition. `snapshot/0' stays as-is for the callers that

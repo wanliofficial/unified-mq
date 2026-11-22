@@ -96,12 +96,14 @@ assign(P, Owner, Replicas, Epoch, Phase, Index, Ps, State) ->
     end.
 
 %% Plan 2 (spec §4): 持连副本节点认领分区所有权。两条守卫：
-%%   1. epoch 单调（同 assign / finish_migration 的 E < Epoch 守卫）——防乱序/陈旧 claim；
+%%   1. epoch 单调——与 assign 的 epoch 单调守卫同一谓词（assign 写成
+%%      `E >= Epoch` 的拒绝形式），防乱序/陈旧 claim；并要求 Epoch 为整数，
+%%      否则非整数 epoch 会让分区永久卡死（`1 < bogus` 为真、`bogus < N` 为假）；
 %%   2. Node 必须已在 replicas 集中（ADR-034 D7 在会话分区落地）——迁移目标必须
 %%      已持副本，否则拒绝。ra 串行 apply 保证全局唯一 owner。
 claim(P, Node, Epoch, Index, Ps, State) ->
     case maps:find(P, Ps) of
-        {ok, #{epoch := E} = M} when E < Epoch ->
+        {ok, #{epoch := E} = M} when is_integer(Epoch), E < Epoch ->
             case lists:member(Node, maps:get(replicas, M, [])) of
                 true ->
                     M1 = M#{owner => Node, epoch => Epoch, state => active,
