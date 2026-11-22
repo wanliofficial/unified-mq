@@ -104,7 +104,14 @@ subscribe(ClientId, Filter, QoS) ->
     subscribe(ClientId, Filter, QoS, <<"*">>).
 
 subscribe(ClientId, Filter, QoS, Tenant) ->
-    gen_server:call(?MODULE, {subscribe, ClientId, Filter, QoS, Tenant}).
+    case gen_server:call(?MODULE, {subscribe, ClientId, Filter, QoS, Tenant}) of
+        {ok, SubRef} = Ok ->
+            case maybe_replicate_subscribe(ClientId, SubRef) of
+                ok -> Ok;
+                {error, _} = Err -> Err
+            end;
+        {error, _} = Err -> Err
+    end.
 
 join(Kind, Group, ClientId, Filter, QoS) ->
     join(Kind, Group, ClientId, Filter, QoS, <<"*">>).
@@ -120,7 +127,10 @@ join(Kind, Group, ClientId, Filter, QoS, Tenant, Opts) when is_map(Opts) ->
                               Tenant, Opts}).
 
 unsubscribe(ClientId, Filter) ->
-    gen_server:call(?MODULE, {unsubscribe, ClientId, Filter}).
+    case gen_server:call(?MODULE, {unsubscribe, ClientId, Filter}) of
+        ok -> maybe_replicate_unsubscribe(ClientId, Filter);
+        Other -> Other
+    end.
 
 leave(SubRef, ClientId) ->
     gen_server:call(?MODULE, {leave, SubRef, ClientId}).
@@ -149,7 +159,102 @@ retry(SubRef, PartitionId, Offset, Consumer) ->
     gen_server:call(?MODULE, {retry, SubRef, PartitionId, Offset, Consumer}).
 
 inflight(ClientId, Term) ->
-    gen_server:call(?MODULE, {inflight, ClientId, Term}).
+    case gen_server:call(?MODULE, {inflight, ClientId, Term}) of
+        ok -> maybe_replicate_inflight(ClientId, Term);
+        Other -> Other
+    end.
+
+%% MQ-17 §3.4 / 不变量 I2: the session-replication hook (spec §3.4). It lives
+%% in `persistent_term' under `{?MODULE, session_replicator}' and is either
+%% `undefined' (the absent default: a single node answers every Op locally and no
+%% replication happens at all -- zero overhead, byte-identical to before) or
+%% `fun((session_op()) -> ok | {error, term()})', installed by `broker_cluster'
+%% (env-gated, Plan 1 Task 5). Everything below is the initiator side: the worker
+%% itself never replicates, it only consults the hook in the *caller's* process
+%% (the conn_fsm), mirroring how `broker_queue:append_replica/1' is called by
+%% the process that owns the append rather than by the queue's gen_server --
+%% blocking the single writer on cross-node rpc per subscribe would stall every
+%% other session write.
+session_replicator() ->
+    persistent_term:get({?MODULE, session_replicator}, undefined).
+
+%% Caller-process SYNC replication. `ok' when there is no hook; a hook returning
+%% `{error,_}' is honoured so the caller can fail the SUBACK (§3.4 "多数派 ack
+%% 后才回 ACK"). A crashing hook is an error too, not a crashed caller.
+-spec replicate_sync(session_op()) -> ok | {error, term()}.
+replicate_sync(Op) ->
+    case session_replicator() of
+        undefined ->
+            ok;
+        Fun ->
+            try Fun(Op)
+            catch Class:Reason -> {error, {session_replication, {Class, Reason}}}
+            end
+    end.
+
+%% Fire-and-forget cursor replication (the ONLY site that may block: the flush
+%% tick inside the worker). No hook -> no spawn at all (I2: the flush tick does
+%% not pay for replication on a single node). When a hook exists the per-row Op
+%% is spawned so the worker's tick never waits on a replica round-trip.
+-spec replicate_cursor_async(term()) -> ok.
+replicate_cursor_async(SubRef) ->
+    case session_replicator() of
+        undefined ->
+            ok;
+        Fun ->
+            _ = spawn(fun() -> replicate_cursors_once(SubRef, Fun) end),
+            ok
+    end.
+
+%% One `{cursor,...}' Op per row of the flushed subscription. Isolated in its
+%% own function (rather than a comprehension) so the row's SubRef/P are new
+%% bindings and the hook call's `catch' is `try ... catch' (warnings_as_errors).
+replicate_cursors_once(SubRef, Fun) ->
+    Rows = ets:match_object(?CURSORS, {{SubRef, '_'}, '_'}),
+    lists:foreach(
+      fun({{_SubRef, PartitionId}, Row}) ->
+              _ = try Fun({cursor, SubRef, PartitionId, Row})
+                  catch _:_ -> ok
+                  end,
+              ok
+      end, Rows),
+    ok.
+
+%% The subscribe/inflight/unsubscribe replication is gated on hook presence
+%% *before* touching the tables, so the absent-hook path stays zero-overhead:
+%% no `ets:lookup', no extra match, no spawn -- exactly today's behaviour.
+maybe_replicate_subscribe(ClientId, SubRef) ->
+    case session_replicator() of
+        undefined -> ok;
+        _ ->
+            case ets:lookup(?ENTITIES, SubRef) of
+                [{SubRef, Info}] -> replicate_sync({subscribe, ClientId, SubRef, Info});
+                [] -> ok
+            end
+    end.
+
+maybe_replicate_inflight(ClientId, Term) ->
+    case session_replicator() of
+        undefined -> ok;
+        _ -> replicate_sync({inflight, ClientId, Term})
+    end.
+
+%% The local removal already happened and cannot be rolled back, so a hook error
+%% here only warns -- the caller still gets `ok' (see unsubscribe's contract).
+%% The Op names the deterministic exclusive SubRef (`{exclusive, ClientId,
+%% Filter}') the removal path used, which is also what `apply_replica/1' consumes.
+maybe_replicate_unsubscribe(ClientId, Filter) ->
+    case session_replicator() of
+        undefined -> ok;
+        _ ->
+            case replicate_sync({unsubscribe, ClientId, {exclusive, ClientId, Filter}}) of
+                ok -> ok;
+                {error, Reason} ->
+                    log_warning("session replication of unsubscribe failed for ~p (~p)",
+                                [ClientId, Reason]),
+                    ok
+            end
+    end.
 
 attach(ClientId, Pid, Persist) ->
     gen_server:call(?MODULE, {attach, ClientId, Pid, Persist}).
@@ -911,6 +1016,10 @@ flush_sub_cursors(SubRef, State) ->
         [_] ->
             case broker_subscription_files:write_cursors(SubRef, cursors_body(SubRef)) of
                 ok ->
+                    %% MQ-17 §3.4: cursors replicate ASYNC, from inside the worker
+                    %% (the only site that may run in it). The helper spawns per
+                    %% row so the flush tick never waits on a replica round-trip.
+                    _ = replicate_cursor_async(SubRef),
                     State#{cursor_dirty := maps:remove(SubRef, Dirty)};
                 {error, _Reason} ->
                     %% The in-memory cursor is still correct to read (a restart is the
