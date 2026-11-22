@@ -59,9 +59,17 @@ start_link(Spec) ->
 %% a test that already knows which agent and session it wants. Returns as soon as
 %% the request is written -- the outcome arrives as the `stopReason' in the
 %% `$acp/session/<id>' turn projection.
+%%
+%% Finite timeout, deliberately. `handle_call' is transport-free today so the
+%% reply is immediate, but `infinity' would turn any future transport call added
+%% into that clause into a permanent hang (the caller can never get out, and a
+%% kernel-side publisher would be blocked by it). 30 s covers a busy gen_server
+%% behind a long `prompt' backlog; anything longer is a genuine fault.
+-define(PROMPT_TIMEOUT, 30000).
+
 -spec prompt(pid(), binary(), [map()]) -> ok | {error, term()}.
 prompt(Pid, SessionId, Prompt) ->
-    gen_server:call(Pid, {prompt, SessionId, Prompt}, infinity).
+    gen_server:call(Pid, {prompt, SessionId, Prompt}, ?PROMPT_TIMEOUT).
 
 -spec cancel(pid()) -> ok.
 cancel(Pid) ->
