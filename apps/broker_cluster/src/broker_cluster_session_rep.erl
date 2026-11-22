@@ -5,7 +5,8 @@
 -module(broker_cluster_session_rep).
 
 -export([replicate_session/2, replicate_session/3, remote_apply/1,
-         replicate_session_of/1, replicate_session_targeted/1]).
+         replicate_session_of/1, replicate_session_targeted/1,
+         targeted_plan/1]). %% targeted_plan/1 exported for the routing unit test
 
 -define(MAX_ACKS, 64).
 
@@ -70,23 +71,37 @@ replicate_session_best_effort(Op) ->
     _ = try replicate_session_targeted(Op) catch _:_ -> ok end,
     ok.
 
+%% @doc Pure routing decision (横切测试点): 给定一个 Op，若其会话分区有副本集，
+%% 返回 {targeted, Partition, Replicas}；否则（cursor / 未知 Op / 无元数据 /
+%% 散列出错）返回 broadcast。所有失败都在本函数内捕获并降级为 broadcast，绝不
+%% 外抛——调用方是 fire-and-forget 的 spawnee（见 replicate_session_of/1）。
+%%
+%% 假设（Plan 2 §12 未决点）：会话分区 P 暂按与元数据分区 P **同键**读取副本集
+%% （会话副本集复用元数据 replicas）。两套空间独立，此同键假设需在 plan 后续确认。
+-spec targeted_plan(term()) -> {targeted, non_neg_integer(), [node()]} | broadcast.
+targeted_plan({cursor, _SubRef, _PartitionId, _Row}) ->
+    broadcast;
+targeted_plan(Op) ->
+    try
+        ClientId = op_client_id(Op),
+        Count = broker_cluster_session_owner:session_partition_count(),
+        P = broker_cluster_session_owner:partition_of(ClientId, Count),
+        case broker_cluster:replicas(P) of
+            {ok, Rs} when is_list(Rs), Rs =/= [] -> {targeted, P, Rs};
+            _ -> broadcast
+        end
+    catch
+        _:_ -> broadcast
+    end.
+
 -spec replicate_session_targeted(term()) -> ok.
-replicate_session_targeted(Op = {cursor, _SubRef, _PartitionId, _Row}) ->
-    %% cursor Op 无 ClientId 可散列，且已由单一写入者按 SubRef 路由，沿用广播。
-    replicate_session_broadcast_all(Op);
 replicate_session_targeted(Op) ->
-    ClientId = op_client_id(Op),
-    Count = broker_cluster_session_owner:session_partition_count(),
-    P = broker_cluster_session_owner:partition_of(ClientId, Count),
-    try broker_cluster:replicas(P) of
-        {ok, Rs} when is_list(Rs) ->
+    case targeted_plan(Op) of
+        {targeted, P, Rs} ->
             _ = replicate_session(P, Op, Rs),
             ok;
-        _ ->
-            %% 该会话分区暂无元数据副本集，退回广播（安全，幂等覆盖）。
+        broadcast ->
             replicate_session_broadcast_all(Op)
-    catch
-        _:_ -> replicate_session_broadcast_all(Op)
     end.
 
 %% Plan-1 fallback: 广播到镜像里所有有副本集的分区。
