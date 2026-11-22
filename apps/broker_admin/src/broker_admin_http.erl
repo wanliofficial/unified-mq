@@ -101,9 +101,19 @@ route(post, <<"/api/v1/cluster/members">>, _H, Body) ->
     cluster_members(Body);
 route(post, <<"/api/v1/revoke">>, _H, Body) ->
     revoke_principal(Body);
-route(delete, <<"/api/v1/revoke/", Principal/binary>>, _H, _B) ->
-    ok = broker_security:clear_revocation(Principal),
-    json(200, #{status => cleared, principal => Principal});
+route(delete, <<"/api/v1/revoke/", Enc/binary>>, _H, _B) when Enc =/= <<>> ->
+    %% The admin listener hands us the raw request target, so a principal with
+    %% `@', `/', a space or any other escapable byte arrives percent-encoded.
+    %% Decode before touching the registry, or we clear a key nobody wrote.
+    %% `percent_decode/1' throws on a malformed escape, so a client typo must
+    %% become a 400 (closed error term), not a 500 from the listener's catch.
+    case percent_decode(Enc) of
+        {ok, Principal} ->
+            ok = broker_security:clear_revocation(Principal),
+            json(200, #{status => cleared, principal => Principal});
+        error ->
+            json(400, #{error => invalid_principal_encoding})
+    end;
 route(_Method, <<"/healthz">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, <<"/readyz">>, _H, _B) ->
@@ -111,6 +121,8 @@ route(_Method, <<"/readyz">>, _H, _B) ->
 route(_Method, <<"/metrics">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, <<"/api/v1/cluster/members">>, _H, _B) ->
+    json(405, #{error => method_not_allowed});
+route(_Method, <<"/api/v1/revoke">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, _Path, _H, _B) ->
     json(404, #{error => not_found}).
@@ -519,6 +531,16 @@ strip_query(Path) ->
     case binary:split(Path, <<"?">>) of
         [P | _] -> P;
         [] -> Path
+    end.
+
+%% `uri_string:percent_decode/1' throws on a malformed escape (e.g. `"%ZZ"') or
+%% on a `%XX' that decodes to invalid UTF-8, so catch and map both to a closed
+%% `error' term the DELETE clause turns into a 400 rather than a listener 500.
+percent_decode(Bin) ->
+    try uri_string:percent_decode(Bin) of
+        Decoded -> {ok, Decoded}
+    catch
+        _:_ -> error
     end.
 
 json(Status, Map) ->
