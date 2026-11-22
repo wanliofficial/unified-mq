@@ -67,7 +67,11 @@ remote_apply_ok(_Config) ->
 %% documented {error, {replication_failed, Acks, Needed}} shape. Exercises
 %% `parallel_apply/3' + `collect/2' real counting, not just the short-circuit cases.
 majority_failure_counts_acks(_Config) ->
-    SavedTimeout = application:get_env(broker_cluster, replicate_timeout_ms),
+    %% 3-arity get_env returns the raw value (or the default), not {ok, V}:
+    %% a suite earlier in the full run may leave replicate_timeout_ms set, so
+    %% the saved value must restore that exact integer rather than crash on
+    %% {ok, N} in the `case' below.
+    SavedTimeout = application:get_env(broker_cluster, replicate_timeout_ms, undefined),
     ok = application:set_env(broker_cluster, replicate_timeout_ms, 500),
     try
         Fake = ['nonexistent-a@nohost', 'nonexistent-b@nohost'],
