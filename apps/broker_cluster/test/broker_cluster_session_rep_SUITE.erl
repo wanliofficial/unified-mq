@@ -48,7 +48,7 @@ end_per_suite(_Config) ->
 init_per_testcase(_, Config) -> Config.
 end_per_testcase(_, _) -> ok.
 
-all() -> [single_node_is_ok, no_replicas_is_ok, remote_apply_ok].
+all() -> [single_node_is_ok, no_replicas_is_ok, remote_apply_ok, majority_failure_counts_acks].
 
 %% Hermetic: the initiator's trivial majority cases, no cluster metadata needed.
 single_node_is_ok(_Config) ->
@@ -59,3 +59,25 @@ no_replicas_is_ok(_Config) ->
 
 remote_apply_ok(_Config) ->
     ?assertEqual(ok, broker_cluster_session_rep:remote_apply({inflight, <<"c1">>, #{1 => x}})).
+
+%% Hermetic majority-counting / failure path: replica set = self + two UNREACHABLE
+%% nodes, so no Raft cluster is needed. `rpc:call' to a nonexistent node returns
+%% `{badrpc, nodedown}' quickly, and the spawned collector counts each as a non-ack.
+%% Needed = 2, local counts as 1 ack -> 1 < 2 -> replication_failed with the
+%% documented {error, {replication_failed, Acks, Needed}} shape. Exercises
+%% `parallel_apply/3' + `collect/2' real counting, not just the short-circuit cases.
+majority_failure_counts_acks(_Config) ->
+    SavedTimeout = application:get_env(broker_cluster, replicate_timeout_ms),
+    ok = application:set_env(broker_cluster, replicate_timeout_ms, 500),
+    try
+        Fake = ['nonexistent-a@nohost', 'nonexistent-b@nohost'],
+        Result = broker_cluster_session_rep:replicate_session(
+                   7, {inflight, <<"c">>, #{}}, [node() | Fake]),
+        ?assertMatch({error, {replication_failed, 1, 2}}, Result)
+    after
+        case SavedTimeout of
+            undefined -> application:unset_env(broker_cluster, replicate_timeout_ms);
+            T when is_integer(T) ->
+                application:set_env(broker_cluster, replicate_timeout_ms, T)
+        end
+    end.

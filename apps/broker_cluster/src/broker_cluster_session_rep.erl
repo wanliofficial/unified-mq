@@ -51,6 +51,12 @@ remote_apply(Op) ->
 %%%_* Internal ------------------------------------------------------------
 
 parallel_apply(Op, Nodes, Timeout) ->
+    %% Mailbox-safety contract: if `collect/2' returns on its `after' deadline while
+    %% a spawn is still in flight, that spawn may later deliver `{sess_repl_result, ..}'
+    %% to the caller's mailbox unconsumed. This is inherited verbatim from
+    %% `broker_cluster_rep' (identical pattern). Callers wiring this in (Task 4/5)
+    %% MUST ensure the calling process is not a long-lived, mailbox-sensitive
+    %% gen_server, or must otherwise drain/absorb those stray messages.
     Parent = self(),
     _ = [spawn(fun() ->
                        Result = rpc:call(N, ?MODULE, remote_apply, [Op], Timeout),
