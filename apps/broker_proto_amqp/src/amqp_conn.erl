@@ -1034,7 +1034,16 @@ get_deliver(Channel, Ref, Queue, NoAck, P, O, Msg, St0) ->
     %% real bug later.
     case NoAck =:= 1 of
         true ->
-            _ = try broker_subscription:ack(Ref, P, O, St2#st.client_id) catch _:_ -> ok end,
+            %% In NoAck mode the broker trusts the client to have processed the
+            %% message; if ack fails here the subscription cursor will not
+            %% advance, leading to redelivery on reconnect. Log the gap.
+            try broker_subscription:ack(Ref, P, O, St2#st.client_id)
+            catch Class:Reason ->
+                logger:error("AMQP ack failed (NoAck mode) for client ~p "
+                             "partition ~p offset ~p: ~p:~p (cursor will not "
+                             "advance, redelivery likely)",
+                             [St2#st.client_id, P, O, Class, Reason])
+            end,
             put_ch(Channel, Ch#ch{next_tag = Tag + 1}, St2);
         _ ->
             put_ch(Channel, Ch#ch{next_tag = Tag + 1,

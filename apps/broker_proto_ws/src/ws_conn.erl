@@ -543,9 +543,20 @@ do_ack(Map, #st{client_id = ClientId} = St) ->
     Id = maps:get(<<"delivery_id">>, Map, undefined),
     case maps:take(Id, St#st.pending) of
         {#{refs := Refs, partition := P, offset := O}, Pending} ->
-            lists:foreach(fun(Ref) -> _ = try broker_subscription:ack(Ref, P, O, ClientId) catch _:_ -> ok end end,
-                          Refs),
-            {noreply, send_json(#{<<"op">> => <<"ackack">>, <<"delivery_id">> => Id}, 
+            %% Ack failure in batch mode means the client got ackack but the
+            %% broker's cursor will not advance, leading to redelivery.
+            lists:foreach(
+              fun(Ref) ->
+                  try broker_subscription:ack(Ref, P, O, ClientId)
+                  catch Class:Reason ->
+                      logger:error("WS ack failed for client ~p delivery ~p "
+                                   "partition ~p offset ~p: ~p:~p (cursor "
+                                   "stalled, client thinks acked)",
+                                   [ClientId, Id, P, O, Class, Reason])
+                  end
+              end,
+              Refs),
+            {noreply, send_json(#{<<"op">> => <<"ackack">>, <<"delivery_id">> => Id},
                                 St#st{pending = Pending})};
         error ->
             {noreply, send_error(<<"unknown_delivery">>, <<"no such delivery_id">>, St)}

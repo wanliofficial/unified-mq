@@ -579,15 +579,31 @@ handle_ack(Destination, Payload, St0) ->
 %% tuple here would corrupt it and silently degrade every later API call to
 %% the catch-all error).
 ack_apply(ack, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0) ->
-    _ = try broker_subscription:ack(Ref, P, O, VClient) catch _:_ -> ok end,
+    %% Failure to mark the offset read means the subscription system will not
+    %% advance its cursor past this point, but JetStream has already moved on.
+    %% The result is repeated delivery or a stuck partition. Log it.
+    try broker_subscription:ack(Ref, P, O, VClient)
+    catch Class:Reason ->
+        logger:error("JetStream ack failed for stream ~p consumer ~p seq ~p: "
+                     "~p:~p (offset ~p on partition ~p not marked read)",
+                     [Stream, CName, Seq, Class, Reason, O, P])
+    end,
     CKey = consumer_key(Stream, CName),
     Consumer1 = Consumer#{refs => maps:remove(Seq,
                                               maps:get(refs, Consumer, #{}))},
     persist_consumers(St0#st{consumers =
                                  maps:put(CKey, Consumer1,
                                           St0#st.consumers)});
-ack_apply(nak, Ref, P, O, VClient, _Stream, _CName, _Seq, _Consumer, St) ->
-    _ = try broker_subscription:release(Ref, P, [O], VClient) catch _:_ -> ok end,
+ack_apply(nak, Ref, P, O, VClient, _Stream, CName, _Seq, _Consumer, St) ->
+    %% Failure to release the offset back to the pool means JetStream will
+    %% consider it consumed when it is not. Log so the stuck offset is visible.
+    try broker_subscription:release(Ref, P, [O], VClient)
+    catch Class:Reason ->
+        logger:error("JetStream release failed for consumer ~p offset ~p on "
+                     "partition ~p: ~p:~p (offset not returned to pool, "
+                     "partition may stall)",
+                     [CName, O, P, Class, Reason])
+    end,
     St;
 ack_apply(term, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0) ->
     ack_apply(ack, Ref, P, O, VClient, Stream, CName, Seq, Consumer, St0);

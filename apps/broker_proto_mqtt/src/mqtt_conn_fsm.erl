@@ -1239,7 +1239,15 @@ ack_and_dispatch(Msg, 1, Partition, Offset, Refs, WirePid, D) ->
     %% routed set is empty; 3.1.1 keeps the same two-byte PUBACK it always had.
     RC = case Refs of [] -> 16#10; _ -> 0 end,
     D1 = send_frame(enc(#puback{packet_id = WirePid, reason_code = RC}, D), D),
-    _ = try broker_subscription:dispatch(Refs, {Partition, Offset, Msg}) catch _:_ -> ok end,
+    %% Delivery failure must not be silent: the publisher got a PUBACK (success)
+    %% but subscribers will never see this message. Log at error level so the
+    %% gap is observable in the broker logs, not hidden in a catch-all.
+    try broker_subscription:dispatch(Refs, {Partition, Offset, Msg})
+    catch Class:Reason ->
+        logger:error("MQTT dispatch failed for client ~p partition ~p offset ~p: "
+                     "~p:~p (publisher got PUBACK, delivery lost)",
+                     [D#st.client_id, Partition, Offset, Class, Reason])
+    end,
     {state, connected, D1};
 ack_and_dispatch(Msg, 2, Partition, Offset, Refs, WirePid, D0) ->
     %% ADR-018 §18.3 R5 (Method A): the message is delivered on PUBLISH, and
