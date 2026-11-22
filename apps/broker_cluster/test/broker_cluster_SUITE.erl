@@ -26,7 +26,9 @@ all() ->
      remote_append_normalises_a_successful_append,
      hooks_can_be_installed_and_removed,
      queue_accepts_replicated_commit_only_with_a_replicator,
-     queue_refuses_replicated_commit_without_a_replicator].
+     queue_refuses_replicated_commit_without_a_replicator,
+     session_hook_absent_by_default,
+     session_hook_installed_when_enabled].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -44,6 +46,11 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_cluster, members, []),
     ok = application:set_env(broker_cluster, quorum_timeout_ms, 3000),
     ok = application:set_env(broker_cluster, replicate_timeout_ms, 300),
+    %% MQ-17 Plan 1 Task 5: session_replication is the decoupled env that gates
+    %% the {broker_subscription_worker, session_replicator} hook. Default it off
+    %% so every other case runs byte-for-byte single-node; the session-hook
+    %% cases flip it explicitly and restore it here.
+    ok = application:set_env(broker_cluster, session_replication, false),
     %% `set_env' before `load' is overwritten by the .app file's env, so the
     %% apps under test are loaded explicitly first (the same lesson
     %% broker_queue_SUITE's init_per_suite records).
@@ -191,6 +198,35 @@ queue_refuses_replicated_commit_without_a_replicator(Config) ->
     fsync = broker_queue:reliability(),
     {error, {unsupported_sync_mode, replicated_commit}} =
         broker_queue:append(0, msg(#{cluster_epoch => 0}), replicated_commit),
+    ok.
+
+%% MQ-17 Plan 1 Task 5 / spec §5 / I2: the session_replicator hook is env-gated
+%% and absent by default. This is the regression guard for "default off = no
+%% hook installed = byte-for-byte single node".
+session_hook_absent_by_default(_Config) ->
+    ok = application:set_env(broker_cluster, session_replication, false),
+    ok = broker_cluster:reinstall_hooks(false),
+    undefined =
+        persistent_term:get({broker_subscription_worker, session_replicator},
+                            undefined),
+    ok.
+
+%% MQ-17 Plan 1 Task 5: with session_replication on, install_hooks installs the
+%% hook (a 1-arity fun delegating to replicate_session_of/1); uninstall_hooks
+%% erases it again so a runtime toggle leaves no residue.
+session_hook_installed_when_enabled(_Config) ->
+    ok = application:set_env(broker_cluster, session_replication, true),
+    ok = broker_cluster:install_hooks(),
+    Fun = persistent_term:get({broker_subscription_worker, session_replicator},
+                              undefined),
+    true = is_function(Fun, 1),
+    %% The hook body is fire-and-forget; call it once to prove it is safe with
+    %% an empty metadata mirror (no cluster -> best-effort no-op).
+    ok = Fun(no_such_op),
+    ok = broker_cluster:uninstall_hooks(),
+    undefined =
+        persistent_term:get({broker_subscription_worker, session_replicator},
+                            undefined),
     ok.
 
 %%%_* Helpers ---------------------------------------------------------------

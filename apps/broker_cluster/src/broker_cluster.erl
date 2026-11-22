@@ -182,6 +182,7 @@ install_hooks() ->
     %% into `proto_meta' without depending on this application.
     persistent_term:put({broker_cluster, epoch}, fun ?MODULE:epoch/1),
     ok = install_cross_node_hooks(),
+    ok = install_session_hook(),
     ok.
 
 %% S12-D (ADR-034 D8): default `false'. When it is off none of the routing
@@ -200,6 +201,23 @@ install_cross_node_hooks() ->
                                 fun ?MODULE:qos0_fanout/1),
             ok;
         _ ->
+            ok
+    end.
+
+%% @doc spec §5 / I2: default `false'. Installs the {broker_subscription_worker,
+%% session_replicator} persistent_term hook so the single-writer replicates
+%% session ops to replicas. OFF by default -> no hook installed, broker
+%% subscription paths are byte-for-byte single-node. The hook is fire-and-forget
+%% (spawns) so it never blocks the conn_fsm / worker callers.
+install_session_hook() ->
+    case application:get_env(broker_cluster, session_replication, false) of
+        true ->
+            persistent_term:put(
+              {broker_subscription_worker, session_replicator},
+              fun(Op) -> broker_cluster_session_rep:replicate_session_of(Op) end),
+            ok;
+        _ ->
+            _ = persistent_term:erase({broker_subscription_worker, session_replicator}),
             ok
     end.
 
@@ -259,6 +277,7 @@ uninstall_hooks() ->
     _ = persistent_term:erase({broker_subscription, owner}),
     _ = persistent_term:erase({broker_subscription, qos0_fanout}),
     _ = persistent_term:erase({broker_cluster, epoch}),
+    _ = persistent_term:erase({broker_subscription_worker, session_replicator}),
     ok.
 
 %%%_* Cross-node routing (ADR-034) -----------------------------------------

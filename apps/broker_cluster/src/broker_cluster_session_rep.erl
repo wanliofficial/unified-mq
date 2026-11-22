@@ -4,7 +4,8 @@
 %% broker_subscription_worker:session_op/0。
 -module(broker_cluster_session_rep).
 
--export([replicate_session/2, replicate_session/3, remote_apply/1]).
+-export([replicate_session/2, replicate_session/3, remote_apply/1,
+         replicate_session_of/1]).
 
 -define(MAX_ACKS, 64).
 
@@ -47,6 +48,40 @@ remote_apply(Op) ->
     catch
         _:_ -> {error, apply_replica_crashed}
     end.
+
+%% @doc Hook body (spec §3.5). FIRE-AND-FORGET: spawn so the calling process
+%% (conn_fsm on subscribe/unsubscribe, or a detached worker process on cursor)
+%% never blocks on a cross-node replica round-trip. Plan 1 has no
+%% session->partition map, so this best-effort broadcasts to every replica set
+%% in the metadata snapshot; receivers dedupe by idempotent per-key overwrites
+%% (apply_replica is set-table). Precise routing is Plan 2.
+-spec replicate_session_of(term()) -> ok.
+replicate_session_of(Op) ->
+    _ = try spawn(fun() -> replicate_session_best_effort(Op) end)
+    catch _:_ -> ok end,
+    ok.
+
+%% @private Plan-1 approximation of session->partition routing: there is no
+%% session->partition map yet, so broadcast the Op to every replica set in the
+%% local metadata mirror. The mirror (`broker_cluster_cache:partition_view/0')
+%% is a `#{Partition => Meta}' map; partitions with no replicas are skipped. No
+%% metadata (empty mirror) is the single-node default and is a safe no-op.
+replicate_session_best_effort(Op) ->
+    try broker_cluster:partition_view() of
+        View ->
+            maps:fold(
+              fun(Partition, Meta, ok) ->
+                      case Meta of
+                          #{replicas := Rs} when is_list(Rs) ->
+                              _ = replicate_session(Partition, Op, Rs),
+                              ok;
+                          _ -> ok
+                      end
+              end, ok, View)
+    catch
+        _:_ -> ok
+    end,
+    ok.
 
 %%%_* Internal ------------------------------------------------------------
 
