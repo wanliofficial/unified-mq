@@ -14,6 +14,8 @@
 %%   POST /api/v1/drain        stop accepting new connections (S12-A, ADR-032 D2)
 %%   POST /api/v1/undrain      resume accepting
 %%   POST /api/v1/cluster/members   online join/leave (ADR-033 D2)
+%%   POST /api/v1/revoke       吊销 principal（body: principal, ttl_ms?）
+%%   DELETE /api/v1/revoke/:p  解除吊销
 %%   GET  /api/v1/config       redacted config audit snapshot + sha256
 %%   GET  /api/v1/version      release / OTP / data-format versions
 %%   GET  /api/v1/backups      backup inventory
@@ -97,6 +99,11 @@ route(post, <<"/api/v1/tls/reload">>, _H, _B) ->
     end;
 route(post, <<"/api/v1/cluster/members">>, _H, Body) ->
     cluster_members(Body);
+route(post, <<"/api/v1/revoke">>, _H, Body) ->
+    revoke_principal(Body);
+route(delete, <<"/api/v1/revoke/", Principal/binary>>, _H, _B) ->
+    ok = broker_security:clear_revocation(Principal),
+    json(200, #{status => cleared, principal => Principal});
 route(_Method, <<"/healthz">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, <<"/readyz">>, _H, _B) ->
@@ -221,6 +228,34 @@ reply_cluster(Action, Result) ->
             json(503, #{error => cluster_membership_failed,
                         reason => to_bin(io_lib:format("~p", [Reason])),
                         action => Action})
+    end.
+
+%%%_* 吊销（MQ-17 #10）-------------------------------------------------------
+
+revoke_principal(Body) ->
+    case parse_revoke_body(Body) of
+        {ok, Principal, TTL} ->
+            ok = broker_security:revoke(Principal, TTL),
+            json(200, #{status => revoked, principal => Principal});
+        {error, Error} ->
+            json(400, Error)
+    end.
+
+parse_revoke_body(<<>>) ->
+    {error, #{error => body_required}};
+parse_revoke_body(Body) ->
+    try json:decode(Body) of
+        #{<<"principal">> := P} = M ->
+            case {is_binary(P), maps:get(<<"ttl_ms">>, M, undefined)} of
+                {true, undefined} -> {ok, P, undefined};
+                {true, T} when is_integer(T), T >= 0 -> {ok, P, T};
+                {true, _} -> {error, #{error => invalid_ttl_ms}};
+                {false, _} -> {error, #{error => principal_must_be_a_string}}
+            end;
+        _ ->
+            {error, #{error => body_must_have_principal}}
+    catch
+        _:_ -> {error, #{error => invalid_json}}
     end.
 
 safe_snapshot() ->

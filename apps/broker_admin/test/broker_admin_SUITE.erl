@@ -33,6 +33,7 @@ all() ->
      cluster_members_rejects_wrong_method,
      cluster_members_validates_the_request,
      cluster_members_without_cluster_app_returns_503,
+     revoke_endpoint_revokes_and_clears,
      node_view_reports_state_and_connections,
      node_view_reports_dist_tls_without_leaking_keys,
      insecure_bind_with_empty_token_refuses_to_start].
@@ -529,6 +530,23 @@ cluster_members_without_cluster_app_returns_503(Config) ->
         request_json(post, "/api/v1/cluster/members", [],
                      #{<<"action">> => <<"join">>, <<"node">> => Self}, Config),
     ok.
+
+%%%_* Principal revocation (MQ-17 #10) -------------------------------------
+
+%% A POST revokes a principal (optionally with a TTL); the matching DELETE
+%% clears the revocation. Both are token-protected like every other `/api/'
+%% route, so the case sets the configured token and presents it as a Bearer.
+revoke_endpoint_revokes_and_clears(Config) ->
+    application:set_env(broker_admin, token, ?TOKEN),
+    {200, #{<<"status">> := <<"revoked">>}} =
+        request_json(post, "/api/v1/revoke",
+                     [{<<"authorization">>, <<"Bearer ", ?TOKEN/binary>>}],
+                     #{<<"principal">> => <<"alice">>}, Config),
+    true = broker_security:revoked(<<"alice">>),
+    {200, #{<<"status">> := <<"cleared">>}} =
+        request(delete, "/api/v1/revoke/alice",
+                [{<<"authorization">>, <<"Bearer ", ?TOKEN/binary>>}], Config),
+    false = broker_security:revoked(<<"alice">>).
 
 node_view_reports_state_and_connections(Config) ->
     start_probe(Config),
