@@ -45,8 +45,10 @@ levels(Bin) ->
 
 match([], []) ->
     true;
-match([_ | _], [<<"#">>]) ->
-    %% `#' matches the parent level too: `sport/#' matches `sport'.
+match(_TopicLevels, [<<"#">>]) ->
+    %% `#' matches the parent level too: `sport/#' matches `sport' as well as
+    %% `sport/tennis'. A non-empty remaining topic is covered here just as an
+    %% exhausted one is (MQTT 3.1.1 §4.7.1.2).
     true;
 match([H | T], [H | FT]) ->
     match(T, FT);
