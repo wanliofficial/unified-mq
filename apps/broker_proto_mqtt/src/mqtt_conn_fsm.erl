@@ -357,6 +357,11 @@ event(#disconnect{}, connected, D) ->
     %% `normal', because a client saying goodbye is not a supervisor event.
     log(info, "client disconnect (client_id=~p)", [D#st.client_id]),
     {stop, normal, D#st{will = undefined}};
+event(mqtt_evict, _StateName, D) ->
+    %% MQ-17 #10: `broker_revocation:revoke/2' sends this to every live session
+    %% of the revoked principal. Deliberately state-independent: evicting a
+    %% connection is legal whatever it was doing.
+    evict_self(D);
 event(Frame, awaiting_connect, D) when is_tuple(Frame) ->
     %% §3.1: a frame before CONNECT is a protocol violation, not a retryable
     %% condition -- the stream position is unknown to us.
@@ -649,28 +654,55 @@ connect_success(#connect{clean_session = Clean0} = C, D1) ->
     case subscribe_partitions(D3) of
         {ok, D4} ->
             D5 = count_connection(D4),
-            log(info, "session up: client_id=~p principal=~p "
-                      "level=~p clean=~p session_present=~p "
-                      "max_qos=~p keepalive_ms=~p",
-                [C#connect.client_id, D5#st.principal, C#connect.proto_level,
-                 Clean, SP, D5#st.max_qos, D5#st.keepalive_ms]),
-            %% E7/R7: the connect-time round is what serves a
-            %% reconnecting session its backlog and its DUP
-            %% resends -- leaving it to the poll tick would make
-            %% a catch-up arrive up to pull_poll_interval_ms late
-            %% even though we know, right here, that the session
-            %% may have unread state.
-            %%
-            %% ADR-012 §12.3 / ADR-018 §18.3 R3: a restored QoS 2
-            %% entry that had already been PUBREC'd resumes with
-            %% PUBREL and must NOT be re-PUBLISHed. Doing it before
-            %% the round also keeps the two from racing for the same
-            %% packet id.
-            schedule_round(resend_released(
-                             send_frame(connack_bin(SP, 0, D5), D5)));
+            %% MQ-17 #10: index this live session so a revocation can evict it.
+            %% The immediate re-check closes the race between revoke/2's
+            %% snapshot and this registration, and it is also the only
+            %% revocation check the enhanced-auth path gets (it never runs
+            %% authenticate/2).
+            ok = broker_revocation:register_session(D5#st.principal, self()),
+            case broker_security:revoked(D5#st.principal) of
+                true ->
+                    evict_self(D5);
+                false ->
+                    log(info, "session up: client_id=~p principal=~p "
+                              "level=~p clean=~p session_present=~p "
+                              "max_qos=~p keepalive_ms=~p",
+                        [C#connect.client_id, D5#st.principal,
+                         C#connect.proto_level, Clean, SP, D5#st.max_qos,
+                         D5#st.keepalive_ms]),
+                    %% E7/R7: the connect-time round is what serves a
+                    %% reconnecting session its backlog and its DUP
+                    %% resends -- leaving it to the poll tick would make
+                    %% a catch-up arrive up to pull_poll_interval_ms late
+                    %% even though we know, right here, that the session
+                    %% may have unread state.
+                    %%
+                    %% ADR-012 §12.3 / ADR-018 §18.3 R3: a restored QoS 2
+                    %% entry that had already been PUBREC'd resumes with
+                    %% PUBREL and must NOT be re-PUBLISHed. Doing it before
+                    %% the round also keeps the two from racing for the same
+                    %% packet id.
+                    schedule_round(resend_released(
+                                     send_frame(connack_bin(SP, 0, D5), D5)))
+            end;
         {error, Reason} ->
             {stop, {partition_subscribe_failed, Reason}, D3}
     end.
+
+%% MQ-17 #10: evict this connection -- cancel any parked delayed Will, send a
+%% DISCONNECT (0x87 Not authorized on v5; none on 3.1.1/3.1), clear the local
+%% immediate Will and stop normal. This follows `event(#disconnect{}, ...)'s
+%% "clean goodbye" semantics so terminate/3 does not publish the Will
+%% (ADR-018 §18.1). Both the `mqtt_evict' message and the post-registration
+%% re-check in connect_success/2 go through here.
+evict_self(#st{client_id = ClientId, principal = Principal} = D) ->
+    _ = mqtt_will_server:cancel(ClientId),
+    _ = broker_revocation:unregister_session(Principal, self()),
+    RC = case vsn(D) of 5 -> 16#87; _ -> 0 end,
+    log(info, "evicted by revocation (client_id=~p principal=~p)",
+        [ClientId, Principal]),
+    {stop, normal, send_frame(enc(#disconnect{reason_code = RC}, D),
+                              D#st{will = undefined})}.
 
 %% S12-B (ADR-032 D7): ask the node-level gate and keep the lease in state.
 %%
@@ -2985,6 +3017,10 @@ ka_arm(_StateName, D) ->
 %% so a subscriber observing the Will still sees this session as the owner of
 %% the client id.
 terminate(Reason, _StateName, #st{partitions = Ps} = D) ->
+    %% MQ-17 #10: drop this session from the revocation index on every ending,
+    %% not just the eviction path. `unregister_session/2' is total, so the
+    %% pre-auth refusal paths (`principal = undefined') are a safe no-op.
+    _ = broker_revocation:unregister_session(D#st.principal, self()),
     _ = report_gauge(conn_mailbox_len, -D#st.reported_mailbox),
     _ = report_gauge(conn_inflight, -D#st.reported_inflight),
     _ = uncount_connection(D),

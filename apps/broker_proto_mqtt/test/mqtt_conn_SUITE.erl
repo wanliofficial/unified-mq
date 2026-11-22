@@ -123,6 +123,11 @@ all() ->
      will_is_published_on_tcp_close,
      will_is_not_published_on_disconnect,
      will_is_not_published_on_takeover,
+     %% MQ-17 #10: revocation evicts LIVE sessions (DISCONNECT, Will suppressed).
+     a_revoked_principal_live_session_is_evicted_without_will,
+     a_revoked_principal_v5_session_gets_disconnect_0x87,
+     a_revoked_principal_mqtt31_session_is_evicted,
+     a_revoked_principal_enhanced_auth_session_self_evicts,
      will_retain_updates_the_tree,
      will_is_published_on_a_keepalive_timeout,
      will_is_not_republished_after_a_broker_restart,
@@ -270,6 +275,10 @@ init_per_testcase(Case, Config) ->
     %% README §10.2: trace propagation is opt-in; every case starts from off.
     ok = application:set_env(broker_event, trace_context, off),
     ok = case_env(Case),
+    %% MQ-17 #10: every case starts from a clean revocation table; neither
+    %% init_per_testcase nor stop_all resets it, so a mid-case assertion failure
+    %% would otherwise leak "alice revoked" into other cases sharing this CT node.
+    _ = broker_revocation:reset(),
     {ok, _Started} = application:ensure_all_started(broker_storage),
     [{data_dir, DataDir} | Config].
 
@@ -1622,6 +1631,74 @@ will_is_not_published_on_takeover(_Config) ->
     true = mqtt_silence(csock(Watcher), 600),
     {ok, normal} = mqtt_close(Watcher),
     ok.
+
+%% MQ-17 #10: revocation is not only "the next CONNECT is refused" -- the
+%% sessions that are live *now* are evicted. Eviction is a normal-goodbye
+%% shutdown (DISCONNECT out, Will discarded), so a subscriber watching the
+%% Will topic hears nothing.
+a_revoked_principal_live_session_is_evicted_without_will(_Config) ->
+    ok = boot(),
+    ok = broker_security:clear_revocation(<<"alice">>),
+    {Watcher, _} = mqtt_open(#{client_id => <<"willwatch">>}),
+    #suback{} = mqtt_subscribe(Watcher, 1, [{<<"will/#">>, 1}]),
+    {A, _} = mqtt_open(#{client_id => <<"alice-will">>,
+                         username => <<"alice">>, password => <<"pw">>,
+                         will_topic => <<"will/alice">>,
+                         will_payload => <<"bye">>, will_qos => 1}),
+    ok = broker_security:revoke(<<"alice">>, undefined),
+    #disconnect{} = mqtt_recv(csock(A)),
+    {ok, _} = mqtt_close(A),
+    true = mqtt_silence(csock(Watcher), 400),
+    {ok, _} = mqtt_close(Watcher),
+    ok = broker_security:clear_revocation(<<"alice">>).
+
+%% §4.13: a v5 eviction carries 0x87 (Not authorized) so the client can tell a
+%% revocation from a network failure.
+a_revoked_principal_v5_session_gets_disconnect_0x87(_Config) ->
+    ok = boot(),
+    ok = broker_security:clear_revocation(<<"alice">>),
+    {A, #connack{return_code = 0}} =
+        mqtt_open_v5(#{client_id => <<"alice-v5">>,
+                       username => <<"alice">>, password => <<"pw">>}),
+    ok = broker_security:revoke(<<"alice">>, undefined),
+    #disconnect{reason_code = 16#87} = mqtt_recv_v5(csock(A)),
+    {ok, _} = mqtt_close(A),
+    ok = broker_security:clear_revocation(<<"alice">>).
+
+%% 3.1 has no reason code at all, so the eviction is the bare 2-byte DISCONNECT.
+a_revoked_principal_mqtt31_session_is_evicted(_Config) ->
+    ok = boot(),
+    ok = broker_security:clear_revocation(<<"alice">>),
+    {A, #connack{return_code = 0}} =
+        mqtt_open_v31(#{client_id => <<"a31">>,
+                        username => <<"alice">>, password => <<"pw">>}),
+    ok = broker_security:revoke(<<"alice">>, undefined),
+    #disconnect{} = mqtt_recv(csock(A)),
+    {ok, _} = mqtt_close(A),
+    ok = broker_security:clear_revocation(<<"alice">>).
+
+%% The enhanced-auth path resolves its principal without ever calling
+%% authenticate/2, so Task 4's CONNECT-time check cannot see a revocation that
+%% landed mid-handshake. The post-registration re-check in connect_success/2 is
+%% what closes that hole: the handshake completes with a principal that is
+%% already revoked, so the connection evicts itself instead of sending CONNACK.
+a_revoked_principal_enhanced_auth_session_self_evicts(_Config) ->
+    ok = boot(),
+    ok = broker_security:clear_revocation(<<"alice">>),
+    {A, #auth{reason_code = 16#18,
+              props = #{authentication_data := Challenge}}} =
+        mqtt_open_v5(#{client_id => <<"authrev">>,
+                       props => #{authentication_method => <<"plain">>}}),
+    %% Revoke between the challenge and the answer: nothing is registered yet,
+    %% so revoke/2's eviction sweep has no pid to send to -- only the re-check
+    %% in the attach tail can catch this connection.
+    ok = broker_security:revoke(<<"alice">>, undefined),
+    ok = mqtt_send_v5(A, #auth{reason_code = 16#18,
+        props = #{authentication_data =>
+                      term_to_binary({<<"alice">>, Challenge, <<"pw">>})}}),
+    #disconnect{reason_code = 16#87} = mqtt_recv_v5(csock(A)),
+    {ok, _} = mqtt_close(A),
+    ok = broker_security:clear_revocation(<<"alice">>).
 
 %% C-16's third trigger: the peer went silent past 1.5x keepalive, which is a
 %% connection failure by §3.1.2.10 -- the Will fires even though the socket was
