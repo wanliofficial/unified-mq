@@ -33,7 +33,7 @@
 -module(mqtt_conn_fsm).
 -behaviour(gen_statem).
 
--export([start_link/2]).
+-export([start_link/2, claims_to_make/3]).
 -export([init/1, callback_mode/0, handle_event/4, terminate/3, code_change/4]).
 
 -include("mqtt_frame.hrl").
@@ -56,6 +56,8 @@
              principal = undefined,
              tenant_id = <<"default">>,
              client_id = undefined,
+             owner_part = undefined,       %% Plan 2: 本会话的会话分区（整数）| undefined
+             owner_node = undefined,       %% Plan 2: 该分区的 owner 节点 | undefined
              keepalive_ms = 0,
              attached = false,
              %% S12-B (ADR-032 D7): this connection's node-level admission
@@ -195,6 +197,34 @@ handle_event(_Et, {handshake, _Ref, RanchTransport, Sock, Timeout}, awaiting_own
 handle_event(_Et, Content, awaiting_owner, D) ->
     log(warning, "event before socket handoff: ~p", [Content]),
     {keep_state, D};
+
+%% Plan 2 §6: owner 节点死亡且正是本会话的 owner → claim 该分区（本节点持连），
+%% 然后重读本地 session 就地续传（无新 CONNECT/CONNACK）。仅在 session_replication
+%% 开、且 owner_node 匹配本死亡节点时动作；否则透传给后续子句（不吞普通事件）。
+%%
+%% 必须放在 S8 catch-all 之前：`erlang:monitor_node/2' 投递的 `{nodedown,Node}' 是
+%% 普通 info 消息（`handle_event_function' 下 EventType = info），否则会落入
+%% transport:decode_msg/2 的 `other' 分支被当成未知事件记录。guard `Node =/= undefined'
+%% 且 `#st{owner_node = Node}' 保证只拦本会话 owner 的那次 nodedown。
+handle_event(_Et, {nodedown, Node}, _StateName,
+             #st{owner_node = Node, owner_part = P, client_id = ClientId} = D)
+  when Node =/= undefined, is_integer(P) ->
+    case application:get_env(broker_cluster, session_replication, false) of
+        true ->
+            _ = try
+                    Epoch = case broker_cluster:epoch(P) of
+                                {ok, E} when is_integer(E) -> E + 1;
+                                _ -> 1
+                            end,
+                    _ = broker_cluster:claim(P, node(), Epoch),
+                    %% 本节点成为新 owner，本地已有副本：重读 session 以确保仍 attached。
+                    _ = broker_subscription:session(ClientId),
+                    ok
+                catch _:_ -> ok end,
+            {keep_state, D#st{owner_node = node()}};
+        _ ->
+            {keep_state, D}
+    end;
 
 %% S8: before the state matrix sees an event, the transport gets a look at it.
 %% `{tcp,...}' / `{ssl,...}' / `{quic,...}' are transport-shaped, and each
@@ -888,7 +918,46 @@ attach_session(ClientId, _Clean, Persist, D) ->
             %% its own attach): nothing to hand the socket over to.
             ok
     end,
-    D#st{attached = true, persist = Persist, will_gen = WillGen}.
+    maybe_monitor_owner(ClientId, D#st{attached = true, persist = Persist,
+                                       will_gen = WillGen}).
+
+%% Plan 2 §6: 开关关 → 不装 monitor（逐字节退化 I2）。开 → 记录本会话的分区与
+%% owner，并 monitor owner 节点（owner 是本节点则不 monitor）。整段 try/catch
+%% 兜底：broker_cluster 应用可能未加载（单机/未起集群），此时退化为「不装 monitor」。
+maybe_monitor_owner(ClientId, D) ->
+    case application:get_env(broker_cluster, session_replication, false) of
+        true ->
+            try
+                Count = broker_cluster_session_owner:session_partition_count(),
+                P = broker_cluster_session_owner:partition_of(ClientId, Count),
+                case broker_cluster_session_owner:session_owner(P) of
+                    {ok, Owner} when is_atom(Owner), Owner =/= node() ->
+                        _ = erlang:monitor_node(Owner, true),
+                        D#st{owner_part = P, owner_node = Owner};
+                    _ ->
+                        D#st{owner_part = P, owner_node = undefined}
+                end
+            catch _:_ -> D end;
+        _ ->
+            D
+    end.
+
+%% @doc 纯逻辑（Plan 2 §4 步骤 3 的局部判断，连接信息不进 ra）：给定 owner 视图
+%% `#{ClientId => {Partition, Owner}}`、死亡节点 DeadNode、本节点持连集合
+%% HeldClients，返回需 claim 的 `[{ClientId, Partition}]`。条件：Owner =:= DeadNode
+%% 且 ClientId 在本节点持连集合内（持连才可能本地有该会话副本）。
+-spec claims_to_make(#{binary() => {non_neg_integer(), node()}}, node(),
+                     [binary()]) -> [{binary(), non_neg_integer()}].
+claims_to_make(View, DeadNode, HeldClients) ->
+    Held = sets:from_list(HeldClients),
+    maps:fold(
+      fun(ClientId, {Partition, Owner}, Acc) when Owner =:= DeadNode ->
+              case sets:is_element(ClientId, Held) of
+                  true -> [{ClientId, Partition} | Acc];
+                  false -> Acc
+              end;
+         (_ClientId, _Pair, Acc) -> Acc
+      end, [], View).
 
 clean_session_teardown(D) ->
     %% ADR-019 §19.2: an exclusive subscription is *removed*, a group membership
