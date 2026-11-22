@@ -430,4 +430,8 @@ key_specs() ->
      %% silence, and the gauge tracks how many sessions are asleep right now.
      {mqtt_sn_sleep_denied, counter},
      {mqtt_sn_keepalive_timeout, counter},
-     {mqtt_sn_asleep, gauge}].
+     {mqtt_sn_asleep, gauge},
+     %% S12-D+ (spec 2026-11-22-session-state-replication §5): 会话状态复制到
+     %% 副本的延迟与失败计数。仿 cluster_replication_latency_us / _failed，闭集冻结。
+     {cluster_session_replication_latency_us, histogram},
+     {cluster_session_replication_failed, counter}].

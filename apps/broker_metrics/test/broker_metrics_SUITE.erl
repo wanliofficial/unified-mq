@@ -8,6 +8,8 @@
 
 -compile([export_all, nowarn_export_all]).
 
+-include_lib("stdlib/include/assert.hrl").
+
 -behaviour(logger_handler).
 -export([log/2]).
 
@@ -25,7 +27,8 @@ all() ->
      disabled_is_noop,
      reset_clears,
      no_high_cardinality_keys,
-     report_line_is_single].
+     report_line_is_single,
+     session_replication_keys_registered].
 
 -define(KEYS,
         [connections_current, connections_peak, auth_failures,
@@ -53,7 +56,10 @@ all() ->
          cluster_no_quorum,
          %% S8-C: MQTT-SN's sleep refusals, keepalive deaths and how many
          %% sessions are asleep right now.
-         mqtt_sn_sleep_denied, mqtt_sn_keepalive_timeout, mqtt_sn_asleep]).
+         mqtt_sn_sleep_denied, mqtt_sn_keepalive_timeout, mqtt_sn_asleep,
+         %% S12-D+ (spec 2026-11-22-session-state-replication §5): 会话状态复制到
+         %% 副本的延迟与失败计数，置于列表末尾以匹配 key_specs/0 顺序。
+         cluster_session_replication_latency_us, cluster_session_replication_failed]).
 
 init_per_suite(Config) ->
     %% No report loop during the suite: the single-line test starts its own.
@@ -97,6 +103,20 @@ no_high_cardinality_keys(_Config) ->
               false = is_binary(K)
       end, broker_metrics:keys()),
     ok.
+
+%% S12-D+ (spec 2026-11-22-session-state-replication §5): the two new keys are
+%% registered with their frozen kinds.
+session_replication_keys_registered(_Config) ->
+    ok = broker_metrics:init(),
+    Keys = broker_metrics:keys(),
+    ?assert(lists:member(cluster_session_replication_failed, Keys)),
+    ?assertEqual(counter,
+                 maps:get(cluster_session_replication_failed,
+                          broker_metrics:key_types())),
+    ?assert(lists:member(cluster_session_replication_latency_us, Keys)),
+    ?assertEqual(histogram,
+                 maps:get(cluster_session_replication_latency_us,
+                          broker_metrics:key_types())).
 
 %%%_* Write path -----------------------------------------------------------
 
