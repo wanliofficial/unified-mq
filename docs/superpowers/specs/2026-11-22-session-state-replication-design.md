@@ -39,16 +39,16 @@ API：`replicate_session(Partition, Op) -> ok | {error, term()}`。
 
 - 查本分区副本集：`broker_cluster:replicas(Partition)`。`not_found` 或单节点 → `ok`（单机默认，无元数据即无复制）。
 - `Needed = length(Replicas) div 2 + 1`；并行 `rpc:call` 到各副本（`Others = [N || N <- Replicas, N =/= node()]`，受 `?MAX_ACKS` 限）。
-- 每条 ack 经 `broker_cluster_session_rep:apply_replica`（接收侧）；统计多数派。未达 → `{error, {replication_failed, Acks, Needed}}` + `inc(cluster_session_replication_failed)`。
+- 每条 ack 经 `broker_cluster_session_rep:remote_apply`（接收侧，内部转调 `broker_subscription_worker:apply_replica/1`）；统计多数派。未达 → `{error, {replication_failed, Acks, Needed}}` + `inc(cluster_session_replication_failed)`。
 - 成功路径观测 `observe(cluster_session_replication_latency_us, Elapsed)`。
 
 仿 `broker_cluster_rep`：复制只测副本往返（本地已先落盘/落表），多数派未达即失败。
 
-### 3.3 接收侧 `broker_subscription_worker:apply_replica/2`（新入口）
+### 3.3 接收侧 `broker_subscription_worker:apply_replica/1`（新入口）
 
-`apply_replica(Op) -> ok | {error, term()}`，在副本本地把会话 Op 应用到 ETS：
+`apply_replica(Op) -> ok`，在副本本地把会话 Op 应用到 ETS（纯内存写入；畸形 Op 直接崩溃，不做防御式返回，由调用侧 rpc 承担失败语义）：
 
-- Op 形如 `{subscribe, ClientId, SubRef, Info}` / `{inflight, ClientId, Term}` / `{unsubscribe, ClientId, SubRef}` / `{cursor, SubRef, Row}`。
+- Op 形如 `{subscribe, ClientId, SubRef, Info}` / `{inflight, ClientId, Term}` / `{unsubscribe, ClientId, SubRef}` / `{cursor, SubRef, PartitionId, Row}`。
 - **契约同 `append_replica`**：不跑所有权守卫、不通知订阅者、不回写为权威磁盘（内存为主；本地 `.subs` flush 仍由本地 worker 自管）。
 - **幂等**：以 `(ClientId, SubRef)` / `(ClientId)` / `(SubRef)` 为键覆盖写，rpc 重试安全。
 - 游标 Op 走异步批量（§3.4），订阅 / in-flight 走同步（§3.4）。
@@ -78,7 +78,7 @@ API：`replicate_session(Partition, Op) -> ok | {error, term()}`。
   SUBSCRIBE → broker_subscription_worker(单一写入者)
      → 写本地 ETS + fsync .subs
      → 咨询 session_replicator 钩子 → replicate_session(Partition, sub_op)
-         → 并行 rpc:call 到副本集 → 各副本 apply_replica/2 → 写本地 ETS
+         → 并行 rpc:call 到副本集 → 各副本 apply_replica/1 → 写本地 ETS
          → 多数派 ack → 回 SUBSCRIBE ACK
   PUBLISH 分发 → cursor 推进 → 标 cursor_dirty
      → flush tick(异步) → 复制游标(不阻塞热路径)
@@ -99,7 +99,7 @@ API：`replicate_session(Partition, Op) -> ok | {error, term()}`。
 ## 5. 错误处理与边界
 
 - **多数派未达（同步路径）**：订阅 / in-flight 返回复制失败 → 上层 SUBSCRIBE 失败（订阅未确认）；游标异步路径丢一次复制无妨。
-- **幂等**：`apply_replica/2` 覆盖写，跨节点 rpc 可能重复投递但结果一致。
+- **幂等**：`apply_replica/1` 覆盖写，跨节点 rpc 可能重复投递但结果一致。
 - **RPO**：订阅 / in-flight ≈ 0（同步）；游标有界（≤ `cursor_flush_interval_ms` 窗口回退）。
 - **指标**：新增冻结键 `cluster_session_replication_latency_us` / `cluster_session_replication_failed`（ADR-016 冻结键集，经 `broker_metrics` `init` 注册）。
 - **开关**：新 env（建议 `session_replication`，默认 `false`）控制 `session_replicator` 钩子安装；关闭即全链路退化。是否复用 `cross_node_delivery` 还是独立开关，留待 plan 阶段定（倾向独立，避免与路由耦合）。
@@ -120,7 +120,7 @@ API：`replicate_session(Partition, Op) -> ok | {error, term()}`。
 
 ## 7. 不变量
 
-- **I1**：接收侧 `apply_replica/2` 与本地写入共用同一组 ETS 表，但入口分离——复制流量**绝不**触发所有权守卫或重复通知（同 `append_replica` 契约）。
+- **I1**：接收侧 `apply_replica/1` 与本地写入共用同一组 ETS 表，但入口分离——复制流量**绝不**触发所有权守卫或重复通知（同 `append_replica` 契约）。
 - **I2**：默认关闭时，会话路径与今日单机**逐字节一致**（无钩子 = 无复制调用）。
 - **I3**：迁移目标必须已持有该会话副本（扩展 ADR-034 D7 约束到会话状态）。
 - **I4**：客户端在 owner 崩溃 + 接管期间**无新 CONNECT / 无 CONNACK**（透明性的可验证判据）。
