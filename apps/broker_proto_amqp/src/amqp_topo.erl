@@ -48,15 +48,16 @@ init([]) ->
     true = ets:insert(?TAB, {{exchange, <<>>}, #{type => direct, durable => true}}),
     {ok, #{}}.
 
-handle_call({declare_exchange, Name, Type, Durable}, _From, St) ->
+handle_call({declare_exchange, Name, Type0, Durable}, _From, St) ->
+    Type = normalize_type(Type0),
     case ets:lookup(?TAB, {exchange, Name}) of
-        [{_, #{type := Existing}}] when Type =:= <<>> orelse Type =:= Existing ->
+        [{_, #{type := Existing}}] when Type =:= Existing ->
             {reply, {ok, Existing}, St};
         [{_, #{type := Existing}}] ->
             {reply, {error, {type_mismatch, Existing, Type}}, St};
         [] ->
             true = ets:insert(?TAB, {{exchange, Name},
-                                     #{type => normalize_type(Type), durable => Durable}}),
+                                     #{type => Type, durable => Durable}}),
             {reply, ok, St}
     end;
 handle_call({delete_exchange, Name}, _From, St) ->
@@ -80,7 +81,8 @@ handle_call({declare_queue, Name0, Durable, Exclusive}, _From, St) ->
     end;
 handle_call({delete_queue, Name}, _From, St) ->
     _ = ets:delete(?TAB, {queue, Name}),
-    _ = [ets:delete(?TAB, K) || {{binding, _, Q, _}, _} = K <- ets:tab2list(?TAB), Q =:= Name],
+    _ = [ets:delete(?TAB, Key) || {{binding, _, Q, _} = Key, _V}
+                                     <- ets:tab2list(?TAB), Q =:= Name],
     {reply, ok, St};
 handle_call({bind, Exchange, Queue, RK, _Args}, _From, St) ->
     case {ets:member(?TAB, {queue, Queue}), ets:member(?TAB, {exchange, Exchange})} of
