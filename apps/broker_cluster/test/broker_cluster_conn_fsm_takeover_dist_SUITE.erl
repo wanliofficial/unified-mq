@@ -21,7 +21,8 @@
 -define(LISTENERS, [#{port => 0, num_acceptors => 4,
                       mqtt_max_qos => 1, max_keepalive_ms => 60000}]).
 
-all() -> [live_connection_zero_reconnect_on_owner_crash].
+all() -> [live_connection_zero_reconnect_on_owner_crash,
+          no_owner_no_takeover].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -141,6 +142,43 @@ live_connection_zero_reconnect_on_owner_crash(Config) ->
 takeover_ok(Node) ->
     Snap = rpc(Node, broker_metrics, snapshot, []),
     maps:get(cluster_session_takeover_ok, Snap, 0).
+
+%% 负向证明：会话分区无 owner（不 assign）→ conn 不 monitor 远端 →
+%% kill 任意非 holder 节点都不触发 claim → takeover 确定不发生（metric 恒 0、
+%% cache owner 不翻到 Holder）。与主用例对照：主用例 assign owner=Owner 后 kill →
+%% takeover 发生；本用例不 assign → 不发生。这证明 takeover metric 真由 claim 驱动，
+%% 而非凭空/本地计数。
+no_owner_no_takeover(Config) ->
+    Nodes = peer_nodes(Config),
+    #{holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
+    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+    ClientId = <<"gap4-noowner">>,
+    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+    %% 故意**不 assign**：分区 P 无 owner，conn 无远端可 monitor、kill 不触发 claim。
+    %% 先把计数器归零并证明四键齐备——否则 `takeover_ok==0' 可能只是「metrics 未
+    %% init 的全零」假绿（`snapshot/0' 回落 `zeros()'）。
+    ok = ensure_metrics(Holder),
+    ok = rpc(Holder, broker_metrics, reset, []),
+    Port = start_listener(Holder),
+    Sock = connect(Port),
+    #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
+    #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
+    Before = takeover_ok(Holder),
+    0 = Before,                          %% reset 归零后必为 0
+    %% kill 一个**非 holder** 节点（无 claim 逻辑，kill 谁都不触发 takeover；holder
+    %% 必须留着读 metric/cache）。不用 `hd(Nodes)': ra leader 常是 Nodes 首元素，
+    %% 此时 `assign_roles/2' 的 Holder 恰是 `hd(Nodes)'，kill 掉就读不到 holder 了。
+    Victim = hd([N || N <- Nodes, N =/= Holder]),
+    ok = stop_peer(Config, Victim),
+    timer:sleep(2000),
+    %% takeover **确定不发生**：delta 仍 0、cache owner 仍非 Holder（owner/1 返回
+    %% `{ok,Owner} | not_found'，从不是裸 node）。
+    0 = takeover_ok(Holder) - Before,
+    ?assertNotEqual({ok, Holder}, rpc(Holder, broker_cluster_cache, owner, [P])),
+    %% 透明性仍成立（本地 poll 兜底，与 claim 无关）。
+    #ping{kind = resp} = ping(Sock),
+    ok = gen_tcp:close(Sock),
+    ok.
 
 %% MQTT PINGREQ → 同 socket 收 PINGRESP。socket 若已闭，recv exit {listener_recv,...}。
 ping(Sock) ->
