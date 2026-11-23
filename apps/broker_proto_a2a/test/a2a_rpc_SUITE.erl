@@ -71,11 +71,19 @@ end_per_testcase(_Case, Config) ->
             ?config(prev_supported_versions, Config)),
     ok.
 
+%% `Prev' is whatever `application:get_env/2' returned: `{ok, V}' when the key
+%% was set, or `undefined' when it was not. The old `Value' clause stored the
+%% `{ok, V}' tuple verbatim -- so every test case rewrapped `supported_versions'
+%% one level deeper ({ok,{ok,...}}), and after enough cases the wrapped value
+%% reached `agent_rpc_version:negotiate/2' as a non-list and crashed with
+%% `function_clause' (a 500 in a later suite that shares this node). Unwrap the
+%% one `{ok, _}' layer `get_env' added; a value that is itself `{ok, _}' is
+%% still restored exactly, because `get_env' only ever wraps once.
+restore(App, Key, {ok, Value}) ->
+    ok = application:set_env(App, Key, Value);
 restore(App, Key, undefined) ->
     _ = application:unset_env(App, Key),
-    ok;
-restore(App, Key, Value) ->
-    ok = application:set_env(App, Key, Value).
+    ok.
 
 %%%_* Routing -----------------------------------------------------------------
 
