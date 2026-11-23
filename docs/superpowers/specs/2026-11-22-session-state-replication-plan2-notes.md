@@ -108,6 +108,8 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 
 > **2026-11-23 追加批注**：缺口 #2 已补并发 CT —— 新套件 `broker_cluster_dualpath_mutex_SUITE`（真 3 节点 ra 组）用确定性双向（claim-then-migrate / migrate-then-claim 各一赢一 `stale_epoch`）+ 20 轮并发对撞，证明 claim 与 nodedown-migrate 同分区同 epoch 下恰好一个成功、owner 唯一且三节点收敛、竞态后写权限只有一份。设计见 `2026-11-23-plan3-dualpath-mutex-design.md`。（注：migrate 路径在**命令层** `migrate/4` 经 ra 验证，不经 `on_nodedown/1`/`pick_new_owner/2` 触发；后者的选主/自排除由 `broker_cluster_nodedown_SUITE` 覆盖。）
 
+> **2026-11-23 追加批注**：缺口 #1 已补去抖窗口 —— `broker_cluster_nodedown_mon` 收到 `{nodedown,O}` 后起定时器（应用环境 `nodedown_debounce_ms`，默认 1500ms），窗口内 `{nodeup,O}` 取消则不迁移，到点仍 down 才派发既有 `on_nodedown`；`=0` 退回即时派发（向后兼容）。去抖只改"何时派发"，不改"派发什么"：唯一 owner 仍由 epoch 单调 + ra 串行 apply 保证。设计见 `2026-11-23-nodedown-debounce-design.md`。
+
 ## 4. Plan 1 / Plan 2 对比
 
 | 维度 | Plan 1 | Plan 2 |
