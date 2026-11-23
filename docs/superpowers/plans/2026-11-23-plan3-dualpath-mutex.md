@@ -379,15 +379,17 @@ run_race(ClaimNode, MigrateNode, MigrateTarget, P, Base) ->
 
 %% 断言恰好一个 {ok, Base+1}、另一个 {error, {stale_epoch, Base+1, Base+1}}，
 %% 返回赢家提议的目标 owner。两个都 ok 或两个都 error 都 ct:fail。
-assert_one_winner({ok, E}, {error, {stale_epoch, E, E}}, E, ClaimTarget, _MigrateTarget) ->
+assert_one_winner({ok, E}, {error, {stale_epoch, E, E}}, _Base, ClaimTarget, _MigrateTarget) ->
     ClaimTarget;
-assert_one_winner({error, {stale_epoch, E, E}}, {ok, E}, E, _ClaimTarget, MigrateTarget) ->
+assert_one_winner({error, {stale_epoch, E, E}}, {ok, E}, _Base, _ClaimTarget, MigrateTarget) ->
     MigrateTarget;
 assert_one_winner(ClaimRes, MigrateRes, Base, _ClaimTarget, _MigrateTarget) ->
     ct:fail({unexpected_race_result, Base, ClaimRes, MigrateRes}).
 ```
 
-> 注意：`migrate` 的 `From` 参数（这里是 `MigrateNode`=N1）只透传进命令、不参与 apply 校验；真正约束是 `To`(N3) 必须 ∈ replicas（`assign` 时 replicas=Nodes，故成立）。`Base = 2*Round` 每轮 +2，恒严格大于上轮竞态结果 epoch（`Base+1`），故每轮 `assign` 都被接受。
+> 注意（**2026-11-23 修正**）：原计划第三位置参数写成 `E`（即 `Base+1`），但调用点传的是 `Base`，二者永不相等 ⇒ 两个匹配分支恒不可达、所有合法结果都掉进 `ct:fail`（实测第一轮即红）。已改为 `_Base`：仅去掉这个调用方永不可满足的约束，arg1/arg2 的 `E` 相等链接（真正契约，要求两侧 epoch 同为 `Base+1`）保持不变，两个都 ok / 两个都 error 仍 `ct:fail`。Task 3 实现时已据此修正并落地。
+
+> 注意：`migrate` 的 `From` 参数（这里是 `MigrateNode`=N1）只透传进命令、不参与 apply 校验；真正约束是 `To`(N3) 必须 ∈ replicas（`assign` 时 replicas=Nodes，故成立）。`Base = 2*Round` 每轮 +2，恒严格大于上一轮竞态结果后的终态 epoch（上一轮 `Base+1` 即本轮 `Base-1`），故每轮 `assign` 都被接受。
 
 - [ ] **Step 3: 跑三个用例**
 

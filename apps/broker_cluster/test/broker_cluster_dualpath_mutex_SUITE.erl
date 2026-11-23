@@ -8,8 +8,11 @@
 %% assign/migrate 要 `E < Epoch' 才接受（即 `E >= Epoch' 拒）；ra 串行 apply 保证
 %% 后到者读到已推进的 epoch，故同 epoch 必一赢一 `{stale_epoch, E, E}'。
 %%
-%% 四用例（本 Task 只落第 1 个）：
+%% 四用例：
 %%   1. claim_then_migrate_same_epoch —— claim 先落地，migrate 同 epoch 被拒；
+%%   2. migrate_then_claim_same_epoch —— migrate 先落地，claim 同 epoch 被拒；
+%%   3. concurrent_claim_vs_migrate_never_double_owner —— 20 轮并发对撞，恰好一赢；
+%%   4. fencing_after_dualpath_race —— 竞态后写权限只有一份（赢家可写、其余 fenced）。
 %%
 %% 范围：只打命令层 claim-vs-migrate 互斥；`on_nodedown' 的遍历/选主已由
 %% `broker_cluster_nodedown_SUITE' 覆盖，本套件不重复，也不引入真 kill。
