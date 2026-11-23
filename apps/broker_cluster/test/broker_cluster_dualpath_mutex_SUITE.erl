@@ -99,14 +99,13 @@ concurrent_claim_vs_migrate_never_double_owner(Config) ->
     Rounds = 20,
     lists:foldl(
       fun(Round, ok) ->
-              %% Base 每轮 +2，严格大于上一轮竞态后的 epoch（Base+1），故 assign 恒被接受。
+              %% Base 每轮 +2，恒严格大于上一轮竞态后的终态 epoch（上一轮 Base+1 即本轮 Base-1），故 assign 恒被接受。
               Base = 2 * Round,
               {ok, Base} = rpc(N1, ?MODULE, assign_partition, [P, N1, Nodes, Base]),
               %% 两个独立异步 RPC 同时提交：claim 目标 N2、migrate 目标 N3。
               {ClaimRes, MigrateRes} = run_race(N2, N1, N3, P, Base),
               Winner = assert_one_winner(ClaimRes, MigrateRes, Base, N2, N3),
-              ok = wait_until_owner(Nodes, P, Winner),
-              ?assertEqual({ok, Base + 1}, rpc(N1, broker_cluster_cache, epoch, [P])),
+              ok = wait_until_converged(Nodes, P, Winner, Base + 1),
               ok
       end, ok, lists:seq(1, Rounds)),
     ok.
@@ -225,6 +224,19 @@ wait_until_owner(Nodes, P, Expected) ->
               lists:all(
                 fun(N) ->
                         rpc(N, broker_cluster_cache, owner, [P]) =:= {ok, Expected}
+                end, Nodes)
+      end).
+
+%% 轮询直到三节点 cache 同时满足：owner(P) =:= Expected 且 epoch(P) =:= Epoch。
+%% 比只等 owner 更强：owner 与 epoch 在 cache 里是同一条记录的原子写，故二者
+%% 同时匹配才排除「陈旧轮次里 owner 恰好相同、epoch 还是上一轮值」的假收敛。
+wait_until_converged(Nodes, P, Expected, Epoch) ->
+    wait_until(
+      fun() ->
+              lists:all(
+                fun(N) ->
+                        rpc(N, broker_cluster_cache, owner, [P]) =:= {ok, Expected}
+                            andalso rpc(N, broker_cluster_cache, epoch, [P]) =:= {ok, Epoch}
                 end, Nodes)
       end).
 
