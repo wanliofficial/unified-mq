@@ -20,11 +20,14 @@
                   replicas := [node()],
                   state := active | migrating,
                   index := non_neg_integer()}.
--type state() :: #{partitions := #{partition() => meta()}}.
+-type state() :: #{partitions := #{partition() => meta()},
+                   session_partition_count => pos_integer() | undefined,
+                   session_partition_epoch => non_neg_integer()}.
 
 -spec init(map()) -> state().
 init(_Config) ->
-    #{partitions => #{}}.
+    #{partitions => #{}, session_partition_count => undefined,
+      session_partition_epoch => 0}.
 
 -spec apply(map(), term(), state()) ->
           {state(), term(), list()} | {state(), term()}.
@@ -57,6 +60,8 @@ apply(#{index := Index}, Command, #{partitions := Ps} = State) ->
             end;
         {claim, P, Node, Epoch} ->
             claim(P, Node, Epoch, Index, Ps, State);
+        {set_session_partition_count, Count, Epoch} ->
+            set_session_partition_count(Count, Epoch, Ps, State);
         {get, P} ->
             case maps:find(P, Ps) of
                 {ok, M} -> {State, {ok, M}, []};
@@ -71,10 +76,15 @@ apply(#{index := Index}, Command, #{partitions := Ps} = State) ->
 %% Rebuilding the cache after a snapshot install: apply/3 is not replayed for
 %% entries covered by the snapshot, so without this a restarted node would keep
 %% an empty cache until the next ownership change.
-snapshot_installed(_Meta, _Snapshot, _State, _Machine, _Module) ->
-    #{partitions := Ps} = _State,
+snapshot_installed(_Meta, _Snapshot, State, _Machine, _Module) ->
+    #{partitions := Ps} = State,
     broker_cluster_cache:clear(),
     maps:foreach(fun(P, M) -> broker_cluster_cache:put(P, M) end, Ps),
+    case maps:get(session_partition_count, State, undefined) of
+        undefined -> ok;
+        C -> broker_cluster_cache:put_session_partition_config(
+               C, maps:get(session_partition_epoch, State, 0))
+    end,
     ok.
 
 overview(#{partitions := Ps}) ->
@@ -117,6 +127,22 @@ claim(P, Node, Epoch, Index, Ps, State) ->
             {State, {error, {stale_epoch, E, Epoch}}, []};
         error ->
             {State, {error, not_found}, []}
+    end.
+
+%% Plan 3 (gap #3, design §3.1): 会话分区数的权威值。epoch 单调守卫与 claim
+%% 同构：拒绝陈旧写；count 必须是正整数，否则分区空间非法。
+%% 更新用 `=>`（可选键）以容忍旧快照缺字段。
+set_session_partition_count(Count, Epoch, _Ps, State) ->
+    Cur = maps:get(session_partition_epoch, State, 0),
+    if
+        not is_integer(Count); Count =< 0 ->
+            {State, {error, {bad_count, Count}}, []};
+        not is_integer(Epoch); Epoch =< Cur ->
+            {State, {error, {stale_epoch, Cur, Epoch}}, []};
+        true ->
+            broker_cluster_cache:put_session_partition_config(Count, Epoch),
+            {State#{session_partition_count => Count,
+                    session_partition_epoch => Epoch}, {ok, Epoch}, []}
     end.
 
 replicas_of(P, Ps) ->

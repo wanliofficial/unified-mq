@@ -10,7 +10,8 @@
 -include_lib("broker_core/include/broker_message.hrl").
 
 -export([start/0, stop/0]).
--export([assign/4, migrate/4, finish_migration/2, remove/1, claim/3]).
+-export([assign/4, migrate/4, finish_migration/2, remove/1, claim/3,
+         set_session_partition_count/1]).
 -export([join/1, join/2, leave/1, leave/2]).
 -export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
          partition_view/0]).
@@ -95,6 +96,16 @@ inc_takeover({error, not_found}) ->
     broker_metrics:inc(cluster_session_takeover_not_found);
 inc_takeover(_Other) ->
     ok.
+
+%% @doc Plan 3 (gap #3): 提交权威会话分区数。写 ra，全集群一致。
+-spec set_session_partition_count(pos_integer()) ->
+          {ok, non_neg_integer()} | {error, term()}.
+set_session_partition_count(Count) when is_integer(Count), Count > 0 ->
+    Epoch = case broker_cluster_cache:session_partition_config() of
+                {ok, _, E} -> E + 1;
+                not_found -> 1
+            end,
+    command({set_session_partition_count, Count, Epoch}).
 
 %%%_* Online membership change (ADR-033) ----------------------------------
 %%

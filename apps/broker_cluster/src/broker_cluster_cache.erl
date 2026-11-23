@@ -15,7 +15,8 @@
 -behaviour(gen_server).
 
 -export([start_link/0, put/2, get/1, all/0, partition_view/0, clear/0,
-         clear_partition/1, owner/1, epoch/1, replicas/1]).
+         clear_partition/1, owner/1, epoch/1, replicas/1,
+         put_session_partition_config/2, session_partition_config/0]).
 %% ADR-034 D6: the committed floor is a minimum over every node's cursor. The
 %% reports live here because this server already owns the local mirror, and the
 %% table is *not* a second cursor truth: it only answers "how far may GC go".
@@ -26,6 +27,11 @@
 
 -define(TAB, broker_cluster_cache).
 -define(COMMITTED, broker_cluster_committed).
+
+%% 集群级会话分区配置的保留键：一个不可能与 non_neg_integer() 分区键相同的原子。
+%% 单独一行存，使 `all/0' / `partition_view/0' 可以显式过滤，绝不把它当分区。
+%% 行形状是三元组 {Key, Count, Epoch}，与分区行 {P, Meta} 的 arity 不同。
+-define(SESSION_CFG, '$session_partition_config').
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -48,7 +54,7 @@ get(Partition) ->
     end.
 
 all() ->
-    try [Meta || {_P, Meta} <- ets:tab2list(?TAB)]
+    try [Meta || {P, Meta} <- ets:tab2list(?TAB), P =/= ?SESSION_CFG]
     catch _:_ -> []
     end.
 
@@ -56,8 +62,28 @@ all() ->
 %% callers only want the metas), but a rebalancer has to name the partition it
 %% wants to move, so this keeps the pair.
 partition_view() ->
-    try maps:from_list(ets:tab2list(?TAB))
+    try maps:from_list([{P, Meta} || {P, Meta} <- ets:tab2list(?TAB),
+                                     P =/= ?SESSION_CFG])
     catch _:_ -> #{}
+    end.
+
+%% @doc 集群级会话分区配置（Plan 3 gap #3）：权威 C 与它的 epoch。
+%% 与分区行同表不同键，单独读取，不进 partition_view。
+-spec put_session_partition_config(pos_integer(), non_neg_integer()) -> ok.
+put_session_partition_config(Count, Epoch)
+  when is_integer(Count), Count > 0, is_integer(Epoch), Epoch >= 0 ->
+    case ets:info(?TAB, name) of
+        undefined -> ok;
+        _ -> true = ets:insert(?TAB, {?SESSION_CFG, Count, Epoch}), ok
+    end.
+
+-spec session_partition_config() -> {ok, pos_integer(), non_neg_integer()} | not_found.
+session_partition_config() ->
+    try ets:lookup(?TAB, ?SESSION_CFG) of
+        [{?SESSION_CFG, Count, Epoch}] -> {ok, Count, Epoch};
+        [] -> not_found
+    catch
+        _:_ -> not_found
     end.
 
 clear() ->
