@@ -12,7 +12,8 @@ all() -> [claim_moves_owner_when_holding_replica,
           set_count_commits_and_mirrors,
           set_count_rejects_stale_epoch,
           set_count_rejects_bad_count,
-          old_snapshot_without_count_fields_is_tolerated].
+          old_snapshot_without_count_fields_is_tolerated,
+          set_count_twice_advances_epoch].
 
 %% 同 broker_cluster_session_owner_SUITE 的约定：apply/3 会镜像到本地 cache，
 %% 起一个 cache 让侧写落地（put/2 在无表时也只是 no-op，起进程只是保持
@@ -90,14 +91,18 @@ set_count_commits_and_mirrors(_Config) ->
     ?assertEqual({ok, 16, 1}, broker_cluster_cache:session_partition_config()),
     ok.
 
-%% epoch 单调：不更大的 epoch 被拒且无副作用。
+%% epoch 单调：不更大的 epoch 被拒且无副作用（state 与 cache 都不动）。
 set_count_rejects_stale_epoch(_Config) ->
+    %% 先落一个已知配置到 cache，再用被拒的 set 验证它没被覆盖。
+    ok = broker_cluster_cache:put_session_partition_config(8, 5),
     S0 = #{partitions => #{}, session_partition_count => 8,
            session_partition_epoch => 5},
     {S1, {error, {stale_epoch, 5, 3}}, []} = broker_cluster_meta_machine:apply(
                                                #{index => 11},
                                                {set_session_partition_count, 16, 3}, S0),
     ?assertEqual(S0, S1),
+    %% 拒绝路径不得镜像：cache 仍是最初的 {ok, 8, 5}，不是被拒的 16/3。
+    ?assertEqual({ok, 8, 5}, broker_cluster_cache:session_partition_config()),
     ok.
 
 %% 非正整数被拒。
@@ -122,4 +127,17 @@ old_snapshot_without_count_fields_is_tolerated(_Config) ->
                           #{index => 14}, {set_session_partition_count, 8, 1}, S0),
     ?assertEqual(8, maps:get(session_partition_count, S1)),
     ?assertEqual(1, maps:get(session_partition_epoch, S1)),
+    ok.
+
+%% 连续两次成功 set：state 与 cache 都更新到最新值（覆盖既有镜像）。
+set_count_twice_advances_epoch(_Config) ->
+    S0 = #{partitions => #{}},
+    {S1, {ok, 1}, []} = broker_cluster_meta_machine:apply(
+                          #{index => 20}, {set_session_partition_count, 16, 1}, S0),
+    ?assertEqual({ok, 16, 1}, broker_cluster_cache:session_partition_config()),
+    {S2, {ok, 2}, []} = broker_cluster_meta_machine:apply(
+                          #{index => 21}, {set_session_partition_count, 32, 2}, S1),
+    ?assertEqual(32, maps:get(session_partition_count, S2)),
+    ?assertEqual(2, maps:get(session_partition_epoch, S2)),
+    ?assertEqual({ok, 32, 2}, broker_cluster_cache:session_partition_config()),
     ok.
