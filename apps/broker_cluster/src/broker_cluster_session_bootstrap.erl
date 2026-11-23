@@ -15,7 +15,7 @@
 
 -behaviour(gen_server).
 
--export([ensure/1, ensure/0, start_link/0]).
+-export([ensure/1, ensure/0, rescale/1, rescale/0, reclaim/2, start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -98,6 +98,112 @@ ensure_partition(P, Members) ->
             _ = broker_cluster:assign(P, Owner, Sorted, Epoch),
             ok
     end.
+
+%%%_* Autoscale (design §3.4/§3.5) -----------------------------------------
+
+%% @doc 成员变化驱动扩缩容（设计 §3.4）。相同 C 不动；冷却期内不动；
+%% 否则提交新 C，再按新 C 重建/回收分区。默认开启（session_partition_autoscale）。
+%% 返回 `{rescaled, OldC, NewC} | unchanged | {error, Reason}`。
+-spec rescale() -> {rescaled, pos_integer(), pos_integer()} | unchanged | {error, term()}.
+rescale() ->
+    case autoscale_enabled() of
+        false ->
+            unchanged;
+        true ->
+            case members() of
+                {ok, Members} -> rescale(Members);
+                {error, _} = E -> E
+            end
+    end.
+
+-spec rescale([node()]) ->
+          {rescaled, pos_integer(), pos_integer()} | unchanged | {error, term()}.
+rescale(Members) when is_list(Members), Members =/= [] ->
+    case autoscale_enabled() of
+        false ->
+            unchanged;
+        true ->
+            case broker_cluster_cache:session_partition_config() of
+                {ok, OldC, _Epoch} ->
+                    NewC = broker_cluster_session_partition:derive_count(length(Members)),
+                    maybe_rescale(OldC, NewC, Members);
+                not_found ->
+                    %% 还没有权威 C：走 ensure（它会建）。
+                    _ = ensure(Members),
+                    unchanged
+            end
+    end;
+rescale(_) ->
+    {error, no_members}.
+
+maybe_rescale(OldC, OldC, _Members) ->
+    unchanged;
+maybe_rescale(OldC, NewC, Members) ->
+    case within_rescale_cooldown() of
+        true ->
+            unchanged;
+        false ->
+            case broker_cluster:set_session_partition_count(NewC) of
+                {ok, _Epoch} ->
+                    record_rescale_now(),
+                    %% 扩容：为 0..NewC-1 建/修元数据。
+                    _ = ensure_partitions(NewC, Members),
+                    %% 缩容：NewC..OldC-1 这些已不存在的分区回收。
+                    _ = reclaim(shrink_range(NewC, OldC), Members),
+                    {rescaled, OldC, NewC};
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+%% 缩容区间：`NewC..OldC-1`；扩容时（NewC >= OldC）为空列表。
+%% 不能直接用 `lists:seq(NewC, OldC - 1)`——Erlang 的 seq/2 在 From > To 时
+%% 抛 function_clause，不是返回空（扩容就会崩）。
+shrink_range(NewC, OldC) when NewC >= OldC -> [];
+shrink_range(NewC, OldC) -> lists:seq(NewC, OldC - 1).
+
+%% @doc 缩容回收（设计 §3.5）：对给定分区列表中"owner 已不在当前成员里"的
+%% 提交 remove。仍有存活 owner 的分区不删（等 conn_fsm 迁移）。
+%% 复用调用方传入的 Members，避免每个分区再打一次 ra 成员查询。
+-spec reclaim([non_neg_integer()], [node()]) -> {reclaimed, [non_neg_integer()]}.
+reclaim(Partitions, Members) ->
+    Gone = lists:filter(fun(P) -> partition_unused(P, Members) end, Partitions),
+    lists:foreach(fun(P) -> _ = broker_cluster:remove(P) end, Gone),
+    {reclaimed, Gone}.
+
+%% 判据：没有元数据 → 无需回收；有 owner 但该 owner 已不在当前成员里 → 回收。
+partition_unused(P, Members) ->
+    case broker_cluster_cache:get(P) of
+        not_found -> false;
+        {ok, #{owner := O}} -> not lists:member(O, Members)
+    end.
+
+%% I2 退化：feature 关闭时扩缩容也必须整体停摆（不能因为曾建过元数据就继续写），
+%% 否则关闭开关后节点仍会改 C。两个开关都开才生效。
+autoscale_enabled() ->
+    case application:get_env(broker_cluster, session_replication, false) of
+        true ->
+            application:get_env(broker_cluster, session_partition_autoscale, true);
+        _ ->
+            false
+    end.
+
+cooldown_ms() ->
+    case application:get_env(broker_cluster, rescale_cooldown_ms, 300000) of
+        N when is_integer(N), N >= 0 -> N;
+        _ -> 300000
+    end.
+
+within_rescale_cooldown() ->
+    case persistent_term:get({?MODULE, last_rescale_ms}, undefined) of
+        undefined -> false;
+        Last -> erlang:monotonic_time(millisecond) - Last < cooldown_ms()
+    end.
+
+record_rescale_now() ->
+    persistent_term:put({?MODULE, last_rescale_ms},
+                        erlang:monotonic_time(millisecond)),
+    ok.
 
 members() ->
     try broker_cluster_meta:members() of

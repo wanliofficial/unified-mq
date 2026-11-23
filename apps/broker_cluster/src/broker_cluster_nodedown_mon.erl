@@ -106,7 +106,11 @@ monitor_members(#{monitored := Mon} = St) ->
                      unmonitor_node(N),
                      maps:remove(N, Acc)
              end, New, Stale),
-    St#{monitored := Mon1}.
+    St1 = St#{monitored := Mon1},
+    %% Plan 3 (gap #3): 成员收敛后尝试扩缩容会话分区空间（幂等、有冷却）。
+    %% 开关关闭 / 无权威 C 时 rescale 是 no-op；失败绝不崩监视进程。
+    _ = try broker_cluster_session_bootstrap:rescale() catch _:_ -> ok end,
+    St1.
 
 unmonitor_all(#{monitored := Mon, pending := Pend} = St) ->
     _ = [unmonitor_node(N) || N <- maps:keys(Mon)],

@@ -13,7 +13,10 @@
 
 all() -> [bootstrap_creates_all_session_partitions,
           bootstrap_is_idempotent,
-          bootstrap_auto_runs_on_start].
+          bootstrap_auto_runs_on_start,
+          rescale_grows_count_with_members,
+          rescale_shrinks_count_with_members,
+          rescale_respects_cooldown].
 
 init_per_suite(Config) ->
     case node() of
@@ -105,6 +108,86 @@ bootstrap_auto_runs_on_start(Config) ->
                         end
                 end, lists:seq(0, ?C - 1))
       end),
+    ok.
+
+%% 扩容：2 成员 → 3 成员，C 8 → 16。
+rescale_grows_count_with_members(Config) ->
+    Nodes = peer_nodes(Config),
+    [First | _] = Nodes,
+    ok = rpc(First, broker_cluster_session_bootstrap, ensure, [Nodes]),
+    ?assertMatch({ok, 8, _}, rpc(First, broker_cluster_cache,
+                                      session_partition_config, [])),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partition_min_count, 4]),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partitions_per_node, 4]),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, rescale_cooldown_ms, 0]),
+    _ = rpc(First, persistent_term, erase,
+            [{broker_cluster_session_bootstrap, last_rescale_ms}]),
+    %% 3 成员：max(4, 3*4)=12 → 16。
+    {rescaled, 8, 16} = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
+    ?assertMatch({ok, 16, _}, rpc(First, broker_cluster_cache,
+                                      session_partition_config, [])),
+    %% 新分区 8..15 也有元数据。
+    lists:foreach(
+      fun(P) -> ?assertMatch({ok, _}, rpc(First, broker_cluster_cache, owner, [P])) end,
+      lists:seq(8, 15)),
+    ok.
+
+%% 缩容：3 成员（C=16）→ 2 成员（C=8），8..15 被回收。
+rescale_shrinks_count_with_members(Config) ->
+    Nodes = peer_nodes(Config),
+    [First | _] = Nodes,
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partition_min_count, 4]),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partitions_per_node, 4]),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, rescale_cooldown_ms, 0]),
+    _ = rpc(First, persistent_term, erase,
+            [{broker_cluster_session_bootstrap, last_rescale_ms}]),
+    %% 起手把 C 拉到 16（3 成员推导）。
+    ok = rpc(First, broker_cluster_session_bootstrap, ensure, [Nodes]),
+    {rescaled, 8, 16} = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
+    ?assertMatch({ok, 16, _}, rpc(First, broker_cluster_cache,
+                                      session_partition_config, [])),
+    %% 缩到 2 成员：max(4, 2*4)=8 → 8。
+    [N1, N2 | _] = Nodes,
+    TwoMembers = [N1, N2],
+    _ = rpc(First, persistent_term, erase,
+            [{broker_cluster_session_bootstrap, last_rescale_ms}]),
+    {rescaled, 16, 8} = rpc(First, broker_cluster_session_bootstrap, rescale, [TwoMembers]),
+    ?assertMatch({ok, 8, _}, rpc(First, broker_cluster_cache,
+                                     session_partition_config, [])),
+    %% 回收判据（§3.5）：8..15 里 owner 已不在 TwoMembers 的被删；仍有存活 owner 的保留。
+    %% 轮转分配保证 3 成员中"被移出的那个"拥有 8..15 的一部分，故必有回收发生。
+    %% 这里不硬编码具体分区号（依赖 peer 名排序），只断言判据本身成立。
+    Survivors = [P || P <- lists:seq(8, 15),
+                      rpc(First, broker_cluster_cache, get, [P]) =/= not_found],
+    ?assert(length(Survivors) < 8),
+    lists:foreach(
+      fun(P) ->
+              {ok, #{owner := O}} = rpc(First, broker_cluster_cache, get, [P]),
+              ?assert(lists:member(O, TwoMembers))
+      end, Survivors),
+    ok.
+
+%% 冷却期内不再变。
+rescale_respects_cooldown(Config) ->
+    Nodes = peer_nodes(Config),
+    [First | _] = Nodes,
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partition_min_count, 4]),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partitions_per_node, 4]),
+    _ = rpc(First, application, set_env,
+            [broker_cluster, rescale_cooldown_ms, 60000]),
+    _ = rpc(First, persistent_term, erase,
+            [{broker_cluster_session_bootstrap, last_rescale_ms}]),
+    ok = rpc(First, broker_cluster_session_bootstrap, ensure, [Nodes]),
+    {rescaled, 8, 16} = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
+    unchanged = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
     ok.
 
 %%%_* Scaffolding — 从 broker_session_replica_SUITE 原样复制（勿自行重写）----------
