@@ -11,15 +11,20 @@ all() -> [partition_of_is_deterministic_and_in_range,
           session_owner_reads_local_cache,
           count_prefers_ra_mirror_over_env,
           count_honours_non_default_env,
-          epoch_is_zero_without_config].
+          epoch_is_zero_without_config,
+          derives_count_when_meta_unavailable,
+          memo_is_erased_when_config_is_set].
 
 init_per_testcase(_Case, Config) ->
     _ = application:load(broker_cluster),
+    %% 推导 memo 是 VM 级 persistent_term：用例间必须清，避免串扰。
+    _ = persistent_term:erase({broker_cluster_session_owner, derived_count}),
     {ok, Cache} = broker_cluster_cache:start_link(),
     unlink(Cache),
     [{count, 4} | Config].
 end_per_testcase(_Case, _Config) ->
     _ = application:unset_env(broker_cluster, session_partition_count),
+    _ = persistent_term:erase({broker_cluster_session_owner, derived_count}),
     _ = try gen_server:stop(broker_cluster_cache) catch _:_ -> ok end,
     ok.
 
@@ -75,4 +80,25 @@ epoch_is_zero_without_config(_Config) ->
     ?assertEqual(0, broker_cluster_session_owner:session_partition_epoch()),
     ok = broker_cluster_cache:put_session_partition_config(8, 7),
     ?assertEqual(7, broker_cluster_session_owner:session_partition_epoch()),
+    ok.
+
+%% 无权威 C、无 env 时按成员数推导；meta 不可用（未起 / 返回非列表）也要
+%% 返回正整数的安全值，而不是崩溃或 0。
+derives_count_when_meta_unavailable(_Config) ->
+    _ = application:unset_env(broker_cluster, session_partition_count),
+    ?assertEqual(not_found, broker_cluster_cache:session_partition_config()),
+    C = broker_cluster_session_owner:session_partition_count(),
+    ?assert(is_integer(C)),
+    ?assert(C >= 4),
+    ok.
+
+%% 权威 C 写入后 memo 被清，之后读命中 cache 而不是旧 memo。
+memo_is_erased_when_config_is_set(_Config) ->
+    _ = application:unset_env(broker_cluster, session_partition_count),
+    _ = broker_cluster_session_owner:session_partition_count(),   %% 触发 memo 写入
+    ok = broker_cluster_cache:put_session_partition_config(16, 1),
+    ?assertEqual(16, broker_cluster_session_owner:session_partition_count()),
+    ?assertEqual(undefined,
+                 persistent_term:get({broker_cluster_session_owner, derived_count},
+                                     undefined)),
     ok.

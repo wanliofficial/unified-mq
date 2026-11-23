@@ -72,6 +72,8 @@ partition_view() ->
 -spec put_session_partition_config(pos_integer(), non_neg_integer()) -> ok.
 put_session_partition_config(Count, Epoch)
   when is_integer(Count), Count > 0, is_integer(Epoch), Epoch >= 0 ->
+    %% 权威 C 落地：清掉 session_owner 的推导 memo，避免它继续盖住新值。
+    _ = persistent_term:erase({broker_cluster_session_owner, derived_count}),
     case ets:info(?TAB, name) of
         undefined -> ok;
         _ -> true = ets:insert(?TAB, {?SESSION_CFG, Count, Epoch}), ok
@@ -91,6 +93,8 @@ clear() ->
     %% ADR-034 D6: a cleared mirror must not leave stale committed candidates
     %% pinning a partition nobody owns any more.
     try ets:delete_all_objects(?COMMITTED) catch _:_ -> true end,
+    %% 镜像全清也意味着权威 C 不再可信：一并清掉推导 memo。
+    _ = persistent_term:erase({broker_cluster_session_owner, derived_count}),
     ok.
 
 clear_partition(Partition) ->

@@ -49,16 +49,30 @@ session_owner(Partition) ->
 
 %% 尚无权威 C 时的兜底：env 显式正整数优先（运维覆盖），否则按推导规则算。
 %% 用 get_env/3（带默认值），否则 arity-2 返回 {ok, V} 会让守卫永不匹配。
+%%
+%% 推导要经 broker_cluster_meta:members()（本地 gen_server + 本地 ra 调用），
+%% 而本函数在 session_rep 的每条操作上都会被读到；用 persistent_term 记住推导
+%% 结果，避免 cache 尚未写入权威 C 的窗口内每次操作都过一次 CTL 进程。
+%% 权威 C 一旦写入 cache（put_session_partition_config/2）即 erase 本 memo，
+%% 且读路径优先命中 cache，故 memo 只在前置窗口内被读，不会长期陈旧。
 configured_or_derived_count() ->
     case application:get_env(broker_cluster, session_partition_count, undefined) of
         N when is_integer(N), N > 0 ->
             N;
         _ ->
-            Members = cluster_member_count(),
-            broker_cluster_session_partition:derive_count(Members)
+            case persistent_term:get({?MODULE, derived_count}, undefined) of
+                C when is_integer(C), C > 0 ->
+                    C;
+                _ ->
+                    Members = cluster_member_count(),
+                    C = broker_cluster_session_partition:derive_count(Members),
+                    persistent_term:put({?MODULE, derived_count}, C),
+                    C
+            end
     end.
 
-%% 读当前成员数；拿不到（单机 / ra 未起 / 无 quorum）按 1 算，得到最小值。
+%% 读当前集群**成员数**；拿不到（单机 / ra 未起 / 无 quorum）按 1 算，
+%% 得到最小成员数，再由 derive_count/1 把 1 映射成最小分区数（4）。
 cluster_member_count() ->
     try broker_cluster_meta:members() of
         L when is_list(L), L =/= [] -> length(L);
