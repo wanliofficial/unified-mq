@@ -26,7 +26,8 @@
 all() ->
     [claim_then_migrate_same_epoch,
      migrate_then_claim_same_epoch,
-     concurrent_claim_vs_migrate_never_double_owner].
+     concurrent_claim_vs_migrate_never_double_owner,
+     fencing_after_dualpath_race].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -108,6 +109,30 @@ concurrent_claim_vs_migrate_never_double_owner(Config) ->
               ok = wait_until_converged(Nodes, P, Winner, Base + 1),
               ok
       end, ok, lists:seq(1, Rounds)),
+    ok.
+
+%% 用例 4（互斥的可见后果）：跑一轮 claim-vs-migrate 对撞，拿到赢家 owner W 后，
+%% 断言写权限只有一份：W 以 Base+1 可写；两个非 owner（含败者）以 Base+1 被
+%% fencing 拒；W 以陈旧 epoch Base 也被拒。
+fencing_after_dualpath_race(Config) ->
+    [N1, N2, N3] = Nodes = peer_nodes(Config),
+    P = ?PARTITION,
+    Base = 2,
+    {ok, Base} = rpc(N1, ?MODULE, assign_partition, [P, N1, Nodes, Base]),
+    {ClaimRes, MigrateRes} = run_race(N2, N1, N3, P, Base),
+    Winner = assert_one_winner(ClaimRes, MigrateRes, Base, N2, N3),
+    ok = wait_until_converged(Nodes, P, Winner, Base + 1),
+    Epoch = Base + 1,
+    %% 唯一合法 owner 以当前 epoch 可写。
+    ok = rpc(Winner, broker_cluster, authorize_append, [P, Epoch]),
+    %% 两个非 owner（含败者）以当前 epoch 写：被 fencing 拒。
+    Losers = Nodes -- [Winner],
+    [?assertMatch({error, {fenced, _}},
+                  rpc(L, broker_cluster, authorize_append, [P, Epoch]))
+     || L <- Losers],
+    %% 赢家以陈旧 epoch 写：也被拒。
+    ?assertMatch({error, {fenced, _}},
+                 rpc(Winner, broker_cluster, authorize_append, [P, Base])),
     ok.
 
 %% 在 ClaimNode 发 claim(P, ClaimNode, Base+1)，在 MigrateNode 发
