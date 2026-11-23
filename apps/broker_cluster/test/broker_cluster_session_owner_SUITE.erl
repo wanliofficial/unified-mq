@@ -8,7 +8,10 @@
 
 all() -> [partition_of_is_deterministic_and_in_range,
           partition_of_spreads_across_space,
-          session_owner_reads_local_cache].
+          session_owner_reads_local_cache,
+          count_prefers_ra_mirror_over_env,
+          count_honours_non_default_env,
+          epoch_is_zero_without_config].
 
 init_per_testcase(_Case, Config) ->
     _ = application:load(broker_cluster),
@@ -16,6 +19,7 @@ init_per_testcase(_Case, Config) ->
     unlink(Cache),
     [{count, 4} | Config].
 end_per_testcase(_Case, _Config) ->
+    _ = application:unset_env(broker_cluster, session_partition_count),
     _ = try gen_server:stop(broker_cluster_cache) catch _:_ -> ok end,
     ok.
 
@@ -50,4 +54,25 @@ session_owner_reads_local_cache(_Config) ->
                                         state => active, index => 1}),
     ?assertEqual({ok, node()},
                  broker_cluster_session_owner:session_owner(0)),
+    ok.
+
+%% 权威 C 一旦镜像进 cache，就读它，而不是 env。
+count_prefers_ra_mirror_over_env(_Config) ->
+    ok = application:set_env(broker_cluster, session_partition_count, 8),
+    ?assertEqual(8, broker_cluster_session_owner:session_partition_count()),
+    ok = broker_cluster_cache:put_session_partition_config(16, 3),
+    ?assertEqual(16, broker_cluster_session_owner:session_partition_count()),
+    ok.
+
+%% env 覆盖必须真正生效（防止 get_env/2 静默忽略：用非默认值 64）。
+count_honours_non_default_env(_Config) ->
+    ok = application:set_env(broker_cluster, session_partition_count, 64),
+    ?assertEqual(64, broker_cluster_session_owner:session_partition_count()),
+    ok.
+
+%% 无权威配置时 epoch 读 0（不是 undefined / 崩溃）。
+epoch_is_zero_without_config(_Config) ->
+    ?assertEqual(0, broker_cluster_session_owner:session_partition_epoch()),
+    ok = broker_cluster_cache:put_session_partition_config(8, 7),
+    ?assertEqual(7, broker_cluster_session_owner:session_partition_epoch()),
     ok.
