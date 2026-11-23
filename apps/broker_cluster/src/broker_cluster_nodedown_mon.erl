@@ -32,28 +32,44 @@ init(HandlerArg) ->
                   default -> fun broker_cluster_nodedown:on_nodedown/1;
                   F when is_function(F, 1) -> F
               end,
-    {ok, arm(#{handler => Handler, monitored => #{}})}.
+    {ok, arm(#{handler => Handler, monitored => #{}, pending => #{}})}.
 
 handle_call(_Req, _From, St) -> {reply, ok, St}.
 
 handle_cast(rearm, St) -> {noreply, arm(St)};
 handle_cast(_Msg, St) -> {noreply, St}.
 
-handle_info({nodedown, Node}, #{handler := H, monitored := Mon} = St) ->
+handle_info({nodedown, Node}, #{handler := H, monitored := Mon, pending := Pend} = St) ->
+    case debounce_ms() of
+        0 ->
+            %% 向后兼容：即时派发（旧的即时行为）。
+            _ = try H(Node) catch _:_ -> ok end,
+            unmonitor_node(Node),
+            {noreply, St#{monitored := maps:remove(Node, Mon)}};
+        Ms when is_integer(Ms), Ms > 0 ->
+            case maps:is_key(Node, Pend) of
+                true ->
+                    %% 同一断连的重复 nodedown：忽略，不重置定时器。
+                    {noreply, St};
+                false ->
+                    TRef = erlang:send_after(Ms, self(), {nodedown_expired, Node}),
+                    {noreply, St#{pending := maps:put(Node, TRef, Pend)}}
+            end
+    end;
+handle_info({nodeup, Node}, #{pending := Pend} = St) ->
+    %% 窗口内自愈：取消该节点的去抖定时器（若有），不迁移；随后重挂监视。
+    {noreply, monitor_members(St#{pending := cancel_pending(Node, Pend)})};
+handle_info({nodedown_expired, Node}, #{handler := H, pending := Pend} = St) ->
+    %% 去抖窗口到点、期间无 nodeup：确认真崩溃，派发迁移。
     _ = try H(Node) catch _:_ -> ok end,
-    %% 配对 monitor_node(true) 的引用计数：显式 demonitor 归零。注意 ERTS 在
-    %% handle_nodedown 时本就会清理该节点的 monitor 项，所以这里主要是显式的
-    %% 「挂/撤成对」卫生（防御未来语义变化），而非修复一个可观测的泄漏。
-    unmonitor_node(Node),
-    {noreply, St#{monitored := maps:remove(Node, Mon)}};
-handle_info({nodeup, _Node}, St) ->
-    %% 节点回来（或成员变化）：重新拉成员、补挂。nodeup 后 ra 通常已可达。
-    {noreply, monitor_members(St)};
+    {noreply, St#{pending := maps:remove(Node, Pend)}};
 handle_info(_Other, St) ->
     {noreply, St}.
 
-terminate(_Reason, #{monitored := Mon}) ->
+terminate(_Reason, #{monitored := Mon, pending := Pend}) ->
     _ = [unmonitor_node(N) || N <- maps:keys(Mon)],
+    _ = [try erlang:cancel_timer(TRef) catch _:_ -> ok end
+         || TRef <- maps:values(Pend)],
     ok.
 
 %%%_* Internal ------------------------------------------------------------
@@ -98,6 +114,25 @@ unmonitor_all(#{monitored := Mon} = St) ->
 unmonitor_node(Node) ->
     try erlang:monitor_node(Node, false)
     catch _:_ -> ok
+    end.
+
+%% 去抖窗口（毫秒）：应用环境 nodedown_debounce_ms，缺省 1500；非负整数，非法值回落默认。
+debounce_ms() ->
+    case application:get_env(broker_cluster, nodedown_debounce_ms, 1500) of
+        N when is_integer(N), N >= 0 -> N;
+        _ -> 1500
+    end.
+
+%% 取消节点 O 的去抖定时器（若有）：cancel_timer + flush 可能已投递的裸
+%% {nodedown_expired, O}，返回更新后的 pending。无定时器则原样返回。
+cancel_pending(Node, Pend) ->
+    case maps:take(Node, Pend) of
+        {TRef, Rest} ->
+            _ = erlang:cancel_timer(TRef),
+            receive {nodedown_expired, Node} -> ok after 0 -> ok end,
+            Rest;
+        error ->
+            Pend
     end.
 
 %% 成员读取容错：ra 未起 / 无 quorum 时退回空列表（休眠），绝不崩。

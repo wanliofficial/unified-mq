@@ -7,7 +7,9 @@
 
 all() -> [dispatches_nodedown_to_handler,
           dormant_when_disabled,
-          nodedown_demonitors_after_dispatch].
+          nodedown_demonitors_after_dispatch,
+          debounces_then_cancels_on_nodeup,
+          dispatches_after_window_expires].
 
 init_per_testcase(_C, Config) ->
     _ = application:load(broker_cluster),
@@ -21,6 +23,7 @@ end_per_testcase(_C, _Config) ->
 
 dispatches_nodedown_to_handler(_Config) ->
     ok = application:set_env(broker_cluster, session_replication, true),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 0),
     Self = self(),
     H = fun(Node) -> Self ! {hit, Node} end,
     {ok, _} = broker_cluster_nodedown_mon:start_link(H),
@@ -31,6 +34,7 @@ dispatches_nodedown_to_handler(_Config) ->
 
 dormant_when_disabled(_Config) ->
     ok = application:set_env(broker_cluster, session_replication, false),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 0),
     Self = self(),
     H = fun(Node) -> Self ! {hit, Node} end,
     {ok, Pid} = broker_cluster_nodedown_mon:start_link(H),
@@ -54,6 +58,7 @@ broker_cluster_nodedown_mon_pid() ->
 %% 不再含 X。这一步不能被“只删 map”的旧实现骗过。
 nodedown_demonitors_after_dispatch(_Config) ->
     ok = application:set_env(broker_cluster, session_replication, true),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 0),
     {ok, Pid} = broker_cluster_nodedown_mon:start_link(fun(_) -> ok end),
     %% 监视“所有 monitor_node/2 调用”，只关心 false 那一次（demonitor）。
     _ = erlang:trace_pattern({erlang, monitor_node, 2}, true, [global]),
@@ -79,4 +84,37 @@ wait_for_demonitor(Pid, Node, Left) ->
             wait_for_demonitor(Pid, Node, Left - 1)
     after 200 ->
         false
+    end.
+
+%% 去抖：窗口内 nodeup 自愈 → 取消定时器，绝不派发 on_nodedown（无误迁移）。
+debounces_then_cancels_on_nodeup(_Config) ->
+    ok = application:set_env(broker_cluster, session_replication, true),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 300),
+    Self = self(),
+    H = fun(Node) -> Self ! {hit, Node} end,
+    {ok, _} = broker_cluster_nodedown_mon:start_link(H),
+    Node = ghost@host,
+    broker_cluster_nodedown_mon_pid() ! {nodedown, Node},
+    %% 窗口内（<300ms）自愈。
+    timer:sleep(100),
+    broker_cluster_nodedown_mon_pid() ! {nodeup, Node},
+    receive {hit, Node} -> ct:fail(should_have_been_debounced)
+    after 500 -> ok
+    end.
+
+%% 去抖：窗口到点、期间无 nodeup → 恰好派发一次（不重复）。
+dispatches_after_window_expires(_Config) ->
+    ok = application:set_env(broker_cluster, session_replication, true),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 100),
+    Self = self(),
+    H = fun(Node) -> Self ! {hit, Node} end,
+    {ok, _} = broker_cluster_nodedown_mon:start_link(H),
+    Node = ghost@host,
+    broker_cluster_nodedown_mon_pid() ! {nodedown, Node},
+    receive {hit, Node} -> ok
+    after 2000 -> ct:fail(no_dispatch_after_window)
+    end,
+    %% 二次确认：定时器只发一次，不会重复派发。
+    receive {hit, Node} -> ct:fail(double_dispatch)
+    after 200 -> ok
     end.
