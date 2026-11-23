@@ -7,6 +7,7 @@
 all() -> [derive_count_is_power_of_two_at_least_min,
           derive_count_grows_with_members,
           derive_count_small_cluster_uses_min,
+          derive_count_honours_env_overrides,
           next_power_of_two_boundaries,
           pick_owner_is_deterministic_and_in_replicas].
 
@@ -46,6 +47,16 @@ derive_count_small_cluster_uses_min(_Config) ->
     ?assertEqual(16, broker_cluster_session_partition:derive_count(3)),
     ok.
 
+%% 非默认 env 必须生效（防止 C1 那种 get_env/2 静默忽略回归）。
+derive_count_honours_env_overrides(_Config) ->
+    ok = application:set_env(broker_cluster, session_partition_min_count, 32),
+    ok = application:set_env(broker_cluster, session_partitions_per_node, 1),
+    ?assertEqual(32, broker_cluster_session_partition:derive_count(1)),
+    ok = application:set_env(broker_cluster, session_partition_min_count, 1),
+    ok = application:set_env(broker_cluster, session_partitions_per_node, 2),
+    ?assertEqual(8, broker_cluster_session_partition:derive_count(4)),
+    ok.
+
 next_power_of_two_boundaries(_Config) ->
     ?assertEqual(1, broker_cluster_session_partition:next_power_of_two(1)),
     ?assertEqual(1, broker_cluster_session_partition:next_power_of_two(0)),
@@ -70,6 +81,11 @@ pick_owner_is_deterministic_and_in_replicas(_Config) ->
     Owners = [broker_cluster_session_partition:pick_owner(P, Members)
               || P <- lists:seq(0, 15)],
     ?assertEqual(3, length(lists:usort(Owners))),
+    %% 成员列表顺序不影响 owner 选择（每条路径必须选同一 owner）。
+    ?assertEqual(broker_cluster_session_partition:pick_owner(1, [n3, n1, n2]),
+                 broker_cluster_session_partition:pick_owner(1, [n1, n2, n3])),
+    %% 空成员列表：无成员就不该建分区，契约返回 undefined。
+    ?assertEqual(undefined, broker_cluster_session_partition:pick_owner(0, [])),
     ok.
 
 is_power_of_two(N) when is_integer(N), N > 0 ->

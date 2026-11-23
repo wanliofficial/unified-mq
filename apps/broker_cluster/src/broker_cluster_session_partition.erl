@@ -38,7 +38,7 @@ pick_owner(P, Members) when is_integer(P), P >= 0 ->
     lists:nth((P rem length(Sorted)) + 1, Sorted).
 
 env_int(Key, Default) ->
-    case application:get_env(broker_cluster, Key) of
+    case application:get_env(broker_cluster, Key, Default) of
         N when is_integer(N), N > 0 -> N;
         _ -> Default
     end.
