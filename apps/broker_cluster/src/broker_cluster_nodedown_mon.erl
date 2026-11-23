@@ -40,20 +40,22 @@ handle_cast(rearm, St) -> {noreply, arm(St)};
 handle_cast(_Msg, St) -> {noreply, St}.
 
 handle_info({nodedown, Node}, #{handler := H, monitored := Mon, pending := Pend} = St) ->
+    %% ERTS 在 nodedown 时已自动撤除该节点的 monitor；同步从 monitored 移除，避免节点
+    %% 稍后回归时 monitor_members 因 maps:is_key 跳过重挂、漏判其下次崩溃。
+    unmonitor_node(Node),
+    Mon1 = maps:remove(Node, Mon),
     case debounce_ms() of
         0 ->
-            %% 向后兼容：即时派发（旧的即时行为）。
             _ = try H(Node) catch _:_ -> ok end,
-            unmonitor_node(Node),
-            {noreply, St#{monitored := maps:remove(Node, Mon)}};
+            {noreply, St#{monitored := Mon1}};
         Ms when is_integer(Ms), Ms > 0 ->
             case maps:is_key(Node, Pend) of
                 true ->
                     %% 同一断连的重复 nodedown：忽略，不重置定时器。
-                    {noreply, St};
+                    {noreply, St#{monitored := Mon1}};
                 false ->
                     TRef = erlang:send_after(Ms, self(), {nodedown_expired, Node}),
-                    {noreply, St#{pending := maps:put(Node, TRef, Pend)}}
+                    {noreply, St#{monitored := Mon1, pending := maps:put(Node, TRef, Pend)}}
             end
     end;
 handle_info({nodeup, Node}, #{pending := Pend} = St) ->
@@ -106,9 +108,10 @@ monitor_members(#{monitored := Mon} = St) ->
              end, New, Stale),
     St#{monitored := Mon1}.
 
-unmonitor_all(#{monitored := Mon} = St) ->
+unmonitor_all(#{monitored := Mon, pending := Pend} = St) ->
     _ = [unmonitor_node(N) || N <- maps:keys(Mon)],
-    St#{monitored := #{}}.
+    _ = [try erlang:cancel_timer(TRef) catch _:_ -> ok end || TRef <- maps:values(Pend)],
+    St#{monitored := #{}, pending := #{}}.
 
 %% monitor_node/2 撤监视的容错包装：任何错误都吞掉，绝不崩监视进程。
 unmonitor_node(Node) ->

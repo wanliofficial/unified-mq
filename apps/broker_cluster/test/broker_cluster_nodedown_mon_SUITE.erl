@@ -9,7 +9,9 @@ all() -> [dispatches_nodedown_to_handler,
           dormant_when_disabled,
           nodedown_demonitors_after_dispatch,
           debounces_then_cancels_on_nodeup,
-          dispatches_after_window_expires].
+          dispatches_after_window_expires,
+          removes_from_monitored_after_debounce,
+          disable_during_pending_cancels_timer].
 
 init_per_testcase(_C, Config) ->
     _ = application:load(broker_cluster),
@@ -117,4 +119,45 @@ dispatches_after_window_expires(_Config) ->
     %% 二次确认：定时器只发一次，不会重复派发。
     receive {hit, Node} -> ct:fail(double_dispatch)
     after 200 -> ok
+    end.
+
+%% 回归（Finding B）：去抖崩溃到点后，节点须从 monitored 移除，否则其回归将被漏挂监控。
+removes_from_monitored_after_debounce(_Config) ->
+    ok = application:set_env(broker_cluster, session_replication, true),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 100),
+    {ok, Pid} = broker_cluster_nodedown_mon:start_link(fun(_) -> ok end),
+    Node = fallen@host,
+    Pid ! {nodedown, Node},
+    ok = wait_until(fun() -> not maps:is_key(Node, monitored_of(Pid)) end, 2000),
+    ?assertNot(maps:is_key(Node, monitored_of(Pid))),
+    ok.
+
+monitored_of(Pid) ->
+    maps:get(monitored, sys:get_state(Pid)).
+
+%% 回归（Finding A）：pending 窗口内关掉 session_replication（rearm→unmonitor_all）须取消定时器，不派发。
+disable_during_pending_cancels_timer(_Config) ->
+    ok = application:set_env(broker_cluster, session_replication, true),
+    ok = application:set_env(broker_cluster, nodedown_debounce_ms, 400),
+    Self = self(),
+    H = fun(Node) -> Self ! {hit, Node} end,
+    {ok, _} = broker_cluster_nodedown_mon:start_link(H),
+    Node = sinking@host,
+    broker_cluster_nodedown_mon_pid() ! {nodedown, Node},
+    timer:sleep(100),
+    %% 窗口内关开关并重挂。
+    ok = application:set_env(broker_cluster, session_replication, false),
+    broker_cluster_nodedown_mon:rearm(),
+    receive {hit, Node} -> ct:fail(stray_dispatch_after_disable)
+    after 600 -> ok
+    end.
+
+%% 本地轮询等待：每 50ms 跑一次 Pred，直到 true 或 Left 用尽（用尽则 ct:fail 超时）。
+wait_until(_Pred, Left) when Left =< 0 -> ct:fail({timeout, ?MODULE});
+wait_until(Pred, Left) ->
+    try Pred() of
+        true -> ok;
+        _ -> timer:sleep(50), wait_until(Pred, Left - 50)
+    catch
+        _:_ -> timer:sleep(50), wait_until(Pred, Left - 50)
     end.
