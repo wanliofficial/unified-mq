@@ -22,7 +22,7 @@ Plan 2 的透明故障接管有**两条互不依赖**的所有权变更路径（
 
 1. 两条路径恰好一个成功（`{ok, Epoch}`）、另一个被 epoch 单调守卫拒绝（`{error, {stale_epoch, E, E}}`）；
 2. 无论谁先落地，最终 owner 唯一，且三节点 cache 收敛一致，等于**赢家提议的目标**；
-3. 竞态结束后所有权可见后果正确：唯一 owner 以当前 epoch 可写，其余以陈旧 epoch 被 fencing 拒绝。
+3. 竞态结束后所有权可见后果正确：唯一 owner 以当前 epoch 可写，两个非 owner（含败者）以当前 epoch 被 fencing 拒绝，且赢家再以陈旧 epoch 写也被拒。
 
 **非目标**：
 

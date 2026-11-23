@@ -150,8 +150,10 @@ run_race(ClaimNode, MigrateNode, MigrateTarget, P, Base) ->
     MigrateRes = rpc:yield(MigrateTag),
     {ClaimRes, MigrateRes}.
 
-%% 断言恰好一个 {ok, Base+1}、另一个 {error, {stale_epoch, Base+1, Base+1}}，
+%% 断言两侧 epoch 相等（恰好一个 {ok, E}、另一个 {error, {stale_epoch, E, E}}），
 %% 返回赢家提议的目标 owner。两个都 ok 或两个都 error 都 ct:fail。
+%% 注：第三参 Base 仅用于失败诊断（实际 epoch 值 E 是否等于 Base+1 由调用方的
+%% wait_until_converged(..., Base+1) 保证，此处只锁「两侧同 epoch」这一互斥不变量）。
 assert_one_winner({ok, E}, {error, {stale_epoch, E, E}}, _Base, ClaimTarget, _MigrateTarget) ->
     ClaimTarget;
 assert_one_winner({error, {stale_epoch, E, E}}, {ok, E}, _Base, _ClaimTarget, MigrateTarget) ->
@@ -166,6 +168,24 @@ form_cluster_h(Nodes) ->
     ok.
 
 assign_partition(Partition, Owner, Nodes, Epoch) ->
+    assign_partition(Partition, Owner, Nodes, Epoch, 30).
+
+%% 组刚形成、首个命令发出时 leader 选举可能尚未完成，assign 可能拿到
+%% {error,no_leader} / {error,no_quorum}（ra 未提交，非 epoch 拒绝）。有界重试
+%% 容忍之——这是唯一能让「正确分支」在 CI 高负载下误红、却与互斥性无关的路径。
+%% epoch 拒绝（{stale_epoch,...}）不在此列、立即返回；本函数只在用例起跑时做
+%% 初始化 assign，不存在「已成功又被重试成 stale_epoch」的风险。
+assign_partition(Partition, Owner, Nodes, Epoch, Retries)
+  when Retries > 0 ->
+    case broker_cluster:assign(Partition, Owner, Nodes, Epoch) of
+        {error, no_leader} ->
+            timer:sleep(100), assign_partition(Partition, Owner, Nodes, Epoch, Retries - 1);
+        {error, no_quorum} ->
+            timer:sleep(100), assign_partition(Partition, Owner, Nodes, Epoch, Retries - 1);
+        Result ->
+            Result
+    end;
+assign_partition(Partition, Owner, Nodes, Epoch, _Retries) ->
     broker_cluster:assign(Partition, Owner, Nodes, Epoch).
 
 %%%_* Peers ----------------------------------------------------------------
@@ -270,7 +290,7 @@ wait_until_converged(Nodes, P, Expected, Epoch) ->
 
 wait_until(Pred) -> wait_until(Pred, 20000, 100).
 
-wait_until(_Pred, 0, _Step) -> ct:fail({timeout, ?MODULE});
+wait_until(_Pred, Wait, _Step) when Wait =< 0 -> ct:fail({timeout, ?MODULE});
 wait_until(Pred, Wait, Step) ->
     try Pred() of
         true -> ok;
