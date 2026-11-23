@@ -529,80 +529,60 @@ git commit -m "test(cluster,gap4): kill owner 后同 socket 零重连 + conn_fsm
 
 ## Task 3: 变异验证（证明 CT 真在测接管）
 
+> **修订说明（2026-11-23，据 Task 2 两阶段评审）**：原 draft 的两个变异用例有硬伤——`mutates_claim_noop` 实际只验证「无 owner → 不 monitor → 不 claim」（黑盒不 assign，测不到 claim 被改 no-op 的源码级变异），名不副实；`mutates_owner_is_leader_flakes_takeover` 无任何固定断言（只 `ct:comment`），永远绿，放 `all/0` 是误导；且 draft 用裸 `Owner` 比较（`broker_cluster_cache:owner/1` 返回 `{ok,Owner}|not_found`）必超时红。据此修订为：
+> 1. **保留一个稳健的负向永久用例 `no_owner_no_takeover`**：会话分区**不 assign**（无 owner）→ conn 不 monitor 远端 → kill 不触发 claim → takeover **确定不发生**。先 `ensure_metrics(Holder)` + `broker_metrics:reset/0` 归零（堵死假绿），断言 takeover_ok delta==0、cache owner 仍非 Holder、同 socket 仍透明。加入 `all/0`。
+> 2. **把「claim 改 no-op → 主用例红」与「owner==leader → flaky」改为设计期一次性验证**（设计 §8）：临时改源码、跑主用例看红、revert，**不提交**、不做成永久 CT 用例。步骤见 Step 3。
+
 **Files:**
-- Modify: `apps/broker_cluster/test/broker_cluster_conn_fsm_takeover_dist_SUITE.erl`（新增 2 个 `*_mutant` 验证用例，加入 `all/0`）
+- Modify: `apps/broker_cluster/test/broker_cluster_conn_fsm_takeover_dist_SUITE.erl`（新增 1 个负向用例 `no_owner_no_takeover`，加入 `all/0`）
 
-证明套件不是退化测试：把 conn 的 claim 改 no-op、或去掉 owner≠leader 控制，takeover 断言会红。
+- [ ] **Step 1: 注册负向用例到 all/0**
 
-- [ ] **Step 1: 加两个变异验证用例 + 注册到 all/0**
-
-在 `all/0` 加入两行：
+在 `all/0` 加入一行：
 ```erlang
 all() -> [live_connection_zero_reconnect_on_owner_crash,
-          mutates_claim_noop_fails_takeover,
-          mutates_owner_is_leader_flakes_takeover].
+          no_owner_no_takeover].
 ```
 
-追加两用例（复用 Task 1/2 的脚手架，clone 主用例前奏）：
+- [ ] **Step 2: 加负向用例 `no_owner_no_takeover`**
 
 ```erlang
-%% 变异1：conn_fsm 的 claim 若被改 no-op，takeover 断言（cache 翻转 + metric）必红。
-%% 这里以「不 assign owner=远端、让 conn 无 owner 可 monitor」模拟「claim 不发生」：
-%% 会话分区不存在 → conn 不 monitor 远端 → kill 任意节点都不触发 claim → takeover 永不发生。
-%% 故断言 takeover_ok 在合理窗口内仍为 0（证明 metric 真由 claim 驱动，非凭空计数）。
-mutates_claim_noop_fails_takeover(Config) ->
+%% 负向证明：会话分区无 owner（不 assign）→ conn 不 monitor 远端 →
+%% kill 任意节点都不触发 claim → takeover 确定不发生（metric 恒 0、cache owner 不翻到 Holder）。
+%% 与主用例对照：主用例 assign owner=Owner 后 kill → takeover 发生；本用例不 assign → 不发生。
+%% 这证明 takeover metric 真由 claim 驱动，而非凭空/本地计数。
+no_owner_no_takeover(Config) ->
     Nodes = peer_nodes(Config),
-    #{owner := Owner, holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
+    #{holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
     Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
-    ClientId = <<"gap4-mut1">>,
+    ClientId = <<"gap4-noowner">>,
     P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
-    %% 故意**不 assign**：分区 P 无 owner，conn 不 monitor，kill 不触发 claim。
+    %% 故意**不 assign**：分区 P 无 owner，conn 无远端可 monitor、kill 不触发 claim。
+    ok = ensure_metrics(Holder),
+    ok = rpc(Holder, broker_metrics, reset, []),
     Port = start_listener(Holder),
     Sock = connect(Port),
     #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
     #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
-    ok = stop_peer(Config, Owner),
-    %% 透明性仍成立（本地 poll 兜底）。
-    #ping{kind = resp} = ping(Sock),
-    %% 但 takeover **不发生**：等 2s 后 metric 仍 0、cache owner 仍非 Holder。
+    Before = takeover_ok(Holder),
+    0 = Before,                          %% reset 归零后必为 0
+    ok = stop_peer(Config, hd(Nodes)),   %% kill 一个非 holder 节点（无 claim 可触发）
     timer:sleep(2000),
-    ?assertEqual(0, takeover_ok(Holder)),
-    ?assertNotEqual(Holder, rpc(Holder, broker_cluster_cache, owner, [P])),
-    ok = gen_tcp:close(Sock),
-    ok.
-
-%% 变异2：owner == leader 时 kill，conn claim fire-once 可能撞 no_leader → takeover
-%% 不确定。本用例**固定** owner=leader，断言 takeover 可能失败（计数不增），证明
-%% 「owner 选非 leader」是 takeover 确定性的必要手段（去掉它 →  flaky）。
-mutates_owner_is_leader_flakes_takeover(Config) ->
-    Nodes = peer_nodes(Config),
-    Leader = ra_leader(Nodes),
-    Owner = Leader,                          %% 故意让 owner == leader
-    Holder = hd(Nodes -- [Owner]),
-    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
-    ClientId = <<"gap4-mut2">>,
-    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
-    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
-    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [P]) =:= Owner end),
-    Port = start_listener(Holder),
-    Sock = connect(Port),
-    #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
-    #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
-    ok = stop_peer(Config, Owner),
+    %% takeover **确定不发生**：delta 仍 0、cache owner 仍非 Holder（{ok,_}|not_found 形状）。
+    0 = takeover_ok(Holder) - Before,
+    ?assertNotEqual({ok, Holder}, rpc(Holder, broker_cluster_cache, owner, [P])),
+    %% 透明性仍成立（本地 poll 兜底，与 claim 无关）。
     #ping{kind = resp} = ping(Sock),
-    %% owner==leader 时 claim 撞 no_leader：takeover 不确定。这里**不强断言它成功**，
-    %% 只打印结果，证明去掉 leader 控制后行为不可控（CI 上会出现随机红/绿）。
-    case takeover_ok(Holder) of
-        0 -> ct:comment("owner==leader: claim 撞 no_leader，takeover 未发生（预期 flaky）");
-        N when N >= 1 -> ct:comment("owner==leader: 本次侥幸接管 ok=~p（不可复现的确定性）", [N])
-    end,
     ok = gen_tcp:close(Sock),
     ok.
 ```
+要点：
+- `ensure_metrics(Holder)` + `broker_metrics:reset/0` 先把计数器归零并确认四键齐备——否则 `takeover_ok==0` 可能是「metrics 未 init 的全零」假绿。
+- 所有 `broker_cluster_cache:owner/1` 比较用 `{ok,_}` 形状（与 Task 1/2 一致）。
+- kill 的是 `hd(Nodes)`（任一非 holder 节点，因无 claim 逻辑，kill 谁都不触发 takeover）；holder 自身保留以读 metric/cache。
+- 这是**负向永久用例**（确定红/绿、无 flaky），适合放 `all/0`。
 
-> 说明：变异2 是「**展示**」用例——它故意构造 flaky 条件并打印结果，**不**断言固定成败（断言固定成败会让变异用例本身 flaky）。其目的是文档化「owner≠leader 控制不可去掉」。若 CI 不希望跑潜在 flaky 的变异2，可从 `all/0` 移除、仅留注释；由实现者按 §设计 §7.1 决定。
-
-- [ ] **Step 2: 跑套件，确认绿（变异1 通过、变异2 打印注释）**
+- [ ] **Step 3: 跑套件，确认绿**
 
 ```bash
 export PATH="$HOME/Development/otp-29.1.2/lib/erlang/bin:$PATH"
@@ -611,15 +591,32 @@ rm -rf _build/test
 rebar3 ct --suite=apps/broker_cluster/test/broker_cluster_conn_fsm_takeover_dist_SUITE.erl
 find _build/test/logs -name suite.log -path "*conn_fsm_takeover_dist*" -exec grep -E "^=result|^=successful|^=failed" {} \;
 ```
-Expected: 三用例全 `=result ok`，`=successful 3`，`=failed 0`。变异1 证明 metric 由 claim 驱动（不 assign → 计数 0）；变异2 打印 owner==leader 的不可控结果。
+Expected: 两用例全 `=result ok`，`=successful 2`，`=failed 0`。
 
-- [ ] **Step 3: 提交**
+- [ ] **Step 4: 提交**
 
 ```bash
 cd /home/wanli/.local/share/opencode/worktree/gap4-conn-fsm-e2e-ct
 git add apps/broker_cluster/test/broker_cluster_conn_fsm_takeover_dist_SUITE.erl
-git commit -m "test(cluster,gap4): 变异验证——claim no-op/owner==leader 下 takeover 行为（缺口 #4 T3）"
+git commit -m "test(cluster,gap4): 负向变异——无 owner 时 takeover 确定不发生（缺口 #4 T3）"
 ```
+
+- [ ] **Step 5: 设计期源码级变异验证（一次性，不提交、不做成 CT 用例）**
+
+按设计 §8「设计期执行」：临时改源码证明主用例真能抓到「claim 坏了 / owner==leader flaky」，验证后 **revert，不提交**。任选其一（推荐做 a）：
+
+a) **claim no-op → 主用例红。** 临时把 `apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl` 的内联 claim handler（`{nodedown, Owner}` 分支 / `takeover_target/2` 调用处）改成直接 `noreply` 不执行 claim（不递增 `cluster_session_takeover_ok`、不写 cache）。跑主用例：
+```bash
+export PATH="$HOME/Development/otp-29.1.2/lib/erlang/bin:$PATH"
+cd /home/wanli/.local/share/opencode/worktree/gap4-conn-fsm-e2e-ct
+rm -rf _build/test
+rebar3 ct --suite=apps/broker_cluster/test/broker_cluster_conn_fsm_takeover_dist_SUITE.erl 2>&1 | tail -40
+```
+**Expected（红）：** `live_connection_zero_reconnect_on_owner_crash` 因 `takeover_ok(Holder) >= 1` / `owner(P)=:={ok,Holder}` 超时 `=result` 非 ok（透明性①②③仍绿——证明该变异只关掉 takeover，不波及零重连续期）。确认后 `git checkout -- apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl` 还原。
+
+b) **owner==leader → flaky。** 临时把主用例的 `assign_roles(ra_leader(Nodes), Nodes)` 改为强制 `Owner = ra_leader(Nodes)`（owner==leader），连跑主用例 5 次观察是否偶发 `no_leader`/takeover 不确定；确认后 revert。此步为经验性记录，不纳入 `all/0`。
+
+> 记录：把 a)/b) 的实测结论（哪一行改、主用例是否如期变红、owner==leader 是否 flaky）写进本步骤下方批注，作为「变异验证已执行」的证据。**不要**把变异源码或变异用例提交。
 
 ---
 
