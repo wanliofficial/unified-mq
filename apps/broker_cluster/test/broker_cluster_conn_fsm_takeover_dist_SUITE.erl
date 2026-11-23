@@ -22,7 +22,8 @@
                       mqtt_max_qos => 1, max_keepalive_ms => 60000}]).
 
 all() -> [live_connection_zero_reconnect_on_owner_crash,
-          no_owner_no_takeover].
+          no_owner_no_takeover,
+          connection_remaps_when_partition_epoch_changes].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -179,6 +180,74 @@ no_owner_no_takeover(Config) ->
     #ping{kind = resp} = ping(Sock),
     ok = gen_tcp:close(Sock),
     ok.
+
+%% Plan 3 (gap #3): 分区配置 epoch 变化 → conn 在 poll tick 上迁移到新分区
+%% （owner_part 改变），但 socket 不重连（仍能 PINGRESP round-trip）。
+%%
+%% 注意：phash2(Cid, 3) 与 phash2(Cid, 6) 约 55% 的 id 会撞（迁移后分区号不变，
+%% wait_until 必然超时）。故用 pick_remapping_client_id/0 现算一个在本用例的
+%% 3→6 分区变化下确实会换分区的 id，绝不写死单个字面量。
+connection_remaps_when_partition_epoch_changes(Config) ->
+    Nodes = peer_nodes(Config),
+    #{owner := Owner, holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
+    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+    ?assertEqual(?PARTITIONS, Count),
+    ClientId = pick_remapping_client_id(Count, Count * 2),
+    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [P]) =:= {ok, Owner} end),
+    %% 建权威 C + epoch（conn 的 maybe_monitor_owner 才能记下 owner_epoch）。
+    {ok, _} = rpc(Holder, broker_cluster, set_session_partition_count, [Count]),
+    Port = start_listener(Holder),
+    Sock = connect(Port),
+    #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
+    #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
+    BeforePart = wait_owner_part(Holder),
+    ?assertEqual(P, BeforePart),
+    %% 提交更大的 C（epoch 递增）：conn 应在下一个 poll tick 上迁移。
+    Bigger = Count * 2,
+    {ok, _} = rpc(Holder, broker_cluster, set_session_partition_count, [Bigger]),
+    AfterPart = wait_owner_part_changed(Holder, BeforePart),
+    ?assertEqual(rpc(Holder, broker_cluster_session_owner, partition_of,
+                     [ClientId, Bigger]),
+                 AfterPart),
+    %% socket 未重连：PINGRESP 仍在原 socket 上 round-trip。
+    #ping{kind = resp} = ping(Sock),
+    ok = gen_tcp:close(Sock),
+    ok.
+
+%% 找第一个在 OldC→NewC 下确实换分区的 client id（确定性、不走运气）。
+pick_remapping_client_id(OldC, NewC) ->
+    pick_remapping_client_id(OldC, NewC, 0).
+
+pick_remapping_client_id(OldC, NewC, N) when N < 1000 ->
+    Cid = <<"gap3-remap-", (integer_to_binary(N))/binary>>,
+    case erlang:phash2(Cid, OldC) =/= erlang:phash2(Cid, NewC) of
+        true -> Cid;
+        false -> pick_remapping_client_id(OldC, NewC, N + 1)
+    end.
+
+%% holder 上唯一 conn 的 owner_part；连接刚建好时 owner_part 可能尚未写入，
+%% 故轮询等待其非 undefined。
+wait_owner_part(Holder) ->
+    wait_until(fun() ->
+                       P = owner_part_of(Holder),
+                       is_integer(P)
+               end),
+    owner_part_of(Holder).
+
+wait_owner_part_changed(Holder, Before) ->
+    wait_until(fun() ->
+                       P = owner_part_of(Holder),
+                       is_integer(P) andalso P =/= Before
+               end),
+    owner_part_of(Holder).
+
+owner_part_of(Holder) ->
+    case conn_fsm_pid(Holder) of
+        Pid when is_pid(Pid) -> rpc(Holder, mqtt_conn_fsm, owner_part, [Pid]);
+        _ -> undefined
+    end.
 
 %% MQTT PINGREQ → 同 socket 收 PINGRESP。socket 若已闭，recv exit {listener_recv,...}。
 ping(Sock) ->

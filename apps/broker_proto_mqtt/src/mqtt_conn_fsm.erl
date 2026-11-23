@@ -33,7 +33,7 @@
 -module(mqtt_conn_fsm).
 -behaviour(gen_statem).
 
--export([start_link/2, takeover_target/2]).
+-export([start_link/2, takeover_target/2, owner_part/1]).
 -export([init/1, callback_mode/0, handle_event/4, terminate/3, code_change/4]).
 
 -include("mqtt_frame.hrl").
@@ -58,6 +58,7 @@
              client_id = undefined,
              owner_part = undefined,       %% Plan 2: 本会话的会话分区（整数）| undefined
              owner_node = undefined,       %% Plan 2: 该分区的 owner 节点 | undefined
+             owner_epoch = 0,              %% Plan 3 (gap #3): 上次见到的分区配置 epoch
              keepalive_ms = 0,
              attached = false,
              %% S12-B (ADR-032 D7): this connection's node-level admission
@@ -342,7 +343,7 @@ event({mqtt_takeover, NewPid}, _StateName, D) ->
     log(info, "taken over by ~p", [NewPid]),
     {stop, takeover, D};
 event({poll_t, Ref}, connected, #st{poll_ref = Ref} = D) ->
-    pull_round(D#st{poll_ref = undefined});
+    pull_round(remap_if_partition_moved(D#st{poll_ref = undefined}));
 event({poll_t, _Stale}, StateName, D) ->
     {state, StateName, D};
 event({round_t, Ref}, connected, #st{round_ref = Ref} = D) ->
@@ -950,16 +951,55 @@ maybe_monitor_owner(ClientId, D) ->
             try
                 Count = broker_cluster_session_owner:session_partition_count(),
                 P = broker_cluster_session_owner:partition_of(ClientId, Count),
+                Epoch = broker_cluster_session_owner:session_partition_epoch(),
                 case broker_cluster_session_owner:session_owner(P) of
                     {ok, Owner} when is_atom(Owner), Owner =/= node() ->
                         _ = erlang:monitor_node(Owner, true),
-                        D#st{owner_part = P, owner_node = Owner};
+                        D#st{owner_part = P, owner_node = Owner, owner_epoch = Epoch};
                     _ ->
-                        D#st{owner_part = P, owner_node = undefined}
+                        D#st{owner_part = P, owner_node = undefined,
+                             owner_epoch = Epoch}
                 end
             catch _:_ -> D end;
         _ ->
             D
+    end.
+
+%% @doc Plan 3 (gap #3): 会话分区配置 epoch 变了就重算分区、重挂 monitor。
+%% 连接/socket 完全不动（与缺口 #4 的零重连性质一致：这里不碰 socket）。
+%% 旧分区上的陈旧写由既有 epoch fencing 拒绝（不变量 I6）。
+remap_if_partition_moved(#st{owner_part = undefined} = D) ->
+    D;
+remap_if_partition_moved(#st{client_id = ClientId, owner_node = OldOwner,
+                            owner_epoch = Seen} = D) ->
+    try
+        case broker_cluster_session_owner:session_partition_epoch() of
+            Seen ->
+                D;
+            Epoch ->
+                Count = broker_cluster_session_owner:session_partition_count(),
+                NewP = broker_cluster_session_owner:partition_of(ClientId, Count),
+                case OldOwner of
+                    undefined -> ok;
+                    _ -> _ = try erlang:monitor_node(OldOwner, false) catch _:_ -> ok end
+                end,
+                case broker_cluster_session_owner:session_owner(NewP) of
+                    {ok, Owner} when is_atom(Owner), Owner =/= node() ->
+                        _ = erlang:monitor_node(Owner, true),
+                        D#st{owner_part = NewP, owner_node = Owner, owner_epoch = Epoch};
+                    _ ->
+                        D#st{owner_part = NewP, owner_node = undefined,
+                             owner_epoch = Epoch}
+                end
+        end
+    catch _:_ -> D end.
+
+%% @doc 诊断/测试用：读一条连接当前记录的会话分区。纯读，不改状态。
+-spec owner_part(pid()) -> non_neg_integer() | undefined.
+owner_part(Pid) ->
+    case sys:get_state(Pid) of
+        {_StateName, #st{owner_part = P}} -> P;
+        _ -> undefined
     end.
 
 %% @doc 纯判定：owner 死亡事件是否属于本连接、且可发起 claim。本 conn_fsm 一个连接
