@@ -66,10 +66,18 @@ end_per_testcase(_Case, Config) ->
 
 %%%_* Case ------------------------------------------------------------------
 
-%% Task 1 plumbing 冒烟：真 wire 客户端连到 holder 的 ranch listener，conn_fsm 在
-%% holder 起、attach 会话、monitor 远端 owner、subscribe + publish 收到 PUBLISH。
+%% 缺口 #4 端到端：真 3 节点 ra 组；kill 会话 owner 后断言同 socket 不重连地续期
+%% （PINGRESP + PUBLISH 仍在原 socket、conn_fsm pid 存活）+ 内联 claim 接管
+%% （holder 的 cache owner 翻转 + metric `cluster_session_takeover_ok' 递增）。
+%%
+%% 确定性依据（关键）：会话 owner 选非 ra leader 节点（`assign_roles'），避开
+%% conn claim fire-once 撞 `no_leader'；且 peer boot 不启动 broker_cluster app
+%% → `nodedown_mon' migrator 未起，conn 的内联 `{nodedown,Owner}' handler 是
+%% kill owner 后唯一的 takeover actor，吃 raw dist `:DOWN'、不等 60s 去抖，故
+%% post-kill 用 ~20s 预算即可。
 live_connection_zero_reconnect_on_owner_crash(Config) ->
     Nodes = peer_nodes(Config),
+    %% Owner 必 ≠ ra leader（load-bearing，不可折叠）。
     #{owner := Owner, holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
     %% 选 ClientId 使命中会话分区 P（控 ClientId → 稳定 hash）。
     Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
@@ -77,28 +85,67 @@ live_connection_zero_reconnect_on_owner_crash(Config) ->
     P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
     {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
     %% 等 owner 复制进 Holder 的 cache，conn 才 monitor 得到远端 owner。
-    %% 注意：`broker_cluster_cache:owner/1' 返回 `{ok, Owner}'（非裸 Owner，plan 写成
-    %% `=:= Owner' 是 bug——与 broker_cluster_dist_SUITE 的 `=:= {ok, N1}' 一致）。
+    %% `broker_cluster_cache:owner/1' 返回 `{ok, Owner}'（非裸 Owner）。
     wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [P]) =:= {ok, Owner} end),
+    %% 指标真 init + 四键齐备（否则 snapshot 回落全零，断言假绿/假红）。
+    ok = ensure_metrics(Holder),
     %% 在 holder 起真 ranch listener。
     Port = start_listener(Holder),
-    %% 真 wire 客户端：CONNECT → CONNACK（1 次）。conn_fsm 只在 CONNECT 到达时才由
-    %% mqtt_conn_sup 起，故 pid 检查必须**在** open 之后（plan 在 open 前查是 bug）。
+    %% 崩溃前：建立 wire 连接。conn_fsm 只在 CONNECT 到达时才由 mqtt_conn_sup 起，
+    %% 故 pid 检查必须在 open 之后。此刻只有订阅者一个连在 holder，conn_fsm_pid/1
+    %% 唯一、可归属到订阅者连接。
     Sock = connect(Port),
     #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
     ConnPid = conn_fsm_pid(Holder),
     true = is_pid(ConnPid) orelse ct:fail(no_conn_yet),
     %% subscribe t/# QoS1 → SUBACK。
     #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
-    %% 同节点另起客户端 publish t/a QoS1 → 收 PUBLISH → PUBACK。
-    Pub = connect(Port),
-    #connack{return_code = 0} = open(Pub, #{client_id => <<"gap4-pub">>}),
-    ok = send_publish(Pub, 7, <<"t/a">>, <<"hi">>, 1),
-    #puback{} = recv(Pub),
-    #publish{topic = <<"t/a">>, payload = <<"hi">>} = recv(Sock),
+    %% 基线投递 + 基线 PINGRESP（崩溃前同 socket 可用）。
+    Pub0 = connect(Port),
+    #connack{return_code = 0} = open(Pub0, #{client_id => <<"gap4-pub0">>}),
+    ok = send_publish(Pub0, 7, <<"t/a">>, <<"pre">>, 1),
+    #puback{} = recv(Pub0),
+    #publish{topic = <<"t/a">>, payload = <<"pre">>} = recv(Sock),
+    #ping{kind = resp} = ping(Sock),
+    %% CLOSE 发布者，让 kill 时 holder 上只有订阅者一个 conn（接管指标可归属、不歧义）。
+    ok = gen_tcp:close(Pub0),
+    %% === kill owner（graceful peer:stop；多数派存活：Holder + Third；leader != owner）===
+    ok = stop_peer(Config, Owner),
+    %% === 透明性①：同 socket 不闭、PINGRESP 仍 round-trip。不嗅探 socket（recv 0 会
+    %% 消费帧/超时）；若 socket 已闭，ping 内 recv 以 {listener_recv,closed,_} exit，
+    %% 用例失败——正是要的断言。 ===
+    #ping{kind = resp} = ping(Sock),
+    %% === 透明性②：conn_fsm pid 全程存活（未因 nodedown 重启/换 pid）。conn_fsm 在
+    %% Holder（远端节点），`is_process_alive/1' 对非本节点 pid 抛 badarg，故经 rpc 在
+    %% Holder 本地查。 ===
+    true = rpc(Holder, erlang, is_process_alive, [ConnPid]),
+    %% === 透明性③：续期——崩溃后 publish 仍在**同一 socket** 收到 PUBLISH（无重连）。
+    %% 接管后投递靠 poll tick（~1s）兜底，给足超时；只放宽等待，不弱化「同 socket
+    %% 收到」的断言。 ===
+    Pub1 = connect(Port),
+    #connack{return_code = 0} = open(Pub1, #{client_id => <<"gap4-pub1">>}),
+    ok = send_publish(Pub1, 8, <<"t/b">>, <<"post">>, 1),
+    #puback{} = recv(Pub1),
+    #publish{topic = <<"t/b">>, payload = <<"post">>} = recv(Sock, 15000),
+    %% === takeover①：Holder 的 cache owner 翻转为 Holder（内联 claim 成功）。 ===
+    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [P]) =:= {ok, Holder} end),
+    %% === takeover②：metric cluster_session_takeover_ok 递增（≥1）。 ===
+    wait_until(fun() -> takeover_ok(Holder) >= 1 end),
+    ?assert(takeover_ok(Holder) >= 1),
     ok = gen_tcp:close(Sock),
-    ok = gen_tcp:close(Pub),
+    ok = gen_tcp:close(Pub1),
     ok.
+
+%% 读 holder 快照里四个接管键中的 cluster_session_takeover_ok（缺键 = 0，但
+%% ensure_metrics/1 已先校验四键齐备，故此处缺键即显式失败）。
+takeover_ok(Node) ->
+    Snap = rpc(Node, broker_metrics, snapshot, []),
+    maps:get(cluster_session_takeover_ok, Snap, 0).
+
+%% MQTT PINGREQ → 同 socket 收 PINGRESP。socket 若已闭，recv exit {listener_recv,...}。
+ping(Sock) ->
+    ok = gen_tcp:send(Sock, mqtt_frame:encode(#ping{kind = req})),
+    recv(Sock).
 
 %%%_* Cluster formation (照搬 broker_session_replica_SUITE) ------------------------
 
@@ -137,6 +184,26 @@ boot_data_plane() ->
     ok = application:set_env(broker_cluster, cross_node_timeout_ms, 2000),
     ok = broker_cluster:install_hooks(),
     ok.
+
+%% 确证 holder 上 `broker_metrics' 真 init 过：否则 `snapshot/0' 回落全零
+%% `zeros()'，让下面的接管断言假绿（`takeover_ok >= 1' 永远读 0、或
+%% `takeover_ok =:= 0' 永远成立）。照搬 `broker_session_replica_SUITE:ensure_metrics/1'：
+%% 缺状态就显式补 init，并校验四个接管键都在快照里（缺键 = 显式失败，不是静默 0）。
+ensure_metrics(Node) ->
+    case rpc(Node, persistent_term, get, [{broker_metrics, state}, undefined]) of
+        undefined -> ok = rpc(Node, broker_metrics, init, []);
+        _ -> ok
+    end,
+    %% snapshot/0 返回全部冻结键；取四个接管键。缺键 = maps:get 显式 Badkey 失败，
+    %% 非静默 0；非整数 = 显式失败。
+    Snap = maps:with(takeover_keys(), rpc(Node, broker_metrics, snapshot, [])),
+    ?assertEqual(lists:sort(takeover_keys()), lists:sort(maps:keys(Snap))),
+    lists:foreach(fun(K) -> ?assert(is_integer(maps:get(K, Snap))) end, takeover_keys()),
+    ok.
+
+takeover_keys() ->
+    [cluster_session_takeover_ok, cluster_session_takeover_stale_epoch,
+     cluster_session_takeover_no_replica, cluster_session_takeover_not_found].
 
 %%%_* Peers (照搬 broker_session_replica_SUITE) ----------------------------------
 
