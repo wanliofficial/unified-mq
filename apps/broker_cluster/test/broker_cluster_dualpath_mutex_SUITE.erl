@@ -24,7 +24,8 @@
 -define(PARTITION, 0).
 
 all() ->
-    [claim_then_migrate_same_epoch].
+    [claim_then_migrate_same_epoch,
+     migrate_then_claim_same_epoch].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -70,6 +71,21 @@ claim_then_migrate_same_epoch(Config) ->
     ?assertEqual({error, {stale_epoch, 2, 2}},
                  rpc(N1, broker_cluster, migrate, [P, N1, N3, 2])),
     ok = wait_until_owner(Nodes, P, N2),
+    ok.
+
+%% 用例 2（确定性反向）：migrate 先落地（epoch 2，owner -> N3），claim 以同一
+%% epoch 2 提交，必被拒（{stale_epoch, 2, 2}）；终态 owner 稳定为 migrate 的目标。
+migrate_then_claim_same_epoch(Config) ->
+    [N1, N2, N3] = Nodes = peer_nodes(Config),
+    P = ?PARTITION,
+    {ok, 1} = rpc(N1, ?MODULE, assign_partition, [P, N1, Nodes, 1]),
+    %% migrate 先赢：owner -> N3，epoch -> 2。
+    {ok, 2} = rpc(N1, broker_cluster, migrate, [P, N1, N3, 2]),
+    %% claim 同 epoch 2 提交：必被拒。
+    ?assertEqual({error, {stale_epoch, 2, 2}},
+                 rpc(N2, broker_cluster, claim, [P, N2, 2])),
+    %% 终态：owner 仍是 N3，三节点收敛一致。
+    ok = wait_until_owner(Nodes, P, N3),
     ok.
 
 %%%_* Cluster helpers -------------------------------------------------------
