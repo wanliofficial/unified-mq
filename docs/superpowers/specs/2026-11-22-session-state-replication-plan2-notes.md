@@ -110,6 +110,8 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 
 > **2026-11-23 追加批注**：缺口 #1 已补去抖窗口 —— `broker_cluster_nodedown_mon` 收到 `{nodedown,O}` 后起定时器（应用环境 `nodedown_debounce_ms`，默认 1500ms），窗口内 `{nodeup,O}` 取消则不迁移，到点仍 down 才派发既有 `on_nodedown`；`=0` 退回即时派发（向后兼容）。去抖只改"何时派发"，不改"派发什么"：唯一 owner 仍由 epoch 单调 + ra 串行 apply 保证。设计见 `2026-11-23-nodedown-debounce-design.md`。
 
+> **2026-11-23 追加批注**：缺口 #4 已补 conn_fsm 接管端到端（MQTT 线级零重连）真 3 节点集群 CT —— 新套件 `broker_cluster_conn_fsm_takeover_dist_SUITE`（真 3 节点 ra 组 + 真 `gen_tcp` socket + 手写 MQTT 客户端 + 真 ranch listener）。主用例 `live_connection_zero_reconnect_on_owner_crash`：会话分区 owner 选**非 ra leader** 节点（`assign_roles`），活 MQTT 客户端经真 TCP 连到 replica 节点（holder）的 ranch listener，kill owner（graceful `peer:stop`，多数派存活）后断言**同一 socket 不重连**——PINGRESP 仍 round-trip、conn_fsm pid 存活、post-crash PUBLISH 仍在原 socket 收到（线级透明性）——且 conn_fsm 内联 claim 接管：holder 的 `broker_cluster_cache:owner/1` 翻转为 `{ok,Holder}`、metric `cluster_session_takeover_ok ≥ 1`。确定性依据：该 peer boot **不**启动 `broker_cluster` app → `broker_cluster_nodedown_mon`（migrator）未起，conn 的内联 `{nodedown,Owner}` handler 是 kill owner 后唯一 takeover actor（吃 raw dist `:DOWN`、不等去抖）；owner≠leader 避开 claim fire-once 撞 `no_leader`。附负向用例 `no_owner_no_takeover`（不 assign → kill 非 holder 节点 → takeover 确定不发生，metric `reset` 后 delta 归零 + cache 不翻到 holder，堵死"metrics 未 init 全零"假绿）。套件非退化由**设计期源码级变异**验证（一次性、已 revert）：临时将 `mqtt_conn_fsm` 的内联 claim 改 no-op，主用例如期在 takeover① 超时变红、透明性①②③ 保持绿，证明 CT 真在测接管。设计/计划见 `2026-11-23-conn-fsm-takeover-e2e-ct-design.md` 与 `2026-11-23-conn-fsm-takeover-e2e-ct.md`。
+
 ## 4. Plan 1 / Plan 2 对比
 
 | 维度 | Plan 1 | Plan 2 |
