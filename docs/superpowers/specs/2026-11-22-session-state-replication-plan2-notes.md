@@ -106,6 +106,8 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 | 4 | conn_fsm 接管路径的**端到端**（MQTT 线级零重连）未在本 Plan 证明 | 本 Plan 只在**会话平面**证明 identity 保持（订阅集/inflight/游标）；conn_fsm 的 nodedown→claim→续传由单元级套件覆盖，未在真 3 节点 CT 里跑活 TCP 连接 | 走 MQTT 协议连接的真集群透明性 CT（Plan 3） |
 | 5 | 会话分区与元数据分区**同键**读 replicas 是未决假设（spec §12） | 若将来引入独立会话副本组，`targeted_plan/1` 与 claim 的副本集来源需换 | 定稿 §12 未决点（Plan 3） |
 
+> **2026-11-23 追加批注**：缺口 #2 已补并发 CT —— 新套件 `broker_cluster_dualpath_mutex_SUITE`（真 3 节点 ra 组）用确定性双向（claim-then-migrate / migrate-then-claim 各一赢一 `stale_epoch`）+ 20 轮并发对撞，证明 claim 与 nodedown-migrate 同分区同 epoch 下恰好一个成功、owner 唯一且三节点收敛、竞态后写权限只有一份。设计见 `2026-11-23-plan3-dualpath-mutex-design.md`。
+
 ## 4. Plan 1 / Plan 2 对比
 
 | 维度 | Plan 1 | Plan 2 |
