@@ -25,7 +25,8 @@
 
 all() ->
     [claim_then_migrate_same_epoch,
-     migrate_then_claim_same_epoch].
+     migrate_then_claim_same_epoch,
+     concurrent_claim_vs_migrate_never_double_owner].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -87,6 +88,49 @@ migrate_then_claim_same_epoch(Config) ->
     %% 终态：owner 仍是 N3，三节点收敛一致。
     ok = wait_until_owner(Nodes, P, N3),
     ok.
+
+%% 用例 3（并发打时序）：20 轮，每轮把分区重置到已知 epoch Base，然后并发让
+%% claim(P, N2, Base+1) 与 migrate(P, N1, N3, Base+1) 对撞（同 epoch、不同目标）。
+%% 断言每轮恰好一个 {ok, Base+1}、另一个 {error, {stale_epoch, Base+1, Base+1}}，
+%% 且三节点 owner 收敛到赢家提议的目标、epoch = Base+1。
+concurrent_claim_vs_migrate_never_double_owner(Config) ->
+    [N1, N2, N3] = Nodes = peer_nodes(Config),
+    P = ?PARTITION,
+    Rounds = 20,
+    lists:foldl(
+      fun(Round, ok) ->
+              %% Base 每轮 +2，严格大于上一轮竞态后的 epoch（Base+1），故 assign 恒被接受。
+              Base = 2 * Round,
+              {ok, Base} = rpc(N1, ?MODULE, assign_partition, [P, N1, Nodes, Base]),
+              %% 两个独立异步 RPC 同时提交：claim 目标 N2、migrate 目标 N3。
+              {ClaimRes, MigrateRes} = run_race(N2, N1, N3, P, Base),
+              Winner = assert_one_winner(ClaimRes, MigrateRes, Base, N2, N3),
+              ok = wait_until_owner(Nodes, P, Winner),
+              ?assertEqual({ok, Base + 1}, rpc(N1, broker_cluster_cache, epoch, [P])),
+              ok
+      end, ok, lists:seq(1, Rounds)),
+    ok.
+
+%% 在 ClaimNode 发 claim(P, ClaimNode, Base+1)，在 MigrateNode 发
+%% migrate(P, MigrateNode, MigrateTarget, Base+1)，两个 rpc:async_call 立即返回、
+%% 真正并发提交，再各自 yield 取回结果。返回 {ClaimResult, MigrateResult}。
+run_race(ClaimNode, MigrateNode, MigrateTarget, P, Base) ->
+    Epoch = Base + 1,
+    ClaimTag = rpc:async_call(ClaimNode, broker_cluster, claim, [P, ClaimNode, Epoch]),
+    MigrateTag = rpc:async_call(MigrateNode, broker_cluster, migrate,
+                                [P, MigrateNode, MigrateTarget, Epoch]),
+    ClaimRes = rpc:yield(ClaimTag),
+    MigrateRes = rpc:yield(MigrateTag),
+    {ClaimRes, MigrateRes}.
+
+%% 断言恰好一个 {ok, Base+1}、另一个 {error, {stale_epoch, Base+1, Base+1}}，
+%% 返回赢家提议的目标 owner。两个都 ok 或两个都 error 都 ct:fail。
+assert_one_winner({ok, E}, {error, {stale_epoch, E, E}}, _Base, ClaimTarget, _MigrateTarget) ->
+    ClaimTarget;
+assert_one_winner({error, {stale_epoch, E, E}}, {ok, E}, _Base, _ClaimTarget, MigrateTarget) ->
+    MigrateTarget;
+assert_one_winner(ClaimRes, MigrateRes, Base, _ClaimTarget, _MigrateTarget) ->
+    ct:fail({unexpected_race_result, Base, ClaimRes, MigrateRes}).
 
 %%%_* Cluster helpers -------------------------------------------------------
 
