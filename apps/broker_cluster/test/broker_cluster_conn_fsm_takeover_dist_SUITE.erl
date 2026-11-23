@@ -1,0 +1,342 @@
+%% @doc 缺口 #4：conn_fsm 接管端到端（MQTT 线级零重连）真集群 CT。
+%%
+%% 活 MQTT 客户端经真 TCP 连到 replica 节点（holder）的 ranch listener；其会话
+%% 分区 P 的 owner 在另一节点（owner）。kill owner 后断言：**同一 socket 不重连**
+%% 地继续收订阅消息（线级零重连透明性）+ conn_fsm 内联 claim 端到端接管成功。
+%%
+%% 脚手架复用 broker_session_replica_SUITE 的真 3 节点 ra 组。关键事实：该 boot
+%% 不启动 broker_cluster app，故 nodedown_mon（migrator）未起——conn 的内联 claim
+%% 是 kill owner 后唯一的 takeover actor，takeover 确定性由「owner 选非 leader 节点」
+%% 保证（避开 conn claim fire-once 撞 no_leader）。
+-module(broker_cluster_conn_fsm_takeover_dist_SUITE).
+
+-compile([export_all, nowarn_export_all]).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("broker_proto_mqtt/include/mqtt_frame.hrl").
+
+-define(NODES, 3).
+-define(PARTITIONS, 3).
+-define(LISTENERS, [#{port => 0, num_acceptors => 4,
+                      mqtt_max_qos => 1, max_keepalive_ms => 60000}]).
+
+all() -> [live_connection_zero_reconnect_on_owner_crash].
+
+%%%_* Fixtures --------------------------------------------------------------
+
+init_per_suite(Config) ->
+    case node() of
+        nonode@nohost ->
+            case net_kernel:start([unifiedmq_gap4ct, shortnames]) of
+                {ok, _} -> [{started_net, true} | Config];
+                {error, Reason} ->
+                    ct:fail({cannot_start_distribution, check_epmd, Reason})
+            end;
+        _ -> [{started_net, false} | Config]
+    end.
+
+end_per_suite(Config) ->
+    case ?config(started_net, Config) of
+        true -> _ = net_kernel:stop(), ok;
+        _ -> ok
+    end.
+
+init_per_testcase(Case, Config) ->
+    Peers = start_peers(Case, Config),
+    Nodes = [maps:get(node, P) || P <- Peers],
+    ok = form_cluster_h(Nodes),
+    %% 设 env（含 nodedown_debounce_ms 双保险）+ boot data plane（storage/queue/
+    %% router/subscription；**不含** broker_cluster app → nodedown_mon 不起）。
+    lists:foreach(
+      fun(N) ->
+              ok = rpc(N, application, set_env, [broker_cluster, members, Nodes]),
+              ok = rpc(N, application, set_env, [broker_cluster, session_replication, true]),
+              ok = rpc(N, application, set_env,
+                       [broker_cluster, session_partition_count, ?PARTITIONS]),
+              ok = rpc(N, application, set_env,
+                       [broker_cluster, nodedown_debounce_ms, 60000]),
+              ok = rpc(N, ?MODULE, boot_data_plane, [])
+      end, Nodes),
+    [{peers, Peers}, {nodes, Nodes} | Config].
+
+end_per_testcase(_Case, Config) ->
+    stop_peers(?config(peers, Config)),
+    ok.
+
+%%%_* Case ------------------------------------------------------------------
+
+%% Task 1 plumbing 冒烟：真 wire 客户端连到 holder 的 ranch listener，conn_fsm 在
+%% holder 起、attach 会话、monitor 远端 owner、subscribe + publish 收到 PUBLISH。
+live_connection_zero_reconnect_on_owner_crash(Config) ->
+    Nodes = peer_nodes(Config),
+    #{owner := Owner, holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
+    %% 选 ClientId 使命中会话分区 P（控 ClientId → 稳定 hash）。
+    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+    ClientId = <<"gap4-sub">>,
+    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+    %% 等 owner 复制进 Holder 的 cache，conn 才 monitor 得到远端 owner。
+    %% 注意：`broker_cluster_cache:owner/1' 返回 `{ok, Owner}'（非裸 Owner，plan 写成
+    %% `=:= Owner' 是 bug——与 broker_cluster_dist_SUITE 的 `=:= {ok, N1}' 一致）。
+    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [P]) =:= {ok, Owner} end),
+    %% 在 holder 起真 ranch listener。
+    Port = start_listener(Holder),
+    %% 真 wire 客户端：CONNECT → CONNACK（1 次）。conn_fsm 只在 CONNECT 到达时才由
+    %% mqtt_conn_sup 起，故 pid 检查必须**在** open 之后（plan 在 open 前查是 bug）。
+    Sock = connect(Port),
+    #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
+    ConnPid = conn_fsm_pid(Holder),
+    true = is_pid(ConnPid) orelse ct:fail(no_conn_yet),
+    %% subscribe t/# QoS1 → SUBACK。
+    #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
+    %% 同节点另起客户端 publish t/a QoS1 → 收 PUBLISH → PUBACK。
+    Pub = connect(Port),
+    #connack{return_code = 0} = open(Pub, #{client_id => <<"gap4-pub">>}),
+    ok = send_publish(Pub, 7, <<"t/a">>, <<"hi">>, 1),
+    #puback{} = recv(Pub),
+    #publish{topic = <<"t/a">>, payload = <<"hi">>} = recv(Sock),
+    ok = gen_tcp:close(Sock),
+    ok = gen_tcp:close(Pub),
+    ok.
+
+%%%_* Cluster formation (照搬 broker_session_replica_SUITE) ------------------------
+
+form_cluster_h(Nodes) ->
+    ok = lists:foldl(fun(N, ok) -> rpc(N, start_meta, [Nodes]) end, ok, Nodes),
+    ok.
+
+start_meta(Members) ->
+    ok = application:set_env(broker_cluster, members, Members),
+    {ok, Meta} = broker_cluster_meta:start_link(),
+    unlink(Meta),
+    ok.
+
+assign_partition(Partition, Owner, Nodes, Epoch) ->
+    broker_cluster:assign(Partition, Owner, Nodes, Epoch).
+
+boot_data_plane() ->
+    {ok, RaDir} = application:get_env(broker_cluster, data_dir),
+    DataDir = filename:join(RaDir, "data"),
+    ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
+    _ = [application:load(A)
+         || A <- [broker_metrics, broker_core, broker_storage, broker_router,
+                  broker_queue, broker_subscription, broker_cluster]],
+    ok = application:set_env(broker_storage, backend, broker_storage_wal),
+    ok = application:set_env(broker_storage, data_dir, DataDir),
+    ok = application:set_env(broker_storage, wal, #{require_durable_fs => false}),
+    ok = application:set_env(broker_queue, partitions, ?PARTITIONS),
+    ok = application:set_env(broker_router, partitions, ?PARTITIONS),
+    ok = application:set_env(broker_subscription, data_dir, DataDir),
+    {ok, _} = application:ensure_all_started(broker_storage),
+    [ok = broker_queue:create_partition(P) || P <- broker_queue:partition_ids()],
+    {ok, _} = application:ensure_all_started(broker_router),
+    {ok, _} = application:ensure_all_started(broker_queue),
+    {ok, _} = application:ensure_all_started(broker_subscription),
+    ok = application:set_env(broker_cluster, cross_node_delivery, true),
+    ok = application:set_env(broker_cluster, cross_node_timeout_ms, 2000),
+    ok = broker_cluster:install_hooks(),
+    ok.
+
+%%%_* Peers (照搬 broker_session_replica_SUITE) ----------------------------------
+
+start_peers(Case, Config) ->
+    Names = [peer_name(Case, I) || I <- lists:seq(1, ?NODES)],
+    SuiteDir = filename:dirname(code:which(?MODULE)),
+    CodePaths = lists:usort([SuiteDir | [D || D <- code:get_path(), is_code_dir(D)]]),
+    lists:reverse(
+      lists:foldl(
+        fun({I, Name}, Acc) ->
+                DataDir = filename:join([?config(priv_dir, Config),
+                                         atom_to_list(Case),
+                                         "n" ++ integer_to_list(I), "ra"]),
+                try
+                    {ok, Pid, Node} = peer:start_link(
+                                        #{name => Name,
+                                          args => ["-pa" | CodePaths],
+                                          wait_boot => 20000}),
+                    ok = rpc(Node, prepare_peer, [DataDir]),
+                    [#{pid => Pid, node => Node, data_dir => DataDir} | Acc]
+                catch
+                    Class:Reason:Stack ->
+                        stop_peers(Acc),
+                        erlang:raise(Class, Reason, Stack)
+                end
+        end, [], lists:zip(lists:seq(1, ?NODES), Names))).
+
+stop_peers(Peers) ->
+    lists:foreach(
+      fun(#{pid := Pid}) ->
+              _ = try peer:stop(Pid) catch _:_ -> ok end
+      end, Peers),
+    ok.
+
+stop_peer(Config, Node) ->
+    Peers = ?config(peers, Config),
+    case [P || #{node := N} = P <- Peers, N =:= Node] of
+        [#{pid := Pid}] -> _ = try peer:stop(Pid) catch _:_ -> ok end, ok;
+        _ -> ok
+    end.
+
+peer_name(Case, I) ->
+    list_to_atom("gap4_" ++ sanitise(atom_to_list(Case)) ++ "_" ++ integer_to_list(I)).
+
+is_code_dir(Dir) -> filename:basename(Dir) =:= "ebin".
+
+sanitise(S) ->
+    [case C of _ when C >= $a andalso C =< $z -> C;
+                 _ when C >= $A andalso C =< $Z -> C;
+                 _ when C >= $0 andalso C =< $9 -> C;
+                 _ -> $_ end || C <- S].
+
+peer_nodes(Config) -> [Node || #{node := Node} <- ?config(peers, Config)].
+
+prepare_peer(DataDir) ->
+    _ = application:load(broker_cluster),
+    ok = application:set_env(broker_cluster, data_dir, DataDir),
+    ok = application:set_env(broker_cluster, members, []),
+    ok = application:set_env(broker_cluster, quorum_timeout_ms, 3000),
+    ok = application:set_env(broker_cluster, replicate_timeout_ms, 1000),
+    ok = filelib:ensure_dir(filename:join(DataDir, "x")),
+    {ok, _} = application:ensure_all_started(ra),
+    application:set_env(ra, data_dir, filename:absname(DataDir)),
+    case ra_system:fetch(default) of
+        undefined ->
+            case ra_system:start_default() of
+                {ok, _} -> ok;
+                {error, {already_started, _}} -> ok
+            end;
+        _ -> ok
+    end,
+    {ok, Cache} = broker_cluster_cache:start_link(),
+    unlink(Cache),
+    ok.
+
+%%%_* Leader query + role assignment -------------------------------------------
+
+%% 该 ra 组的 leader 节点（系统 id `broker_cluster`，server id `{broker_cluster_meta,N}'）。
+%% 本 ra 版本无 `ra:leader/1`（plan 的写法已校准）：用 `ra:members/1`，其返回值是
+%% `{ok, Members, {_Name, LeaderNode}}`（`ra_leader_call_ret` 的第三元素即 leader id）。
+ra_leader(Nodes) ->
+    [N | _] = Nodes,
+    wait_until(
+      fun() ->
+              case rpc(N, ?MODULE, ra_members, [N]) of
+                  {ok, L} when is_atom(L) -> {return, L};
+                  _ -> false
+              end
+      end).
+
+%% 在 peer 上跑：`broker_cluster_meta' 的 ra 组 leader 节点，从 members 的三元组取。
+ra_members(N) ->
+    case ra:members({broker_cluster_meta, N}) of
+        {ok, _Members, {_Name, LeaderNode}} -> {ok, LeaderNode};
+        Other -> Other
+    end.
+
+wait_until({return, V}) -> V;
+wait_until(Pred) -> wait_until(Pred, 20000, 100).
+wait_until(_Pred, 0, _Step) -> ct:fail({timeout, ?MODULE});
+wait_until(Pred, Wait, Step) ->
+    try Pred() of
+        true -> ok;
+        {return, V} -> V;
+        _ -> timer:sleep(Step), wait_until(Pred, Wait - Step, Step)
+    catch
+        _:_ -> timer:sleep(Step), wait_until(Pred, Wait - Step, Step)
+    end.
+
+%% 角色分配：Owner 必 ≠ leader（避开 conn claim fire-once 撞 no_leader）。
+%% Holder = 跑活 conn 的存活 replica（≠ Owner）；Third = 余下节点。
+assign_roles(Leader, Nodes) ->
+    Others = Nodes -- [Leader],
+    Owner = hd(Others),
+    Rest = Nodes -- [Owner],          %% 含 Leader + 另一个
+    Holder = hd(Rest),
+    Third = hd(Rest -- [Holder]),
+    #{owner => Owner, holder => Holder, third => Third}.
+
+%%%_* Listener on peer --------------------------------------------------------
+
+start_listener(Node) ->
+    %% 校准点 #3：必须先 `application:load(broker_proto_mqtt)` 再 set_env——`load/1`
+    %% 会用 `.app' 里的缺省值（listeners=[]）覆盖此前 set 的 env（实测）。peer 的
+    %% `boot_data_plane/0' 并不加载 broker_proto_mqtt，故这里显式先 load；否则
+    %% listener 子 spec 永远为空，`ranch:get_port({mqtt,0})' 报 badkey。
+    _ = rpc(Node, application, load, [broker_proto_mqtt]),
+    ok = rpc(Node, application, set_env, [broker_proto_mqtt, listeners, ?LISTENERS]),
+    ok = rpc(Node, application, set_env, [broker_proto_mqtt, pull_poll_interval_ms, 1000]),
+    ok = rpc(Node, application, set_env, [broker_proto_mqtt, max_keepalive_ms, 60000]),
+    {ok, _} = rpc(Node, application, ensure_all_started, [broker_proto_mqtt]),
+    case rpc(Node, ranch, get_port, [{mqtt, 0}]) of
+        Port when is_integer(Port) -> Port;
+        Other -> ct:fail({listener_port_unavailable, Other})
+    end.
+
+%% holder 上当前唯一的 conn_fsm pid（mqtt_conn_sup 的子进程）。
+conn_fsm_pid(Node) ->
+    case rpc(Node, supervisor, which_children, [mqtt_conn_sup]) of
+        Ch when is_list(Ch) ->
+            case [Pid || {_Id, Pid, worker, _} <- Ch, is_pid(Pid)] of
+                [Pid | _] -> Pid;
+                [] -> undefined
+            end;
+        _ -> undefined
+    end.
+
+%%%_* Real-wire MQTT client (照搬 mqtt_listener_SUITE 客户端形态) --------------
+
+connect(Port) ->
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                                 [binary, {active, false}, {nodelay, true}]),
+    Sock.
+
+open(Sock, Knobs) ->
+    ok = gen_tcp:send(Sock, mqtt_frame:encode(
+                             #connect{client_id = maps:get(client_id, Knobs),
+                                      clean_session = 1,
+                                      keep_alive = 0})),
+    recv(Sock).
+
+subscribe(Sock, PacketId, Filter, QoS) ->
+    ok = gen_tcp:send(Sock, mqtt_frame:encode(
+                             #subscribe{packet_id = PacketId,
+                                        topics = [{Filter, QoS}]})),
+    recv(Sock).
+
+send_publish(Sock, PacketId, Topic, Payload, QoS) ->
+    ok = gen_tcp:send(Sock, mqtt_frame:encode(
+                          #publish{qos = QoS, topic = Topic,
+                                   packet_id = PacketId, payload = Payload})).
+
+recv(Sock) -> recv(Sock, 5000).
+
+recv(Sock, Timeout) ->
+    Buf = buf(Sock),
+    try mqtt_frame:decode(Buf) of
+        {ok, Frame, Rest} -> set_buf(Sock, Rest), Frame;
+        {more, _} ->
+            case gen_tcp:recv(Sock, 0, Timeout) of
+                {ok, Data} -> set_buf(Sock, <<Buf/binary, Data/binary>>), recv(Sock, Timeout);
+                {error, R} -> exit({listener_recv, R, Buf})
+            end;
+        {error, R} -> exit({listener_recv_malformed, R, Buf})
+    catch
+        Class:Reason -> exit({listener_recv_crashed, {Class, Reason}, Buf})
+    end.
+
+buf(Sock) ->
+    case erlang:get({gap4_buf, Sock}) of undefined -> <<>>; B -> B end.
+set_buf(Sock, Buf) -> erlang:put({gap4_buf, Sock}, Buf), ok.
+
+%%%_* RPC ---------------------------------------------------------------------
+
+%% Runs on the PEER via rpc: used by start_peers/prepare_peer and form_cluster_h.
+rpc(Node, F, A) ->
+    rpc(Node, ?MODULE, F, A).
+
+rpc(Node, M, F, A) ->
+    case rpc:call(Node, M, F, A, 30000) of
+        {badrpc, Reason} -> ct:fail({badrpc, Node, M, F, Reason});
+        Result -> Result
+    end.
