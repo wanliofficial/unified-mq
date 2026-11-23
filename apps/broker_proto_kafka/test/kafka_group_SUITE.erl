@@ -337,19 +337,29 @@ session_timeout_sweeps_dead_member(_Config) ->
     _M3 = spawn(fun() ->
         try kafka_group:join(?GROUP, <<"m3">>, undefined,
                              <<"consumer">>,
-                             [{<<"roundrobin">>, <<>>}], 1000, 5000)
+                             [{<<"roundrobin">>, <<>>}], 1000, 30000)
         catch _:_ -> ok
         end
     end),
-    %% Wait for m3's join to open the rebalance.
+    %% Wait for m3's join to open the rebalance. Probing *m1* is safe: m1's
+    %% heartbeat answers REBALANCE_IN_PROGRESS (27) and only refreshes m1's own
+    %% last_seen. Never probe m3 here -- do_heartbeat refreshes last_seen, so
+    %% polling m3 would keep its 1s session alive and the sweep could never drop
+    %% it (the previous version spun for the whole wait_for budget and failed).
     wait_for(fun() ->
         kafka_group:heartbeat(?GROUP, Gen1 + 1, <<"m1">>) =:= {error, 27}
-        end, 2000),
-    %% Once m3's session lapses and the sweep runs, m3 is gone: its heartbeat
-    %% is UNKNOWN_MEMBER_ID regardless of generation.
+        end, 3000),
+    %% m3 never re-joins and nothing heartbeats it, so after its 1s session
+    %% lapses the next 1s sweep drops it and opens a further rebalance, moving
+    %% the generation from Gen1+1 to Gen1+2. Watch m1 for that bump (still only
+    %% touching m1), which is the observable consequence of m3 being swept.
     wait_for(fun() ->
-        kafka_group:heartbeat(?GROUP, Gen1 + 1, <<"m3">>) =:= {error, 25}
-        end, 4000),
+        kafka_group:heartbeat(?GROUP, Gen1 + 1, <<"m1">>) =:= {error, 22}
+        end, 5000),
+    %% Now confirm m3 itself is gone: a heartbeat finds no such member and
+    %% answers UNKNOWN_MEMBER_ID (25), regardless of the generation passed.
+    ?assertEqual({error, 25},
+                 kafka_group:heartbeat(?GROUP, Gen1 + 1, <<"m3">>)),
     M1 ! stop,
     M2 ! stop.
 
@@ -379,9 +389,20 @@ wait_msg(Tag, Timeout) ->
         ct:fail({timeout_waiting_for, Tag})
     end.
 
-wait_for(_Fun, 0) -> ct:fail(condition_never_met);
-wait_for(Fun, N) ->
+%% Poll Fun until it returns true or TimeoutMs of wall clock elapses. The second
+%% argument is a *millisecond* budget (the callers pass 3000/5000 expecting ms);
+%% the previous version treated it as an iteration count -- 4000 loops x 150ms
+%% = 600s -- so a genuine failure burned ten minutes before reporting. Poll
+%% every 100ms and fail fast once the budget is gone.
+wait_for(Fun, TimeoutMs) ->
+    wait_for(Fun, TimeoutMs, erlang:monotonic_time(millisecond)).
+
+wait_for(Fun, TimeoutMs, Started) ->
     case Fun() of
         true -> ok;
-        false -> timer:sleep(150), wait_for(Fun, N - 1)
+        false ->
+            case erlang:monotonic_time(millisecond) - Started >= TimeoutMs of
+                true -> ct:fail({condition_never_met, TimeoutMs});
+                false -> timer:sleep(100), wait_for(Fun, TimeoutMs, Started)
+            end
     end.

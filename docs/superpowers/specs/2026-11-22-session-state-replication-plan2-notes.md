@@ -156,6 +156,7 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
   > - 全量 CT 把它记为失败，真正原因是 **rebar3 与 OTP 29 的 cover 兼容 bug**：`rebar_prv_cover:maybe_write_coverdata/2` 调 `cover:modules/1`，而 OTP 29 的 `cover` 只导出 `modules/0`，故在**测试全部跑完后**写 coverdata 阶段抛 `undef {cover,modules,[]}`，导致 `rebar3 ct` 非零退出。进度行显示 13 个 `.` 之后才崩，与测试本身、与 `wait_for` 无关。
   > - **不可在项目侧规避**：`rebar.config` 加 `{cover_enabled, false}` 无效（rebar3 的 CT provider 无条件调 `cover:modules()`，配置拦不住）；升级 rebar3 也无效（3.28.0 为截至该日最新 release，崩溃相同）。属上游 rebar3/OTP 兼容问题，待 rebar3 修复或换 OTP。
   > - 结论：**`wait_for` 无需修改**；此项应从「既有缺陷」改为「上游 cover 崩溃、测试实为 PASS」，不计入本项目的失败。
+  > **2026-11-23 二度复核（再次推翻上面的「推翻」批注）**：上述更正批注**仍不准确**。直接单跑未改动的 `session_timeout_sweeps_dead_member`（`git checkout` 回 `5753e54` 起的老版本、不套用任何修复），结果 **失败** `condition_never_met`，suite.log 记 `=started 11:05:08 / =ended 11:15:12 / =elapsed 604.252594s`。即它跑满约 **600s**（正是 `wait_for(Fun,4000)` 的迭代预算 4000×150ms）才失败——这与「约 1s PASS、套件 13/13 ok」的实证直接矛盾。`wait_for` 自 `5753e54` 引入至今定义未变，且用例会轮询 m3 自身——`do_heartbeat` 命中 `{{ok,_},_}` 分支即刷新 `last_seen`，使 m3 的 1s 会话永不过期、sweep 永远丢弃不到它，故条件永不成立。因此 **§5.3 原诊断（`wait_for` 第二参当迭代次数、属既有缺陷）结论成立**；该批注的 cover 崩溃解释混淆了「全量非零退出（cover 写盘）」与「单个用例 `condition_never_met`（真实失败）」。已修复测试（`wait_for` 改为毫秒预算；轮询改探 m1 的 generation 推进、不再刷新 m3，最后一次性断言 m3→`UNKNOWN_MEMBER_ID`），修复后该用例 **2.02s PASS、套件 13/13 ok、全量 1705/1705 全绿**（`rm -rf _build/test` 后无 cover 写盘崩溃）。
 
 ### 5.4 全量 CT 实跑（2026-11-23 追加）
 
@@ -166,6 +167,7 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
   > **构建缓存陷阱（给后来者）**：删改测试套件后，仅 `rm -rf _build/test/extras` **不够**——rebar3 还会在 `_build/test/lib/<app>/test/` 保留一份旧源码副本。彻底的办法是 `rm -rf _build/test` 或至少删掉该目录下的残留文件，否则 CT 会报 `error_in_suite`（"cannot be compiled or loaded"），看起来像测试真的挂了。
 - `kafka_group_SUITE:session_timeout_sweeps_dead_member` 仍在全量中出现（既有缺陷，见上）。
   > **2026-11-23 追加批注**：上条「既有缺陷」措辞作废，见 §5.3 同一用例的更正批注——它是 rebar3×OTP29 的 cover 写盘崩溃（`undef {cover,modules,[]}`），测试本身约 1s PASS，并非套件缺陷，`wait_for` 无需修改。
+  > **2026-11-23 二度复核**：上面的更正措辞仍不准确，见 §5.3「二度复核」批注——单跑未改动版本实测 **604s 后失败** `condition_never_met`，属既有 `wait_for`/测试逻辑缺陷，已修复（2.02s PASS）。
 
 ## 6. 关联
 
