@@ -12,7 +12,8 @@
 -define(C, 8).
 
 all() -> [bootstrap_creates_all_session_partitions,
-          bootstrap_is_idempotent].
+          bootstrap_is_idempotent,
+          bootstrap_auto_runs_on_start].
 
 init_per_suite(Config) ->
     case node() of
@@ -81,26 +82,46 @@ bootstrap_is_idempotent(Config) ->
     ?assertEqual(Before, After),
     ok.
 
+%% 自动路径：不显式调 ensure/1，靠 bootstrap gen_server 在 init 后自跑。
+bootstrap_auto_runs_on_start(Config) ->
+    Nodes = peer_nodes(Config),
+    [First | _] = Nodes,
+    %% 只起 bootstrap gen_server 本身，不整体启动 broker_cluster 应用：
+    %% 脚手架已在 peer 上单独起了 cache/meta（prepare_peer/start_meta），
+    %% 走 ensure_all_started 会因 supervisor 子进程 already_started 而失败。
+    %% 用 gen_server:start/4（未链接）：rpc:call 的临时进程退出时不会连坐
+    %% 杀掉它。这恰好覆盖本用例要验证的路径：init/1 自投递 run_bootstrap
+    %% → 重试循环 → 建元数据。
+    {ok, _Boot} = rpc(First, gen_server, start,
+                      [{local, broker_cluster_session_bootstrap},
+                       broker_cluster_session_bootstrap, [], []]),
+    wait_until(
+      fun() ->
+              lists:all(
+                fun(P) ->
+                        case rpc(First, broker_cluster_cache, owner, [P]) of
+                            {ok, O} -> lists:member(O, Nodes);
+                            _ -> false
+                        end
+                end, lists:seq(0, ?C - 1))
+      end),
+    ok.
+
 %%%_* Scaffolding — 从 broker_session_replica_SUITE 原样复制（勿自行重写）----------
 %% start_peers/2, stop_peers/1, stop_peer/2, peer_name/2, is_code_dir/1,
 %% sanitise/1, peer_nodes/1, prepare_peer/1, start_meta/1, boot_data_plane/0,
-%% form_cluster_h/1, assign_partition/4, wait_until/1, rpc/3, rpc/4
+%% form_cluster_h/1, wait_until/1, rpc/3, rpc/4
 %% —— 全部逐字复制自 broker_session_replica_SUITE.erl，仅把 peer_name 前缀改为 gap3b_。
 
 %%%_* Cluster helpers ------------------------------------------------------
 %%
 %% `form_cluster_h/1' runs on the TEST node (it rpc's into each peer to hang the
-%% metadata server). `assign_partition/4' and `boot_data_plane/0' execute in the
-%% peer's process.
+%% metadata server). `boot_data_plane/0' executes in the peer's process.
 
 %% 每台挂元数据服，组成一个真正的 ra 组。
 form_cluster_h(Nodes) ->
     ok = lists:foldl(fun(N, ok) -> rpc(N, start_meta, [Nodes]) end, ok, Nodes),
     ok.
-
-%% 分配会话分区（ra 命令）：真实机器状态。
-assign_partition(Partition, Owner, Nodes, Epoch) ->
-    broker_cluster:assign(Partition, Owner, Nodes, Epoch).
 
 %% 每节点启动 data plane（storage/queue/router/subscription + hooks）。
 boot_data_plane() ->

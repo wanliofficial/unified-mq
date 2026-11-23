@@ -24,11 +24,19 @@
 %%%_* Public API -----------------------------------------------------------
 
 %% @doc 用当前集群成员跑一次 bootstrap。
+%%
+%% 先判开关：feature 关闭时直接返回，绝不 probe ra（否则 gen_server 每 2s
+%% 白跑一次 members() + ra 查询）。
 -spec ensure() -> ok | {error, term()}.
 ensure() ->
-    case members() of
-        {ok, Members} -> ensure(Members);
-        {error, _} = E -> E
+    case application:get_env(broker_cluster, session_replication, false) of
+        true ->
+            case members() of
+                {ok, Members} -> ensure(Members);
+                {error, _} = E -> E
+            end;
+        _ ->
+            ok
     end.
 
 %% @doc 用显式成员跑一次 bootstrap（测试用，避免依赖 ra 成员视图）。
@@ -44,22 +52,24 @@ ensure(_) ->
 %%%_* Internal (pure, testable) ---------------------------------------------
 
 do_ensure(Members) ->
-    Count = ensure_count(Members),
-    ensure_partitions(Count, Members).
+    case ensure_count(Members) of
+        {ok, Count} -> ensure_partitions(Count, Members);
+        {error, _} = E -> E
+    end.
 
 %% 1) 权威 C 不存在就建；存在就以它为准确保分区空间一致。
+%% C 必须先在 ra 里提交成功才继续（I9：C 集群一致）。提交失败（无 quorum /
+%% leader 未选出）时把错误往上抛，让 gen_server 的 2s 重试循环再来一遍——
+%% 绝不能吞掉错误后假装 ok，否则分区元数据永远建不起来、接管链路静默失效。
 ensure_count(Members) ->
     case broker_cluster_cache:session_partition_config() of
         {ok, Count, _Epoch} ->
-            Count;
+            {ok, Count};
         not_found ->
             Desired = desired_count(Members),
             case broker_cluster:set_session_partition_count(Desired) of
-                {ok, _} -> Desired;
-                {error, _} ->
-                    %% 提交失败（无 quorum）：用推导值继续，至少能补齐本节点
-                    %% 已能看到的元数据；下次 bootstrap 再对齐。
-                    Desired
+                {ok, _} -> {ok, Desired};
+                {error, _} = E -> E
             end
     end.
 
@@ -78,13 +88,14 @@ ensure_partitions(Count, Members) ->
     ok.
 
 ensure_partition(P, Members) ->
-    Owner = broker_cluster_session_partition:pick_owner(P, Members),
+    Sorted = lists:sort(Members),
+    Owner = broker_cluster_session_partition:pick_owner(P, Sorted),
     case broker_cluster_cache:get(P) of
-        {ok, #{replicas := Rs, owner := O}} when Rs =:= Members, O =:= Owner ->
+        {ok, #{replicas := Rs, owner := O}} when Rs =:= Sorted, O =:= Owner ->
             ok;                                   %% 已达标，幂等 no-op
         _ ->
             Epoch = broker_cluster:epoch_or_zero(P) + 1,
-            _ = broker_cluster:assign(P, Owner, Members, Epoch),
+            _ = broker_cluster:assign(P, Owner, Sorted, Epoch),
             ok
     end.
 
