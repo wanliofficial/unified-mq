@@ -150,6 +150,12 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 
 - `broker_proto_mcp/test/mcp_dispatch_SUITE.erl`：历史记录称其「未跟踪 WIP、编译不过」。**在本分支该文件不存在**（`git ls-files | grep mcp_dispatch` 只有 `src/mcp_dispatch.erl`，测试目录只有 `mcp_listener_SUITE` / `mcp_route_SUITE` / `mcp_stdio_SUITE`），因此它**不是**本分支的失败来源，只是历史记录留下的旧条目。
 - `kafka_group_SUITE:session_timeout_sweeps_dead_member`：历史记录称其为既有 `wait_for` 缺陷。本 Task 实测复核：该套件其余 13 用例全绿，唯 `all()` 末位的这一例跑 240s 仍未出结果。原因是 `wait_for(Fun, 2000|4000)` 的第二个参数是**迭代次数**而非毫秒，每次 `timer:sleep(150)`，故实际预算是 300s / 600s 量级——**历史结论仍成立**，是既有缺陷、与 Plan 2 无关，未在本 Task 修复。
+  > **2026-11-23 追加批注（推翻上述诊断）**：实测复核后该条目**结论有误**，`wait_for` 并非缺陷。
+  > - 该用例单跑 **PASS，约 1 秒**（`_build/test/logs/**/suite.log` 记 `=result ok`；07:24:18→07:24:19）；`kafka_group_SUITE` 全部 **13/13 ok**。不存在「跑 240s 未出结果」。
+  > - `wait_for/2` 第二参数当迭代次数是**一直如此**（`kafka_group_SUITE.erl` 自引入提交 `5753e54` 起未被改过，定义与调用从未变动），套件长期通过；「300s/600s 预算导致超时假象」的说法不成立。
+  > - 全量 CT 把它记为失败，真正原因是 **rebar3 与 OTP 29 的 cover 兼容 bug**：`rebar_prv_cover:maybe_write_coverdata/2` 调 `cover:modules/1`，而 OTP 29 的 `cover` 只导出 `modules/0`，故在**测试全部跑完后**写 coverdata 阶段抛 `undef {cover,modules,[]}`，导致 `rebar3 ct` 非零退出。进度行显示 13 个 `.` 之后才崩，与测试本身、与 `wait_for` 无关。
+  > - **不可在项目侧规避**：`rebar.config` 加 `{cover_enabled, false}` 无效（rebar3 的 CT provider 无条件调 `cover:modules()`，配置拦不住）；升级 rebar3 也无效（3.28.0 为截至该日最新 release，崩溃相同）。属上游 rebar3/OTP 兼容问题，待 rebar3 修复或换 OTP。
+  > - 结论：**`wait_for` 无需修改**；此项应从「既有缺陷」改为「上游 cover 崩溃、测试实为 PASS」，不计入本项目的失败。
 
 ### 5.4 全量 CT 实跑（2026-11-23 追加）
 
@@ -159,6 +165,7 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 - 唯一失败 `mqtt_conn_SUITE:error_in_suite`，**不是产品缺陷**：`mqtt_conn_fsm_claim_SUITE` 已在 Task 5 review 中被 `git rm`，但 rebar3 把测试源码复制进 `_build/test/lib/broker_proto_mqtt/test/`，旧副本残留导致 CT 扫描时加载失败。清掉该残留后再跑 `mqtt_conn_SUITE` → **131/131 全绿**。
   > **构建缓存陷阱（给后来者）**：删改测试套件后，仅 `rm -rf _build/test/extras` **不够**——rebar3 还会在 `_build/test/lib/<app>/test/` 保留一份旧源码副本。彻底的办法是 `rm -rf _build/test` 或至少删掉该目录下的残留文件，否则 CT 会报 `error_in_suite`（"cannot be compiled or loaded"），看起来像测试真的挂了。
 - `kafka_group_SUITE:session_timeout_sweeps_dead_member` 仍在全量中出现（既有缺陷，见上）。
+  > **2026-11-23 追加批注**：上条「既有缺陷」措辞作废，见 §5.3 同一用例的更正批注——它是 rebar3×OTP29 的 cover 写盘崩溃（`undef {cover,modules,[]}`），测试本身约 1s PASS，并非套件缺陷，`wait_for` 无需修改。
 
 ## 6. 关联
 
