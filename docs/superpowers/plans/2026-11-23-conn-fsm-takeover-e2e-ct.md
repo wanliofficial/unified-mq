@@ -581,6 +581,7 @@ no_owner_no_takeover(Config) ->
 - 所有 `broker_cluster_cache:owner/1` 比较用 `{ok,_}` 形状（与 Task 1/2 一致）。
 - kill 的是 `hd(Nodes)`（任一非 holder 节点，因无 claim 逻辑，kill 谁都不触发 takeover）；holder 自身保留以读 metric/cache。
 - 这是**负向永久用例**（确定红/绿、无 flaky），适合放 `all/0`。
+- **实现期校准（2026-11-23 实测）**：不要字面用 `hd(Nodes)` 当 kill 目标——ra leader 常是 `Nodes` 首元素，此时 `assign_roles/2` 的 `Holder` 恰是 `hd(Nodes)`（实测 no_owner 用例 holder = `n1`），kill 掉就读不到 holder 的 metric/cache 了。实现取 `Victim = hd([N || N <- Nodes, N =/= Holder])`（保证非 holder、确定性），语义与「kill 任一非 holder 节点」一致。
 
 - [ ] **Step 3: 跑套件，确认绿**
 
@@ -617,6 +618,14 @@ rebar3 ct --suite=apps/broker_cluster/test/broker_cluster_conn_fsm_takeover_dist
 b) **owner==leader → flaky。** 临时把主用例的 `assign_roles(ra_leader(Nodes), Nodes)` 改为强制 `Owner = ra_leader(Nodes)`（owner==leader），连跑主用例 5 次观察是否偶发 `no_leader`/takeover 不确定；确认后 revert。此步为经验性记录，不纳入 `all/0`。
 
 > 记录：把 a)/b) 的实测结论（哪一行改、主用例是否如期变红、owner==leader 是否 flaky）写进本步骤下方批注，作为「变异验证已执行」的证据。**不要**把变异源码或变异用例提交。
+
+> **2026-11-23 执行记录（变异 a，已执行、已 revert、未提交）**：
+> - **改了什么**：`apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl` 的 `handle_event(_Et, {nodedown, Node}, _StateName, #st{owner_node = Node, ...})` 分支体内，把 `Epoch = try broker_cluster:epoch(P) ... end,` + `try broker_cluster:claim(P, node(), Epoch) of` 两段整体替换为 `try {error, claim_mutation_disabled} of` —— 于是 claim **完全不执行**（不递增 `cluster_session_takeover_ok`、不写 cache），只走「claim 失败保连接」分支（`keep_state, D`），透明性/续期逻辑一字未动。
+> - **红确认（符合预期）**：`live_connection_zero_reconnect_on_owner_crash` → `=result failed: {test_case_failed,{timeout,broker_cluster_conn_fsm_takeover_dist_SUITE}}`，失败位置 `broker_cluster_conn_fsm_takeover_dist_SUITE.erl:132`（takeover① 的 `wait_until`: `broker_cluster_cache:owner(P) =:= {ok,Holder}`，20s 超时）；peer 侧日志 `mqtt_conn: takeover claim failed for partition 3: {error, claim_mutation_disabled}`。
+> - **透明性仍绿**：失败点之前的透明性①②③（同 socket PINGRESP、conn_fsm pid 存活、崩溃后同一 socket 续收 PUBLISH `t/b`）全部通过 —— 证明该变异只关掉 takeover、不波及零重连续期，且主用例的 takeover 断言确由 claim 的真实结果驱动（不是本地/凭空计数）。
+> - **对照**：同轮 `no_owner_no_takeover` 仍 `=result ok`（负向用例与该变异无耦合）。
+> - **还原**：`git checkout -- apps/broker_proto_mqtt/src/mqtt_conn_fsm.erl`；`git status` 该源文件干净（0 行 diff），还原后重跑套件 `=successful 2 / =failed 0`。未提交任何变异源码、未新增变异 CT 用例。
+> - b) owner==leader flaky 未单独执行（非必做）：a) 已足以证明「claim 坏 → 主用例红」，此项留作经验性观察。
 
 ---
 
