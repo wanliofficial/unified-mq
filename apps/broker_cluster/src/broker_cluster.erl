@@ -12,6 +12,9 @@
 -export([start/0, stop/0]).
 -export([assign/4, migrate/4, finish_migration/2, remove/1, claim/3,
          set_session_partition_count/1]).
+%% MQ-15: shared assignment ra commands (the cross-node allocation truth).
+-export([shared_claim/7, shared_ack/4, shared_release/3, shared_reclaim/5,
+         shared_join/3, shared_leave/2, shared_consumers_on/1]).
 -export([join/1, join/2, leave/1, leave/2]).
 -export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
          partition_view/0]).
@@ -72,6 +75,54 @@ claim(Partition, Node, Epoch) when is_integer(Partition), is_atom(Node),
     Result = command({claim, Partition, Node, Epoch}),
     _ = try inc_takeover(Result) catch _:_ -> ok end,
     Result.
+
+%%%_* MQ-15 shared assignment commands --------------------------------------
+%%
+%% Thin wrappers over `command/1': the mutual-exclusion invariant is enforced
+%% inside the ra state machine (single-threaded apply), so these are safe to
+%% call from any node. The worker passes `High' (the committed watermark) and
+%% `Blocked' precomputed; the state machine never reads the queue.
+
+%% @doc Claim up to `Max' offsets for `ClientId' on `{Sub, Partition}'. Returns
+%% `{ok, [Offsets]}', `{ok, quota_hit}' (this consumer is at its own share while
+%% the group still has room) or `{error, overflow}' (the whole window is full).
+-spec shared_claim(term(), non_neg_integer(), binary(), non_neg_integer(),
+                   non_neg_integer(), map(), non_neg_integer()) ->
+          {ok, [offset()]} | {ok, quota_hit} | {error, term()}.
+shared_claim(Sub, Partition, ClientId, Max, High, Blocked, PerConsumerMax)
+  when is_integer(Partition) ->
+    command({shared_claim, Sub, Partition, ClientId, Max, High, Blocked,
+             PerConsumerMax}).
+
+-spec shared_ack(term(), non_neg_integer(), offset(), binary()) ->
+          {ok, non_neg_integer()} | {error, term()}.
+shared_ack(Sub, Partition, Offset, ClientId) ->
+    command({shared_ack, Sub, Partition, Offset, ClientId}).
+
+-spec shared_release(term(), non_neg_integer(), binary()) -> {ok, non_neg_integer()} | {error, term()}.
+shared_release(Sub, Partition, ClientId) ->
+    command({shared_release, Sub, Partition, ClientId}).
+
+%% @doc Threshold-triggered rebalance: move `Offsets' from `FromId' to `ToId',
+%% but only where `FromId' still holds them.
+-spec shared_reclaim(term(), non_neg_integer(), binary(), binary(), [offset()]) ->
+          {ok, [offset()]} | {error, term()}.
+shared_reclaim(Sub, Partition, FromId, ToId, Offsets) ->
+    command({shared_reclaim, Sub, Partition, FromId, ToId, Offsets}).
+
+-spec shared_join(term(), binary(), node()) -> {ok, node()} | {error, term()}.
+shared_join(Sub, ClientId, Node) ->
+    command({shared_join, Sub, ClientId, Node}).
+
+-spec shared_leave(term(), binary()) -> {ok, removed} | {error, term()}.
+shared_leave(Sub, ClientId) ->
+    command({shared_leave, Sub, ClientId}).
+
+%% @doc The ClientIds hosted on `Node' -- the nodedown handler uses this to
+%% release exactly a crashed node's offsets.
+-spec shared_consumers_on(node()) -> [binary()] | {error, term()}.
+shared_consumers_on(Node) when is_atom(Node) ->
+    command({shared_consumers_on, Node}).
 
 %% 把 claim 结果映射到对应冻结键。错误形状以 meta_machine:claim/6 为准：
 %% `{error, {not_a_replica, _}}' / `{error, {stale_epoch, _, _}}' /

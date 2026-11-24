@@ -456,7 +456,7 @@ Expected: FAIL（`undef` —— `shared_claim/7` 等未导出）。
 
 ```erlang
 %% 在 -export 列表追加：
-%%   shared_claim/7, shared_ack/4, shared_release/3, shared_reclaim/6,
+%%   shared_claim/7, shared_ack/4, shared_release/3, shared_reclaim/5,
 %%   shared_join/3, shared_leave/2, shared_consumers_on/1
 
 shared_claim(Sub, P, ClientId, Max, High, Blocked, PerConsumerMax)
@@ -481,6 +481,8 @@ shared_leave(Sub, ClientId) ->
 shared_consumers_on(Node) ->
     command({shared_consumers_on, Node}).
 ```
+
+（`shared_reclaim/5`：5 个参数 Sub/P/FromId/ToId/Offsets。）
 
 `shared_claim` 的 `High` 是 worker 预计算的 committed watermark（设计 §3.3「ra 内不读队列」），`PerConsumerMax` 由 worker 计算后传入（MQ-11 配额在 worker 侧，ra 内 claim/7 用它）。注意 Task 1 的 `shared_claim` apply 分支当前传了 `0` 作 PerConsumerMax —— 改为透传命令里的值：
 

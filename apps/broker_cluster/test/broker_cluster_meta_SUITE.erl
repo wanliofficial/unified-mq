@@ -151,47 +151,68 @@ set_count_twice_advances_epoch(_Config) ->
 
 %%%_* MQ-15 shared assignment -------------------------------------------------
 
-%% The ra-side row's `assigned' map, asserted through the cache mirror.
-assigned_of({ok, Row}) -> maps:get(assigned, Row);
-assigned_of(not_found) -> not_found.
+%% These cases exercise the pure assignment algebra through `apply/3' and assert
+%% on the RETURNED state, not the shared cache mirror: the cache is a
+%% node-global singleton that a sibling suite's async ra apply can pollute, but
+%% the returned state is the authoritative, private result of each command.
+%% Only `shared_assignments_survive_snapshot_install' reads the cache, since the
+%% cache mirror is precisely what a snapshot restore must rebuild.
+
+%% The `assigned' map for `{Sub, P}' out of a state's `shared_assignments'.
+assigned_in(State, Sub, P) ->
+    As = maps:get(shared_assignments, State, #{}),
+    case maps:find({Sub, P}, As) of
+        {ok, Row} -> maps:get(assigned, Row, #{});
+        error -> not_found
+    end.
+
+%% The ClientIds hosted on `Node' out of a state's `shared_consumers'.
+consumers_on(State, Node) ->
+    Cs = maps:get(shared_consumers, State, #{}),
+    [ClientId || {{_Sub, ClientId}, N} <- maps:to_list(Cs), N =:= Node].
 
 shared_claim_assigns_without_duplicate_across_calls(_Config) ->
     S0 = #{partitions => #{}},
     Sub = {shared, <<"g">>, <<"s/#">>},
     %% Max=2: an empty window fills exactly 2, so the second claim must skip the
     %% two already assigned and take the next two -- never an overlap.
-    {S1, {ok, [1, 2], As1}, []} = broker_cluster_meta_machine:apply(
+    {S1, {ok, [1, 2]}, []} = broker_cluster_meta_machine:apply(
                                    #{index => 1},
                                    {shared_claim, Sub, 0, <<"c1">>, 2, 100, #{}, 0},
                                    S0),
-    %% The mirror carries the committed assignment table.
-    ?assertEqual(#{1 => <<"c1">>, 2 => <<"c1">>},
-                 assigned_of(broker_cluster_cache:shared_assignment(Sub, 0))),
+    ?assertEqual(#{1 => <<"c1">>, 2 => <<"c1">>}, assigned_in(S1, Sub, 0)),
     %% A second claim on the same window continues past the first and never hands
     %% out an offset the first one already owns -- mutual exclusion.
-    {_S2, {ok, [3, 4], _As2}, []} = broker_cluster_meta_machine:apply(
-                                    #{index => 2},
-                                    {shared_claim, Sub, 0, <<"c2">>, 2, 100, #{}, 0},
-                                    S1),
-    ?assertEqual(As1, maps:get(shared_assignments, S1)),
+    {S2, {ok, [3, 4]}, []} = broker_cluster_meta_machine:apply(
+                                   #{index => 2},
+                                   {shared_claim, Sub, 0, <<"c2">>, 2, 100, #{}, 0},
+                                   S1),
+    %% c2's claim did not disturb c1's offsets, and added its own: the full
+    %% assigned set is the union, with no offset owned by two consumers.
+    ?assertEqual(#{1 => <<"c1">>, 2 => <<"c1">>, 3 => <<"c2">>, 4 => <<"c2">>},
+                 assigned_in(S2, Sub, 0)),
     ok.
 
 shared_ack_advances_the_read_point(_Config) ->
     S0 = #{partitions => #{}},
     Sub = {shared, <<"g">>, <<"s/#">>},
-    {S1, {ok, [1, 2], As1}, []} = broker_cluster_meta_machine:apply(
+    {S1, {ok, [1, 2]}, []} = broker_cluster_meta_machine:apply(
                                    #{index => 1},
                                    {shared_claim, Sub, 0, <<"c1">>, 2, 100, #{}, 0},
                                    S0),
     %% c1 acks offset 1: the read point advances to 2.
     {S2, {ok, 2}, []} = broker_cluster_meta_machine:apply(
                           #{index => 2}, {shared_ack, Sub, 0, 1, <<"c1">>}, S1),
-    {ok, Row} = broker_cluster_cache:shared_assignment(Sub, 0),
-    ?assertEqual(2, broker_cursor:next_read(Row)),
-    %% An ack from a consumer that does not own the offset is refused, no-op.
-    {_S3, {error, unowned}, []} = broker_cluster_meta_machine:apply(
+    %% c1 acked offset 1: the row's read point advances to 2 and offset 1 leaves
+    %% the assigned set.
+    #{assigned := #{2 := <<"c1">>}, low := 2} = maps:get({Sub, 0},
+                                                        maps:get(shared_assignments, S2)),
+    %% An ack from a consumer that does not own the offset is refused, no-op: the
+    %% state after the failed ack (S3) equals the state after the good ack (S2).
+    {S3, {error, unowned}, []} = broker_cluster_meta_machine:apply(
                                    #{index => 3}, {shared_ack, Sub, 0, 2, <<"c2">>}, S2),
-    ?assertEqual(As1, maps:get(shared_assignments, S1)),
+    ?assertEqual(maps:get(shared_assignments, S2),
+                 maps:get(shared_assignments, S3)),
     ok.
 
 shared_release_returns_all_of_a_consumer(_Config) ->
@@ -200,10 +221,10 @@ shared_release_returns_all_of_a_consumer(_Config) ->
     {S1, _, []} = broker_cluster_meta_machine:apply(
                     #{index => 1},
                     {shared_claim, Sub, 0, <<"c1">>, 2, 100, #{}, 0}, S0),
-    {_S2, {ok, 2}, []} = broker_cluster_meta_machine:apply(
+    {S2, {ok, 2}, []} = broker_cluster_meta_machine:apply(
                           #{index => 2}, {shared_release, Sub, 0, <<"c1">>}, S1),
-    {ok, Row} = broker_cluster_cache:shared_assignment(Sub, 0),
-    ?assertEqual(#{}, maps:get(assigned, Row)),
+    %% Release returns everything c1 held and empties its assigned set.
+    ?assertEqual(#{}, assigned_in(S2, Sub, 0)),
     ok.
 
 shared_consumers_table_tracks_join_leave(_Config) ->
@@ -211,10 +232,10 @@ shared_consumers_table_tracks_join_leave(_Config) ->
     Sub = {shared, <<"g">>, <<"s/#">>},
     {S1, {ok, _Node}, []} = broker_cluster_meta_machine:apply(
                                #{index => 1}, {shared_join, Sub, <<"c1">>, node()}, S0),
-    ?assertEqual([<<"c1">>], broker_cluster_cache:shared_consumers_on(node())),
-    {_S2, {ok, removed}, []} = broker_cluster_meta_machine:apply(
+    ?assertEqual([<<"c1">>], consumers_on(S1, node())),
+    {S2, {ok, removed}, []} = broker_cluster_meta_machine:apply(
                                 #{index => 2}, {shared_leave, Sub, <<"c1">>}, S1),
-    ?assertEqual([], broker_cluster_cache:shared_consumers_on(node())),
+    ?assertEqual([], consumers_on(S2, node())),
     ok.
 
 shared_reclaim_moves_only_the_named_offsets(_Config) ->
@@ -223,12 +244,12 @@ shared_reclaim_moves_only_the_named_offsets(_Config) ->
     {S1, _, []} = broker_cluster_meta_machine:apply(
                     #{index => 1},
                     {shared_claim, Sub, 0, <<"c1">>, 2, 100, #{}, 0}, S0),
-    {_S2, {ok, [2]}, []} = broker_cluster_meta_machine:apply(
+    {S2, {ok, [2]}, []} = broker_cluster_meta_machine:apply(
                            #{index => 2},
                            {shared_reclaim, Sub, 0, <<"c1">>, <<"c2">>, [2]}, S1),
-    {ok, Row} = broker_cluster_cache:shared_assignment(Sub, 0),
-    ?assertEqual(<<"c2">>, maps:get(2, maps:get(assigned, Row))),
-    ?assertEqual(<<"c1">>, maps:get(1, maps:get(assigned, Row))),
+    Assigned = assigned_in(S2, Sub, 0),
+    ?assertEqual(<<"c2">>, maps:get(2, Assigned)),
+    ?assertEqual(<<"c1">>, maps:get(1, Assigned)),
     ok.
 
 shared_assignments_survive_snapshot_install(_Config) ->

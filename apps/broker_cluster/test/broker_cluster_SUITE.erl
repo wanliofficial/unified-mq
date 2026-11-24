@@ -10,6 +10,7 @@
 -compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
 -include_lib("broker_core/include/broker_message.hrl").
 
 -define(SERVER, {broker_cluster_meta, node()}).
@@ -28,7 +29,10 @@ all() ->
      queue_accepts_replicated_commit_only_with_a_replicator,
      queue_refuses_replicated_commit_without_a_replicator,
      session_hook_absent_by_default,
-     session_hook_installed_when_enabled].
+     session_hook_installed_when_enabled,
+     %% MQ-15: shared assignment through the real ra command path.
+     shared_claim_ack_release_through_ra,
+     shared_consumers_on_reports_a_joined_node].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -59,6 +63,9 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_queue, reliability, fsync),
     {ok, Cache} = broker_cluster_cache:start_link(),
     unlink(Cache),
+    %% MQ-15: a sibling suite (meta_SUITE) may have left shared-mirror rows in a
+    %% still-registered cache; start clean so the shared cases see only their own.
+    broker_cluster_cache:clear(),
     {ok, Meta} = broker_cluster_meta:start_link(),
     unlink(Meta),
     [{data_dir, DataDir} | Config].
@@ -227,6 +234,47 @@ session_hook_installed_when_enabled(_Config) ->
     undefined =
         persistent_term:get({broker_subscription_worker, session_replicator},
                             undefined),
+    ok.
+
+%%%_* MQ-15 shared assignment through ra ---------------------------------------
+
+%% The worker-facing `broker_cluster:shared_*' API drives the real ra command
+%% path: claim from two consumers never overlaps, ack advances the read point,
+%% release returns everything the consumer held, and `shared_consumers_on'
+%% reports exactly the joined node's consumers.
+shared_claim_ack_release_through_ra(_Config) ->
+    Sub = {shared, <<"g">>, <<"s/#">>},
+    {ok, [1, 2]} = broker_cluster:shared_claim(Sub, 0, <<"c1">>, 2, 100, #{}, 0),
+    {ok, [3, 4]} = broker_cluster:shared_claim(Sub, 0, <<"c2">>, 2, 100, #{}, 0),
+    {ok, #{1 := <<"c1">>, 2 := <<"c1">>, 3 := <<"c2">>, 4 := <<"c2">>}} =
+        (fun() ->
+                 {ok, Row} = broker_cluster_cache:shared_assignment(Sub, 0),
+                 {ok, maps:get(assigned, Row)}
+         end)(),
+    %% c1 acks offset 1: the read point moves to 2.
+    {ok, 2} = broker_cluster:shared_ack(Sub, 0, 1, <<"c1">>),
+    %% An ack from a consumer that does not own the offset is refused.
+    {error, unowned} = broker_cluster:shared_ack(Sub, 0, 3, <<"c1">>),
+    %% Release returns c1's remaining offset (2); the table keeps c2's.
+    {ok, 1} = broker_cluster:shared_release(Sub, 0, <<"c1">>),
+    {ok, #{3 := <<"c2">>, 4 := <<"c2">>}} =
+        (fun() ->
+                 {ok, Row} = broker_cluster_cache:shared_assignment(Sub, 0),
+                 {ok, maps:get(assigned, Row)}
+         end)(),
+    ok.
+
+%% `shared_consumers_on/1' answers the nodedown handler's query: it returns
+%% exactly the ClientIds joined on the queried node, and nothing else.
+shared_consumers_on_reports_a_joined_node(_Config) ->
+    Sub = {shared, <<"g">>, <<"s/#">>},
+    {ok, _Node} = broker_cluster:shared_join(Sub, <<"c1">>, node()),
+    ?assertEqual([<<"c1">>], broker_cluster:shared_consumers_on(node())),
+    {ok, _} = broker_cluster:shared_join(Sub, <<"c2">>, node()),
+    ?assertEqual(lists:sort([<<"c1">>, <<"c2">>]),
+                 lists:sort(broker_cluster:shared_consumers_on(node()))),
+    {ok, removed} = broker_cluster:shared_leave(Sub, <<"c1">>),
+    ?assertEqual([<<"c2">>], broker_cluster:shared_consumers_on(node())),
     ok.
 
 %%%_* Helpers ---------------------------------------------------------------
