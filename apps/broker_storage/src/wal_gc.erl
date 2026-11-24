@@ -24,7 +24,8 @@
 -include_lib("kernel/include/file.hrl").
 -include_lib("broker_core/include/broker_message.hrl").
 
--export([start_link/0, run/0, status/0, scan/1, plan/3, retention_config/0]).
+-export([start_link/0, run/0, status/0, scan/1, plan/3, retention_config/0,
+         lag_bytes/2, retention_lag/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(WAL_SUBDIR, "wal").
@@ -69,6 +70,27 @@ run() ->
 status() ->
     Retention = retention_config(),
     [status_for(Scan, Retention) || Scan <- scan(data_dir())].
+
+%% @doc MQ-11 §3.4: bytes retained only because `committed' has not reached a
+%% segment yet -- the slow-consumer pin, measured in bytes. Every whole
+%% candidate segment whose `next' is past `committed + 1' cannot be deleted, so
+%% the sum of their sizes is the lag between the slowest live cursor and the WAL
+%% tail. The active segment is never a candidate (it is still being written).
+%% Observation only: `plan/3' does not read this, so the deletion decision is
+%% unchanged (invariant 6).
+-spec lag_bytes(scanned(), map()) -> non_neg_integer().
+lag_bytes(#{segments := Segments}, Info) ->
+    #{committed := Committed, active_segment := Active} = Info,
+    Pinned = [S || #{next := Next} = S <- candidates(Segments, Active),
+                   Next > Committed + 1],
+    sum_sizes(Pinned).
+
+%% @doc Per-partition observation of MQ-11's retention pin:
+%% `[{PartitionId, LagBytes}]'. Read-only; no writer means lag 0 (nothing is
+%% known to be pinned).
+-spec retention_lag() -> [{partition_id(), non_neg_integer()}].
+retention_lag() ->
+    [lag_for(Scan) || Scan <- scan(data_dir())].
 
 %% @doc Enumerate `data_dir/wal/<partition>' directories. A missing `wal'
 %% directory is an empty result, not an error: a node that never created a
@@ -141,27 +163,49 @@ terminate(_Reason, _State) ->
 %%%_* Sweep --------------------------------------------------------------
 
 sweep(#{data_dir := DataDir, retention := Retention}) ->
-    lists:foreach(fun(Scan) -> collect(Scan, Retention) end, scan(DataDir)),
+    MaxLag =
+        lists:foldl(
+          fun(Scan, Acc) ->
+                  {ok, Lag} = collect(Scan, Retention),
+                  erlang:max(Acc, Lag)
+          end, 0, scan(DataDir)),
+    %% MQ-11 §3.4: a single gauge (ADR-016 forbids per-partition labels), so it
+    %% reports the worst partition -- the one an operator must look at first.
+    broker_metrics:gauge(retention_lag_bytes, MaxLag),
+    maybe_warn_lag(MaxLag),
     ok.
+
+maybe_warn_lag(Lag) ->
+    case application:get_env(broker_storage, retention_lag_warn_bytes, 0) of
+        Threshold when is_integer(Threshold), Threshold > 0, Lag > Threshold ->
+            logger:warning(
+              "retention_lag_bytes ~p exceeds retention_lag_warn_bytes ~p",
+              [Lag, Threshold]),
+            ok;
+        _ ->
+            ok
+    end.
 
 collect(#{partition := PartitionId} = Scan, Retention) ->
     case writer_pid(PartitionId) of
         undefined ->
-            ok;
+            {ok, 0};
         Pid ->
             try wal_writer:retention_info(Pid) of
                 Info ->
                     Decision = plan(Scan, Retention, Info),
                     maybe_count_blocked(Decision),
+                    Lag = lag_bytes(Scan, Info),
                     case maps:get(deletes, Decision) of
                         [] -> ok;
                         _ -> _ = wal_writer:truncate(Pid, maps:get(cut, Decision)), ok
-                    end
+                    end,
+                    {ok, Lag}
             catch
                 _:_ ->
                     %% The writer is restarting or the partition was closed;
                     %% the next tick will see it again.
-                    ok
+                    {ok, 0}
             end
     end.
 
@@ -258,6 +302,18 @@ sum_sizes(Segments) ->
     lists:sum([maps:get(size, S) || S <- Segments]).
 
 %%%_* Status -------------------------------------------------------------
+
+lag_for(#{partition := PartitionId} = Scan) ->
+    case writer_pid(PartitionId) of
+        undefined ->
+            {PartitionId, 0};
+        Pid ->
+            try wal_writer:retention_info(Pid) of
+                Info -> {PartitionId, lag_bytes(Scan, Info)}
+            catch
+                _:_ -> {PartitionId, 0}
+            end
+    end.
 
 status_for(#{partition := PartitionId} = Scan, Retention) ->
     Segments = maps:get(segments, Scan),

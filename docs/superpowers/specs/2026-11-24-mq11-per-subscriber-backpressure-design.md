@@ -1,6 +1,6 @@
 # MQ-11 per-subscriber 背压（慢消费者隔离）—— 设计
 
-> 状态：设计稿（brainstorm 产出，待 review → writing-plans → 实现）
+> 状态：**已实现（2026-11-24）**——§2 fair-share 配额 + `shared_consumer_quota_hit` + §3.4 retention lag 观测（`retention_lag_bytes` / `wal_gc:lag_bytes/2`）已落地；见 §10 实现记录。
 > 缺口出处：`docs/compatibility/unifiedmq-mqtt-family-gap.md` 第 62 行（MQ-11）
 > 日期：2026-11-24
 
@@ -260,3 +260,12 @@ MQ-15 是**跨节点再均衡**（阈值触发，为均衡吞吐），MQ-11 配�
 - Plan 阶段细化：`claim/7` 的精确签名与调用点、`shared_consumer_assigned` 的 per-consumer 上报方式
   （gauge 需带标签还是聚合）、配额与 MQ-15 reclaim 同时开启时的交互细节。
 - 实现顺序与 task 拆分：见后续 writing-plans 产出的 plan。
+
+## 10. 实现记录（2026-11-24）
+
+- **`broker_cursor`**：新增 `claim/7`（`PerConsumerMax` 参数）与 `do_claim/7`、`count_consumer/2`；`claim/5`、`claim/6` 保留并委托（`PerConsumerMax =< 0` 等价关闭，逐字节等价现状）。`{ok, quota_hit, Row}` 为「本消费者到配额、组尚有空间」，与 `{error, overflow}`（组满）区分。
+- **`broker_subscription_worker`**：`claim` handler 从 `?ENTITIES` 读 `consumers` 算配额 `shared_per_consumer_quota/2`（`shared_per_consumer_max > 0` 固定，否则 `max(1, Limit div N)`；N=0 退化 `Limit`）；`quota_hit` 计 `shared_consumer_quota_hit` 并回空 claim。
+- **指标**：新增闭集键 `shared_consumer_quota_hit`（counter）与 `retention_lag_bytes`（gauge）。设计 §3.5 的 `shared_consumer_assigned`（per-consumer gauge）**未做**——它需要 per-consumer 标签，违反 ADR-016 的高基数禁令；按 §9 的 Plan 阶段待定，当前不引入。
+- **retention 观测**：`wal_gc:lag_bytes/2`（纯函数，候选段中 `next > committed + 1` 的字节和）+ `retention_lag/0`（per-partition）；`sweep/1` 取最大 lag 写 `retention_lag_bytes`，`retention_lag_warn_bytes`（默认 0=关）超阈值告警。`plan/3` 删除决策未改（invariant 6）。
+- **测试**：`broker_subscription_SUITE` 新增 4 个纯函数例 + 3 个 worker 例；`wal_gc_SUITE` 新增 2 例（lag 纯函数 + 进程视图）；`broker_metrics_SUITE` 闭集更新。
+- **未做**：`shared_consumer_assigned` per-consumer gauge（高基数，ADR-016）；retention `skip` 强删（依赖倒置，独立专项，§3.4/§9 已声明 out-of-scope）。

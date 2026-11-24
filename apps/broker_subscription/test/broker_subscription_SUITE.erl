@@ -66,6 +66,11 @@ all() ->
      release_returns_offsets_to_the_pool,
      rollback_only_returns_what_is_still_held,
      claim_stops_before_the_watermark,
+     %% MQ-11: per-consumer fair-share quota on the shared window.
+     per_consumer_quota_caps_one_consumer_but_not_the_group,
+     per_consumer_quota_disabled_matches_legacy,
+     per_consumer_quota_group_full_still_overflows,
+     per_consumer_quota_hit_leaves_the_row_unchanged,
      %% ADR-019 §19.1/§19.2/§19.4: worker-level state (claim, ack ownership,
      %% group membership, failover election).
      join_adds_a_consumer_in_order,
@@ -74,6 +79,10 @@ all() ->
      the_worker_never_claims_past_the_watermark,
      a_dead_consumer_releases_its_whole_page,
      a_non_holder_ack_counts_and_changes_nothing,
+     %% MQ-11: worker-level fair-share isolation and adaptation.
+     shared_quota_isolates_a_consumer_at_its_share,
+     shared_quota_dynamic_split_uses_the_live_group_size,
+     shared_quota_expands_when_a_member_leaves,
      %% ADR-019 §19.3: the v2 file layout and the v1 migration.
      inflight_stays_client_keyed,
      migration_rewrites_v1_subs_and_cursors,
@@ -130,6 +139,10 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, retry_base_ms, 1000),
     ok = application:set_env(broker_subscription, retry_max_delay_ms, 60000),
     ok = application:set_env(broker_subscription, max_attempts, 10),
+    %% MQ-11 knobs: production defaults every case, overridden before boot/0 by
+    %% the quota cases (same J10 rule as the knobs above).
+    ok = application:set_env(broker_subscription, shared_state_max, 4096),
+    ok = application:set_env(broker_subscription, shared_per_consumer_max, 0),
     ok = application:set_env(broker_subscription, dlq_name_pattern,
                              <<"$dlq/{tenant}/{original}">>),
     {ok, _Started} = application:ensure_all_started(broker_storage),
@@ -739,6 +752,63 @@ rollback_only_returns_what_is_still_held(_Config) ->
     {ok, [1, 3], _} = broker_cursor:claim(Row4, 2, 6, <<"b">>, 4096),
     ok.
 
+%% MQ-11 §2.3/§2.4: a per-consumer cap stops one consumer at its share without
+%% stopping the group. `a' fills its 2-offset share in an 8-offset window and
+%% then gets `quota_hit' (an empty page), NOT `overflow' -- the group still has
+%% 6 offsets free, and `b' is free to claim its own share.
+per_consumer_quota_caps_one_consumer_but_not_the_group(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1, 2], Row1} =
+        broker_cursor:claim(Row0, 100, 100, <<"a">>, 8, #{}, 2),
+    {ok, quota_hit, Row1} =
+        broker_cursor:claim(Row1, 100, 100, <<"a">>, 8, #{}, 2),
+    {ok, [3, 4], Row2} =
+        broker_cursor:claim(Row1, 100, 100, <<"b">>, 8, #{}, 2),
+    {ok, quota_hit, Row2} =
+        broker_cursor:claim(Row2, 100, 100, <<"b">>, 8, #{}, 2),
+    ok.
+
+%% Invariant 1 (§5): with the cap disabled (`PerConsumerMax =< 0`) the result is
+%% byte-for-byte the legacy group-only claim. This is the zero-regression
+%% contract the whole feature rests on.
+per_consumer_quota_disabled_matches_legacy(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, LegacyOffsets, LegacyRow} =
+        broker_cursor:claim(Row0, 5, 100, <<"a">>, 8),
+    {ok, QuotaOffsets, QuotaRow} =
+        broker_cursor:claim(Row0, 5, 100, <<"a">>, 8, #{}, 0),
+    LegacyOffsets = QuotaOffsets,
+    LegacyRow = QuotaRow,
+    %% A negative cap is treated the same as "disabled".
+    {ok, QuotaOffsets, QuotaRow} =
+        broker_cursor:claim(Row0, 5, 100, <<"a">>, 8, #{}, -1),
+    ok.
+
+%% §2.4 / invariant 3: when the window as a whole is exhausted the answer is
+%% still `{error, overflow}' for everyone, even if the consumer's own cap is
+%% larger. "Group full" and "I am full" must stay distinguishable.
+per_consumer_quota_group_full_still_overflows(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1, 2], Row1} =
+        broker_cursor:claim(Row0, 5, 100, <<"a">>, 2, #{}, 5),
+    {error, overflow} =
+        broker_cursor:claim(Row1, 5, 100, <<"b">>, 2, #{}, 5),
+    ok.
+
+%% A quota hit is a no-op on the row: it must not consume offsets, move `low' or
+%% change `assigned'. The consumer simply retries on a later tick; if the row
+%% changed, a retry would see a phantom assignment.
+per_consumer_quota_hit_leaves_the_row_unchanged(_Config) ->
+    Row0 = broker_cursor:new_shared(1),
+    {ok, [1], Row1} =
+        broker_cursor:claim(Row0, 100, 100, <<"a">>, 8, #{}, 1),
+    {ok, quota_hit, Row2} =
+        broker_cursor:claim(Row1, 100, 100, <<"a">>, 8, #{}, 1),
+    Row1 = Row2,
+    1 = broker_cursor:next_read(Row1),
+    #{assigned := #{1 := <<"a">>}} = Row1,
+    ok.
+
 %%%_* ADR-019 §19.1/§19.2/§19.4: worker-level membership and claims ------------
 
 %% D-13: the member order IS the failover election (ADR-019 §19.4), so it is
@@ -872,6 +942,67 @@ a_non_holder_ack_counts_and_changes_nothing(_Config) ->
     ok = broker_subscription:ack(SubRef, 0, 2, <<"c1">>),
     {ok, 3} = broker_subscription:cursor(SubRef, 0),
     #{shared_ack_unowned := 1} = broker_metrics:snapshot(),
+    ok.
+
+%% MQ-11 §2.1/§2.4: the worker hands each consumer only its fair share, and a
+%% consumer that reaches that share gets an empty page (the pull loop treats it
+%% as idle) while the group still has room. `shared_consumer_quota_hit' counts
+%% it, `shared_window_full' does not move -- that distinction is the whole
+%% point: isolation, not a group-wide stall.
+shared_quota_isolates_a_consumer_at_its_share(_Config) ->
+    ok = application:set_env(broker_subscription, shared_state_max, 8),
+    ok = application:set_env(broker_subscription, shared_per_consumer_max, 1),
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    [begin {ok, _} = append(0, D) end || D <- [<<"s/a">>, <<"s/b">>, <<"s/c">>, <<"s/d">>]],
+    ok = broker_metrics:reset(),
+    %% c1 takes exactly its one-offset share, then its own quota stops it.
+    {ok, [1]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    {ok, []} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    %% c2 is not blocked by c1: it still has its own share available.
+    {ok, [2]} = broker_subscription:claim(SubRef, 0, 100, <<"c2">>),
+    #{shared_consumer_quota_hit := 1, shared_window_full := 0} =
+        broker_metrics:snapshot(),
+    ok.
+
+%% MQ-11 §2.2 / invariant 4: with the default (`shared_per_consumer_max = 0`)
+%% the window is split evenly across the live group, so with N=2 and a window of
+%% 4 each consumer can hold 2 -- and no more. c1 stopping at 2 is the proof the
+%% split is 4 div 2, not the whole window.
+shared_quota_dynamic_split_uses_the_live_group_size(_Config) ->
+    ok = application:set_env(broker_subscription, shared_state_max, 4),
+    ok = application:set_env(broker_subscription, shared_per_consumer_max, 0),
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    [begin {ok, _} = append(0, D) end || D <- [<<"s/a">>, <<"s/b">>, <<"s/c">>, <<"s/d">>,
+                                              <<"s/e">>, <<"s/f">>, <<"s/g">>, <<"s/h">>]],
+    %% c1 = 4 div 2 = 2, then its share is full although the group has room.
+    {ok, [1, 2]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    {ok, []} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    {ok, [3, 4]} = broker_subscription:claim(SubRef, 0, 100, <<"c2">>),
+    ok.
+
+%% Invariant 4: when a member leaves, the survivors' quota is recomputed from the
+%% new group size. c2 leaving halves N to 1, so c1's cap grows from 2 to the whole
+%% 4-window and it can claim two more offsets -- which it could not while c2 was
+%% still a member.
+shared_quota_expands_when_a_member_leaves(_Config) ->
+    ok = application:set_env(broker_subscription, shared_state_max, 4),
+    ok = application:set_env(broker_subscription, shared_per_consumer_max, 0),
+    ok = boot(),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c1">>, <<"s/#">>, 1),
+    {ok, SubRef} = broker_subscription:join(shared, <<"g">>, <<"c2">>, <<"s/#">>, 1),
+    [begin {ok, _} = append(0, D) end || D <- [<<"s/a">>, <<"s/b">>, <<"s/c">>, <<"s/d">>,
+                                              <<"s/e">>, <<"s/f">>, <<"s/g">>, <<"s/h">>]],
+    %% Two members: c1 is capped at 2.
+    {ok, [1, 2]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    {ok, []} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
+    %% c2 leaves; its page returns to the pool and c1's cap becomes the whole
+    %% window (N=1), so c1 can now claim two more offsets.
+    ok = broker_subscription:leave(SubRef, <<"c2">>),
+    {ok, [3, 4]} = broker_subscription:claim(SubRef, 0, 100, <<"c1">>),
     ok.
 
 %%%_* ADR-019 §19.3: the v2 file layout and the v1 migration ------------------

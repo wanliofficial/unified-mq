@@ -21,7 +21,9 @@ all() ->
      blocked_when_committed_pins_everything,
      no_limits_means_no_policy_deletion,
      run_is_safe_with_no_partitions,
-     status_reports_the_oldest_segment_and_deletable_bytes].
+     status_reports_the_oldest_segment_and_deletable_bytes,
+     lag_bytes_counts_segments_pinned_by_committed,
+     retention_lag_reports_pinned_bytes].
 
 init_per_suite(Config) ->
     %% `data_dir' is the suite's persistent data directory; `priv_dir' is a
@@ -122,6 +124,36 @@ no_limits_means_no_policy_deletion(_Config) ->
     ok.
 
 %%%_* Process / status ---------------------------------------------------
+
+%% MQ-11 §3.4: the retention pin measured in bytes. Whole candidate segments
+%% past `committed + 1' are the bytes a slow consumer is holding back; the
+%% active segment is never counted, and a committed watermark that reaches a
+%% segment releases its bytes from the lag.
+lag_bytes_counts_segments_pinned_by_committed(_Config) ->
+    Scan = scan([seg(1, 4, 100), seg(4, 7, 100), seg(7, undefined, 100)]),
+    %% committed = 3: [1,4) ends at the watermark so it is deletable, [4,7) is
+    %% pinned; the active segment is excluded.
+    100 = wal_gc:lag_bytes(Scan, info(3, 1, 7)),
+    %% committed = 0 pins both non-active segments.
+    200 = wal_gc:lag_bytes(Scan, info(0, 1, 7)),
+    %% committed = 6 lets both go: no lag.
+    0 = wal_gc:lag_bytes(Scan, info(6, 1, 7)),
+    ok.
+
+%% The process view reports the same number per partition; a writer that has
+%% not advanced `committed` past its first segment pins that segment's bytes.
+retention_lag_reports_pinned_bytes(Config) ->
+    Dir = ?config(data_dir, Config),
+    ConfigMap = #{data_dir => Dir,
+                  wal => #{require_durable_fs => false, segment_max_records => 3}},
+    {ok, Hd} = broker_storage_wal:create(88, ConfigMap),
+    {ok, _Offsets} =
+        broker_storage_wal:append(Hd, [msg(N) || N <- lists:seq(1, 6)], os_buffer),
+    %% committed = 1 pins the whole first segment [1, 4).
+    ok = broker_storage_wal:advance_committed(Hd, 1),
+    {88, Lag} = lists:keyfind(88, 1, wal_gc:retention_lag()),
+    true = Lag > 0,
+    ok.
 
 run_is_safe_with_no_partitions(_Config) ->
     ok = wal_gc:run(),

@@ -555,10 +555,18 @@ handle_call({claim, SubRef = {_Kind, _, _}, PartitionId, Max, Consumer}, _From, 
             case broker_queue:watermarks(PartitionId) of
                 {ok, _Committed, High} ->
                     Blocked = broker_cursor:blocked(Row, now_ms(), High),
+                    PerConsumerMax = shared_per_consumer_quota(SubRef, Limit),
                     case broker_cursor:claim(Row, Max, High, Consumer, Limit,
-                                             Blocked) of
+                                             Blocked, PerConsumerMax) of
                         {ok, [], _Row1} ->
                             %% The tail: not an error, and not a claim either.
+                            {reply, {ok, []}, State};
+                        {ok, quota_hit, _Row1} ->
+                            %% MQ-11: this consumer hit its own fair share but
+                            %% the group window still has room. Other consumers
+                            %% can keep claiming. Count it (distinct from the
+                            %% group-full counter) and back this consumer off.
+                            broker_metrics:inc(shared_consumer_quota_hit),
                             {reply, {ok, []}, State};
                         {ok, Offsets, Row1} ->
                             true = ets:insert(?CURSORS,
@@ -629,6 +637,38 @@ handle_call({detach, ClientId, Pid}, _From, State) ->
 
 handle_call(Request, _From, State) ->
     {stop, {unexpected_call, Request}, State}.
+
+%% @doc MQ-11: the per-consumer fair-share quota for a shared claim.
+%%
+%% `shared_per_consumer_max > 0' is a fixed cap an operator sets for a predictable
+%% ceiling. Otherwise the window is split evenly across the group's consumers:
+%% `max(1, Limit div N)'. N is read from the `?ENTITIES' consumers list; with no
+%% consumers it degenerates to the whole `Limit' (a single implicit consumer),
+%% which is the pre-MQ-11 behaviour. The quotient floors, so N consumers never
+%% over-allocate the window -- when the window fills, the group (not one slow
+%% consumer) holds it, and a consumer that stops claiming frees its share for
+%% the others.
+-spec shared_per_consumer_quota(term(), pos_integer()) -> pos_integer().
+shared_per_consumer_quota(SubRef, Limit) ->
+    case application:get_env(broker_subscription, shared_per_consumer_max, 0) of
+        Fixed when is_integer(Fixed), Fixed > 0 ->
+            max(1, Fixed);
+        _ ->
+            case consumers_of(SubRef) of
+                [] -> Limit;
+                Consumers -> max(1, Limit div length(Consumers))
+            end
+    end.
+
+%% @doc The `consumers' list for a shared subscription, or `[]' when the entity
+%% is gone (the subscription left between the pull tick and this call). A
+%% missing entity must not crash a claim: it falls back to the whole window.
+-spec consumers_of(term()) -> [term()].
+consumers_of(SubRef) ->
+    case ets:lookup(?ENTITIES, SubRef) of
+        [{_, #{consumers := Consumers}}] -> Consumers;
+        _ -> []
+    end.
 
 handle_cast(Msg, State) ->
     {stop, {unexpected_cast, Msg}, State}.

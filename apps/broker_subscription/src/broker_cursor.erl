@@ -23,7 +23,7 @@
 
 -export([new_plain/2, new_shared/1,
          advance_plain/2, ack_shared/3, grow/2,
-         claim/5, claim/6, release/2, release_offset/2, rollback/3, settle/2,
+         claim/5, claim/6, claim/7, release/2, release_offset/2, rollback/3, settle/2,
          retry/5, attempts/2, backoff/3, due/3, blocked/3,
          retries/1, pause/2,
          next_read/1, committed/1,
@@ -114,15 +114,65 @@ claim(Row, Max, _High, _Consumer, _Limit, _Blocked) when Max =< 0 ->
     {ok, [], Row};
 claim(Row, _Max, _High, _Consumer, Limit, _Blocked) when Limit =< 0 ->
     {ok, [], Row};
-claim(#{kind := shared, low := Low, acked := Acked, assigned := Assigned} = Row,
-      Max, High, Consumer, Limit, Blocked) ->
-    Retries = retries(Row),
-    Room = Limit - (map_size(Acked) + map_size(Assigned) + map_size(Retries)),
+claim(Row, Max, High, Consumer, Limit, Blocked) ->
+    %% Legacy 6-arity entry point: no per-consumer cap (MQ-11 disabled).
+    do_claim(Row, Max, High, Consumer, Limit, Blocked, 0).
+
+%% @doc How many offsets in `Assigned' are held by `Consumer'. The `assigned'
+%% map is `Offset => Consumer', so this is a linear scan of the live entries --
+%% bounded by the window size (<= `shared_state_max'), and run once per claim
+%% from a single serialising worker (MQ-11 §7).
+-spec count_consumer(map(), consumer()) -> non_neg_integer().
+count_consumer(Assigned, Consumer) ->
+    maps:fold(
+      fun(_Offset, C, Acc) ->
+              case C =:= Consumer of
+                  true -> Acc + 1;
+                  false -> Acc
+              end
+      end, 0, Assigned).
+
+%% @doc MQ-11: `PerConsumerMax' caps how many offsets a single consumer may
+%% hold in `assigned' at once. The window is shared (`Limit' covers
+%% `acked ∪ assigned ∪ retries'); without a per-consumer cap one slow consumer
+%% can pin the whole window and starve every other consumer in the group.
+%% `PerConsumerMax' =< 0 disables the cap (falls back to the group-only room),
+%% preserving the pre-MQ-11 behaviour. Returns `{ok, quota_hit, Row}' when this
+%% consumer has hit its own share while the group still has room -- the pull
+%% loop reads that as an idle round, so other consumers keep claiming.
+-spec claim(row(), non_neg_integer(), offset(), consumer(), pos_integer(),
+            map(), non_neg_integer()) ->
+          {ok, [offset()], row()} | {ok, quota_hit, row()} | {error, overflow}.
+claim(Row, Max, High, Consumer, Limit, Blocked, PerConsumerMax) ->
+    do_claim(Row, Max, High, Consumer, Limit, Blocked, PerConsumerMax).
+
+do_claim(Row, Max, _High, _Consumer, _Limit, _Blocked, _PerConsumerMax)
+  when Max =< 0 ->
+    {ok, [], Row};
+do_claim(Row, _Max, _High, _Consumer, Limit, _Blocked, _PerConsumerMax)
+  when Limit =< 0 ->
+    {ok, [], Row};
+do_claim(#{kind := shared, low := Low} = Row, Max, High, Consumer, Limit,
+         Blocked, PerConsumerMax) ->
+    Acked = maps:get(acked, Row, #{}),
+    Assigned = maps:get(assigned, Row, #{}),
+    Retries = maps:get(retries, Row, #{}),
+    GroupRoom = Limit - (map_size(Acked) + map_size(Assigned) + map_size(Retries)),
+    HeldByMe = count_consumer(Assigned, Consumer),
+    QuotaRoom = case PerConsumerMax of
+                    Q when is_integer(Q), Q > 0 -> Q - HeldByMe;
+                    _ -> GroupRoom
+                end,
     if
-        Room =< 0 ->
+        GroupRoom =< 0 ->
+            %% The window as a whole is exhausted: every consumer is blocked.
             {error, overflow};
+        QuotaRoom =< 0 ->
+            %% This consumer hit its own share but the group still has room.
+            %% The worker counts it as a quota hit (not a window full).
+            {ok, quota_hit, Row};
         true ->
-            Take = erlang:min(Max, Room),
+            Take = erlang:min(Max, erlang:min(GroupRoom, QuotaRoom)),
             {Offsets, New} = scan(Low, Take, High, Acked, Assigned, Blocked,
                                   Consumer, []),
             {ok, lists:reverse(Offsets), Row#{assigned := New}}

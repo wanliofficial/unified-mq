@@ -361,6 +361,12 @@ key_specs() ->
      {retention_deleted_segments, counter},
      {retention_blocked_by_slow_consumer, counter},
      {retention_blocked_by_committed, counter},
+     %% MQ-11 §3.4: observation of the slow-consumer retention pin. Bytes that
+     %% cannot be deleted because `committed' has not reached them -- the worst
+     %% partition this sweep (one gauge, no per-partition label, ADR-016).
+     %% Observation only: `wal_gc:plan/3' never reads it, so the deletion
+     %% decision is unchanged (invariant 6).
+     {retention_lag_bytes, gauge},
      {cloudevents_validate_ok, counter},
      {cloudevents_validate_failed, counter},
      %% S3 (ADR-020 §D7/§D8): duplicate events dropped inside a configured
@@ -384,6 +390,15 @@ key_specs() ->
      {shared_ack_unowned, counter},
      {shared_window_full, counter},
      {shared_claim_rollbacks, counter},
+     %% MQ-11 (spec 2026-11-24-mq11-per-subscriber-backpressure §3.5): a
+     %% shared consumer hit its own per-consumer fair-share quota while the
+     %% group window still had room. Counted separately from
+     %% `shared_window_full' (the whole group is blocked) so an operator can
+     %% tell "this consumer is full" from "the group is full" -- the former
+     %% is healthy isolation, the latter is the old failure mode. Closed atom
+     %% set, no labels (ADR-016 §16.2): the per-consumer detail stays in the
+     %% trace logs, not a high-cardinality label.
+     {shared_consumer_quota_hit, counter},
      {failover_promotions, counter},
      %% S2-E (ADR-015 §15.2/§15.3/§15.4): dead-letter appends (and the ones that
      %% failed and must be retried), plus messages skipped because `expires_at'
