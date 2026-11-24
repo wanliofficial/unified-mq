@@ -22,12 +22,21 @@
                   index := non_neg_integer()}.
 -type state() :: #{partitions := #{partition() => meta()},
                    session_partition_count => pos_integer() | undefined,
-                   session_partition_epoch => non_neg_integer()}.
+                   session_partition_epoch => non_neg_integer(),
+                   %% MQ-15: `%{{SubRef, PartitionId} => #{Offset => ClientId}}'. The
+                   %% shared assignment table, the one fact that must be globally
+                   %% consistent (two nodes claiming independently would duplicate).
+                   shared_assignments := #{{sub_key(), partition()} => map()},
+                   %% MQ-15: `%{{SubRef, ClientId} => Node}' -- which node hosts each
+                   %% shared consumer, so a node crash can release exactly its offsets.
+                   shared_consumers := #{{sub_key(), binary()} => node()}}.
+-type sub_key() :: {shared, binary(), binary()}.
 
 -spec init(map()) -> state().
 init(_Config) ->
     #{partitions => #{}, session_partition_count => undefined,
-      session_partition_epoch => 0}.
+      session_partition_epoch => 0,
+      shared_assignments => #{}, shared_consumers => #{}}.
 
 -spec apply(map(), term(), state()) ->
           {state(), term(), list()} | {state(), term()}.
@@ -62,6 +71,20 @@ apply(#{index := Index}, Command, #{partitions := Ps} = State) ->
             claim(P, Node, Epoch, Index, Ps, State);
         {set_session_partition_count, Count, Epoch} ->
             set_session_partition_count(Count, Epoch, Ps, State);
+        {shared_claim, Sub, P, ClientId, Max, High, Blocked, PerConsumerMax} ->
+            shared_claim(Sub, P, ClientId, Max, High, Blocked, PerConsumerMax, State);
+        {shared_ack, Sub, P, Offset, ClientId} ->
+            shared_ack(Sub, P, Offset, ClientId, State);
+        {shared_release, Sub, P, ClientId} ->
+            shared_release(Sub, P, ClientId, State);
+        {shared_reclaim, Sub, P, FromId, ToId, Offsets} ->
+            shared_reclaim(Sub, P, FromId, ToId, Offsets, State);
+        {shared_join, Sub, ClientId, Node} ->
+            shared_join(Sub, ClientId, Node, State);
+        {shared_leave, Sub, ClientId} ->
+            shared_leave(Sub, ClientId, State);
+        {shared_consumers_on, Node} ->
+            {State, shared_consumers_on(Node, State), []};
         {get, P} ->
             case maps:find(P, Ps) of
                 {ok, M} -> {State, {ok, M}, []};
@@ -85,6 +108,12 @@ snapshot_installed(_Meta, _Snapshot, State, _Machine, _Module) ->
         C -> broker_cluster_cache:put_session_partition_config(
                C, maps:get(session_partition_epoch, State, 0))
     end,
+    %% MQ-15: restore the shared mirrors too, or a restarted node would serve an
+    %% empty assignment cache until the next claim.
+    _ = broker_cluster_cache:put_shared_assignments(
+          maps:get(shared_assignments, State, #{})),
+    _ = broker_cluster_cache:put_shared_consumers(
+          maps:get(shared_consumers, State, #{})),
     ok.
 
 overview(#{partitions := Ps}) ->
@@ -150,3 +179,114 @@ replicas_of(P, Ps) ->
         {ok, #{replicas := R}} -> R;
         error -> [node()]
     end.
+
+%%%_* MQ-15 shared assignment commands ---------------------------------------
+%%
+%% The shared assignment table is a `%{{SubRef, P} => #{Offset => ClientId}}'
+%% map. Unlike partition ownership it carries no epoch: these are monotone set
+%% operations (claim adds, ack/release remove) whose convergence does not depend
+%% on ordering, and the mutual-exclusion invariant (one offset -> one consumer)
+%% is guaranteed by ra's single-threaded apply, not by fencing. The pure set
+%% algebra is `broker_cursor', reused verbatim from the worker's local path.
+
+shared_claim(Sub, P, ClientId, Max, High, Blocked, PerConsumerMax, State) ->
+    As = maps:get(shared_assignments, State, #{}),
+    Key = {Sub, P},
+    %% No stored row yet: this is the first claim for this {Sub,P}. Seed an
+    %% empty window at low=1 (`broker_cursor' recomputes `low' from the acked
+    %% prefix on every ack, so it is never stored -- design §3.2). `claim/7'
+    %% scans from `low' up to the `High' watermark, so it never hands out an
+    %% offset past the log tail. `High' bounds the scan; it does not seed low.
+    Row = maps:get(Key, As, broker_cursor:new_shared(1)),
+    Window = application:get_env(broker_subscription, shared_state_max, 4096),
+    case broker_cursor:claim(Row, Max, High, ClientId, Window, Blocked, PerConsumerMax) of
+        {ok, [], _} ->
+            {State, {ok, [], As}, []};
+        {ok, quota_hit, _} ->
+            {State, {ok, quota_hit, As}, []};
+        {ok, Offsets, Row1} ->
+            As1 = As#{Key => Row1},
+            broker_cluster_cache:put_shared_assignments(As1),
+            {State#{shared_assignments => As1}, {ok, Offsets, As1}, []};
+        {error, overflow} ->
+            {State, {error, overflow}, []}
+    end.
+
+shared_ack(Sub, P, Offset, ClientId, State) ->
+    As = maps:get(shared_assignments, State, #{}),
+    Key = {Sub, P},
+    case maps:find(Key, As) of
+        error ->
+            {State, {error, not_found}, []};
+        {ok, Row} ->
+            case broker_cursor:ack_shared(Row, Offset, ClientId) of
+                unowned ->
+                    {State, {error, unowned}, []};
+                {ok, Row1} ->
+                    As1 = As#{Key => Row1},
+                    broker_cluster_cache:put_shared_assignments(As1),
+                    {State#{shared_assignments => As1},
+                     {ok, broker_cursor:next_read(Row1)}, []}
+            end
+    end.
+
+shared_release(Sub, P, ClientId, State) ->
+    As = maps:get(shared_assignments, State, #{}),
+    Key = {Sub, P},
+    case maps:find(Key, As) of
+        error ->
+            {State, {ok, 0}, []};
+        {ok, Row} ->
+            Row1 = broker_cursor:release(Row, ClientId),
+            Released = count_held(Row, ClientId),
+            As1 = As#{Key => Row1},
+            broker_cluster_cache:put_shared_assignments(As1),
+            {State#{shared_assignments => As1}, {ok, Released}, []}
+    end.
+
+shared_reclaim(Sub, P, FromId, ToId, Offsets, State) ->
+    As = maps:get(shared_assignments, State, #{}),
+    Key = {Sub, P},
+    case maps:find(Key, As) of
+        error ->
+            {State, {error, not_found}, []};
+        {ok, Row} ->
+            Row1 = reclaim_offsets(Row, FromId, ToId, Offsets),
+            As1 = As#{Key => Row1},
+            broker_cluster_cache:put_shared_assignments(As1),
+            {State#{shared_assignments => As1}, {ok, Offsets}, []}
+    end.
+
+shared_join(Sub, ClientId, Node, State) ->
+    Cs = maps:get(shared_consumers, State, #{}),
+    Cs1 = Cs#{{Sub, ClientId} => Node},
+    broker_cluster_cache:put_shared_consumers(Cs1),
+    {State#{shared_consumers => Cs1}, {ok, Node}, []}.
+
+shared_leave(Sub, ClientId, State) ->
+    Cs = maps:get(shared_consumers, State, #{}),
+    Cs1 = maps:remove({Sub, ClientId}, Cs),
+    broker_cluster_cache:put_shared_consumers(Cs1),
+    {State#{shared_consumers => Cs1}, {ok, removed}, []}.
+
+shared_consumers_on(Node, State) ->
+    Cs = maps:get(shared_consumers, State, #{}),
+    [ClientId || {{_Sub, ClientId}, N} <- maps:to_list(Cs), N =:= Node].
+
+%% Move `Offsets' from FromId to ToId, but only where FromId currently holds them.
+reclaim_offsets(Row, FromId, ToId, Offsets) ->
+    Assigned = maps:get(assigned, Row, #{}),
+    Acked = maps:get(acked, Row, #{}),
+    Retries = maps:get(retries, Row, #{}),
+    Assigned1 = lists:foldl(
+                   fun(O, Acc) ->
+                           case maps:get(O, Acc, undefined) of
+                               FromId -> Acc#{O => ToId};
+                               _ -> Acc
+                           end
+                   end, Assigned, Offsets),
+    Row#{assigned := Assigned1, acked := Acked, retries := Retries}.
+
+count_held(Row, ClientId) ->
+    Assigned = maps:get(assigned, Row, #{}),
+    length([1 || {_O, C} <- maps:to_list(Assigned), C =:= ClientId]).

@@ -16,7 +16,10 @@
 
 -export([start_link/0, put/2, get/1, all/0, partition_view/0, clear/0,
          clear_partition/1, owner/1, epoch/1, replicas/1,
-         put_session_partition_config/2, session_partition_config/0]).
+         put_session_partition_config/2, session_partition_config/0,
+         %% MQ-15: shared assignment mirrors.
+         put_shared_assignments/1, shared_assignment/2,
+         put_shared_consumers/1, shared_consumers_on/1]).
 %% ADR-034 D6: the committed floor is a minimum over every node's cursor. The
 %% reports live here because this server already owns the local mirror, and the
 %% table is *not* a second cursor truth: it only answers "how far may GC go".
@@ -32,6 +35,10 @@
 %% 单独一行存，使 `all/0' / `partition_view/0' 可以显式过滤，绝不把它当分区。
 %% 行形状是三元组 {Key, Count, Epoch}，与分区行 {P, Meta} 的 arity 不同。
 -define(SESSION_CFG, '$session_partition_config').
+
+%% MQ-15: 同样用「不可能与整数分区键 / ?SESSION_CFG 冲突」的保留键存 shared 两表。
+-define(SHARED_ASG, '$shared_assignments').
+-define(SHARED_CON, '$shared_consumers').
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -86,6 +93,47 @@ session_partition_config() ->
         [] -> not_found
     catch
         _:_ -> not_found
+    end.
+
+%% @doc MQ-15: replace the whole shared-assignment mirror. Called by the ra
+%% state machine on every apply and by `snapshot_installed/5'.
+-spec put_shared_assignments(map()) -> ok.
+put_shared_assignments(As) when is_map(As) ->
+    case ets:info(?TAB, name) of
+        undefined -> ok;
+        _ -> true = ets:insert(?TAB, {?SHARED_ASG, As}), ok
+    end.
+
+%% @doc The ra-side assignment row for `{SubRef, PartitionId}', or `not_found'.
+-spec shared_assignment(term(), non_neg_integer()) -> {ok, map()} | not_found.
+shared_assignment(Sub, P) ->
+    try ets:lookup(?TAB, ?SHARED_ASG) of
+        [{?SHARED_ASG, As}] ->
+            case maps:find({Sub, P}, As) of
+                {ok, Row} -> {ok, Row};
+                error -> not_found
+            end;
+        [] -> not_found
+    catch
+        _:_ -> not_found
+    end.
+
+-spec put_shared_consumers(map()) -> ok.
+put_shared_consumers(Cs) when is_map(Cs) ->
+    case ets:info(?TAB, name) of
+        undefined -> ok;
+        _ -> true = ets:insert(?TAB, {?SHARED_CON, Cs}), ok
+    end.
+
+%% @doc The ClientIds hosted on `Node', for crash-release (nodedown handler).
+-spec shared_consumers_on(node()) -> [binary()].
+shared_consumers_on(Node) ->
+    try ets:lookup(?TAB, ?SHARED_CON) of
+        [{?SHARED_CON, Cs}] ->
+            [ClientId || {{_Sub, ClientId}, N} <- maps:to_list(Cs), N =:= Node];
+        [] -> []
+    catch
+        _:_ -> []
     end.
 
 clear() ->
