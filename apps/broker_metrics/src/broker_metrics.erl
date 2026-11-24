@@ -399,6 +399,15 @@ key_specs() ->
      %% set, no labels (ADR-016 §16.2): the per-consumer detail stays in the
      %% trace logs, not a high-cardinality label.
      {shared_consumer_quota_hit, counter},
+     %% MQ-15 (spec 2026-11-24-mq15-shared-subscription-cluster-rebalance): a
+     %% threshold-triggered rebalance moved an offset from an overloaded shared
+     %% consumer to a freer one, and a shared assignment command that could not
+     %% commit (the ra metadata group had no quorum). Both are part of the same
+     %% closed shared-assignment key family above -- closed atom set, no labels
+     %% (ADR-016 §16.2); `shared_rebalance_no_quorum' climbing means the cluster
+     %% control plane is degraded while the data plane keeps its last view.
+     {shared_reclaim, counter},
+     {shared_rebalance_no_quorum, counter},
      {failover_promotions, counter},
      %% S2-E (ADR-015 §15.2/§15.3/§15.4): dead-letter appends (and the ones that
      %% failed and must be retried), plus messages skipped because `expires_at'
