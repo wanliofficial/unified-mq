@@ -200,3 +200,15 @@ rebar3 as t14 release
 | 直方图原子操作在每消息路径的成本 | 只对 publish/ack/wal_sync 三处做直方图；其余用 counter |
 | `snapshot/0` 遍历所有键在键多时变慢 | S2-A 时 ≤ 40 键，O(40) 可接受；S6 后键集合为 58（§4 时点说明），遍历仍是 O(键数)，导出层再加缓存 |
 | 埋点遗漏导致 Gate 4 证据不足 | §4 表逐项对照 review；`keys_are_stable` 钉住集合 |
+
+## 核实批注（2026-11-24）
+
+- **§4 时点说明的行号已漂移**：`redelivery_total` 现接线于 `broker_subscription_worker`
+  的 `handle_call({retry,...})` / `redelivery_total` 处（约 `:1267`），不再是 `:955`；
+  `wal_writer` 的 `retention_deleted_bytes` 计数在 `:635-642`（非 `:641`）。
+- **`dlq_size` 递减点已修正**：原文写「`broker_dlq:146`（GC 时递减）」不准确。`broker_dlq:146`
+  只 **+1**（每次死信追加）；递减改由 `broker_dlq:on_consume/2` 在
+  `broker_subscription_worker` 的 ack 路径执行——订阅过滤器属 `$dlq` 命名空间、且被 ack 的记录
+  带 `x-original-message-id` 时才 −1。该缺口已于 2026-11-24 修复（提交 `fix(mq): 补齐 S9-A
+  idle_timeout_ms 与 dlq_size 递减…`），新增用例
+  `dlq_size_decrements_when_a_dead_letter_is_consumed`。

@@ -336,3 +336,11 @@ rebar3 as t14 release
 4. **`broker_cursor:grow/2`** 仅用于构造测试状态，不在数据路径。
 5. **`role/2` 由 facade 在调用方进程直接读 ETS**（failover active = `first_attached(Consumers)`）；worker 另有 `refresh_active/2` 维护 `active_of` 以计数 `failover_promotions`，因此该计数晚于 facade 的 role 答案一个 `DOWN` 消息——断言须轮询 `broker_metrics:snapshot()`。
 6. **R9 的 Shared 组由 `.subs` 写入器预置**：`$share/...` 线上语法属于 S2.5，T14 用 broker 自己的 `broker_subscription_files:write_subs/2` 造出与真实 join 相同的一组文件，再由 boot 正常恢复。
+
+## 核实批注（2026-11-24）
+
+- **信封 vsn 已为 2**：正文写「信封 vsn 1」，实际 `broker_subscription_files` 写入
+  `{vsn, 2, SubRef, Body}`（`decode_any/3` 同时兼容 vsn 1 只读）；inflight 内容 blob 已为 vsn 3。
+- 两处用例名/归属与实际不符：`shared_ack_from_a_non_holder_does_not_move_low` 现名
+  `a_non_holder_ack_counts_and_changes_nothing`；`a_durable_wake_reaches_every_shared_member`
+  在 `broker_subscription_SUITE` 而非 conn_SUITE。

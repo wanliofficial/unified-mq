@@ -307,3 +307,17 @@ rebar3 as t14 release
 6. **`killed` 不是 `mqtt_disconnect`**：DISCONNECT 现在让 FSM `{stop, normal, ...}` 并清 `will`，`terminate/3` 靠 `will =:= undefined` 判断"干净告别"。原先用 `mqtt_disconnect` 作为 stop reason 会让正常的客户端告别被记成异常终止。
 7. **T14/T15 的 `data_dir` 期望数从 2 改为 3**：新增 `broker_retain` 也持有 `data_dir`；两个 harness 的渲染断言同步更新，防止某个 app 静默指向开发机路径。
 8. **retain 写盘错误无重试**：§3.4 原文写「不断连地重试一次，仍失败则断连」，实现里 `retain_store/3` 只对真正的写盘错误 `{error, _}`（非 `overflow`）直接 `{stop, {retain_store_failed, _}, D}` 断连且不回 ack，没有重试层。
+
+## 核实批注（2026-11-24）
+
+以下与当前代码相反/已演进；正文保留为历史，以此批注为准：
+
+- **C-16「接管时发布 Will」已反转**：当前 `mqtt_conn_fsm:publish_will(takeover, _D) -> ok`
+  （接管**不**发布 Will），用例为 `will_is_not_published_on_takeover`
+  （`mqtt_conn_SUITE.erl:125,1617`）。ADR-018 §18.1 已更正。§2 表格第 36 行、§8.2 C-16、
+  §8.3 用例名处均按此理解。
+- **`broker_retain` API 已重命名**：`store/1`→`put/2`、`store_sync/1`→`put/2`(fsync)、
+  `match/1`→`lookup/1`、`size/0`→`stats/0`/`entries/0`，并新增 `flush/0`；语义等价。
+- **inflight blob 已升 vsn 3**：`retained_pending_is_not_persisted`、
+  `inflight_v1_blob_is_read_as_qos1` 等旧用例名不存在，现由
+  `inflight_blob_is_v3_and_skips_retained_entries` 覆盖；v1/v2 仍可读。

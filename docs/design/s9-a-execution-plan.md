@@ -446,3 +446,12 @@ git commit -m "docs(s9-a): record agent rpc and a2a listener in architecture and
 | SSE 业务流、`SubscribeToTask`、Push config、出站 webhook | **S9-C** |
 | MCP / ACP | **S9-D / S9-E** |
 | 能力矩阵、压测、`security.md` §12、README 状态行 | **S9-F** |
+
+## 核实批注（2026-11-24）
+
+- **`idle_timeout_ms`（默认 75s）已补齐实现**：S9-A 原声明 a2a 连接保留时长含
+  `idle_timeout_ms`，但落地时遗漏（`broker_proto_a2a` 仅有 `request_timeout_ms`）。2026-11-24
+  已补：`a2a_rpc:idle_timeout_ms/0` + `agent_rpc_http:read_request` 用其作为「等待下一个请求行」
+  的空闲超时（`request_timeout_ms` 仍约束已开始请求的读取），并加用例
+  `idle_timeout_closes_an_idle_keepalive_connection`（`a2a_listener_SUITE`）。
+- `agent_rpc_auth_SUITE` 实测 13 例，与 §DoD 一致（无需修订）。

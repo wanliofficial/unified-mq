@@ -183,3 +183,9 @@ rebar3 as t14 release
 3. **DLQ 配置键落在 `broker_subscription`**（`dlq_name_pattern`），不新建 `broker_dlq` app：DLQ 是普通 destination（§15.3），命名属于「谁决定死信投递」，即订阅 worker。
 4. **已在 DLQ 的消息再次超时**返回 `already_dead_letter`，不再嵌套死信，直接推进 cursor：否则 `$dlq/t/$dlq/t/...` 会无限增长，而诊断证据已经在 DLQ 里。
 5. **`dlq_size` 是 gauge，S2-E 只增不减**（ADR-015 §15.6 第 4 条；段删除在 S2-F 才发生），语义是「当前保留在 DLQ 的条数」的诚实上界。
+
+## 核实批注（2026-11-24）
+
+- **`dead_letter/4` → 实际 `dead_letter/3`**：`broker_dlq:dead_letter/3`（`Meta` 已含
+  qos/kind/attempts），偏差清单未列此条，语义无损。
+- `dlq_size` 递减点见 `s2-a` 核实批注（消费时递减，非 GC）。
