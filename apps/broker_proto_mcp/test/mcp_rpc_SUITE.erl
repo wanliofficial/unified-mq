@@ -87,6 +87,16 @@ end_per_testcase(_Case, Config) ->
             ?config(prev_allowed_origins, Config)),
     ok.
 
+%% `Prev' is whatever `application:get_env/2' returned: `{ok, V}' when the key was
+%% set, `undefined' when it was not. The old `Value' clause stored the `{ok, V}'
+%% tuple verbatim, so every test case rewrapped `require_auth' / `allowed_origins'
+%% one level deeper ({ok,{ok,...}}). A wrapped `require_auth' then reached
+%% `mcp_rpc:require_auth/0' consumers as a non-boolean and crashed `function_clause'
+%% -> a 500 in a later suite sharing this node. Unwrap the single `{ok, _}' layer
+%% `get_env' added; a value that is itself `{ok, _}' still restores exactly, since
+%% `get_env' only ever wraps once. Mirrors a2a_rpc_SUITE's restore/3.
+restore(App, Key, {ok, Value}) ->
+    ok = application:set_env(App, Key, Value);
 restore(App, Key, undefined) ->
     _ = application:unset_env(App, Key),
     ok;
