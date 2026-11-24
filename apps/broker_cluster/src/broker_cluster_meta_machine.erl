@@ -201,13 +201,13 @@ shared_claim(Sub, P, ClientId, Max, High, Blocked, PerConsumerMax, State) ->
     Window = application:get_env(broker_subscription, shared_state_max, 4096),
     case broker_cursor:claim(Row, Max, High, ClientId, Window, Blocked, PerConsumerMax) of
         {ok, [], _} ->
-            {State, {ok, [], As}, []};
+            {State, {ok, []}, []};
         {ok, quota_hit, _} ->
-            {State, {ok, quota_hit, As}, []};
+            {State, {ok, quota_hit}, []};
         {ok, Offsets, Row1} ->
             As1 = As#{Key => Row1},
             broker_cluster_cache:put_shared_assignments(As1),
-            {State#{shared_assignments => As1}, {ok, Offsets, As1}, []};
+            {State#{shared_assignments => As1}, {ok, Offsets}, []};
         {error, overflow} ->
             {State, {error, overflow}, []}
     end.

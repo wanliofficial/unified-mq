@@ -65,7 +65,9 @@
          subscribe/3, subscribe/4, join/5, join/6, join/7, unsubscribe/2,
          leave/2, ack/4, claim/4, release/4, retry/4,
          inflight/2, attach/3, detach/2,
-         apply_replica/1]).
+         apply_replica/1,
+         %% MQ-15: pure cross-node shared decision, exposed for the worker suite.
+         reply_new_subscribe_for_test/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -449,6 +451,7 @@ handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant, Opts}, _From,
                         ok ->
                             true = ets:insert(?ENTITIES, {SubRef, Info1}),
                             true = ets:insert(?MEMBERS, {{ClientId, SubRef}}),
+                            track_shared_join(Kind, SubRef, ClientId),
                             {reply, {ok, SubRef},
                              refresh_active(SubRef, State)};
                         {error, Reason} ->
@@ -464,6 +467,7 @@ handle_call({join, Kind, Group, ClientId, Filter, QoS, Tenant, Opts}, _From,
                              qos => QoS, tenant_id => Tenant,
                              consumers => [ClientId],
                              anchor => anchor_opt(Opts)},
+                    track_shared_join(Kind, SubRef, ClientId),
                     reply_new_subscribe2(SubRef, Info, State);
                 {error, Reason} ->
                     {reply, {error, {router_register, Reason}}, State}
@@ -501,6 +505,8 @@ handle_call({leave, SubRef, ClientId}, _From, State) ->
                         [] ->
                             %% Last member left: the entity, its cursors, its
                             %% Router entry and its files all go (ADR-019 §19.2).
+                            track_shared_leave(maps:get(kind, Info), SubRef,
+                                               ClientId),
                             _ = broker_router:unregister(SubRef),
                             ok = broker_subscription_files:delete_subscription(SubRef),
                             remove_local(SubRef),
@@ -508,6 +514,8 @@ handle_call({leave, SubRef, ClientId}, _From, State) ->
                             {reply, ok, drop_dirty(SubRef, State1)};
                         [NewActive | _] ->
                             Info1 = Info#{consumers => Rest},
+                            track_shared_leave(maps:get(kind, Info), SubRef,
+                                               ClientId),
                             case persist_entity(SubRef, Info1) of
                                 ok ->
                                     true = ets:insert(?ENTITIES, {SubRef, Info1}),
@@ -530,16 +538,12 @@ handle_call({ack, SubRef, PartitionId, Offset, Consumer}, _From, State) ->
                      %% protocol error.
                      State;
                  [{_, Row}] ->
-                     case ack_row(Row, Offset, Consumer) of
-                         unowned ->
-                             broker_metrics:inc(shared_ack_unowned),
-                             State;
-                         {ok, Row1} ->
-                             true = ets:insert(?CURSORS,
-                                               {{SubRef, PartitionId}, Row1}),
-                             State2 = absorb_advance(SubRef, delta(Row, Row1), State),
-                             _ = maybe_account_dlq_consume(SubRef, PartitionId, Offset),
-                             State2
+                     case cluster_flag() of
+                         false ->
+                             ack_local(SubRef, PartitionId, Offset, Consumer,
+                                       Row, State);
+                         true ->
+                             ack_via_ra(SubRef, PartitionId, Offset, Consumer, State)
                      end
              end,
     {reply, ok, State1};
@@ -552,49 +556,40 @@ handle_call({claim, SubRef = {_Kind, _, _}, PartitionId, Max, Consumer}, _From, 
             {reply, {error, wrong_kind}, State};
         [{_, Row}] ->
             #{shared_state_max := Limit} = State,
-            case broker_queue:watermarks(PartitionId) of
-                {ok, _Committed, High} ->
-                    Blocked = broker_cursor:blocked(Row, now_ms(), High),
-                    PerConsumerMax = shared_per_consumer_quota(SubRef, Limit),
-                    case broker_cursor:claim(Row, Max, High, Consumer, Limit,
-                                             Blocked, PerConsumerMax) of
-                        {ok, [], _Row1} ->
-                            %% The tail: not an error, and not a claim either.
-                            {reply, {ok, []}, State};
-                        {ok, quota_hit, _Row1} ->
-                            %% MQ-11: this consumer hit its own fair share but
-                            %% the group window still has room. Other consumers
-                            %% can keep claiming. Count it (distinct from the
-                            %% group-full counter) and back this consumer off.
-                            broker_metrics:inc(shared_consumer_quota_hit),
-                            {reply, {ok, []}, State};
-                        {ok, Offsets, Row1} ->
-                            true = ets:insert(?CURSORS,
-                                              {{SubRef, PartitionId}, Row1}),
-                            broker_metrics:inc(shared_claims),
-                            {reply, {ok, Offsets}, State};
-                        {error, overflow} ->
-                            broker_metrics:inc(shared_window_full),
-                            {reply, {error, overflow}, State}
-                    end;
-                {error, Reason} ->
-                    %% The pull loop degrades to `idle' this round and retries on
-                    %% the poll tick; a watermark read must not crash a
-                    %% connection (§19.1).
-                    {reply, {error, {watermark, PartitionId, Reason}}, State}
+            case cluster_flag() of
+                false ->
+                    claim_local(SubRef, PartitionId, Max, Consumer, Row, Limit, State);
+                true ->
+                    claim_via_ra(SubRef, PartitionId, Max, Consumer, Row, Limit, State)
             end
     end;
 
 handle_call({release, SubRef = {_Kind, _, _}, PartitionId, Offsets, Consumer}, _From, State) ->
     case ets:lookup(?CURSORS, {SubRef, PartitionId}) of
         [{_, #{kind := shared} = Row}] ->
-            %% Ownership-checked per offset inside the cursor module, so a
-            %% rollback cannot resurrect an offset that was acked in the
-            %% meantime (§19.5).
-            true = ets:insert(?CURSORS,
-                              {{SubRef, PartitionId},
-                               broker_cursor:rollback(Row, Offsets, Consumer)}),
-            {reply, ok, State};
+            case cluster_flag() of
+                false ->
+                    %% Ownership-checked per offset inside the cursor module, so a
+                    %% rollback cannot resurrect an offset that was acked in the
+                    %% meantime (§19.5).
+                    true = ets:insert(?CURSORS,
+                                      {{SubRef, PartitionId},
+                                       broker_cursor:rollback(Row, Offsets, Consumer)}),
+                    {reply, ok, State};
+                true ->
+                    %% Flag on: the global assignment table is the truth, so a
+                    %% release returns every unacked offset this consumer holds
+                    %% on the partition to the pool (not just the named list) --
+                    %% the consumer is done with this partition's batch.
+                    case broker_cluster:shared_release(SubRef, PartitionId, Consumer) of
+                        {ok, _Released} ->
+                            update_shared_mirror(SubRef, PartitionId),
+                            {reply, ok, State};
+                        {error, _} ->
+                            broker_metrics:inc(shared_rebalance_no_quorum),
+                            {reply, ok, State}
+                    end
+            end;
         _ ->
             %% The row is gone (subscription left) or not shared: nothing to
             %% return, and the caller is retiring this ref anyway.
@@ -706,6 +701,112 @@ handle_info(inflight_tick, State) ->
 
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%%%_* MQ-15 shared claim/ack helpers ------------------------------------------
+%%
+%% Standalone (not inside the handle_call/3 clause chain): the flag-off branch
+%% is the pre-MQ-15 worker-local path, kept verbatim; the flag-on branch routes
+%% the decision through the ra metadata group and mirrors the committed row back.
+
+%% Flag off (default): the pre-MQ-15 worker-local grab-next-free claim, verbatim.
+claim_local(SubRef, PartitionId, Max, Consumer, Row, Limit, State) ->
+    case broker_queue:watermarks(PartitionId) of
+        {ok, _Committed, High} ->
+            Blocked = broker_cursor:blocked(Row, now_ms(), High),
+            PerConsumerMax = shared_per_consumer_quota(SubRef, Limit),
+            case broker_cursor:claim(Row, Max, High, Consumer, Limit,
+                                     Blocked, PerConsumerMax) of
+                {ok, [], _Row1} ->
+                    %% The tail: not an error, and not a claim either.
+                    {reply, {ok, []}, State};
+                {ok, quota_hit, _Row1} ->
+                    %% MQ-11: this consumer hit its own fair share but the group
+                    %% window still has room. Other consumers can keep claiming.
+                    broker_metrics:inc(shared_consumer_quota_hit),
+                    {reply, {ok, []}, State};
+                {ok, Offsets, Row1} ->
+                    true = ets:insert(?CURSORS, {{SubRef, PartitionId}, Row1}),
+                    broker_metrics:inc(shared_claims),
+                    {reply, {ok, Offsets}, State};
+                {error, overflow} ->
+                    broker_metrics:inc(shared_window_full),
+                    {reply, {error, overflow}, State}
+            end;
+        {error, Reason} ->
+            %% The pull loop degrades to `idle' this round and retries on the poll
+            %% tick; a watermark read must not crash a connection (§19.1).
+            {reply, {error, {watermark, PartitionId, Reason}}, State}
+    end.
+
+%% Flag on: the assignment decision lives in the ra metadata group. The local
+%% `?CURSORS' row becomes a read-only mirror of the committed table; the `Blocked'
+%% set is computed from that mirror as in the local path (it carries the global
+%% `assigned' after the previous `update_shared_mirror').
+claim_via_ra(SubRef, PartitionId, Max, Consumer, Row, Limit, State) ->
+    case broker_queue:watermarks(PartitionId) of
+        {ok, _Committed, High} ->
+            Blocked = broker_cursor:blocked(Row, now_ms(), High),
+            PerConsumerMax = shared_per_consumer_quota(SubRef, Limit),
+            case broker_cluster:shared_claim(SubRef, PartitionId, Consumer,
+                                             Max, High, Blocked, PerConsumerMax) of
+                {ok, Offsets} when is_list(Offsets) ->
+                    update_shared_mirror(SubRef, PartitionId),
+                    broker_metrics:inc(shared_claims),
+                    {reply, {ok, Offsets}, State};
+                {ok, quota_hit} ->
+                    broker_metrics:inc(shared_consumer_quota_hit),
+                    {reply, {ok, []}, State};
+                {error, overflow} ->
+                    broker_metrics:inc(shared_window_full),
+                    {reply, {error, overflow}, State};
+                {error, _} = Error ->
+                    broker_metrics:inc(shared_rebalance_no_quorum),
+                    {reply, Error, State}
+            end;
+        {error, Reason} ->
+            {reply, {error, {watermark, PartitionId, Reason}}, State}
+    end.
+
+%% Pull the committed assignment row for `{SubRef, PartitionId}' back from the ra
+%% cache mirror into the local `?CURSORS' row, so the next `Blocked' compute and
+%% the read path see the cluster-wide assignment, not a stale local copy.
+update_shared_mirror(SubRef, PartitionId) ->
+    case broker_cluster_cache:shared_assignment(SubRef, PartitionId) of
+        {ok, MirrorRow} ->
+            true = ets:insert(?CURSORS, {{SubRef, PartitionId}, MirrorRow}),
+            ok;
+        not_found ->
+            ok
+    end.
+
+%% Flag off (default): the pre-MQ-15 ack against the worker-local row.
+ack_local(SubRef, PartitionId, Offset, Consumer, Row, State) ->
+    case ack_row(Row, Offset, Consumer) of
+        unowned ->
+            broker_metrics:inc(shared_ack_unowned),
+            State;
+        {ok, Row1} ->
+            true = ets:insert(?CURSORS, {{SubRef, PartitionId}, Row1}),
+            State2 = absorb_advance(SubRef, delta(Row, Row1), State),
+            _ = maybe_account_dlq_consume(SubRef, PartitionId, Offset),
+            State2
+    end.
+
+%% Flag on: the ack is applied in the ra metadata group (advancing the committed
+%% read point cluster-wide), then mirrored back into the local row.
+ack_via_ra(SubRef, PartitionId, Offset, Consumer, State) ->
+    case broker_cluster:shared_ack(SubRef, PartitionId, Offset, Consumer) of
+        {ok, _Low} ->
+            update_shared_mirror(SubRef, PartitionId),
+            _ = maybe_account_dlq_consume(SubRef, PartitionId, Offset),
+            State;
+        {error, unowned} ->
+            broker_metrics:inc(shared_ack_unowned),
+            State;
+        {error, _} ->
+            broker_metrics:inc(shared_rebalance_no_quorum),
+            State
+    end.
 
 terminate(_Reason, State) ->
     %% Best effort only: this runs while the application is being stopped, and
@@ -994,15 +1095,79 @@ tail_offsets([], Acc) ->
 cross_node_subscribe_ok(Kind, _Partitions) when Kind =/= shared ->
     ok;
 cross_node_subscribe_ok(shared, Partitions) ->
-    case persistent_term:get({broker_subscription, owner}, undefined) of
-        Owner when is_function(Owner, 1) ->
-            case [P || P <- Partitions, not owner_is_self(Owner, P)] of
-                [] -> ok;
-                [P | _] -> {error, {cross_node_shared_unsupported, P}}
+    cross_node_shared_decision(shared, Partitions).
+
+%% MQ-15: the cross-node shared gate. Off (default), the worker-local claim path
+%% would let two nodes hand out the same offset, so a shared subscription that
+%% spans partitions owned by other nodes is refused exactly as before ADR-034
+%% -- zero regression. On, the assignment lives in the ra metadata group (one
+%% truth, single-threaded apply), so a cross-owner partition is safe: the claim
+%% is serialised cluster-wide. If the ra metadata group is not running we still
+%% refuse -- accepting a cross-node shared group we cannot serialize would be the
+%% very duplicate delivery MQ-15 exists to remove.
+cross_node_shared_decision(shared, Partitions) ->
+    case cluster_flag() of
+        false ->
+            case persistent_term:get({broker_subscription, owner}, undefined) of
+                Owner when is_function(Owner, 1) ->
+                    case [P || P <- Partitions, not owner_is_self(Owner, P)] of
+                        [] -> ok;
+                        [P | _] -> {error, {cross_node_shared_unsupported, P}}
+                    end;
+                _ ->
+                    ok
             end;
-        _ ->
+        true ->
+            case ra_metadata_available() of
+                true -> ok;
+                false -> {error, {shared_rebalance_unavailable, no_meta}}
+            end
+    end;
+cross_node_shared_decision(Kind, _Partitions) when Kind =/= shared ->
+    ok.
+
+%% Test seam: the cross-node shared decision as a plain value, so the worker
+%% suite can assert the flag off/on behaviour without a running ra group.
+-spec reply_new_subscribe_for_test(term(), [partition_id()]) -> ok | {error, term()}.
+reply_new_subscribe_for_test(SubRef, Partitions) ->
+    case element(1, SubRef) of
+        Kind -> cross_node_shared_decision(Kind, Partitions)
+    end.
+
+cluster_flag() ->
+    application:get_env(broker_subscription, cluster_shared_rebalance, false).
+
+%% MQ-15: record that `ClientId' on this node joined/left a shared group, so a
+%% later node crash can release exactly the offsets that node's consumers held
+%% (the nodedown handler queries `broker_cluster:shared_consumers_on/1'). Only
+%% shared groups, only when the flag is on, and defensive: a missing ra group is
+%% not fatal to a local join/leave.
+track_shared_join(Kind, SubRef, ClientId) ->
+    case Kind =:= shared andalso cluster_flag() of
+        true ->
+            _ = try broker_cluster:shared_join(SubRef, ClientId, node())
+                catch _:_ -> ok end,
+            ok;
+        false ->
             ok
     end.
+
+track_shared_leave(Kind, SubRef, ClientId) ->
+    case Kind =:= shared andalso cluster_flag() of
+        true ->
+            _ = try broker_cluster:shared_leave(SubRef, ClientId)
+                catch _:_ -> ok end,
+            ok;
+        false ->
+            ok
+    end.
+
+%% Is the ra metadata group (the shared-assignment truth) running on this node?
+%% ra registers the server under the local name `broker_cluster_meta' (the first
+%% element of its `{broker_cluster_meta, Node}' id); absent, there is no group to
+%% serialize a cross-node claim, so the gate refuses.
+ra_metadata_available() ->
+    whereis(broker_cluster_meta) =/= undefined.
 
 owner_is_self(Owner, Partition) ->
     try Owner(Partition) of

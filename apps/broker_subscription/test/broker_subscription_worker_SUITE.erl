@@ -87,7 +87,69 @@ all() -> [subscribe_without_hook_unchanged,
           apply_replica_subscribe_idempotent,
           apply_replica_unsubscribe_clears,
           apply_replica_inflight,
-          apply_replica_cursor].
+          apply_replica_cursor,
+          %% MQ-15: cross-node shared gate under the feature flag.
+          flag_off_keeps_cross_node_shared_refused,
+          flag_on_relaxes_cross_node_shared,
+          flag_on_non_shared_is_always_ok].
+
+
+%%%_* MQ-15 cross-node shared decision ----------------------------------------
+
+%% Pure decision (no ra group needed): the gate must keep refusing a shared group
+%% that spans non-owner partitions while the flag is off (zero regression), and
+%% stop refusing once the flag is on (the ra group then serialises the claim).
+
+flag_off_keeps_cross_node_shared_refused(_Config) ->
+    ok = application:set_env(broker_subscription, cluster_shared_rebalance, false),
+    %% A persistent_term owner that puts partition 1 on a *remote* node.
+    Owner = fun(1) -> {ok, 'other@node'}; (_) -> not_found end,
+    persistent_term:put({broker_subscription, owner}, Owner),
+    try
+        ?assertMatch({error, {cross_node_shared_unsupported, 1}},
+                     broker_subscription_worker:reply_new_subscribe_for_test(
+                       {shared, <<"g">>, <<"s/#">>}, [0, 1])),
+        %% A group wholly on this node is still allowed.
+        ?assertEqual(ok,
+                     broker_subscription_worker:reply_new_subscribe_for_test(
+                       {shared, <<"g">>, <<"s/#">>}, [0]))
+    after
+        persistent_term:erase({broker_subscription, owner}),
+        application:unset_env(broker_subscription, cluster_shared_rebalance)
+    end.
+
+flag_on_relaxes_cross_node_shared(_Config) ->
+    ok = application:set_env(broker_subscription, cluster_shared_rebalance, true),
+    Owner = fun(1) -> {ok, 'other@node'}; (_) -> not_found end,
+    persistent_term:put({broker_subscription, owner}, Owner),
+    try
+        %% Off it was refused; on it must NOT be a cross_node_shared_unsupported
+        %% refusal. With no ra group running it is `{shared_rebalance_unavailable,
+        %% no_meta}'; with a group it would be `ok'. Either is acceptable here.
+        Result =
+            broker_subscription_worker:reply_new_subscribe_for_test(
+              {shared, <<"g">>, <<"s/#">>}, [0, 1]),
+        ?assertNotMatch({error, {cross_node_shared_unsupported, _}}, Result)
+    after
+        persistent_term:erase({broker_subscription, owner}),
+        application:unset_env(broker_subscription, cluster_shared_rebalance)
+    end.
+
+flag_on_non_shared_is_always_ok(_Config) ->
+    ok = application:set_env(broker_subscription, cluster_shared_rebalance, true),
+    Owner = fun(1) -> {ok, 'other@node'}; (_) -> not_found end,
+    persistent_term:put({broker_subscription, owner}, Owner),
+    try
+        ?assertEqual(ok,
+                     broker_subscription_worker:reply_new_subscribe_for_test(
+                       {exclusive, <<"c1">>, <<"t/x">>}, [0, 1])),
+        ?assertEqual(ok,
+                     broker_subscription_worker:reply_new_subscribe_for_test(
+                       {failover, <<"c1">>, <<"t/x">>}, [0, 1]))
+    after
+        persistent_term:erase({broker_subscription, owner}),
+        application:unset_env(broker_subscription, cluster_shared_rebalance)
+    end.
 
 %% MQ-17 Plan 1 Task 4: the initiator side consults the `session_replicator'
 %% hook in the CALLER's process (the conn_fsm), never inside the worker's
