@@ -173,7 +173,8 @@ rescale_shrinks_count_with_members(Config) ->
       end, Survivors),
     ok.
 
-%% 冷却期内不再变。
+%% 冷却闸门必须真正覆盖到 within_rescale_cooldown/0。要点：第二次调用必须
+%% 「本应改变 C」却被冷却挡住——否则它会在 equal-C 子句短路，根本到不了闸门。
 rescale_respects_cooldown(Config) ->
     Nodes = peer_nodes(Config),
     [First | _] = Nodes,
@@ -186,8 +187,26 @@ rescale_respects_cooldown(Config) ->
     _ = rpc(First, persistent_term, erase,
             [{broker_cluster_session_bootstrap, last_rescale_ms}]),
     ok = rpc(First, broker_cluster_session_bootstrap, ensure, [Nodes]),
+    %% 第一次：3 成员 max(4,12)=12→16，真正扩缩容并打冷却时间戳。
     {rescaled, 8, 16} = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
+    {ok, 16, Epoch1} = rpc(First, broker_cluster_cache,
+                                 session_partition_config, []),
+    %% 相同成员的 equal-C 通道是自愈式幂等修复：跑一遍但每个已达标分区的
+    %% epoch 不变（no-op 守卫不写），证明修复不会无谓 churn epoch。
+    EpochsBefore = [rpc(First, broker_cluster, epoch_or_zero, [P])
+                    || P <- lists:seq(0, 15)],
     unchanged = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
+    EpochsAfter = [rpc(First, broker_cluster, epoch_or_zero, [P])
+                   || P <- lists:seq(0, 15)],
+    ?assertEqual(EpochsBefore, EpochsAfter),
+    %% 关键：把 per_node 抬到 8，使 derive_count(3)=next_pow2(max(4,24))=32 =/= 16。
+    %% 这一次 C 本应改变，却正处冷却期内，必须被闸门挡住返回 unchanged。
+    _ = rpc(First, application, set_env,
+            [broker_cluster, session_partitions_per_node, 8]),
+    unchanged = rpc(First, broker_cluster_session_bootstrap, rescale, [Nodes]),
+    %% epoch 必须仍是第一次扩缩容后的值：证明闸门（而非 equal-C 短路）挡住了提交。
+    ?assertEqual({ok, 16, Epoch1},
+                 rpc(First, broker_cluster_cache, session_partition_config, [])),
     ok.
 
 %%%_* Scaffolding — 从 broker_session_replica_SUITE 原样复制（勿自行重写）----------

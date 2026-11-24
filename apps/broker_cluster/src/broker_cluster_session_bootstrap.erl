@@ -81,22 +81,31 @@ desired_count(Members) ->
         _ -> broker_cluster_session_partition:derive_count(length(Members))
     end.
 
-%% 2) 对 0..C-1 幂等 assign。
+%% 2) 对 0..C-1 幂等 assign。第一个失败即上抛，绝不吞错后假装 ok——
+%% 吞错会让 Task 4 的 bootstrap 重试循环误以为分区已建好而永久停摆。
 ensure_partitions(Count, Members) ->
-    lists:foreach(
-      fun(P) -> ensure_partition(P, Members) end, lists:seq(0, Count - 1)),
-    ok.
+    ensure_partition_list(lists:seq(0, Count - 1), Members).
+
+ensure_partition_list([], _Members) ->
+    ok;
+ensure_partition_list([P | Rest], Members) ->
+    case ensure_partition(P, Members) of
+        ok -> ensure_partition_list(Rest, Members);
+        {error, _} = E -> E
+    end.
 
 ensure_partition(P, Members) ->
     Sorted = lists:sort(Members),
     Owner = broker_cluster_session_partition:pick_owner(P, Sorted),
     case broker_cluster_cache:get(P) of
         {ok, #{replicas := Rs, owner := O}} when Rs =:= Sorted, O =:= Owner ->
-            ok;                                   %% 已达标，幂等 no-op
+            ok;                                   %% 已达标，幂等 no-op（不写 epoch）
         _ ->
             Epoch = broker_cluster:epoch_or_zero(P) + 1,
-            _ = broker_cluster:assign(P, Owner, Sorted, Epoch),
-            ok
+            case broker_cluster:assign(P, Owner, Sorted, Epoch) of
+                {ok, _} -> ok;
+                {error, _} = E -> E
+            end
     end.
 
 %%%_* Autoscale (design §3.4/§3.5) -----------------------------------------
@@ -116,6 +125,9 @@ rescale() ->
             end
     end.
 
+%% @doc 用显式成员跑一次扩缩容。**仅测试用**：生产必须走 rescale/0（成员取自
+%% ra 权威视图）。传入的列表会被当作真实成员用于 derive_count 与 reclaim，
+%% 传错会按错误成员集回收分区元数据。
 -spec rescale([node()]) ->
           {rescaled, pos_integer(), pos_integer()} | unchanged | {error, term()}.
 rescale(Members) when is_list(Members), Members =/= [] ->
@@ -136,24 +148,50 @@ rescale(Members) when is_list(Members), Members =/= [] ->
 rescale(_) ->
     {error, no_members}.
 
-maybe_rescale(OldC, OldC, _Members) ->
-    unchanged;
+maybe_rescale(OldC, OldC, Members) ->
+    case within_rescale_cooldown() of
+        true ->
+            unchanged;
+        false ->
+            %% 相同 C 也跑一次幂等修复：上次若在「C 已提交但 assign 失败」后中断，
+            %% 缺失的分区必须这次补上（否则永久缺元数据，takeover 切片死掉）。
+            commit_and_rebuild(OldC, OldC, Members)
+    end;
 maybe_rescale(OldC, NewC, Members) ->
     case within_rescale_cooldown() of
         true ->
             unchanged;
         false ->
-            case broker_cluster:set_session_partition_count(NewC) of
-                {ok, _Epoch} ->
+            case commit_and_rebuild(OldC, NewC, Members) of
+                {ok, _} ->
                     record_rescale_now(),
-                    %% 扩容：为 0..NewC-1 建/修元数据。
-                    _ = ensure_partitions(NewC, Members),
-                    %% 缩容：NewC..OldC-1 这些已不存在的分区回收。
-                    _ = reclaim(shrink_range(NewC, OldC), Members),
                     {rescaled, OldC, NewC};
-                {error, _} = E ->
-                    E
+                Other ->
+                    Other
             end
+    end.
+
+%% 分区工作先做、成功才在 maybe_rescale 里打冷却时间戳（见上）。这样 assign
+%% 失败不会留下「已进冷却、却什么都没建」的假象。
+commit_and_rebuild(OldC, OldC, Members) ->
+    case ensure_partitions(OldC, Members) of
+        ok ->
+            _ = reclaim(shrink_range(OldC, OldC), Members),
+            unchanged;
+        {error, _} = E -> E
+    end;
+commit_and_rebuild(OldC, NewC, Members) ->
+    case broker_cluster:set_session_partition_count(NewC) of
+        {ok, _Epoch} ->
+            case ensure_partitions(NewC, Members) of
+                ok ->
+                    case reclaim(shrink_range(NewC, OldC), Members) of
+                        {reclaimed, _} -> {ok, NewC};
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E -> E
+            end;
+        {error, _} = E -> E
     end.
 
 %% 缩容区间：`NewC..OldC-1`；扩容时（NewC >= OldC）为空列表。
@@ -162,14 +200,32 @@ maybe_rescale(OldC, NewC, Members) ->
 shrink_range(NewC, OldC) when NewC >= OldC -> [];
 shrink_range(NewC, OldC) -> lists:seq(NewC, OldC - 1).
 
-%% @doc 缩容回收（设计 §3.5）：对给定分区列表中"owner 已不在当前成员里"的
-%% 提交 remove。仍有存活 owner 的分区不删（等 conn_fsm 迁移）。
-%% 复用调用方传入的 Members，避免每个分区再打一次 ra 成员查询。
--spec reclaim([non_neg_integer()], [node()]) -> {reclaimed, [non_neg_integer()]}.
+%% @doc 缩容回收（设计 §3.5 的保守变体）：只删「owner 已不在当前成员里」的分区。
+%%
+%% 已知取舍（计划风险 3）：`[NewC, OldC)` 中 owner 仍在成员里的分区**不会**被
+%% 二次回收——conn_fsm 迁移到新分区后不会回调这里，故这些行会长期留在元数据里
+%% 且 owner/epoch 陈旧。安全的原因是 `partition_of/2` 恒返回 `< C`，路由与
+%% owner 查询永远不会取到 `P >= C` 的行；代价是跨多轮扩缩容会累积残留行。
+%% 真正的「无人引用即回收」留待后续迭代（需要跟踪每个分区的活跃 monitor）。
+%%
+%% 复用调用方传入的 Members，避免每个分区再打一次 ra 成员查询。remove 的
+%% 错误必须上抛，不能被 `_ =' 吞掉——否则元数据删不掉却报 ok。
+-spec reclaim([non_neg_integer()], [node()]) ->
+          {reclaimed, [non_neg_integer()]} | {error, term()}.
 reclaim(Partitions, Members) ->
     Gone = lists:filter(fun(P) -> partition_unused(P, Members) end, Partitions),
-    lists:foreach(fun(P) -> _ = broker_cluster:remove(P) end, Gone),
-    {reclaimed, Gone}.
+    case remove_all(Gone) of
+        ok -> {reclaimed, Gone};
+        {error, _} = E -> E
+    end.
+
+remove_all([]) -> ok;
+remove_all([P | Rest]) ->
+    case broker_cluster:remove(P) of
+        {ok, _} -> remove_all(Rest);
+        {error, not_found} -> remove_all(Rest);  %% 已无元数据，等同成功
+        {error, _} = E -> E
+    end.
 
 %% 判据：没有元数据 → 无需回收；有 owner 但该 owner 已不在当前成员里 → 回收。
 partition_unused(P, Members) ->
