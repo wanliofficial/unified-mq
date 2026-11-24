@@ -71,8 +71,8 @@ owner 节点崩溃时,持有该客户端**活连接**的节点 N 从**本地副�
 
 Plan 2 引入一个**固定数量的会话分区**（建议 env `session_partition_count`,默认取一个与集群规模匹配的小值,如节点数),与 `broker_rebalance` 的元数据分区是**两套独立空间**:
 
-- **会话分区**:由 `session_partition_count` 定义稠密空间 `0..C-1`,`partition_of(ClientId) = erlang:phash2(ClientId, C)`。Plan 1 复制据此把会话状态复制到「该会话分区的副本集」;§4 的 claim 据此定位分区。副本集 = 该会话分区在 ra 中对应元数据的 `replicas`（或独立的会话副本组,留 §12 plan 阶段定）。
-- **元数据分区**:`broker_rebalance` 现有分区,继续承载 owner/epoch/fencing,**不动**。
+- **会话分区**:由 `session_partition_count` 定义稠密空间 `0..C-1`,`partition_of(ClientId) = erlang:phash2(ClientId, C)`。Plan 1 复制据此把会话状态复制到「该会话分区的副本集」;§4 的 claim 据此定位分区。副本集 = 该会话分区在 ra 中对应元数据的 `replicas`。**§12 已定稿（2026-11-24 缺口 #5）:会话副本集复用元数据表 `0..C-1` 号段的 `replicas`,不引入独立会话副本组。**
+- **元数据分区**:`broker_rebalance` 现有分区（队列/路由动态分区，另一号段）,继续承载 owner/epoch/fencing,**不动**。
 
 > 设计取舍:两套空间避免把会话散列绑死在动态元数据分区上（后者随 rebalance 变,会导致会话分区归属漂移、fencing 抖动)。会话分区空间固定,`phash2` 稳定,epoch fencing 兜底任何陈旧写入。
 
@@ -124,6 +124,4 @@ Plan 2 复用 Plan 1 已注册的 `cluster_session_replication_latency_us` / `cl
 
 ## 12. 留给 plan 阶段的未决点
 
-- 会话分区的副本集是「复用元数据分区的 `replicas`」还是「独立的会话副本组」——取决于 §5 两套空间的最终落地,plan 阶段结合 `broker_rebalance` 现状定。
-- `session_partition_count` 的默认值与集群规模（节点数 / 副本因子）的取法。
-- nodedown 触发迁移的触发面与去抖（避免网络抖动误判崩溃,与 ra 自身故障检测的关系）。
+- ~~会话分区的副本集是「复用元数据分区的 `replicas`」还是「独立的会话副本组」~~ **已定稿（2026-11-24 缺口 #5）**:复用元数据表——会话分区与 `broker_rebalance` 的队列/路由动态分区**共用同一张 ra 分区表,靠号段隔离**:会话分区占稠密号段 `0..C-1`（`broker_cluster_session_bootstrap` 保证建齐）,rebalance 管另一号段。`targeted_plan/1`（`broker_cluster_session_rep`）、`replicate_session/2`、conn_fsm 的 `claim/3` 都用 `broker_cluster:replicas(P)`/`owner(P)` 读这同一张表,命中即会话分区 P 的副本集/owner。不引入独立会话副本组（避免第二套 ra 元数据 + 第二套 fencing）。`session_partition_count` 的默认值与集群规模已由缺口 #3 落地（`derive_count` = `next_power_of_two(max(min_count, 节点数*per_node))`,默认 4/4,随集群规模双向联动）。nodedown 触发迁移的触发面与去抖:由缺口 #3 的 `broker_cluster_nodedown_mon` 承载（成员收敛后触发 `rescale`,带去抖窗口 + 冷却闸门）。

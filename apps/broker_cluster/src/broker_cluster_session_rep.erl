@@ -76,8 +76,14 @@ replicate_session_best_effort(Op) ->
 %% 散列出错）返回 broadcast。所有失败都在本函数内捕获并降级为 broadcast，绝不
 %% 外抛——调用方是 fire-and-forget 的 spawnee（见 replicate_session_of/1）。
 %%
-%% 假设（Plan 2 §12 未决点）：会话分区 P 暂按与元数据分区 P **同键**读取副本集
-%% （会话副本集复用元数据 replicas）。两套空间独立，此同键假设需在 plan 后续确认。
+%% 路由决策（Plan 3 缺口 #5 已定稿）：会话分区 P 按与元数据分区 P **同键**读取
+%% 副本集——会话副本集复用 ra 分区表键 P 的 `replicas`。会话分区与 `broker_rebalance`
+%% 的队列/路由动态分区是**两套号段**，共用同一张元数据表：会话分区占稠密号段
+%% `0..C-1`（`broker_cluster_session_bootstrap` 保证建齐），rebalance 管另一号段；
+%% 同号段内不重叠（会话 P 恒 `< C`，rebalance 分区号由别处分配）。故
+%% `broker_cluster:replicas(P)` 命中的必是会话分区 P 的副本集。两套空间仍各自独立
+%% 演化（会话分区固定稠密、rebalance 动态稀疏），只是共享物理表 + 靠号段隔离。
+%% 设计定稿见 2026-11-22-session-state-replication-plan2-design.md §5 / §12。
 -spec targeted_plan(term()) -> {targeted, non_neg_integer(), [node()]} | broadcast.
 targeted_plan({cursor, _SubRef, _PartitionId, _Row}) ->
     broadcast;
