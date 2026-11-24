@@ -147,3 +147,4 @@ spikes/*/.data/
 /test/protocol-compatibility/s11c/libcoap/data/
 /test/protocol-compatibility/s11c/libcoap/run/
 /test/protocol-compatibility/s11c/libcoap/_build/
+_mcp_run.log
