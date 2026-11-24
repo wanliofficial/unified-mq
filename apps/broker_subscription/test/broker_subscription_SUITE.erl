@@ -88,6 +88,8 @@ all() ->
      backoff_sequence_is_exponential_and_capped,
      shared_retry_waits_for_the_backoff_before_reclaim,
      max_attempts_dead_letters_and_advances,
+     dlq_size_decrements_when_a_dead_letter_is_consumed,
+     dlq_namespace_gate,
      a_dead_letter_is_an_ordinary_subscribable_destination,
      dlq_template_validation_and_rendering,
      a_bad_dlq_template_refuses_boot,
@@ -1121,6 +1123,45 @@ max_attempts_dead_letters_and_advances(_Config) ->
     #{dlq_appends := 1, dlq_size := 1} = broker_metrics:snapshot(),
     ok.
 
+%% The depth gauge must come back down when a dead letter is consumed. A dead
+%% letter is an ordinary destination with `expires_at = undefined', so the only
+%% way it leaves the system is consumption; the ack path now detects a consumed
+%% dead letter (by its `x-original-message-id' header) and decrements `dlq_size'.
+dlq_size_decrements_when_a_dead_letter_is_consumed(_Config) ->
+    ok = application:set_env(broker_subscription, max_attempts, 2),
+    ok = application:set_env(broker_subscription, retry_base_ms, 60000),
+    ok = application:set_env(broker_subscription, retry_tick_ms, 3600000),
+    ok = boot(),
+    ok = broker_metrics:reset(),
+    %% Join the DLQ consumer BEFORE the dead letter exists, so the shared
+    %% cursor's `low' is below the copy and `claim' can pull it.
+    {ok, Audit} = broker_subscription:join(shared, <<"dlq-audit">>,
+                                           <<"audit">>, <<"$dlq/#">>, 1),
+    {ok, SubRef} = broker_subscription:subscribe(<<"c1">>, <<"s/#">>, 1),
+    {ok, Offset} = append(0, <<"s/a">>),
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    ok = broker_subscription:retry(SubRef, 0, Offset, <<"c1">>),
+    #{dlq_appends := 1, dlq_size := 1} = broker_metrics:snapshot(),
+    %% Consume the dead letter: claim pulls the copy, ack advances the cursor
+    %% and the ack path now decrements `dlq_size' for a consumed dead letter.
+    Dest = <<"$dlq/t0/s/a">>,
+    P = dlq_partition(Dest),
+    CopyOffset = find_offset(P, Dest),
+    {ok, Claimed} = broker_subscription:claim(Audit, P, 100, <<"audit">>),
+    true = lists:member(CopyOffset, Claimed),
+    ok = broker_subscription:ack(Audit, P, CopyOffset, <<"audit">>),
+    #{dlq_appends := 1, dlq_size := 0} = broker_metrics:snapshot(),
+    ok.
+
+%% A non-DLQ ack must never touch the gauge (the probe is gated to `$dlq').
+%% `is_dlq_namespace/1' is the gate; assert its boundary directly too.
+dlq_namespace_gate(_Config) ->
+    true = broker_dlq:is_dlq_namespace(<<"$dlq/#">>),
+    true = broker_dlq:is_dlq_namespace(<<"$dlq/t0/s/a">>),
+    false = broker_dlq:is_dlq_namespace(<<"orders/new">>),
+    false = broker_dlq:is_dlq_namespace(<<"sdlq/x">>),
+    ok.
+
 %% E-7: the DLQ is a destination, not a subsystem: an ordinary `$dlq/#' filter
 %% indexes it in the Router exactly like any other topic.
 a_dead_letter_is_an_ordinary_subscribable_destination(_Config) ->
@@ -1225,6 +1266,20 @@ dlq_partition(Dest) ->
 
 find_message(P, Dest) ->
     find_message(P, Dest, 0).
+
+find_offset(P, Dest) -> find_offset(P, Dest, 0).
+
+find_offset(P, Dest, From) ->
+    case broker_queue:read_from(P, From, 100) of
+        {ok, Page, Next} when is_list(Page), Page =/= [] ->
+            case [O || {O, M} <- Page, M#broker_message.destination =:= Dest] of
+                [O | _] -> O;
+                [] when Next > From -> find_offset(P, Dest, Next);
+                _ -> exit({no_message_on_destination, P, Dest})
+            end;
+        _ ->
+            exit({no_message_on_destination, P, Dest})
+    end.
 
 find_message(P, Dest, From) ->
     case broker_queue:read_from(P, From, 100) of

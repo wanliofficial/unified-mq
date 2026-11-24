@@ -537,7 +537,9 @@ handle_call({ack, SubRef, PartitionId, Offset, Consumer}, _From, State) ->
                          {ok, Row1} ->
                              true = ets:insert(?CURSORS,
                                                {{SubRef, PartitionId}, Row1}),
-                             absorb_advance(SubRef, delta(Row, Row1), State)
+                             State2 = absorb_advance(SubRef, delta(Row, Row1), State),
+                             _ = maybe_account_dlq_consume(SubRef, PartitionId, Offset),
+                             State2
                      end
              end,
     {reply, ok, State1};
@@ -1017,6 +1019,20 @@ maybe_release(SubRef, ClientId, State) ->
     State.
 
 %%%_* ack / cursor aggregation ------------------------------------------------
+
+%% A dead letter is consumed like any other message, but its depth gauge must
+%% come back down. Only a subscription whose filter lives in the `$dlq'
+%% namespace can ever receive one, so gate the probe there and leave the hot ack
+%% path of ordinary subscriptions untouched.
+maybe_account_dlq_consume({_Kind, _Key, Filter}, PartitionId, Offset)
+  when is_binary(Filter) ->
+    case broker_dlq:is_dlq_namespace(Filter) of
+        true -> broker_dlq:on_consume(PartitionId, Offset);
+        false -> ok
+    end;
+maybe_account_dlq_consume(_SubRef, _PartitionId, _Offset) ->
+    ok.
+
 
 ack_row(#{kind := shared} = Row, Offset, Consumer) ->
     broker_cursor:ack_shared(Row, Offset, Consumer);

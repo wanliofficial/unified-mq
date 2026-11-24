@@ -51,6 +51,7 @@ all() ->
      unsupported_media_type_415,
      keep_alive_two_requests,
      connection_close_honored,
+     idle_timeout_closes_an_idle_keepalive_connection,
      health,
      anonymous_listener_on_loopback_is_allowed,
      anonymous_listener_on_wide_bind_is_refused,
@@ -475,6 +476,24 @@ connection_close_honored(_Config) ->
     {200, RespHeaders, _} = read_response(S),
     ?assertEqual(<<"close">>, header(<<"connection">>, RespHeaders)),
     ?assertEqual({error, closed}, gen_tcp:recv(S, 1, 2000)),
+    gen_tcp:close(S).
+
+%% S9-A: a keep-alive connection that sends no further request is reaped after
+%% `idle_timeout_ms' rather than parking a ranch slot indefinitely. The wait for
+%% the next request line is the idle period; a short timeout here keeps the test
+%% fast while proving the server closes on its own.
+idle_timeout_closes_an_idle_keepalive_connection(_Config) ->
+    ok = application:set_env(broker_proto_a2a, idle_timeout_ms, 400),
+    {Port, _} = start_listener([]),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {packet, raw}], 2000),
+    %% One request gets a keep-alive response (HTTP/1.1 default), so the loop
+    %% comes back around to wait for the *next* request -- the idle window.
+    Body = rpc_body(<<"SendMessage">>, params(unique(<<"ctx-idle">>)), 1),
+    ok = gen_tcp:send(S, build_request(post_headers(?TOKEN), Body)),
+    {200, _, _} = read_response(S),
+    %% No second request: the server must close within idle_timeout + margin.
+    ?assertEqual({error, closed}, gen_tcp:recv(S, 1, 3000)),
     gen_tcp:close(S).
 
 health(_Config) ->

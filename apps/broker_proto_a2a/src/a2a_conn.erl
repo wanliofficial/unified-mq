@@ -65,7 +65,8 @@ busy_response() ->
 
 loop(Socket, Transport, Count) when Count < ?MAX_REQUESTS ->
     Limits = #{body_bytes => a2a_rpc:max_body_bytes(),
-               request_timeout_ms => a2a_rpc:request_timeout_ms()},
+               request_timeout_ms => a2a_rpc:request_timeout_ms(),
+               idle_timeout_ms => a2a_rpc:idle_timeout_ms()},
     case agent_rpc_http:read_request(Transport, Socket, Limits) of
         {ok, Req} ->
             case safe_handle(Req) of

@@ -16,7 +16,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include_lib("broker_router/include/broker_router.hrl").
 
--export([handle/1, max_body_bytes/0, request_timeout_ms/0,
+-export([handle/1, max_body_bytes/0, request_timeout_ms/0, idle_timeout_ms/0,
          require_auth/0, supported_versions/0, push_method_enabled/0]).
 
 %% `handle/1' answers a plain HTTP response *or* hands the socket to the SSE
@@ -611,6 +611,16 @@ max_body_bytes() ->
 -spec request_timeout_ms() -> pos_integer().
 request_timeout_ms() ->
     application:get_env(broker_proto_a2a, request_timeout_ms, 30000).
+
+%% @doc Max time the connection may sit with no new request before the loop
+%% closes it (S9-A §2b `idle_timeout_ms', default 75 s). Distinct from
+%% `request_timeout_ms', which bounds reading one request once it has started:
+%% the idle timeout governs the wait for the *next* request line on a keep-alive
+%% connection, so a slow-but-alive client between requests is not reaped as
+%% aggressively as a stalled in-progress read.
+-spec idle_timeout_ms() -> pos_integer().
+idle_timeout_ms() ->
+    application:get_env(broker_proto_a2a, idle_timeout_ms, 75000).
 
 -spec require_auth() -> boolean().
 require_auth() ->

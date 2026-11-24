@@ -29,7 +29,7 @@
 -include_lib("broker_core/include/broker_message.hrl").
 -include_lib("broker_router/include/broker_router.hrl").
 
--export([validate_pattern/1, name/2, dead_letter/3]).
+-export([validate_pattern/1, name/2, dead_letter/3, on_consume/2, is_dlq_namespace/1]).
 
 -define(DEFAULT_PATTERN, <<"$dlq/{tenant}/{original}">>).
 
@@ -103,6 +103,37 @@ dead_letter(PartitionId, Offset, #{qos := QoS, kind := Kind} = Meta) ->
 -spec is_dead_letter(#broker_message{}) -> boolean().
 is_dead_letter(#broker_message{headers = Headers}) when is_map(Headers) ->
     maps:is_key(<<"x-original-message-id">>, Headers).
+
+%% @doc Does a subscription filter target the dead-letter namespace? The default
+%% `dlq_name_pattern' (`"$dlq/{tenant}/{original}"') roots every dead-letter
+%% destination at `$dlq', so a consumer filter under that prefix is the only kind
+%% of subscription that can receive a dead letter. Used to gate `on_consume/2' so
+%% ordinary subscriptions never pay for a dead-letter probe on the ack path.
+-spec is_dlq_namespace(binary()) -> boolean().
+is_dlq_namespace(<<"$dlq", _/binary>>) -> true;
+is_dlq_namespace(_) -> false.
+
+%% @doc Called when a subscription offset is acknowledged. A dead letter is an
+%% ordinary destination with `expires_at = undefined', so the only way it leaves
+%% the system is consumption -- there is no GC/segment-delete hook that sees it.
+%% Decrement the depth gauge here so `dlq_size' tracks unconsumed dead letters
+%% rather than climbing forever. The caller gates this to DLQ-namespace
+%% subscriptions, so the storage read below runs only for those (dead letters are
+%% the low-volume exception, not the hot path).
+-spec on_consume(partition_id(), offset()) -> ok.
+on_consume(PartitionId, Offset) ->
+    case broker_queue:read_from(PartitionId, Offset, 1) of
+        {ok, [{Offset, #broker_message{headers = Headers}}], _} when is_map(Headers) ->
+            case maps:is_key(<<"x-original-message-id">>, Headers) of
+                true ->
+                    _ = broker_metrics:gauge_add(dlq_size, -1),
+                    ok;
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
 
 %%%_* Internals ----------------------------------------------------------------
 

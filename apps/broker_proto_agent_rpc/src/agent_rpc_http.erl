@@ -32,17 +32,27 @@
                      body := binary(),
                      keep_alive := boolean()}.
 
-%% @doc Read one request. `Limits' keys: `body_bytes' (default 1 MiB) and
-%% `request_timeout_ms' (default 30 s).
+%% @doc Read one request. `Limits' keys: `body_bytes' (default 1 MiB),
+%% `request_timeout_ms' (default 30 s) bounds reading a request once it has
+%% started, and `idle_timeout_ms' (default 75 s) bounds the wait for the next
+%% request line on a keep-alive connection.
 -spec read_request(module(), term(), map()) ->
           {ok, request()} | {error, term()}.
 read_request(Transport, Socket, Limits) ->
-    Timeout = maps:get(request_timeout_ms, Limits, 30000),
+    ReqTimeout = maps:get(request_timeout_ms, Limits, 30000),
+    %% Callers that do not set `idle_timeout_ms' (e.g. MCP) keep the prior
+    %% behaviour where the wait-for-next-request is bounded by the request
+    %% timeout; A2A sets it explicitly to reap idle keep-alive connections on a
+    %% separate, longer clock.
+    IdleTimeout = maps:get(idle_timeout_ms, Limits, ReqTimeout),
     case setopts(Transport, Socket, [{packet, http_bin}, {active, false}]) of
         ok ->
-            case Transport:recv(Socket, 0, Timeout) of
+            %% Waiting for the next request line is the idle period: a client
+            %% that has finished a response and not sent another within
+            %% `idle_timeout_ms' is reaped here rather than parking a ranch slot.
+            case Transport:recv(Socket, 0, IdleTimeout) of
                 {ok, {http_request, Method, Uri, Version}} ->
-                    case read_headers(Transport, Socket, Timeout, #{}) of
+                    case read_headers(Transport, Socket, ReqTimeout, #{}) of
                         {ok, Headers} ->
                             read_body(Transport, Socket, Method, Uri, Version,
                                       Headers, Limits);
