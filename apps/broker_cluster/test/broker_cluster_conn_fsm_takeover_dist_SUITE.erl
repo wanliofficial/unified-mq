@@ -23,7 +23,8 @@
 
 all() -> [live_connection_zero_reconnect_on_owner_crash,
           no_owner_no_takeover,
-          connection_remaps_when_partition_epoch_changes].
+          connection_remaps_when_partition_epoch_changes,
+          remap_repoints_owner_monitor].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -216,6 +217,52 @@ connection_remaps_when_partition_epoch_changes(Config) ->
     ok = gen_tcp:close(Sock),
     ok.
 
+%% Plan 3 (gap #3) 质量评审补强：迁移后 owner monitor 必须重新挂上。
+%%
+%% 设计要点（别改）：
+%% - 新旧分区 owner 故意选**同一个非 leader 节点**（Owner）。故迁移时 conn 必然
+%%   执行 monitor_node(Owner,false) 再 monitor_node(Owner,true)。若代码只 demonitor
+%%   忘了 remonitor，后续 kill Owner 就不会收到 {nodedown,Owner}，接管不会发生——
+%%   正是本用例要抓的真实缺陷。
+%% - Owner ≠ ra leader（assign_roles 保证），kill 后 2/3 存活=多数派，claim 可成功。
+%% - process_info/2 看不到 node monitor（实测），故只能走行为证明。
+remap_repoints_owner_monitor(Config) ->
+    Nodes = peer_nodes(Config),
+    #{owner := Owner, holder := Holder} = assign_roles(ra_leader(Nodes), Nodes),
+    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+    ?assertEqual(?PARTITIONS, Count),
+    Bigger = Count * 2,
+    ClientId = pick_remapping_client_id(Count, Bigger),
+    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+    NewP = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Bigger]),
+    ?assertNotEqual(P, NewP),
+    %% 两个分区的 owner 都是 Owner（同节点），epoch 各自从 1 起。
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [NewP, Owner, Nodes, 1]),
+    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [P]) =:= {ok, Owner} end),
+    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [NewP]) =:= {ok, Owner} end),
+    ok = ensure_metrics(Holder),
+    {ok, _} = rpc(Holder, broker_cluster, set_session_partition_count, [Count]),
+    Port = start_listener(Holder),
+    Sock = connect(Port),
+    #connack{return_code = 0} = open(Sock, #{client_id => ClientId}),
+    #suback{} = subscribe(Sock, 1, <<"t/#">>, 1),
+    ?assertEqual(P, wait_owner_part(Holder)),
+    %% 迁移：partition 变，owner 不变 → demonitor+remonitor 同一节点。
+    {ok, _} = rpc(Holder, broker_cluster, set_session_partition_count, [Bigger]),
+    ?assertEqual(NewP, wait_owner_part_changed(Holder, P)),
+    %% I6 fencing：旧分区的陈旧写（epoch 不推进）必须被拒。
+    ?assertMatch({error, {stale_epoch, _, _}},
+                 rpc(Holder, broker_cluster, claim, [P, Holder, 1])),
+    %% 关键断言：kill Owner 后接管仍发生 → 证明 monitor 已重新挂上（挂在新分区）。
+    ok = stop_peer(Config, Owner),
+    wait_until(fun() -> takeover_ok(Holder) >= 1 end),
+    wait_until(fun() -> rpc(Holder, broker_cluster_cache, owner, [NewP]) =:= {ok, Holder} end),
+    %% socket 未重连。
+    #ping{kind = resp} = ping(Sock),
+    ok = gen_tcp:close(Sock),
+    ok.
+
 %% 找第一个在 OldC→NewC 下确实换分区的 client id（确定性、不走运气）。
 pick_remapping_client_id(OldC, NewC) ->
     pick_remapping_client_id(OldC, NewC, 0).
@@ -225,7 +272,10 @@ pick_remapping_client_id(OldC, NewC, N) when N < 1000 ->
     case erlang:phash2(Cid, OldC) =/= erlang:phash2(Cid, NewC) of
         true -> Cid;
         false -> pick_remapping_client_id(OldC, NewC, N + 1)
-    end.
+    end;
+
+pick_remapping_client_id(_OldC, _NewC, N) ->
+    ct:fail({no_remapping_client_id_found, N}).
 
 %% holder 上唯一 conn 的 owner_part；连接刚建好时 owner_part 可能尚未写入，
 %% 故轮询等待其非 undefined。

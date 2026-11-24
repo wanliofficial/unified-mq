@@ -988,6 +988,9 @@ remap_if_partition_moved(#st{client_id = ClientId, owner_node = OldOwner,
                         _ = erlang:monitor_node(Owner, true),
                         D#st{owner_part = NewP, owner_node = Owner, owner_epoch = Epoch};
                     _ ->
+                        %% C 已提交但新分区的 owner 尚未 assign（两条独立 ra 命令）：
+                        %% 记 undefined 是安全的——投递走队列分区 pull 路径，不依赖
+                        %% owner；下次 epoch 变化会重新读取 owner。
                         D#st{owner_part = NewP, owner_node = undefined,
                              owner_epoch = Epoch}
                 end
@@ -995,6 +998,9 @@ remap_if_partition_moved(#st{client_id = ClientId, owner_node = OldOwner,
     catch _:_ -> D end.
 
 %% @doc 诊断/测试用：读一条连接当前记录的会话分区。纯读，不改状态。
+%%
+%% 注意：内部用 `sys:get_state/1'，**同步阻塞目标 gen_statem 进程**。仅限
+%% 测试/排障使用，绝不可出现在任何生产/热路径调用链上。
 -spec owner_part(pid()) -> non_neg_integer() | undefined.
 owner_part(Pid) ->
     case sys:get_state(Pid) of
