@@ -119,12 +119,13 @@
 
 ---
 
-## P4 Gate 未勾选项
+## P4 Gate 项（2026-11-25 已全部勾选）
 
-- [ ] **`docs/roadmap.md:537`（Gate S12 唯一未勾选）**：有状态服务的状态持久化与崩溃恢复**绑定 ADR-007 三档的专项压测**未做。
+- [x] **`docs/roadmap.md:537`（Gate S12 最后一项，已于 2026-11-25 勾选）**：有状态服务的
+  状态持久化与崩溃恢复**绑定 ADR-007 三档的专项压测**已补齐。
   - 已具备：崩溃节点重入并追平 epoch 由 `broker_cluster_dist_SUITE:a_crashed_node_rejoins_and_catches_up` 证明。
   - 已具备（2026-11-24 核实）：三档**丢失边界**已实测并落盘——`docs/benchmarks/reliability/s2-b-osbuffer-loss.md` 逐档给出 `fsync` 前缀完整可读、`os_buffer` 尾部可丢且 `high` 回真实末尾、`replicated_commit` 分配 offset 前显式拒绝，含替身档与 dm-flakey 实机档。
-  - 缺：三档的**容量**专项，以及把上限绑定到 S12 有状态服务（ra 元数据层）的专项报告——`docs/benchmarks/` 无对应落盘，故 Gate 仍不勾选。
+  - **已补齐（2026-11-25）：三档容量专项 + 绑定 S12 有状态服务（ra 元数据层）**——`tools/bench/s12_adr007_capacity.erl`（真实 3 peer + 真实 ra + 真实 WAL）实测并落盘 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`：串行 ACK 延迟 L1≈0 < L2≈3 ms < L3≈7–8 ms；饱和吞吐天花板 ≈ 14.7k : 1.9k : 0.85k msg/s（L1:L2:L3）；ra 元数据层控制面 ~450 提交/s（单次 ~2 ms）；失多数派时 L3 逐条拒绝（ok=0/failed=2000）而 L1/L2 照常成功（各 ok=2000）——证明 ra 组的可用性只门控 `replicated_commit`。Gate S12 全部勾选项证据齐备。
 
 ---
 
@@ -133,10 +134,11 @@
 1. ~~**P0-1 ~ P0-7**（纯文档，一次性提交；消除"已实现却记为缺口"的误报）~~ —— **已完成 2026-11-24**
 2. ~~**MQ-11 → MQ-15**（唯一在推进的功能缺口；两者都涉及 `assigned` 窗口与 ra 串行化，MQ-11 先做可为 MQ-15 铺垫）~~ —— **均已交付：MQ-11 `b95a32a`（11-24）、MQ-15 `53946f5`（11-25）。P1 活跃功能缺口清空。**
 3. **P2 的 P0 三项**（是否立项需产品确认目标定位）
-4. **P4** 与容量报告合并做
+4. ~~**P4** 与容量报告合并做~~ —— **已交付 2026-11-25**：Gate S12 最后一项已勾选，三档容量专项 + ra 元数据层绑定报告落盘 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`
 5. ~~**MQ-09 产品化取舍**（纯文档，与 P0-1 合并即可，无排期压力）~~ —— **已落笔 2026-11-24**
 
-> 当前状态（2026-11-25）：**P1 已无 `[ ]` 项**；剩余待办全部集中在 P2（需产品决策）与 P4（容量专项）。
+> 当前状态（2026-11-25）：**P1 已无 `[ ]` 项；P4 容量专项已交付（Gate S12 全部勾选项证据齐备）。**
+> 剩余待办全部集中在 P2（9 项，需产品决策定位）。
 
 ---
 
@@ -145,6 +147,8 @@
 > 对上方每一条 `[ ]` 做了一次「代码/产物 vs 文档口径」核对，判定分四类。**结论（2026-11-24 快照）：P1 全部为真缺口；P2 中 Prometheus 导出为误报（已就地改），TLS1.3/mTLS、畸形包、ADR-007 三档为部分误报（已就地改并标注「能力已在、缺专项证据」）；其余 P0/P1/P2/P4 为真缺口。**
 >
 > **2026-11-25 更新**：上句的「P1 全部为真缺口」已过期——**MQ-11（`b95a32a`）与 MQ-15（`53946f5`）均已交付**，MQ-09 的文档取舍也已随 P0-1 落笔，**P1 已无 `[ ]` 项**。表中 P1 三行已就地更新判定，其余行仍为 2026-11-24 判定。
+>
+> **2026-11-25 再更新**：上句「其余……P4 为真缺口」也已过期——**P4（ADR-007 三档容量专项 + 绑定 S12 有状态服务）已交付**，`docs/roadmap.md` Gate S12 最后一项勾选，表中 P4 行已改为「✅ 已交付」。至此 `[ ]` 仅剩 P2 九项（需产品决策定位）。
 
 | 项 | 判定 | 证据（file:line / 产物） |
 |---|---|---|
@@ -161,6 +165,6 @@
 | P2-P1 畸形包三类断言 | **部分误报** | MQTT 已覆盖 `mqtt_conn_SUITE:1844/1956/2344`、`mqtt_frame_SUITE:427/447`；缺 conformance 三类对账套件（已就地改） |
 | P2-P1 外部 conformance | 真缺口 | `test/conformance/` 不存在，仅设计稿 |
 | P2-P2 规则引擎/Web/SBOM/SLSA/VEX/K8s/FIPS/Edge | 真缺口 | 全仓均无（CI 无 sbom/slsa/vex/fips，无 Chart.yaml/k8s，无 offline buffer） |
-| P4 ADR-007 三档压测 | **部分误报** | 丢失边界已落盘 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md`；缺容量 + S12 绑定（已就地改） |
+| P4 ADR-007 三档压测 | ✅ 已交付（2026-11-25） | 丢失边界 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md` + 容量专项 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`（`tools/bench/s12_adr007_capacity.erl`，真实 3 peer：三档容量天花板 + ra 元数据层绑定 + 失多数派拒绝） |
 
 > 注：本报告只核对「是否已在代码/产物里实现」，不改变每条的立项必要性；多数 P2 项仍是「要不要做」的产品决策，而非「做没做」的遗漏。

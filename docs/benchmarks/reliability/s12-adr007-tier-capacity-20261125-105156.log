@@ -1,0 +1,22 @@
+
+=== S12 / ADR-007 three-tier capacity (3 peer, 1024 B msgs) ===
+
+-- serial latency (N=2000) --
+  os_buffer          ok=2000 failed=0 msg/s=0 p50=0ms p99=0ms max=3ms
+  fsync              ok=2000 failed=0 msg/s=0 p50=3ms p99=6ms max=9ms
+  replicated_commit  ok=2000 failed=0 msg/s=0 p50=7ms p99=11ms max=16ms
+
+-- saturated throughput (3000 ms, 8 concurrent) --
+  os_buffer          workers=8 messages=44214 ceiling=14738 msg/s
+  fsync              workers=8 messages=5641 ceiling=1880 msg/s
+  replicated_commit  workers=8 messages=2553 ceiling=851 msg/s
+
+-- ra metadata-layer commit (S12 stateful service, N=2000) --
+  ok=2000 failed=0 commits/s=449 p50=2ms p99=5ms max=16ms
+
+-- no-majority boundary (both followers down) --
+  os_buffer          ok=2000 failed=0 msg/s=0 p50=0ms p99=0ms max=5ms
+  fsync              ok=2000 failed=0 msg/s=0 p50=3ms p99=6ms max=10ms
+  replicated_commit  ok=0 failed=2000 msg/s=0 p50=nullms p99=nullms max=nullms
+
+=== DONE ===
