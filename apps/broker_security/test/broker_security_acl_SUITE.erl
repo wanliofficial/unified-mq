@@ -20,6 +20,12 @@ all() ->
      pattern_prefix_and_wildcard,
      cross_tenant_request_is_denied_before_any_rule,
      same_tenant_request_is_judged_by_acl,
+     deny_posture_refuses_named_principal_without_a_rule,
+     deny_posture_allows_named_principal_via_a_rule,
+     deny_posture_refuses_anonymous_without_a_rule,
+     deny_posture_allows_anonymous_via_a_wildcard_rule,
+     rule_list_judges_anonymous_by_rules_instead_of_bypassing,
+     deny_posture_is_explicitly_not_the_permissive_default,
      authorized_returns_boolean,
      peer_cannot_see_other_tenants_subscriptions,
      legacy_wildcard_subscription_is_visible_to_all].
@@ -118,6 +124,76 @@ same_tenant_request_is_judged_by_acl(_Config) ->
     allow = broker_security:authorize(<<"alice">>,
                                       #{action => publish, tenant_id => <<"t1">>,
                                         destination => <<"t1/a">>}),
+    ok.
+
+%% deny_by_default ACL posture: the atom `deny' carries no allow rules, so
+%% nothing is allowed -- named principals and anonymous callers alike.
+deny_posture_refuses_named_principal_without_a_rule(_Config) ->
+    application:set_env(broker_security, acl, deny),
+    deny = broker_security:authorize(<<"alice">>,
+                                     #{action => publish, tenant_id => <<"t1">>,
+                                       destination => <<"t1/a">>}),
+    %% A `connect' request is refused too: no rule can allow it.
+    deny = broker_security:authorize(<<"alice">>, {connect, <<"c1">>}),
+    ok.
+
+%% A rule list lets a scoped allow through while keeping the fail-closed default:
+%% no-match is still deny, only the named rule is honoured.
+deny_posture_allows_named_principal_via_a_rule(_Config) ->
+    application:set_env(broker_security, acl,
+                        [rule(allow, <<"alice">>, publish, <<"t1/#">>)]),
+    allow = broker_security:authorize(<<"alice">>,
+                                      #{action => publish, tenant_id => <<"t1">>,
+                                        destination => <<"t1/a">>}),
+    %% bob has no rule, so the fail-closed default refuses him.
+    deny = broker_security:authorize(<<"bob">>,
+                                     #{action => publish, tenant_id => <<"t2">>,
+                                       destination => <<"t2/a">>}),
+    ok.
+
+%% Anonymous under the `deny' atom: refused. The old code could never reach this,
+%% because `authorize_principal(undefined, ...)' was an unconditional `allow'.
+deny_posture_refuses_anonymous_without_a_rule(_Config) ->
+    application:set_env(broker_security, acl, deny),
+    deny = broker_security:authorize(undefined,
+                                     #{action => publish, tenant_id => <<"t1">>,
+                                       destination => <<"t1/a">>}),
+    deny = broker_security:authorize(undefined, {connect, <<"anon">>}),
+    ok.
+
+%% Under a rule list an anonymous caller can be re-allowed on purpose with a
+%% `<<"*">>' principal rule -- the fail-closed default never grants it for free.
+deny_posture_allows_anonymous_via_a_wildcard_rule(_Config) ->
+    application:set_env(broker_security, acl,
+                        [rule(allow, <<"*">>, publish, <<"public/#">>)]),
+    allow = broker_security:authorize(undefined,
+                                      #{action => publish, tenant_id => <<"t1">>,
+                                        destination => <<"public/x">>}),
+    %% Outside the rule's pattern the anonymous caller falls through to deny.
+    deny = broker_security:authorize(undefined,
+                                     #{action => publish, tenant_id => <<"t1">>,
+                                       destination => <<"private/x">>}),
+    ok.
+
+%% The core behavioural change: a rule list no longer lets an anonymous caller
+%% bypass the rules. Before this, `authorize(undefined, ...)' was `allow' even
+%% when rules existed, contradicting the "no match means deny" contract.
+rule_list_judges_anonymous_by_rules_instead_of_bypassing(_Config) ->
+    application:set_env(broker_security, acl,
+                        [rule(allow, <<"alice">>, publish, <<"t1/#">>)]),
+    %% The rule names only alice; an anonymous publish is not a match -> deny.
+    deny = broker_security:authorize(undefined,
+                                     #{action => publish, tenant_id => <<"t1">>,
+                                       destination => <<"t1/a">>}),
+    ok.
+
+%% The permissive `allow' posture is the only one that lets anonymous through
+%% unconditionally; `deny' is explicitly not it.
+deny_posture_is_explicitly_not_the_permissive_default(_Config) ->
+    application:set_env(broker_security, acl, allow),
+    allow = broker_security:authorize(undefined, {connect, <<"anon">>}),
+    application:set_env(broker_security, acl, deny),
+    deny = broker_security:authorize(undefined, {connect, <<"anon">>}),
     ok.
 
 authorized_returns_boolean(_Config) ->

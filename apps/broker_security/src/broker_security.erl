@@ -8,9 +8,10 @@
 %%     `#{effect := allow | deny, principal => P, action => A,
 %%        pattern => Pattern}' maps. `<<"*">>' is the wildcard for principal
 %%     and action; `Pattern' is an exact destination, a trailing `/` prefix, or
-%%     a `*'/`#' suffix wildcard. First match wins. No match means `deny' when
-%%     rules are configured and `allow' when `acl' is the atom `allow' (the S1
-%%     default).
+%%     a `*'/`#' suffix wildcard. First match wins. No match means `deny' when rules
+%%     are configured; under a rule list or the `deny' posture an anonymous
+%%     principal is judged by the rules too, so without a matching allow rule it is
+%%     refused (unlike the permissive `allow' posture, which lets it through).
 %%   * **Tenant isolation**: a principal authenticated with tenant `T' may only
 %%     act inside `T'. A request that names a different tenant is denied even
 %%     when a rule would otherwise allow it -- an ACL rule can widen topics,
@@ -18,8 +19,8 @@
 %%
 %% The pure-function shape stays: the config is read per call, no process, no
 %% boot-time validation. A malformed rule is skipped (never crashes the
-%% publisher); an ACL typo therefore fails closed only when rules exist, which
-%% is the safe direction.
+%% publisher); an ACL typo therefore fails closed whenever a rule list or the
+%% `deny' posture is configured, which is the safe direction.
 -module(broker_security).
 
 -export([authenticate/2, authorize/2, tenant_id/1, mqttsn_psk_for_identity/1,
@@ -92,9 +93,23 @@ tenant_id(Principal) ->
     maps:get(tenant_id, user_record(Principal), <<"default">>).
 
 %% @doc The ACL configuration verbatim (tests and the admin API read it).
--spec acl_rules() -> allow | [map()] | term().
+-spec acl_rules() -> allow | deny | [map()] | term().
 acl_rules() ->
     application:get_env(broker_security, acl, allow).
+
+%% @doc Whether the configured posture lets an anonymous principal through by
+%% default. Only the permissive `allow' atom (and any legacy non-list value) do;
+%% a rule list or the explicit `deny' atom judge an anonymous caller by the rules
+%% like any other principal, so without a matching allow rule it is refused.
+-spec permissive_posture(term()) -> boolean().
+permissive_posture(allow) ->
+    true;
+permissive_posture(Rules) when is_list(Rules) ->
+    false;
+permissive_posture(deny) ->
+    false;
+permissive_posture(_Other) ->
+    true.
 
 %%%_* Revocation facade -----------------------------------------------------
 
@@ -313,7 +328,14 @@ redacted_config() ->
 %% authenticated principal cannot name another tenant, because that is the
 %% privilege boundary, not a policy preference.
 authorize_principal(undefined, _Action, _Tenant, _Destination) ->
-    allow;
+    %% Anonymous principal. Under the permissive default (`allow' posture, or any
+    %% legacy non-list value) an anonymous caller is allowed by default. Under a
+    %% rule list or the explicit `deny' posture it is judged by the rules like any
+    %% other principal, so an unmatched anonymous request is refused.
+    case permissive_posture(acl_rules()) of
+        true -> allow;
+        false -> acl_decision(undefined, _Action, _Destination)
+    end;
 authorize_principal(Principal, Action, Tenant, Destination) ->
     OwnTenant = tenant_id(Principal),
     case tenant_ok(Tenant, OwnTenant) of
@@ -330,6 +352,11 @@ acl_decision(Principal, Action, Destination) ->
     case acl_rules() of
         allow ->
             allow;
+        deny ->
+            %% Fail-closed: the bare `deny' posture carries no allow rules, so every
+            %% request -- named principal or anonymous -- is refused. Operators who
+            %% want selective allows configure a rule list (no-match is then deny).
+            deny;
         Rules when is_list(Rules) ->
             case first_match(Rules, Principal, Action, Destination) of
                 {ok, Effect} -> Effect;
