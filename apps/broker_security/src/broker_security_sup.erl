@@ -7,10 +7,17 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Child = #{id => broker_revocation,
-              start => {broker_revocation, start_link, []},
+    Audit = #{id => broker_audit,
+              start => {broker_audit, start_link, []},
               restart => permanent,
               shutdown => 5000,
               type => worker,
-              modules => [broker_revocation]},
-    {ok, {#{strategy => one_for_all, intensity => 1, period => 5}, [Child]}}.
+              modules => [broker_audit]},
+    Revocation = #{id => broker_revocation,
+                   start => {broker_revocation, start_link, []},
+                   restart => permanent,
+                   shutdown => 5000,
+                   type => worker,
+                   modules => [broker_revocation]},
+    {ok, {#{strategy => one_for_all, intensity => 1, period => 5},
+          [Audit, Revocation]}}.

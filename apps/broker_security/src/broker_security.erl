@@ -62,23 +62,47 @@
 -spec authenticate(binary(), binary()) -> {ok, principal()} | {error, term()}.
 authenticate(Username, Password) when is_binary(Username), is_binary(Password) ->
     case user_record(Username) of
-        #{password := Password} -> {ok, Username};
-        _ -> {error, bad_username_or_password}
+        #{password := Password} ->
+            broker_audit:emit(#{type => 'auth.success', principal => Username,
+                                tenant => tenant_id(Username), result => ok}),
+            {ok, Username};
+        _ ->
+            broker_audit:emit(#{type => 'auth.failure', principal => Username,
+                                result => error,
+                                reason => bad_username_or_password}),
+            {error, bad_username_or_password}
     end;
 authenticate(_Username, _Password) ->
+    broker_audit:emit(#{type => 'auth.failure', result => error,
+                        reason => bad_username_or_password}),
     {error, bad_username_or_password}.
 
 %% @doc `allow' when the principal may perform the request, `deny' otherwise.
 %% Total: a malformed request is a denial, never a crash.
 -spec authorize(principal() | undefined, request() | term()) -> allow | deny.
 authorize(Principal, {connect, _ClientId}) ->
-    authorize_principal(Principal, connect, undefined, undefined);
+    decide(Principal, connect, undefined, undefined);
 authorize(Principal, #{action := Action} = Req) ->
     Tenant = maps:get(tenant_id, Req, undefined),
     Destination = maps:get(destination, Req, undefined),
-    authorize_principal(Principal, Action, Tenant, Destination);
+    decide(Principal, Action, Tenant, Destination);
 authorize(Principal, _Other) ->
-    authorize_principal(Principal, undefined, undefined, undefined).
+    decide(Principal, undefined, undefined, undefined).
+
+%% Run the ACL decision and, on a denial, record a security event. Only denials
+%% are audited: allowed traffic is the normal, high-cardinality case and would
+%% swamp the trail; a denied publish/subscribe/admin is the security signal.
+decide(Principal, Action, Tenant, Destination) ->
+    case authorize_principal(Principal, Action, Tenant, Destination) of
+        allow ->
+            allow;
+        deny ->
+            broker_audit:emit(#{type => 'authz.deny', principal => Principal,
+                                tenant => Tenant, action => Action,
+                                destination => Destination, result => deny,
+                                reason => acl}),
+            deny
+    end.
 
 %% @doc Same decision with a boolean answer, for call sites that prefer it.
 -spec authorized(principal() | undefined, request()) -> boolean().
@@ -103,12 +127,19 @@ acl_rules() ->
 %% 表示永久。转发 `broker_revocation'，保持安全语汇集中在本模块。
 -spec revoke(principal(), non_neg_integer() | undefined) -> ok.
 revoke(Principal, TTL) ->
-    broker_revocation:revoke(Principal, TTL).
+    ok = broker_revocation:revoke(Principal, TTL),
+    broker_audit:emit(#{type => 'revoke.set', principal => Principal,
+                        action => revoke, result => ok,
+                        detail => #{ttl => TTL}}),
+    ok.
 
 %% @doc 解除 `Principal' 的吊销。转发 `broker_revocation'。
 -spec clear_revocation(principal()) -> ok.
 clear_revocation(Principal) ->
-    broker_revocation:clear(Principal).
+    ok = broker_revocation:clear(Principal),
+    broker_audit:emit(#{type => 'revoke.clear', principal => Principal,
+                        action => clear_revocation, result => ok}),
+    ok.
 
 %% @doc `Principal' 当前是否被吊销。转发 `broker_revocation'。
 -spec revoked(principal()) -> boolean().
@@ -137,15 +168,32 @@ revoked(Principal) ->
 authenticate_conn({user_pass, Name, Secret})
   when is_binary(Name), is_binary(Secret) ->
     case user_record(Name) of
-        #{password := Secret} -> {ok, identity(Name)};
-        _ -> {error, bad_username_or_password}
+        #{password := Secret} ->
+            broker_audit:emit(#{type => 'auth.success', principal => Name,
+                                result => ok, detail => #{method => user_pass}}),
+            {ok, identity(Name)};
+        _ ->
+            broker_audit:emit(#{type => 'auth.failure', principal => Name,
+                                result => error, reason => bad_username_or_password,
+                                detail => #{method => user_pass}}),
+            {error, bad_username_or_password}
     end;
 authenticate_conn({token, Secret}) when is_binary(Secret) ->
     case user_by_token(Secret) of
-        {ok, Name} -> {ok, identity(Name)};
-        error -> {error, bad_username_or_password}
+        {ok, Name} ->
+            broker_audit:emit(#{type => 'auth.success', principal => Name,
+                                result => ok, detail => #{method => token}}),
+            {ok, identity(Name)};
+        error ->
+            broker_audit:emit(#{type => 'auth.failure', result => error,
+                                reason => bad_username_or_password,
+                                detail => #{method => token}}),
+            {error, bad_username_or_password}
     end;
 authenticate_conn(_Other) ->
+    broker_audit:emit(#{type => 'auth.failure', result => error,
+                        reason => bad_username_or_password,
+                        detail => #{method => unknown}}),
     {error, bad_username_or_password}.
 
 %% @doc Long-term credential key for TURN (RFC 8489 §9.2.2, RFC 5766 §4):

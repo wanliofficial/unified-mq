@@ -22,6 +22,13 @@ start(_Type, _Args) ->
             %% gen_server 自身只跑 TTL 扫描与死 pid 回收，作为 sup child 与
             %% 应用同生命周期启停。
             ok = broker_revocation:init(),
+            %% Tamper-evident audit (S13): the ring buffer is created here too,
+            %% before the supervisor, so an authentication event during boot has
+            %% a buffer to land in. The writer gen_server is a supervisor child
+            %% (`broker_security_sup'), started with the rest of the app; it only
+            %% drains the buffer, so it being briefly absent costs dropped events,
+            %% never blocked logins.
+            ok = broker_audit:init(),
             broker_security_sup:start_link();
         {error, Reason} ->
             {error, Reason}

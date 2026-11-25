@@ -3,6 +3,6 @@
     {vsn, "0.1.0"},
     {registered, [broker_security_sup, broker_revocation]},
     {mod, {broker_security_app, []}},
-    {applications, [kernel, stdlib, sasl, ssl, broker_core]},
+    {applications, [kernel, stdlib, sasl, ssl, crypto, broker_core]},
     {env, []}
 ]}.

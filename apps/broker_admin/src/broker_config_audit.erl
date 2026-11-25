@@ -51,6 +51,13 @@ log() ->
         logger:notice("broker_config_audit hash=~s snapshot=~0p", [H, Snapshot]),
         _ = write(#{hash => H, snapshot => Snapshot,
                     at => erlang:system_time(second)}),
+        %% Join the same tamper-evident chain the security events use, so the
+        %% boot-time config snapshot is itself hash-linked and signed. A failure
+        %% here must never take boot down (it is inside the surrounding try),
+        %% and `broker_audit:emit/1' is itself total.
+        broker_audit:emit(#{type => 'config.boot', action => 'config.snapshot',
+                            result => ok,
+                            detail => #{hash => H, snapshot => Snapshot}}),
         ok
     catch
         Class:Reason:Stack ->

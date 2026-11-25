@@ -77,24 +77,47 @@ route(post, <<"/api/v1/undrain">>, _H, _B) ->
     %% `undrain/0' only fails for an unsupported message, so it has no error
     %% branch: the drain process always answers `{ok, up}'.
     {ok, State} = broker_drain:undrain(),
+    audit_admin('drain.undrain', #{state => State}),
     json(200, node_view(State));
 route(get, <<"/api/v1/config">>, _H, _B) ->
     json(200, #{hash => broker_config_audit:hash(),
                 config => broker_config_audit:snapshot()});
+route(get, <<"/api/v1/audit/pubkey">>, _H, _B) ->
+    %% The auditor's Ed25519 public key (base64). An offline verifier needs
+    %% only this -- never the private key -- to check every signature in the
+    %% trail. `null' means auditing has no key (module not started).
+    json(200, #{pubkey => broker_audit:pubkey()});
+route(get, <<"/api/v1/audit/verify">>, _H, _B) ->
+    %% Walk the whole chain: check every prev-link, every hash and every
+    %% signature. 200 with `ok => true' when intact; 409 with `ok => false' and
+    %% the first `tampered_at' seq + `reason' when anything is off.
+    case broker_audit:verify() of
+        #{ok := true} = Ok -> json(200, Ok);
+        #{ok := false} = Bad -> json(409, Bad)
+    end;
 route(get, <<"/api/v1/version">>, _H, _B) ->
     json(200, broker_version:info());
 route(get, <<"/api/v1/backups">>, _H, _B) ->
     json(200, #{backups => broker_backup:list()});
 route(post, <<"/api/v1/backup">>, _H, _B) ->
     case broker_backup:create() of
-        {ok, Name} -> json(201, #{backup => to_bin(Name)});
-        {error, Reason} -> json(500, #{error => to_bin(io_lib:format("~p", [Reason]))})
+        {ok, Name} ->
+            audit_admin('backup.create', #{name => to_bin(Name)}),
+            json(201, #{backup => to_bin(Name)});
+        {error, Reason} ->
+            audit_admin('backup.create', #{result => error,
+                                               reason => to_bin(io_lib:format("~p", [Reason]))}),
+            json(500, #{error => to_bin(io_lib:format("~p", [Reason]))})
     end;
 route(post, <<"/api/v1/tls/reload">>, _H, _B) ->
     try broker_security_tls:reload() of
-        ok -> json(200, #{reloaded => true})
+        ok ->
+            audit_admin('tls.reload', #{result => ok}),
+            json(200, #{reloaded => true})
     catch
         Class:Reason ->
+            audit_admin('tls.reload', #{result => error,
+                                            reason => to_bin(io_lib:format("~p:~p", [Class, Reason]))}),
             json(500, #{error => to_bin(io_lib:format("~p:~p", [Class, Reason]))})
     end;
 route(post, <<"/api/v1/cluster/members">>, _H, Body) ->
@@ -123,6 +146,10 @@ route(_Method, <<"/metrics">>, _H, _B) ->
 route(_Method, <<"/api/v1/cluster/members">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, <<"/api/v1/revoke">>, _H, _B) ->
+    json(405, #{error => method_not_allowed});
+route(_Method, <<"/api/v1/audit/pubkey">>, _H, _B) ->
+    json(405, #{error => method_not_allowed});
+route(_Method, <<"/api/v1/audit/verify">>, _H, _B) ->
     json(405, #{error => method_not_allowed});
 route(_Method, _Path, _H, _B) ->
     json(404, #{error => not_found}).
@@ -211,11 +238,17 @@ node_atom(_) ->
 apply_membership(Action, Node) ->
     case started(broker_cluster) of
         false ->
+            audit_admin(cluster_action_type(Action),
+                        #{node => to_bin(io_lib:format("~p", [Node])),
+                          result => error, reason => cluster_not_running}),
             json(503, #{error => cluster_not_running,
                         action => Action, node => Node});
         true ->
             call_cluster(Action, Node)
     end.
+
+cluster_action_type(join) -> <<"cluster.join">>;
+cluster_action_type(leave) -> <<"cluster.leave">>.
 
 %% `broker_cluster' is started but the metadata group may still refuse the
 %% change (no quorum, already a member, ...). Map its replies onto HTTP: a
@@ -229,14 +262,26 @@ call_cluster(leave, Node) ->
 reply_cluster(Action, Result) ->
     case Result of
         ok ->
+            audit_admin(cluster_action_type(Action),
+                        #{node_action => Action, result => ok}),
             json(200, #{status => ok, action => Action});
         {ok, already_member} ->
+            audit_admin(cluster_action_type(Action),
+                        #{node_action => Action, result => already_member}),
             json(200, #{status => already_member, action => Action});
         {ok, not_member} ->
+            audit_admin(cluster_action_type(Action),
+                        #{node_action => Action, result => not_member}),
             json(200, #{status => not_member, action => Action});
         {error, no_quorum} ->
+            audit_admin(cluster_action_type(Action),
+                        #{node_action => Action, result => error,
+                          reason => no_quorum}),
             json(503, #{error => no_quorum, action => Action});
         {error, Reason} ->
+            audit_admin(cluster_action_type(Action),
+                        #{node_action => Action, result => error,
+                          reason => to_bin(io_lib:format("~p", [Reason]))}),
             json(503, #{error => cluster_membership_failed,
                         reason => to_bin(io_lib:format("~p", [Reason])),
                         action => Action})
@@ -354,6 +399,29 @@ bound(B) when is_integer(B) -> integer_to_binary(B).
 
 name(Key) ->
     atom_to_binary(Key, utf8).
+
+%%%_* Audit -----------------------------------------------------------------
+
+%% Record a control-plane action in the tamper-evident security-event trail.
+%% Total and cheap: `broker_audit:emit/1' never blocks and is a no-op when
+%% auditing is off, so it cannot break an admin response. The principal is the
+%% admin caller when a token is configured, `<<"admin">>' otherwise -- enough to
+%% attribute the change without threading the credential into the trail.
+%%
+%% `Detail' may carry a `result' (ok | error | ...) and a `reason'. We hoist the
+%% result to the record's top-level `result' field so a failed action is not
+%% recorded as `ok'; the whole Detail still lands under `detail' for the context.
+audit_admin(Type, Detail) ->
+    Result = maps:get(result, Detail, ok),
+    broker_audit:emit(#{type => 'admin.action', action => Type,
+                        principal => admin_principal(),
+                        tenant => admin, result => Result, detail => Detail}).
+
+admin_principal() ->
+    case configured_token() of
+        <<>> -> <<"admin">>;
+        _ -> <<"admin-token">>
+    end.
 
 %%%_* Auth ----------------------------------------------------------------
 
@@ -494,8 +562,13 @@ drain(Body) ->
         {ok, Timeout} ->
             case apply_drain(Timeout) of
                 {ok, State, Suspended} ->
+                    audit_admin('drain.begin',
+                                #{timeout => Timeout,
+                                  suspended_listeners => Suspended}),
                     json(200, (node_view(State))#{suspended_listeners => Suspended});
                 {error, down} ->
+                    audit_admin('drain.begin', #{result => error,
+                                                     reason => already_down}),
                     json(409, #{error => already_down, node => node_view()})
             end;
         {error, Error} ->

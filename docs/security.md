@@ -21,7 +21,7 @@
 | 管理面 | 未授权创建备份、重载证书 | 默认只绑回环；非空 token 时除健康检查外全部要求 Bearer |
 | 传输 | 明文窃听 | 可选 TLS（所有协议 listener 同一个开关），支持 PEM 轮换 |
 
-不在本版本承诺之内：跨节点传输加密、细粒度到消息级别的授权、密钥管理系统（KMS）集成、审计日志的签名/防篡改。见 §8。
+不在本版本承诺之内：跨节点传输加密、细粒度到消息级别的授权、密钥管理系统（KMS）集成。安全事件审计的**哈希链 + Ed25519 签名已实现**（见 §11.2），但**外部 KMS 托管/轮换**仍不在本版本承诺之内。见 §8。
 
 ---
 
@@ -235,13 +235,42 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 
 ---
 
-## 11. 配置审计
+## 11. 配置审计与防篡改安全事件审计
 
-`broker_config_audit` 在 boot 时写一份**脱敏**的有效配置快照 + 规范化 SHA-256：
+### 11.1 配置审计（`broker_config_audit`）
+
+在 boot 时写一份**脱敏**的有效配置快照 + 规范化 SHA-256：
 
 - 每个模块自己暴露 `redacted_config/0`，审计模块不接触明文密码。
 - 快照经 `/api/v1/config` 暴露；`<data_dir>/config-audit.log` 追加一行 JSON。
 - 审计失败只记日志、**不阻塞启动**（审计是证据，不是门禁）。
+- boot 时同时向**防篡改审计链**（§11.2）写一条 `config.boot` 事件，使配置快照本身也受链保护。
+
+### 11.2 防篡改安全事件审计（`broker_audit`，S13）
+
+`config-audit.log` 的每行 SHA-256 **不与上一行链接**：改/删/重排一行都无从发现。`broker_audit` 为**安全事件**补上哈希链 + Ed25519 签名（`<data_dir>/audit.log`）：
+
+- **记录**（每行 JSON）：`seq`、`at`、`type`、`principal`、`tenant`、`action`、`destination`、`result`、`reason`、`prev`、`hash`、`sig`。首行 `prev = "genesis"`。
+- **链**：`hash = sha256(规范化(除 hash/sig 外所有字段))`，其中含 `prev` → 改动任一行，其后所有 `prev` 全断；删行/重排/中间插入均可被 `verify` 定位到首个异常 `seq`。
+- **签名**：`sig = Ed25519(节点审计私钥, hash)`。能改写文件但**没有私钥**者无法重算合法链。
+- **事件类型（首版 5 类）**：`auth.success` / `auth.failure`（`authenticate/2`、`authenticate_conn/1`）、`authz.deny`（`authorize/2` 的拒绝分支，**只记 deny 不记 allow**，避免正常流量爆炸式基数）、`revoke.set` / `revoke.clear`、`admin.action`（drain/undrain/backup/tls-reload/cluster/revoke 等控制面变更）、`config.boot`。
+
+**旁路化——审计绝不上热路径**（与 `broker_metrics`/`broker_admission` 同思路）：
+
+```
+安全事件发生点 ──emit/1──▶ ETS 环形缓冲(调用方本地、O(1)) ──▶ audit_writer(gen_server, 异步)
+```
+
+- `emit/1` 只往**有界** ETS 环形缓冲（上限 10000）无锁 append，**永不阻塞、永不失败**（非 map 入参、缓冲区不存在、缓冲满都返回 `ok`）。
+- 缓冲满则**丢弃并计数**（`dropped/0`），不反压热路径——撞库/爆破的事件风暴不得拖垮 Broker。
+- 审计失败**不影响启动与业务**：writer 挂了/磁盘满，最多丢事件并计数。
+- `flush/0` 提供同步落盘句柄（优雅关闭、运维、测试用）。
+
+**密钥**：32 字节 Ed25519 seed 的 base64，来自 `broker_audit.private_key`（env）或 `broker_audit.private_key_file`。**未配置时** boot 生成临时密钥并 `warning`（链与签名仍自洽，但**不跨重启**，明确边界）；生产能力应固定密钥。公钥经 `GET /api/v1/audit/pubkey` 暴露，离线校验方**只需公钥**、无需私钥。
+
+**校验**：`broker_audit:verify/0,1,2` 逐行验 `prev` 链 + `hash` + `sig`，返回 `#{ok => true, entries => N, legacy => L}` 或 `#{ok => false, tampered_at => Seq, reason => chain_break | hash_mismatch | bad_signature}`。`GET /api/v1/audit/verify` 走同一实现（完好 200，篡改 409）。**legacy 容忍**：无 `seq/hash/sig` 的旧行计入 `legacy`、不判失败。
+
+**边界照实说**：私钥托管/轮换/HSM（外部 KMS）仍**未实现**（见 §12.3）；首版密钥来自配置/文件。审计**只记安全事件**，每条成功消息的 publish/subscribe 属流量审计，不入链。**尾截断**（删掉文件末尾 N 行）无法只靠哈希链发现——删尾留下的是仍自洽的更短链，堵住它需要外部锚（把尾部哈希另存、送 append-only 汇或可信时间戳），同样归入未实现项；`verify` 返回的 `entries` 可让监控对异常下降告警，是当前诚实的缓解。
 
 ---
 
@@ -253,7 +282,7 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 
 1. ~~跨节点/复制通道的 TLS。~~ **已实现（2026-11-20，ADR-035）**：`broker_cluster.dist_tls` + OTP `-proto_dist inet_tls` + mTLS，默认关闭。**边界照实说**：CA 信任是双向准入闸门；**拨出方向按 SAN 绑定对端身份（证书 SAN 必须写对），拨入方向不校验客户端 SAN**；开关是全组重启，不能灰度混跑；证书轮换需重启。见 `docs/operations.md` §5.5。
 2. Schema Registry 内容校验。
-3. 审计日志签名与防篡改、外部 KMS。
+3. 审计日志的**外部 KMS 托管与轮换**。~~审计日志的哈希链 + Ed25519 签名与防篡改~~ **已实现（2026-11-25，S13，`broker_audit`）**：安全事件走哈希链 + 非对称签名（见 §11.2），`verify` 可定位到首个被篡改的 `seq`，公钥经 `/api/v1/audit/pubkey` 暴露供离线校验。**边界照实说**：首版私钥来自配置/文件（未配置则 boot 生成临时密钥、不跨重启），**私钥托管/轮换/HSM 仍属本条未实现项**。
 4. 每条规则可配置的「未知扩展属性拒绝」策略。
 5. `broker_event:duplicate/1` / `quarantine/2` 仅接在 MQTT 发布路径，其余五协议与 S8-C 的 MQTT-SN 都未接（见 `docs/cloudevents-mapping.md` 的「接线范围」注）。
 6. 可观测性导出层（OTel 等；`broker_metrics:snapshot/0` 之上）。

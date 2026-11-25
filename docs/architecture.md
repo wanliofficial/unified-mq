@@ -26,7 +26,7 @@
 | 分区创建是带外动作，boot 只 recover | ADR-011 §11.2 | `create_partition/1` 是唯一 `create` 调用者；boot 缺分区即整体启动失败 |
 | 协议适配层之间互不引用 | ADR-001 | 各 `broker_proto_*` 只依赖内核门面，彼此没有依赖边。**ADR-001 的原文是「不得依赖其他 Adapter 的**内部**代码」**，S8-B/S8-D 依赖的是 `broker_proto_mqtt` 的**公开面**（`mqtt_conn_fsm` 与 `mqtt_transport` 行为——它们跑的就是那一份引擎），方向单向、无反向边，没有第二份 MQTT 实现 |
 
-**S7 及之后明确未实现**（免得把"还没做"误读成"没画出来"）：S7 的全部验收项已于 2026-11-10 结案——六协议统一身份表见 `docs/security.md` §2.1，各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1（结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」，逐协议差异已列明）。S7 之后明确未实现的是：跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志签名与外部 KMS、每条规则可配置的「未知扩展属性拒绝」、去重/隔离钩子推广到其余协议（五协议 + S8-C 的 MQTT-SN）、OTel 等可观测性导出层，以及 `require_auth` 接进 MQTT CONNECT、`broker_meta` 用户表与数据面认证接线、`topic_meta`/`queue_meta`/`binding_meta` 的运行时读取方。README §10.2 的 trace context **传播本身已实现**（2026-11-09，`broker_event_trace`，见 `docs/security.md` §5.1），未实现的是把指标导出到外部系统。清单与 `docs/security.md` §12、`progress.md` 一致。
+**S7 及之后明确未实现**（免得把"还没做"误读成"没画出来"）：S7 的全部验收项已于 2026-11-10 结案——六协议统一身份表见 `docs/security.md` §2.1，各协议标准 CloudEvents Binding 的结论见 `docs/roadmap.md` §9.1（结论是「统一 `ce-*` 是本 Broker 的项目定义，逐字实现不立项」，逐协议差异已列明）。S7 之后明确未实现的是：跨节点/复制通道 TLS、Schema Registry 内容校验、审计日志的**外部 KMS 托管与轮换**（哈希链 + Ed25519 签名已于 2026-11-25 实现，见 `docs/security.md` §11.2）、每条规则可配置的「未知扩展属性拒绝」、去重/隔离钩子推广到其余协议（五协议 + S8-C 的 MQTT-SN）、OTel 等可观测性导出层，以及 `require_auth` 接进 MQTT CONNECT、`broker_meta` 用户表与数据面认证接线、`topic_meta`/`queue_meta`/`binding_meta` 的运行时读取方。README §10.2 的 trace context **传播本身已实现**（2026-11-09，`broker_event_trace`，见 `docs/security.md` §5.1），未实现的是把指标导出到外部系统。清单与 `docs/security.md` §12、`progress.md` 一致。
 
 ---
 
@@ -909,7 +909,7 @@ broker_subscription_worker ──┘                              ├→ broker_
 | 官方 CloudEvents Binding 逐字实现（差异已逐条列明） | S7 之后（结论已出，不立项） | 需按协议分流：MQTT 5 去前缀、Kafka 换 `ce_`、NATS 补 percent-encoding、WS 加 `cloudevents.json` 子协议、AMQP 迁 1.0 | 统一 `ce-*` 头通道继续作为默认；非无损点见 `docs/protocol-compatibility.md` §4.10 |
 | 跨节点/复制通道 TLS | S7 之后 | `broker_cluster` 的 ra 复制链路 | Metadata Raft 语义与 Fencing 不变 |
 | Schema Registry 内容校验 | S7 之后 | `broker_event` 校验链新增校验器 | 五档策略与冻结的指标键不变 |
-| 审计日志签名与外部 KMS | S7 之后 | `broker_config_audit`、`broker_security` 的密钥来源 | 现有脱敏快照与 ACL 判定不变 |
+| 审计日志外部 KMS 托管与轮换 | S7 之后 | `broker_audit` 的密钥来源 | 哈希链/签名/`verify` 契约与脱敏快照不变；审计的哈希链 + Ed25519 签名已实现（2026-11-25，见 `docs/security.md` §11.2），本条仅剩外部 KMS 托管/轮换 |
 | 每条规则可配置的「未知扩展属性拒绝」 | S7 之后 | `broker_event` 策略链 | 五档策略与冻结的指标键不变 |
 | 去重/隔离钩子推广到其余协议 | S7 之后 | WS/NATS/AMQP/Kafka/Pulsar 发布路径与 `mqtt_sn_conn` 补 `broker_event:duplicate/1` / `quarantine/2` | 五档策略与 MQTT 现有行为不变；见 `docs/cloudevents-mapping.md` |
 | OTel 等可观测性导出层 | S7 之后 | 在 `broker_metrics:snapshot/0` 之上加 OTel 等导出 | 计数点与冻结的键集合不变；`broker_event_trace` 的校验与门控已实现，不因导出层而改动 |

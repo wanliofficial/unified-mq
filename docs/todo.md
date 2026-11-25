@@ -91,7 +91,7 @@
 - [ ] **P0 级（正确性/合规红线）**
   - [x] durable session 复制的 **SIGKILL / 网络分区故障注入证明** —— **✅ 已交付（2026-11-25）**：管线已有（Plan 1，默认关闭），缺「节点丢失后 durable 消息与订阅集合不丢」的 harness。新增 `broker_session_replica_SUITE` 两个硬杀用例——`subscription_set_survives_sigkill`（订阅集 + 游标在 owner 被 OS `kill -9` 后由副本恢复、游标不回退）、`inflight_blob_survives_sigkill`（QoS2 in-flight blob 硬杀后原样恢复、无重复行）；均「先轮询副本表证明复制到达、再硬杀」，并经源码级变异（复制改 no-op → 4 例超时变红）验证非退化。网络分区 / 失多数派 / 无双 owner 分裂脑由 `broker_cluster_dist_SUITE:online_join_is_rejected_without_a_majority` + `broker_rebalance_dist_SUITE`（`no_quorum`）+ 本套件 `stale_owner_fenced` 覆盖。**边界**：模块级会话平面身份证明（非 MQTT 线级零重连——后者由 `broker_cluster_conn_fsm_takeover_dist_SUITE` 覆盖）；真网络分区因 Erlang `global` 自愈无法稳定构造，未引入脆弱用例。
   - **OIDC / JWKS 客户端认证**：现仅 user_pass / token（`broker_security` 统一身份表）。
-  - **防篡改审计日志（哈希链/签名）**：`docs/security.md` §8 明列未实现。
+  - [x] **防篡改安全事件审计（哈希链 + Ed25519 签名）** —— **✅ 已交付（2026-11-25，S13，`broker_audit`）**：`config-audit.log` 每行 SHA-256 **不与上一行链接**（改/删/重排一行无从发现），`broker_audit` 为安全事件补上哈希链 + 签名（`<data_dir>/audit.log`）。`hash = sha256(规范化(除 hash/sig 外所有字段))` 且含 `prev` → 改/删/重排/插入均可被 `verify` 定位到首个异常 `seq`；`sig = Ed25519(节点私钥, hash)`，无私钥者无法重算合法链。`emit/1` 旁路化：只写有界 ETS 环形缓冲（上限 10000），永不阻塞/永不失败，满则丢弃并计数，审计失败不影响启动与业务。首版 5 类事件（`auth.success`/`auth.failure`、`authz.deny` 只记 deny 不记 allow、`revoke.set`/`revoke.clear`、`admin.action`、`config.boot`）。密钥 32B Ed25519 seed 来自 `broker_audit.private_key`/`private_key_file`，未配置则 boot 生成临时密钥 + warning（不跨重启）。公钥经 `GET /api/v1/audit/pubkey` 暴露，`GET /api/v1/audit/verify` 完好 200/篡改 409，legacy 行计入 `legacy` 不判失败。证据：`broker_audit_SUITE` 11 例（链正确/改一字节/删行/重排/伪造内容/坏签名/legacy 容忍/缓冲满丢弃/emit 全函数含删表后/重启续链/admin 两路由），经源码级四向变异验证非退化。**边界照实说**：私钥托管/轮换/HSM（外部 KMS）仍未实现（`docs/security.md` §12.3、§11.2 末）。
 - [ ] **P1 级（生产可用性）**
   - [x] deny-by-default ACL 的默认姿态与推荐配置 —— **✅ 已交付（2026-11-25）**：`broker_security.acl` 新增显式 `deny` 姿态（fail-closed，无 allow 规则时**具名主体与匿名主体一律拒绝**），这是 deny-by-default 对未认证报文的唯一收口开关。`allow`（默认）与规则列表**保持零回归**：未认证报文（无主体，如明文 CoAP）不进入 ACL、默认放行（ADR-031 设计，`coap_dtls_SUITE:plain_udp_unaffected` 钉住）。证据：`broker_security_acl_SUITE` 由 10 例扩到 14 例（`deny_posture_refuses_named_principal_without_a_rule`、`deny_posture_refuses_anonymous_without_a_rule`、`deny_posture_is_explicitly_not_the_permissive_default`、`rule_list_selectively_allows_named_and_denies_unmatched`），经源码级双向变异验证非退化（`acl_decision` 的 `deny` 子句退回 `allow` → 具名拒绝例红；`authorize_principal(undefined,...)` 的 `deny` 分支退回 `allow` → 两匿名拒绝例红）。
   - [x] 客户端 listener 的 TLS 1.3 / mTLS **端到端证据** —— **✅ 已交付（2026-11-25）**：`mqtt_tls_SUITE` 从只跑 `verify_none` 扩到 7 例，新增三条真握手证据——`negotiates_tls1_3_by_default`（客户端 pin `['tlsv1.3']` 握手成功 + `ssl:connection_information/2` 读回 `{protocol,'tlsv1.3'}` 钉死，再跑 CONNACK 证明 1.3 信道承载 MQTT）、`mtls_with_client_cert_completes_the_handshake`（服务端 `verify_peer`+`cacertfile`+`fail_if_no_peer_cert`，客户端出示 CA 链下合法证书握手+CONNACK）、`mtls_rejects_client_without_cert`（同 posture 下无证书客户端无法承载 MQTT：TLS1.2 连接即 `{error,alert}`、TLS1.3 连接报 ok 后被服务端 fatal `certificate_required` 告警拆链，二者皆非 CONNACK 即非绕过）。经**源码级变异**验证非退化：默认 `versions` 砍到 1.2-only → `negotiates_tls1_3` 红；`listener_opts` 强制 `verify_none` → 两 mTLS 例红；`listener_opts` 丢弃 `cacertfile` → 带证书例红。边界：本专项针对**客户端 listener（TCP/TLS）**；**distribution 的 mTLS 已由 ADR-035 交付**，QUIC 强制 TLS1.3（S8-D）、CoAP 仅 DTLS-PSK 无证书（S11-C）各自独立，不混。
@@ -133,7 +133,7 @@
 
 1. ~~**P0-1 ~ P0-7**（纯文档，一次性提交；消除"已实现却记为缺口"的误报）~~ —— **已完成 2026-11-24**
 2. ~~**MQ-11 → MQ-15**（唯一在推进的功能缺口；两者都涉及 `assigned` 窗口与 ra 串行化，MQ-11 先做可为 MQ-15 铺垫）~~ —— **均已交付：MQ-11 `b95a32a`（11-24）、MQ-15 `53946f5`（11-25）。P1 活跃功能缺口清空。**
-3. **P2 的 P0 三项**（是否立项需产品确认目标定位）—— **SIGKILL harness 已交付（2026-11-25）；OIDC/JWKS 与防篡改审计仍需产品决策**
+3. **P2 的 P0 三项**（是否立项需产品确认目标定位）—— **SIGKILL harness 已交付（2026-11-25）；防篡改审计已交付（2026-11-25，见 P0 级清单）；OIDC/JWKS 仍需产品决策**
 4. ~~**P4** 与容量报告合并做~~ —— **已交付 2026-11-25**：Gate S12 最后一项已勾选，三档容量专项 + ra 元数据层绑定报告落盘 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`
 5. ~~**MQ-09 产品化取舍**（纯文档，与 P0-1 合并即可，无排期压力）~~ —— **已落笔 2026-11-24**
 
@@ -150,7 +150,9 @@
 >
 > **2026-11-25 再更新**：上句「其余……P4 为真缺口」也已过期——**P4（ADR-007 三档容量专项 + 绑定 S12 有状态服务）已交付**，`docs/roadmap.md` Gate S12 最后一项勾选，表中 P4 行已改为「✅ 已交付」。至此 `[ ]` 仅剩 P2（真产品定位决策项）。
 >
-> **2026-11-25 五更新**：**deny-by-default ACL 已交付**——`broker_security.acl` 新增显式 `deny` 姿态（fail-closed：具名与匿名主体一律拒绝，是 deny-by-default 对未认证报文的收口开关）；`allow`（默认）与规则列表零回归，未认证报文（无主体，如明文 CoAP）不进入 ACL、默认放行（ADR-031，由 `coap_dtls_SUITE:plain_udp_unaffected` 钉住）；`broker_security_acl_SUITE` 10→14 例、源码级双向变异验证非退化。**P2 真产品定位决策项剩 5 项**（OIDC/JWKS、防篡改审计、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
+> **2026-11-25 五更新**：**deny-by-default ACL 已交付**——`broker_security.acl` 新增显式 `deny` 姿态（fail-closed：具名与匿名主体一律拒绝，是 deny-by-default 对未认证报文的收口开关）；`allow`（默认）与规则列表零回归，未认证报文（无主体，如明文 CoAP）不进入 ACL、默认放行（ADR-031，由 `coap_dtls_SUITE:plain_udp_unaffected` 钉住）；`broker_security_acl_SUITE` 10→14 例、源码级双向变异验证非退化。**P2 真产品定位决策项剩 4 项**（OIDC/JWKS、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
+>
+> **2026-11-25 六更新**：**防篡改安全事件审计已交付（S13，`broker_audit`）**——安全事件走哈希链 + Ed25519 签名（`emit/1` 旁路化只写有界 ETS 环形缓冲、永不阻塞/失败、满则丢弃计数），首版 5 类事件，公钥经 `/api/v1/audit/pubkey` 暴露、`/api/v1/audit/verify` 完好 200/篡改 409，`broker_audit_SUITE` 11 例 + 源码级四向变异验证非退化（详见 P0 级清单）。**P2 真产品定位决策项剩 3 项**（OIDC/JWKS、多存储后端、外部 conformance）。
 
 > **2026-11-25 四更新**：P2 的三个**纯证据缺口**（能力已在、只缺专项证明，不需产品定位）已全部交付——P2-P0 SIGKILL harness（表中行）、**P2-P1 TLS1.3/mTLS 专项**（`mqtt_tls_SUITE` 新增三条真握手证据）、**P2-P1 畸形包三类 conformance 对账**（`test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动 7 行，源码级三向变异验证）；三者均经源码级变异验证非退化。
 
@@ -161,7 +163,7 @@
 | P1 MQ-09 产品化取舍 | 真缺口（纯文档）→ ✅ 已落笔（2026-11-24，随 P0-1） | `unifiedmq-mqtt-family-gap.md:60,166` + `mqtt-feature-comparison.md:166`（含 exclusive/failover 原地 resend vs shared 重 claim 两种形态对比）；核实稿 `2026-11-24-mq09-publish-retry-timer-reconcile-design.md` |
 | P2-P0 SIGKILL/网络分区 harness | ✅ 已交付（2026-11-25） | `broker_session_replica_SUITE` 新增 `subscription_set_survives_sigkill` + `inflight_blob_survives_sigkill`（OS `kill -9` 后 durable 订阅集/游标/in-flight blob 由副本恢复），源码级变异验证非退化；网络分区/`no_quorum` 由既有 dist 套件覆盖 |
 | P2-P0 OIDC/JWKS | 真缺口 | 全仓无 `oidc`/`jwks` |
-| P2-P0 防篡改审计 | 真缺口 | `security.md:24,255` 明列未实现 |
+| P2-P0 防篡改审计 | ✅ 已交付（2026-11-25，S13） | 新模块 `broker_audit`：安全事件哈希链 + Ed25519 签名（`emit/1` 旁路化写有界 ETS 环形缓冲，永不阻塞/失败，满则丢弃计数），首版 5 类事件，公钥经 `/api/v1/audit/pubkey` 暴露、`/api/v1/audit/verify` 完好 200/篡改 409；`broker_audit_SUITE` 11 例 + 源码级四向变异验证非退化；`security.md §11.2/§12.3`、`architecture.md §9` 同步。**边界**：私钥托管/轮换/HSM（外部 KMS）仍未实现 |
 | P2-P1 deny-by-default ACL | ✅ 已交付（2026-11-25） | `broker_security.acl` 新增 `deny` 姿态（fail-closed，对具名与匿名主体一律拒绝，含未认证报文）；`allow`/规则列表零回归，未认证通道默认放行（ADR-031）。`broker_security_acl_SUITE` 10→14 例（`deny_posture_*`），源码级双向变异验证非退化；`security.md §4` 同步 |
 | P2-P1 TLS1.3/mTLS 专项 | **部分误报** → ✅ 已交付（2026-11-25） | 能力已在 `broker_security_tls.erl:43` + `broker_security_tls_SUITE:88`；`mqtt_tls_SUITE` 新增 `negotiates_tls1_3_by_default` + `mtls_with_client_cert_completes_the_handshake` + `mtls_rejects_client_without_cert` 三条真握手断言，源码级变异验证非退化 |
 | P2-P1 多模式存储后端 | 真缺口 | 仅 memory + WAL，无 rocksdb/s3/file |

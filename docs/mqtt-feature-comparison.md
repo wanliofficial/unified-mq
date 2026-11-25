@@ -88,7 +88,7 @@
 | ACL | 有序 first-match，**规则列表无匹配即 deny**；默认值为 `allow`（legacy，可配为规则列表实现 deny-by-default） |
 | 租户隔离 | 认证身份绑定租户，租户隔离先于 ACL；事件属性永不改变身份/租户/目标 |
 | TLS | 所有协议 listener 同一开关，可选 TLS，支持 PEM 轮换（无明确 1.3/mTLS 专项） |
-| 审计 | `broker_security_audit_SUITE` 覆盖；**签名/防篡改未实现**（`security.md` §8） |
+| 审计 | `broker_security_audit_SUITE` 覆盖；**哈希链 + Ed25519 签名已实现（2026-11-25，`broker_audit`，`security.md` §11.2）**，外部 KMS 托管未实现 |
 | 存储后端 | 本地 内存 / WAL（ADR-007 L1/L2）；复制靠 Metadata Raft + `replicated_commit` |
 | 跨协议 | CloudEvents 统一消息模型；逐协议 `ce-*` Binding（S7 结案） |
 | 测试 | 帧层 CT + 真实 paho/mosquitto 逐帧字节一致（T15）+ 崩溃恢复（T14） |
@@ -134,7 +134,7 @@
 - [x] **P0 吊销实时驱逐活动会话**（2026-11-22 已完成）：按 principal 吊销身份，broker 立即发 DISCONNECT 驱逐该用户全部活动连接（抑制 Will），并在吊销期内拒绝其重连；支持可选 TTL，默认永久直到显式清除。实现见 `broker_revocation` 注册表 + `broker_security:revoke/2` 门面 + admin `POST /api/v1/revoke`、`DELETE /api/v1/revoke/:principal`；设计见 `docs/superpowers/specs/2026-11-22-mqtt-session-revocation-design.md`。**范围**：吊销执行只接在 MQTT 连接路径（`mqtt_conn_fsm`），其余协议的统一认证入口（`authenticate/2`、`authenticate_conn/1`）暂不查吊销表；状态为节点本地，粒度仅 principal。
 - [ ] **P1 deny-by-default ACL 默认姿态**：本仓库 ACL 默认 `allow`（legacy）；需明确「新部署默认 deny，无匹配即拒」的推荐配置与文档，避免误配放行。
 - [x] **P1 TLS 1.3 / mTLS 专项**（2026-11-25 已交付）：`mqtt_tls_SUITE` 新增三条真握手证据——`negotiates_tls1_3_by_default`（客户端 pin 1.3，握手成功 + `ssl:connection_information/2` 读回 `{protocol,'tlsv1.3'}`，再跑 CONNACK）、`mtls_with_client_cert_completes_the_handshake`（`verify_peer`+`cacertfile`+`fail_if_no_peer_cert` 下 CA 链证书握手成功）、`mtls_rejects_client_without_cert`（无证书客户端无法承载 MQTT，连接被 fatal `certificate_required` 告警拆链）。源码级变异验证非退化（versions→1.2-only / 强制 verify_none / 丢 cacertfile 三处变异分别令对应例红）。**distribution 的 mTLS 已由 ADR-035 交付**，此条仅覆盖客户端 listener。
-- [ ] **P0 防篡改审计日志（签名/哈希链）**：`security.md` §8 已列未实现；fss 有 hash-chained audit。待办：审计日志签名/VEX 化。
+- [x] **P0 防篡改安全事件审计（哈希链 + Ed25519 签名）** —— **✅ 已交付（2026-11-25，S13，`broker_audit`）**：安全事件哈希链 + Ed25519 签名，`emit/1` 旁路化，`verify` 定位首个篡改 `seq`；见 `security.md` §11.2。**边界**：外部 KMS 托管/轮换未实现。
 - [ ] **P2 FIPS 变体**：fss 有；本仓库无，记录为低优先。
 
 ### 4.3 规则引擎与数据处理

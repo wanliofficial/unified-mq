@@ -1929,7 +1929,7 @@ S10-D D.3 对信令面与 ICE 面做了一轮「先探测真实行为、再冻�
 | 10 | 多路房间 / 大型会议（>2 人）规模化选路 | §1.3 非目标 + §2.7 | 首期对齐 1:1（`max_peers_per_room` 默认 2，超额 close 1008）；多人房间/选路为 P2 |
 | 11 | 各协议官方 CloudEvents Binding 逐字实现 | §1.3 非目标 + S7 已结案（roadmap §9.1） | S7 已定「不立项」；S10 沿用统一 `ce-*` 项目定义，不做逐字 Binding |
 | 12 | 引入 Cowboy 作为全站 HTTP 框架、替换 ranch | §1.3 非目标 + OQ-3 | 信令面复用 `broker_ws`（ranch），不引入 Cowboy；`syn`/`stun` 亦不需要（D.1 已证 stun hex 包与首期范围冲突） |
-| 13 | OTel 导出层、审计日志签名、外部 KMS | §1.3 非目标 + `docs/security.md` §12 既有待办 | 沿用 `docs/security.md` §12 待办，S10 不扩面；可观测只走 `logger` + 冻结的 `broker_metrics`（D.4） |
+| 13 | OTel 导出层、审计日志外部 KMS 托管/轮换 | §1.3 非目标 + `docs/security.md` §12 既有待办 | 审计哈希链 + Ed25519 签名已于 2026-11-25 实现（`security.md` §11.2，S10 之后）；本条仅剩 OTel 导出层与外部 KMS；S10 不扩面 |
 
 上表 13 行覆盖 §1.3 全部 9 项非目标（第 5–9 行是 R-I6 点名的 5 项，其中 TURN over TCP/DTLS 与 5349/TLS 拆开以对应 R-I6 的逐字列举）。**§2 能力矩阵两行（WebRTC / STUN-TURN）的「已知限制」列均引用 §4.23**，其下即本 §4.23.5 逐行清单——与 S8 对 MQTT-SN / QUIC / WS 的处理（§4.11–§4.13）同构。
 
