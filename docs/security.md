@@ -98,8 +98,8 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 `broker_security.acl` 的取值：
 
 - 原子 `allow`：保持 S1 的放行姿态（默认值）。**匿名主体（`undefined`）也一律放行。**
-- 原子 `deny`：fail-closed 姿态，不带任何 allow 规则，**一切请求（具名主体与匿名主体）都被拒绝**。适合「先全关，再用规则列表按需开启」的部署。
-- 规则列表：有序 first-match，无匹配即 `deny`。**匿名主体不再绕过规则**——与具名主体一样走 first-match，无匹配即拒绝（旧行为是匿名无条件放行，即使配了规则；这违背「无匹配即拒绝」的承诺，已修正）。想在 `deny`/规则列表下显式放行匿名，写一条 `principal => <<"*">>` 的 allow 规则即可。
+- 原子 `deny`：fail-closed 姿态，不带任何 allow 规则，**一切请求（具名主体与匿名主体）都被拒绝**。这是 deny-by-default 的开关：它同时关掉匿名（未认证）通道（如明文 CoAP，见 `coap_dtls_SUITE:plain_udp_unaffected` 反向钉住）。
+- 规则列表：有序 first-match，无匹配即 `deny`。**匿名主体不进入 ACL**——未认证报文没有主体可匹配，因此在规则列表下默认放行（与 `allow` 一致；这是 ADR-031 的设计，明文通道刻意不纳入 ACL）。要在 `deny` 姿态下按需放行具名主体，改用规则列表写 allow 规则。
 - 其它非列表值：按 `allow` 处理（向后兼容），不做隐式「规则写错就全拒」以外的解释。
 
 一条规则的形状：
@@ -120,9 +120,9 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 | 尾 `*` 或 `#` | 前缀通配 | `t1/#` 匹配 `t1/a/b` |
 | `*` / `#` / 空 | 全部 | 任何目标 |
 
-`*` 对 principal 和 action 也是通配。非法规则被跳过而不是让发布者崩溃；**只要有规则存在（或姿态为 `deny`），未匹配就是拒绝**，这是安全方向。匿名主体在 `allow` 之外的姿态下同样受「无匹配即拒绝」约束。
+`*` 对 principal 和 action 也是通配。非法规则被跳过而不是让发布者崩溃；**只要有规则存在（或姿态为 `deny`），未匹配就是拒绝**，这是安全方向。匿名（未认证）通道不携带主体，故在 `allow` 与规则列表下放行，仅 `deny` 姿态拒绝——这是 deny-by-default 对未认证报文的唯一收口。
 
-证据：`broker_security_acl_SUITE`（16 例，含 `deny_posture_*` 与 `rule_list_judges_anonymous_by_rules_instead_of_bypassing` 钉住 deny 姿态与匿名判定）+ `broker_security_audit_SUITE` 的 `acl_bypass_by_unmatched_rule_is_denied`、`acl_bypass_by_action_swap_is_denied`、`acl_deny_precedes_a_later_allow`、`legacy_allow_is_explicit_not_a_fallback`。
+证据：`broker_security_acl_SUITE`（14 例，含 `deny_posture_refuses_named_principal_without_a_rule`、`deny_posture_refuses_anonymous_without_a_rule`、`deny_posture_is_explicitly_not_the_permissive_default` 钉住 `deny` 姿态对具名与匿名主体一律拒绝、与 `allow` 姿态有别）+ `broker_security_audit_SUITE` 的 `acl_bypass_by_unmatched_rule_is_denied`、`acl_bypass_by_action_swap_is_denied`、`acl_deny_precedes_a_later_allow`、`legacy_allow_is_explicit_not_a_fallback`；明文 CoAP 通道不被 ACL 拒绝由 `coap_dtls_SUITE:plain_udp_unaffected` 钉住。
 
 ---
 

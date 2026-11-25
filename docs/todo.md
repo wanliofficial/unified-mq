@@ -93,7 +93,7 @@
   - **OIDC / JWKS 客户端认证**：现仅 user_pass / token（`broker_security` 统一身份表）。
   - **防篡改审计日志（哈希链/签名）**：`docs/security.md` §8 明列未实现。
 - [ ] **P1 级（生产可用性）**
-  - [x] deny-by-default ACL 的默认姿态与推荐配置 —— **✅ 已交付（2026-11-25）**：`broker_security.acl` 新增显式 `deny` 姿态（fail-closed，无 allow 规则时全拒）+ 修正旧的匿名绕过「漏洞」——规则列表下匿名主体（`undefined`）不再无条件放行，改为与具名主体一样走 first-match（无匹配即拒），彻底落实「有规则即无匹配拒绝」的承诺。`allow` 默认姿态**保持零回归**。证据：`broker_security_acl_SUITE` 由 10 例扩到 16 例（`deny_posture_refuses_named_principal_without_a_rule`、`deny_posture_allows_named_principal_via_a_rule`、`deny_posture_refuses_anonymous_without_a_rule`、`deny_posture_allows_anonymous_via_a_wildcard_rule`、`rule_list_judges_anonymous_by_rules_instead_of_bypassing`、`deny_posture_is_explicitly_not_the_permissive_default`），经源码级三向变异验证非退化。
+  - [x] deny-by-default ACL 的默认姿态与推荐配置 —— **✅ 已交付（2026-11-25）**：`broker_security.acl` 新增显式 `deny` 姿态（fail-closed，无 allow 规则时**具名主体与匿名主体一律拒绝**），这是 deny-by-default 对未认证报文的唯一收口开关。`allow`（默认）与规则列表**保持零回归**：未认证报文（无主体，如明文 CoAP）不进入 ACL、默认放行（ADR-031 设计，`coap_dtls_SUITE:plain_udp_unaffected` 钉住）。证据：`broker_security_acl_SUITE` 由 10 例扩到 14 例（`deny_posture_refuses_named_principal_without_a_rule`、`deny_posture_refuses_anonymous_without_a_rule`、`deny_posture_is_explicitly_not_the_permissive_default`、`rule_list_selectively_allows_named_and_denies_unmatched`），经源码级双向变异验证非退化（`acl_decision` 的 `deny` 子句退回 `allow` → 具名拒绝例红；`authorize_principal(undefined,...)` 的 `deny` 分支退回 `allow` → 两匿名拒绝例红）。
   - [x] 客户端 listener 的 TLS 1.3 / mTLS **端到端证据** —— **✅ 已交付（2026-11-25）**：`mqtt_tls_SUITE` 从只跑 `verify_none` 扩到 7 例，新增三条真握手证据——`negotiates_tls1_3_by_default`（客户端 pin `['tlsv1.3']` 握手成功 + `ssl:connection_information/2` 读回 `{protocol,'tlsv1.3'}` 钉死，再跑 CONNACK 证明 1.3 信道承载 MQTT）、`mtls_with_client_cert_completes_the_handshake`（服务端 `verify_peer`+`cacertfile`+`fail_if_no_peer_cert`，客户端出示 CA 链下合法证书握手+CONNACK）、`mtls_rejects_client_without_cert`（同 posture 下无证书客户端无法承载 MQTT：TLS1.2 连接即 `{error,alert}`、TLS1.3 连接报 ok 后被服务端 fatal `certificate_required` 告警拆链，二者皆非 CONNACK 即非绕过）。经**源码级变异**验证非退化：默认 `versions` 砍到 1.2-only → `negotiates_tls1_3` 红；`listener_opts` 强制 `verify_none` → 两 mTLS 例红；`listener_opts` 丢弃 `cacertfile` → 带证书例红。边界：本专项针对**客户端 listener（TCP/TLS）**；**distribution 的 mTLS 已由 ADR-035 交付**，QUIC 强制 TLS1.3（S8-D）、CoAP 仅 DTLS-PSK 无证书（S11-C）各自独立，不混。
   - 多模式存储后端（RocksDB / File / S3 冷分层）：现仅内存 + WAL。
   - ~~Prometheus / Grafana / OTel 导出：`broker_metrics` 有指标，无导出层。~~ **Prometheus 导出已交付（2026-11-24 核实）**：`GET /metrics` 返回 `200 text/plain; version=0.0.4`（`broker_admin_http.erl:68-69` 路由、`:305-325` 渲染，测试 `broker_admin_SUITE:metrics_endpoint_lists_the_closed_key_set`）。**仅剩** Grafana dashboard 与 OTel 导出未做。
@@ -150,7 +150,7 @@
 >
 > **2026-11-25 再更新**：上句「其余……P4 为真缺口」也已过期——**P4（ADR-007 三档容量专项 + 绑定 S12 有状态服务）已交付**，`docs/roadmap.md` Gate S12 最后一项勾选，表中 P4 行已改为「✅ 已交付」。至此 `[ ]` 仅剩 P2（真产品定位决策项）。
 >
-> **2026-11-25 五更新**：**deny-by-default ACL 已交付**——`broker_security.acl` 新增显式 `deny` 姿态（fail-closed），并修正旧匿名绕过（规则列表下匿名主体改走 first-match，无匹配即拒，落实「有规则即无匹配拒绝」承诺），`allow` 默认保持零回归；`broker_security_acl_SUITE` 10→16 例、源码级三向变异验证非退化。**P2 真产品定位决策项剩 5 项**（OIDC/JWKS、防篡改审计、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
+> **2026-11-25 五更新**：**deny-by-default ACL 已交付**——`broker_security.acl` 新增显式 `deny` 姿态（fail-closed：具名与匿名主体一律拒绝，是 deny-by-default 对未认证报文的收口开关）；`allow`（默认）与规则列表零回归，未认证报文（无主体，如明文 CoAP）不进入 ACL、默认放行（ADR-031，由 `coap_dtls_SUITE:plain_udp_unaffected` 钉住）；`broker_security_acl_SUITE` 10→14 例、源码级双向变异验证非退化。**P2 真产品定位决策项剩 5 项**（OIDC/JWKS、防篡改审计、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
 
 > **2026-11-25 四更新**：P2 的三个**纯证据缺口**（能力已在、只缺专项证明，不需产品定位）已全部交付——P2-P0 SIGKILL harness（表中行）、**P2-P1 TLS1.3/mTLS 专项**（`mqtt_tls_SUITE` 新增三条真握手证据）、**P2-P1 畸形包三类 conformance 对账**（`test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动 7 行，源码级三向变异验证）；三者均经源码级变异验证非退化。
 
@@ -162,7 +162,7 @@
 | P2-P0 SIGKILL/网络分区 harness | ✅ 已交付（2026-11-25） | `broker_session_replica_SUITE` 新增 `subscription_set_survives_sigkill` + `inflight_blob_survives_sigkill`（OS `kill -9` 后 durable 订阅集/游标/in-flight blob 由副本恢复），源码级变异验证非退化；网络分区/`no_quorum` 由既有 dist 套件覆盖 |
 | P2-P0 OIDC/JWKS | 真缺口 | 全仓无 `oidc`/`jwks` |
 | P2-P0 防篡改审计 | 真缺口 | `security.md:24,255` 明列未实现 |
-| P2-P1 deny-by-default ACL | ✅ 已交付（2026-11-25） | `broker_security.acl` 新增 `deny` 姿态 + 修正匿名绕过；`broker_security_acl_SUITE` 10→16 例（`deny_posture_*`、`rule_list_judges_anonymous_by_rules_instead_of_bypassing`），源码级三向变异验证非退化；`security.md §4` 同步 |
+| P2-P1 deny-by-default ACL | ✅ 已交付（2026-11-25） | `broker_security.acl` 新增 `deny` 姿态（fail-closed，对具名与匿名主体一律拒绝，含未认证报文）；`allow`/规则列表零回归，未认证通道默认放行（ADR-031）。`broker_security_acl_SUITE` 10→14 例（`deny_posture_*`），源码级双向变异验证非退化；`security.md §4` 同步 |
 | P2-P1 TLS1.3/mTLS 专项 | **部分误报** → ✅ 已交付（2026-11-25） | 能力已在 `broker_security_tls.erl:43` + `broker_security_tls_SUITE:88`；`mqtt_tls_SUITE` 新增 `negotiates_tls1_3_by_default` + `mtls_with_client_cert_completes_the_handshake` + `mtls_rejects_client_without_cert` 三条真握手断言，源码级变异验证非退化 |
 | P2-P1 多模式存储后端 | 真缺口 | 仅 memory + WAL，无 rocksdb/s3/file |
 | P2-P1 Prometheus 导出 | **误报（已交付）** | `broker_admin_http.erl:68-69,305-325` + `broker_admin_SUITE:152`（已就地改） |

@@ -9,9 +9,9 @@
 %%        pattern => Pattern}' maps. `<<"*">>' is the wildcard for principal
 %%     and action; `Pattern' is an exact destination, a trailing `/` prefix, or
 %%     a `*'/`#' suffix wildcard. First match wins. No match means `deny' when rules
-%%     are configured; under a rule list or the `deny' posture an anonymous
-%%     principal is judged by the rules too, so without a matching allow rule it is
-%%     refused (unlike the permissive `allow' posture, which lets it through).
+%%     are configured. An unauthenticated datagram (anonymous principal) carries no
+%%     principal to match against, so under `allow' and under a rule list it is
+%%     allowed by default -- only the explicit `deny' posture refuses it.
 %%   * **Tenant isolation**: a principal authenticated with tenant `T' may only
 %%     act inside `T'. A request that names a different tenant is denied even
 %%     when a rule would otherwise allow it -- an ACL rule can widen topics,
@@ -96,20 +96,6 @@ tenant_id(Principal) ->
 -spec acl_rules() -> allow | deny | [map()] | term().
 acl_rules() ->
     application:get_env(broker_security, acl, allow).
-
-%% @doc Whether the configured posture lets an anonymous principal through by
-%% default. Only the permissive `allow' atom (and any legacy non-list value) do;
-%% a rule list or the explicit `deny' atom judge an anonymous caller by the rules
-%% like any other principal, so without a matching allow rule it is refused.
--spec permissive_posture(term()) -> boolean().
-permissive_posture(allow) ->
-    true;
-permissive_posture(Rules) when is_list(Rules) ->
-    false;
-permissive_posture(deny) ->
-    false;
-permissive_posture(_Other) ->
-    true.
 
 %%%_* Revocation facade -----------------------------------------------------
 
@@ -328,13 +314,14 @@ redacted_config() ->
 %% authenticated principal cannot name another tenant, because that is the
 %% privilege boundary, not a policy preference.
 authorize_principal(undefined, _Action, _Tenant, _Destination) ->
-    %% Anonymous principal. Under the permissive default (`allow' posture, or any
-    %% legacy non-list value) an anonymous caller is allowed by default. Under a
-    %% rule list or the explicit `deny' posture it is judged by the rules like any
-    %% other principal, so an unmatched anonymous request is refused.
-    case permissive_posture(acl_rules()) of
-        true -> allow;
-        false -> acl_decision(undefined, _Action, _Destination)
+    %% Anonymous principal: an unauthenticated datagram (e.g. plaintext CoAP).
+    %% Such a channel has no principal to match rules against, so it stays out of
+    %% the ACL by design -- under the permissive `allow' posture and under a rule
+    %% list it is allowed by default. The explicit `deny' posture is the one lever
+    %% that refuses it: deny-by-default closes the unauthenticated door too.
+    case acl_rules() of
+        deny -> deny;
+        _ -> allow
     end;
 authorize_principal(Principal, Action, Tenant, Destination) ->
     OwnTenant = tenant_id(Principal),
