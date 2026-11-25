@@ -164,14 +164,18 @@ revoked(Principal) ->
 %% The error is always `bad_username_or_password' so a probe cannot tell
 %% "no such user" from "wrong secret" -- and a token lookup reports the same
 %% thing, so the two credential shapes are not distinguishable either.
+%%
+%% A principal that is currently revoked is refused with the *same* error: a
+%% revocation must not leak to the client (the MQTT path already refuses a
+%% revoked principal as a wrong-password, rc 4 / v5 0x86). Every protocol
+%% adapter funnels its handshake through this one function, so checking here
+%% enforces revocation on all six protocols rather than only on MQTT.
 -spec authenticate_conn(credential()) -> {ok, conn_identity()} | {error, term()}.
 authenticate_conn({user_pass, Name, Secret})
   when is_binary(Name), is_binary(Secret) ->
     case user_record(Name) of
         #{password := Secret} ->
-            broker_audit:emit(#{type => 'auth.success', principal => Name,
-                                result => ok, detail => #{method => user_pass}}),
-            {ok, identity(Name)};
+            admit(Name, #{method => user_pass});
         _ ->
             broker_audit:emit(#{type => 'auth.failure', principal => Name,
                                 result => error, reason => bad_username_or_password,
@@ -181,9 +185,7 @@ authenticate_conn({user_pass, Name, Secret})
 authenticate_conn({token, Secret}) when is_binary(Secret) ->
     case user_by_token(Secret) of
         {ok, Name} ->
-            broker_audit:emit(#{type => 'auth.success', principal => Name,
-                                result => ok, detail => #{method => token}}),
-            {ok, identity(Name)};
+            admit(Name, #{method => token});
         error ->
             broker_audit:emit(#{type => 'auth.failure', result => error,
                                 reason => bad_username_or_password,
@@ -195,6 +197,23 @@ authenticate_conn(_Other) ->
                         reason => bad_username_or_password,
                         detail => #{method => unknown}}),
     {error, bad_username_or_password}.
+
+%% A credential that matched its record is still refused if the principal is
+%% revoked. The refusal carries the same generic error as a wrong secret, so a
+%% probe cannot learn "this account is revoked"; it is audited as an auth
+%% failure with a `revoked' reason so operators can see the block in the trail.
+admit(Name, Detail) ->
+    case broker_revocation:revoked(Name) of
+        true ->
+            broker_audit:emit(#{type => 'auth.failure', principal => Name,
+                                result => error, reason => revoked,
+                                detail => Detail}),
+            {error, bad_username_or_password};
+        false ->
+            broker_audit:emit(#{type => 'auth.success', principal => Name,
+                                result => ok, detail => Detail}),
+            {ok, identity(Name)}
+    end.
 
 %% @doc Long-term credential key for TURN (RFC 8489 §9.2.2, RFC 5766 §4):
 %% `MD5(username ":" realm ":" password)', using the password stored in the

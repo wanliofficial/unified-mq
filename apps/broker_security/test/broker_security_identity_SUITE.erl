@@ -29,7 +29,8 @@ all() ->
      the_tenant_comes_from_the_record_not_the_caller,
      require_auth_only_applies_to_configured_protocols,
      require_auth_never_applies_to_a_protocol_that_cannot_carry_a_credential,
-     the_anonymous_tenant_is_the_deployment_default].
+     the_anonymous_tenant_is_the_deployment_default,
+     a_revoked_principal_is_refused_with_the_same_error].
 
 init_per_suite(Config) ->
     SavedUsers = application:get_env(broker_security, users, undefined),
@@ -135,6 +136,38 @@ require_auth_never_applies_to_a_protocol_that_cannot_carry_a_credential(_Config)
 the_anonymous_tenant_is_the_deployment_default(_Config) ->
     application:set_env(broker_security, default_tenant, <<"anon-tenant">>),
     <<"anon-tenant">> = broker_security:default_tenant(),
+    ok.
+
+%% Revocation is enforced on the shared auth entry point, so it covers all six
+%% protocols rather than only the MQTT path. A revoked principal is refused with
+%% the *same* generic error a wrong secret produces -- the revocation must not
+%% leak to the client -- and the refusal is lifted once the revocation is cleared.
+a_revoked_principal_is_refused_with_the_same_error(_Config) ->
+    ok = broker_revocation:init(),
+    try
+        %% Sanity: the credential alone resolves before any revocation.
+        {ok, _} = broker_security:authenticate_conn({user_pass, <<"alice">>, <<"pw">>}),
+        ok = broker_revocation:revoke(<<"alice">>, undefined),
+        %% Revoked: refused, and indistinguishable from a wrong secret.
+        Wrong = broker_security:authenticate_conn({user_pass, <<"nobody">>, <<"pw">>}),
+        Revoked = broker_security:authenticate_conn({user_pass, <<"alice">>, <<"pw">>}),
+        {error, bad_username_or_password} = Revoked,
+        Revoked = Wrong,
+        %% The token shape works for a non-revoked principal, and is refused the
+        %% same way once that principal is revoked.
+        {ok, #{principal := <<"svc">>}} =
+            broker_security:authenticate_conn({token, <<"tok">>}),
+        ok = broker_revocation:revoke(<<"svc">>, undefined),
+        {error, bad_username_or_password} =
+            broker_security:authenticate_conn({token, <<"tok">>}),
+        %% Clearing lifts it: the same credential works again.
+        ok = broker_revocation:clear(<<"alice">>),
+        {ok, #{principal := <<"alice">>}} =
+            broker_security:authenticate_conn({user_pass, <<"alice">>, <<"pw">>}),
+        ok = broker_revocation:clear(<<"svc">>)
+    after
+        _ = broker_revocation:reset()
+    end,
     ok.
 
 %%%_* Helpers --------------------------------------------------------------

@@ -648,7 +648,7 @@ curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
 - `ttl_ms` 省略即**永久**吊销；给出时必须是非负整数。非法 JSON、缺 `principal`、`principal` 非字符串、`ttl_ms` 类型错误一律 **400**，且不改变吊销状态。
 - 驱逐对**已建立的连接**立即生效；`DELETE` 只解除吊销、**不会**把已被驱逐的客户端接回来（重连由客户端发起）。
 - **覆盖范围**：本特性是**节点本地**的，与 admission、drain 一致——集群内需在各节点分别调用；按租户/按 client_id 吊销、MQTT-SN 会话吊销不在本期范围。
-- **协议覆盖**：吊销的**拒绝重连**检查接在 MQTT 连接状态机（`mqtt_conn_fsm`）里；WS / NATS / AMQP / Kafka / Pulsar / WebRTC / A2A / MCP 仍走 `broker_security:authenticate/2`、`authenticate_conn/1`，**目前不查吊销表**——同一 principal 在这些协议上的连接不会被驱逐，重连也不会被拒。要全协议生效需要把检查下沉到统一认证入口，属后续工作。
+ - **协议覆盖**：吊销的**拒绝重连**检查接在 MQTT 连接状态机（`mqtt_conn_fsm`）；**自 2026-11-26 起已下沉到统一认证入口 `broker_security:authenticate_conn/1`**——WS / NATS / AMQP / Kafka / Pulsar / WebRTC 六个协议走它，在凭据匹配后查 `revoked/1`，吊销中返回与错误密码**同一个** `bad_username_or_password`、审计记 `auth.failure`+`reason=revoked`；TURN 走 `turn_auth:authorize/2`，在派生键后、授权前拒绝（403）。因此**非 MQTT 连接也无法在吊销后建立**。**边界照实说**：驱逐（主动 kill 已建立的连接）仍只作用于 MQTT；其余协议若在吊销前已建立，吊销后不主动断开，只在其后续刷新/授权时拒绝（「吊销后不新增、存量待其下次操作收敛」）。证据：`broker_security_identity_SUITE:a_revoked_principal_is_refused_with_the_same_error` + `turn_auth_SUITE:a_revoked_principal_is_a_403`，源码级双向变异验证非退化。
 - 驱逐时 v5 连接收到 reason code `0x87`（Not authorized），3.1.1/3.1 收到不带原因码的 DISCONNECT。
 
 ---

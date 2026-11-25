@@ -107,14 +107,23 @@ authenticate_2(Username, Realm, Wire, Cfg) ->
     end.
 
 authorize(Principal, Key, #{action := Action, destination := Destination}) ->
-    Request = #{action => Action, destination => Destination},
-    case broker_security:authorize(Principal, Request) of
-        allow ->
-            {ok, #{principal => Principal,
-                   tenant_id => tenant_of(Principal),
-                   key => Key}};
-        deny ->
-            {error, {403, <<"Forbidden">>}}
+    %% A revoked principal is refused at the live admission point, the same way
+    %% every other protocol's `authenticate_conn/1' now refuses it. The key is
+    %% still derived (MESSAGE-INTEGRITY needs it to prove credential knowledge),
+    %% but no allocation/permission/channel bind is granted while revoked.
+    case broker_security:revoked(Principal) of
+        true ->
+            {error, {403, <<"Forbidden">>}};
+        false ->
+            Request = #{action => Action, destination => Destination},
+            case broker_security:authorize(Principal, Request) of
+                allow ->
+                    {ok, #{principal => Principal,
+                           tenant_id => tenant_of(Principal),
+                           key => Key}};
+                deny ->
+                    {error, {403, <<"Forbidden">>}}
+            end
     end.
 
 %% `tenant_id/1' answers `<<"default">>' for an unknown principal, which is the

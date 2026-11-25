@@ -101,7 +101,7 @@
   - 外部 conformance 接入：L3 外部套件未建，当前只有设计稿 `docs/protocol-conformance-validation.md`（`test/conformance/` 已建、现有 MQTT 自研对账套件，但**尚未接第三方驱动**如 Paho）——这是**真缺口**，属产品决策，与上面的畸形包自研对账分开看。
 - [ ] **P2 级（增强）**
   - 规则引擎（filter / reshape / re-route + sinks）、Web 管理控制台、SBOM/SLSA/VEX 可复现构建、K8s operator/Helm、FIPS 变体、Edge-to-cloud 离线缓冲。
-- [x] **P0 吊销实时驱逐活动会话** —— 2026-11-22 已完成（`broker_revocation` + admin `/api/v1/revoke`）。**范围限制**：只在 MQTT 连接路径生效，其余协议认证入口不查吊销表；状态节点本地、粒度仅 principal。
+- [x] **P0 吊销实时驱逐活动会话** —— 2026-11-22 已完成（`broker_revocation` + admin `/api/v1/revoke`）。**范围**：驱逐只作用在 MQTT 连接路径。**2026-11-26 扩展：吊销在连接准入点强制生效，覆盖全部协议**——`broker_security:authenticate_conn/1`（NATS/AMQP/Kafka/WS/Pulsar/WebRTC 六个协议共用的认证入口）在凭据匹配后查 `broker_revocation:revoked/1`，吊销中返回与错误密码**同一个** `bad_username_or_password`（不向客户端泄露吊销态），审计记为 `auth.failure` + `reason=revoked`；`turn_auth:authorize/2`（TURN）在派生键后、授权前同样拒绝（403）。证据：`broker_security_identity_SUITE:a_revoked_principal_is_refused_with_the_same_error` + `turn_auth_SUITE:a_revoked_principal_is_a_403`，经源码级双向变异验证非退化（去掉两处吊销检查 → 对应例红）。**剩余边界**：驱逐（kill 已建立的会话）仍只在 MQTT 连接 FSM 有索引与派发；其余协议的连接若在吊销前已建立、吊销后不主动断开（只在其后续授权/刷新时拒绝），属「吊销后不新增、存量待其下次操作收敛」的口径。状态节点本地、粒度仅 principal。
 
 ---
 

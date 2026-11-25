@@ -36,6 +36,7 @@ all() ->
      a_nonce_from_the_future_within_the_skew_is_accepted,
      an_acl_deny_is_a_403,
      the_turn_action_is_what_acl_sees,
+     a_revoked_principal_is_a_403,
      no_password_or_key_reaches_the_log,
      the_disabled_app_needs_no_realm].
 
@@ -259,6 +260,30 @@ the_turn_action_is_what_acl_sees(_Config) ->
     %% The destination every action is judged against is the single TURN
     %% pseudo-topic, so one ACL pattern covers the whole app.
     ?assertEqual(<<"$ice/turn">>, maps:get(destination, cfg())).
+
+%% A revoked principal is refused at the admission point, the same way every
+%% other protocol's `authenticate_conn/1' refuses it. The credential and its
+%% MESSAGE-INTEGRITY still verify (the key is derivable), but no allocation is
+%% granted until the revocation is cleared.
+a_revoked_principal_is_a_403(_Config) ->
+    ok = broker_revocation:init(),
+    try
+        Key = ice_test_client:key(<<"alice">>, ?REALM, <<"alicepw">>),
+        %% Sanity: allowed before the revocation.
+        Good = signed_request(<<"alice">>, turn_auth:nonce(?SECRET, unix_now()), Key),
+        ?assertMatch({ok, _}, turn_auth:authenticate(decode(Good), Good, cfg())),
+        ok = broker_revocation:revoke(<<"alice">>, undefined),
+        Blocked = signed_request(<<"alice">>, turn_auth:nonce(?SECRET, unix_now()), Key),
+        ?assertMatch({error, {403, _}},
+                     turn_auth:authenticate(decode(Blocked), Blocked, cfg())),
+        %% Clearing lifts it.
+        ok = broker_revocation:clear(<<"alice">>),
+        Again = signed_request(<<"alice">>, turn_auth:nonce(?SECRET, unix_now()), Key),
+        ?assertMatch({ok, _}, turn_auth:authenticate(decode(Again), Again, cfg()))
+    after
+        _ = broker_revocation:reset()
+    end,
+    ok.
 
 %%%_* Secrets must not leak -------------------------------------------------
 
