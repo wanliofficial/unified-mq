@@ -102,7 +102,9 @@
 > 标记：**缺** = 当前未实现；**部分** = 已实现但形态不同/需配置/未证明；**同** = 对齐。
 > 优先级：**P0** 影响正确性/合规红线；**P1** 影响生产可用性与对标；**P2** 增强项。
 
-> **任务状态同步（2026-11-10）**：下列 24 项已登记为可追踪任务（`#5`–`#28`，按待办出现顺序连续分配），当前状态全部为 **待办（pending）**。任务板另有前期 S7 阶段的 `#1`–`#4`，其对应能力（os_buffer 接 CI、六协议统一认证、S7 立项、trace context 传播）已在代码中结案，状态已同步为 completed，不在本清单内。整体任务板：**4 completed / 0 in_progress / 39 pending（共 43 项）**。其中 `#29`–`#43` 是 2026-11-10 另一次内部评估登记的「ACL/认证 + 集群」缺口（15 项），主题与本竞品对比清单不同，详情见任务板、不并入下表。状态以任务板为准，本表为当日快照；后续进展须同步更新两侧。
+> **任务状态同步（2026-11-10 快照）**：下列 24 项已登记为可追踪任务（`#5`–`#28`，按待办出现顺序连续分配），当日状态全部为 **待办（pending）**。任务板另有前期 S7 阶段的 `#1`–`#4`，其对应能力（os_buffer 接 CI、六协议统一认证、S7 立项、trace context 传播）已在代码中结案，状态已同步为 completed，不在本清单内。整体任务板：**4 completed / 0 in_progress / 39 pending（共 43 项）**。其中 `#29`–`#43` 是 2026-11-10 另一次内部评估登记的「ACL/认证 + 集群」缺口（15 项），主题与本竞品对比清单不同，详情见任务板、不并入下表。状态以任务板为准，本表为当日快照；后续进展须同步更新两侧。
+>
+> **⚠️ 本块与下方分组表均为 2026-11-10 快照，已严重过时。** 后续 §4.6 中 MQ-01~MQ-07、MQ-09~MQ-16 已逐条结案（多数标 `[x]`），MQ-17 的会话复制 Plan 1–3 与吊销踢人也已交付，`#10 吊销实时驱逐活动会话` 于 2026-11-22 结案。**判断某一项是否仍待办，以 §4.1–§4.6 各条的勾选状态与 `docs/compatibility/unifiedmq-mqtt-family-gap.md` 为准，不要用本块或下方分组表的计数。**（2026-11-24 标注）
 
 **按分组的任务编号与状态**
 
@@ -161,7 +163,7 @@
 - [x] **MQTT 5.0 Request Response Information（MQ-06）**：CONNECT 带 `request_response_information=1` 且配了 `mqtt_response_information` 时，成功 CONNACK 回填响应主题前缀（默认关闭）。
 - [x] **MQTT 5.0 CONNACK 能力回填（MQ-07）**：v5 成功 CONNACK 回填保留/通配/订阅标识/共享订阅可用位；Maximum QoS 按 §3.2.2.3.4 省略（缺省即 QoS 2）。
 - [ ] **QoS2 exactly-once 边界（MQ-08）**：本仓库明确「跨崩溃至少一次」（ADR-012/018），与 fss 的「acked QoS1/2 survives node loss（集群副本）」不同——本仓库是单节点 WAL 保证，非集群副本。文档红线已就位（§3 状态表 + 本表 QoS 行）；剩余是把集群副本下的 exactly-once 承诺写清，属集群副本工作项，非 MQTT 协议缺口。
-- [x] **发布侧重试语义（MQ-09）**：同一条连接对未确认消息只投一次，不挂重传定时器；重发只在重连时发生。这是刻意取舍——慢客户端或丢 PUBACK 时由断线补投而非连接内定时器，语义已选定并有测试覆盖，非缺陷。
+- [x] **发布侧重试语义（MQ-09）**：**连接内 ack 超时重试已实现且默认启用**（2026-11-24 核实）——`pull_round/1` 每 `pull_poll_interval_ms`（默认 1000ms）调 `report_ack_timeouts/1`，`ack_timeout_ms` 默认 30000ms；超时的 offset 写入 cursor `retries`，按 `min(retry_base_ms·2^(n-1), retry_max_delay_ms)` 退避，worker `retry_tick_ms`（1000ms）到点用**同一 packet id + DUP=1** 重发，`max_attempts`（默认 10）用尽转 DLQ。重连重发是另一条独立路径（inflight blob catch-up）。**两种重试形态**：exclusive/failover 单读者，超时后**原地 resend**；shared 的 offset 超时 release 回池、由任意成员**重新 claim**（新 packet id、DUP=0），避免与重 claim 的成员重复。核实稿见 `docs/superpowers/specs/2026-11-24-mq09-publish-retry-timer-reconcile-design.md`。
 - [x] **in-flight 刷盘窗口（MQ-10）**：`inflight_flush_interval_ms` 默认 100ms，窗口内崩溃可能让**不同消息**复用同一 packet id；`=0` 可压到最小。这是组提交刷盘延迟的权衡，配置可控，已选语义+测试覆盖。
 - [x] **停投而非背压（MQ-11）**：in-flight 默认 64，满了即停投、不通知发布者、不踢慢消费者。当前刻意只做「停投」；per-subscriber 背压/慢消费者隔离列为下方 P2 待办。
 - [x] **超大出站消息丢弃（MQ-12）**：超过客户端 Maximum Packet Size 的 PUBLISH 直接丢弃并计数，不拆包、不改错误码。这是线格式边界的刻意处理，已选语义+测试覆盖。

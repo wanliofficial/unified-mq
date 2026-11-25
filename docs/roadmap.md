@@ -193,6 +193,7 @@ unified-mq/
 ### 4.2.1 S2.5（MQTT 5 子集，Gate 外）
 
 **状态：✅ 完成（2026-11-08）**。CONNECT/PUBLISH/SUBSCRIBE properties、v5 reason codes（含 `0x84`）、session expiry 落盘与 boot 清理、`$share` 建组、`receive_maximum` 出站窗口、`maximum_packet_size` 入站/出站边界。执行计划与交付记录见 [`design/s2.5-mqtt5-execution-plan.md`](design/s2.5-mqtt5-execution-plan.md)；兼容性口径见 [`protocol-compatibility.md`](protocol-compatibility.md) §4.2。全量 `rebar3 ct` **397/397**、`dialyzer` 干净。topic alias / request-response / AUTH **仍未实现**（ADR-017 §17.1 冻结子集，S5 未纳入）。
+> **（2026-11-24 批注，不改上文历史结论）** 上句描述的 S2.5 时点状态已不再成立：**Topic Alias（MQ-04）、Request Response Information（MQ-06）、AUTH 增强认证（MQ-05）三项已于 2026-11-21 落地**，交付记录见 [`compatibility/unifiedmq-mqtt-family-gap.md`](compatibility/unifiedmq-mqtt-family-gap.md) 的 MQ-04/05/06 行与 `docs/superpowers/specs/2026-11-21-mqtt-auth-connack-design.md`、`2026-11-21-mqtt-request-response-design.md`、`2026-11-20-mqtt5-topic-alias-design.md`。当前 MQTT 5 子集已无未交付项。
 
 ### 4.3 Gate S2
 

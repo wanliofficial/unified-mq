@@ -57,7 +57,7 @@ MQTT-QUIC 已实现 ALPN `mqtt`、单条双向流承载整条 MQTT 连接、流�
 | MQ-06 | 已支持 | Request Response Information | CONNECT 带 `request_response_information=1` 且 broker 配了 `mqtt_response_information`（默认 undefined 关）时，成功 CONNACK 回填该值作为响应主题前缀；客户端据此拼 `Response Topic = RI ++ Correlation Data`。请求/响应经既有 topic 路由透传 `response_topic`/`correlation_data`，无特殊路由（2026-11-21 落地于 mq-request-response） | 这是 broker 分配响应主题命名空间的能力，不是消息字段透传 |
 | MQ-07 | 已支持 | CONNACK 能力回填 | v5 CONNACK 在连接成功（RC=0）时回填**四个**静态能力位：retain / wildcard / subscription-identifier / shared-subscription available 均为 1；**不发 `maximum_qos`**（§3.2.2.3.4 只允许 0/1，值 2 是 Protocol Error；缺省即表示最大 QoS 2，支持 QoS 2 靠省略表达，MQTT-3.2.2-9）；由 `mqtt_connack_props_v5` 开关控制（默认开）。Server Keep Alive、Assigned Client Identifier 仍不回（2026-11-21 落地于 mq-auth-connack，同日按规范修正 maximum_qos） | 不回不等于撒谎；空 ClientID 仍直接拒绝，不会分配一个 |
 | MQ-08 | 语义缺口 | QoS 2 跨崩溃 | 崩溃后允许重复，对外明确「至少一次」而非 exactly-once；线协议和跨重连不重复已成立，对外说明已写入 `docs/mqtt-feature-comparison.md`（§3 状态表 + QoS 行 + 已知限制） | 不是 exactly-once。这是设计，不是忘了写 |
-| MQ-09 | 语义缺口 | 没有发布侧重试定时器 | 同一条连接对未确认消息只投一次。重发只发生在重连 | 规范允许发送方重试。慢客户端或丢 PUBACK 时，要断线才补。对外说明已写入 `docs/mqtt-feature-comparison.md` §4.6 |
+| MQ-09 | 已支持（2026-11-24 核实）| 发布侧重试定时器 | **连接内 ack 超时重试已实现且默认启用**：`pull_round/1` 每 `pull_poll_interval_ms`（默认 1000ms）调 `report_ack_timeouts/1`，扫描 `sent_at` 早于 `ack_timeout_ms`（默认 30000ms）的未确认消息 → `broker_subscription:retry/4` 写入 cursor `retries`，按指数退避 `min(retry_base_ms·2^(n-1), retry_max_delay_ms)` 调度，worker `retry_tick_ms`（1000ms）到点重发**同一 packet id + DUP=1**；`max_attempts`（默认 10）用尽即 dead-letter。重连重发是另一条路径（inflight blob catch-up）。shared 成员超时走 `drop_local`（release 回池、重 claim、新 packet id），与 exclusive/failover 的原地 resend 是两种正确形态 | 规范允许发送方重试，当前实现已覆盖连接内与重连两条路径。核实稿见 `docs/superpowers/specs/2026-11-24-mq09-publish-retry-timer-reconcile-design.md`；测试 `mqtt_conn_SUITE:a_timed_out_delivery_is_redelivered_with_dup_and_the_same_packet_id` / `an_unacked_message_is_resent_with_dup_and_the_same_packet_id` |
 | MQ-10 | 语义缺口 | in-flight 默认 100ms 才刷盘 | 崩溃可能让**不同消息**复用同一个 packet id。`inflight_flush_interval_ms=0` 可以把窗口压到最小 | 按 packet id 去重的客户端会误伤。对外说明已写入 §4.6 |
 | MQ-11 | 语义缺口 | 只有停投，没有背压 | in-flight 默认 64，满了就停。不通知发布者，不踢慢消费者 | 生产上慢订阅者会拖住分区。当前「停投」语义已对外写入 §4.6；per-subscriber 背压仍为待办 |
 | MQ-12 | 语义缺口 | 超大出站消息被丢弃 | 超过客户端 Maximum Packet Size 的 PUBLISH 丢弃并计数，不拆、不改为错误码通知发布者 | 订阅端会缺消息。对外说明已写入 §4.6 |
@@ -163,7 +163,7 @@ TLS 1.3 是强制的，不是可选项。`tls.enabled` 在这里只表示证书�
 MQ-08 到 MQ-14 这一类不是「没写完的报文」，而是已经选定的语义、测试也覆盖了，只是需要对外说明清楚，避免被当成半成品：
 
 - QoS 2 跨崩溃：线协议和跨重连不重复是成立的，对外明确「至少一次」而非 exactly-once（MQ-08）。
-- 发布侧重试：同一连接对未确认消息只投一次，重发只发生在重连；规范允许发送方重试，当前选择不在连接内做重试定时器（MQ-09）。
+- 发布侧重试：**已在 2026-11-24 核实为「连接内已实现且默认启用」**——ack 超时（`ack_timeout_ms` 默认 30s）由 `report_ack_timeouts/1` 检测，cursor 指数退避调度，worker 到点用同 packet id + DUP=1 重发，`max_attempts` 用尽进 DLQ；重连重发是并行的第二条路径。原「只在重连时重发」的描述已过时（MQ-09）。
 - in-flight 默认 100ms 才刷盘：崩溃可能让不同消息复用同一 packet id，`inflight_flush_interval_ms=0` 可压到最小；按 packet id 去重的客户端需知晓（MQ-10）。
 - 只有停投、没有背压通知：in-flight 满了就停，不通知发布者、不踢慢消费者（MQ-11）。
 - 超大出站消息：超过客户端 Maximum Packet Size 的 PUBLISH 丢弃并计数，不拆、不改错误码（MQ-12）。
@@ -172,6 +172,8 @@ MQ-08 到 MQ-14 这一类不是「没写完的报文」，而是已经选定的�
 
 已经从范围外补上的：AUTH 增强认证（MQ-05）、CONNACK 能力回填（MQ-07）、Topic Alias（MQ-04，默认关闭，`mqtt_topic_alias_maximum` >0 启用）与 Request Response Information（MQ-06，默认关闭，`mqtt_response_information` 配置后回填），AUTH/CONNACK 于 2026-11-21 落地于 `mq-auth-connack`，MQ-06 于同日落地于 `mq-request-response`。
 
-明确列在范围外、还没做的：MQTT 3.1、SN 的 DTLS 和转发器封装、QUIC 的 0-RTT 和多流、WS 的 `permessage-deflate`。
+明确列在范围外、还没做的：SN 的 Forwarder Encapsulation（1.2 §5.5）与串口桥、QUIC 的 0-RTT 和多流、WS 的 `permessage-deflate`。
+
+> （2026-11-24 更正）本段原列四项，其中两项已交付，从"还没做"移出：**MQTT 3.1** 于 2026-11-22 落地（见上表 MQ-16），**MQTT-SN DTLS** 于 2026-11-17 落地（见 §4 的 SN-01）。
 
 不要把「paho 8/8」理解成 MQTT 5 完整实现。那些用例覆盖的是连接、QoS、Retain、Will 和一条 5.0 往返，没有覆盖上面这些语义选择与范围外能力。
