@@ -203,3 +203,13 @@ ADR-034 于 2026-11-19 评审签认（四项待签认问题全部签认，见「
 - **验证**：dist 套件 `broker_cluster_cross_node_dist_SUITE` 共 10 例（语义 7 + 负载 2 + 容量 1），全量 `rebar3 ct` **1472/1472**、dialyzer 0 warning、xref 仅既有 unused-export、`rebar3 release` 装配成功。容量/延迟实测见 [`docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`](../benchmarks/2026-11-19-s12d-cross-node-delivery.md)（同主机下界：跨节点写 = 本地落盘 2 ms + 转发 1 ms）。
 - **文档同步**：`docs/adr/README.md`（S12-D 本体升「已接受」）、`docs/roadmap.md`（§S12 行 + Gate S12 状态口径）、`docs/design/s12d-cross-node-delivery-convergence.md` §6（前向指针改为指向已接受 ADR）、`README.md`（状态行补 S12-D 段）、`progress.md`、`docs/operations.md`（§5.4 跨节点投递运维）、`docs/architecture.md`（§9 延期表补 S12-D 行 + app/env 表）同步到 S12-D 收口状态。
 - **边界（与 ADR-032 D5 一致）**：S12-D 不迁移活进程；有状态服务的持久化绑定 ADR-007 三档的专项压测、以及活进程/队列内容的跨节点 handoff，均不在本期范围（roadmap Gate S12 相应项如实标未勾选）。
+
+### 后续放开的裁决边界（2026-11-25，MQ-15；冻结正文 D5 一字未改）
+
+D5 与「已签认的四个问题」第 1 条把「shared 组跨节点**显式拒绝**」定为 v1 边界，并写明*「放开它需要分布式 claim（新 ADR），本期不做」*。**MQ-15 就是这里预留的那件事**，但它没有新增 ADR 去改写 D5，而是以自己的设计稿 + 默认关闭的 feature flag **在 D5 之外增量放开**：
+
+- **做法**：`broker_subscription:claim/ack/release` 的分配决策搬进 ra 元数据组（`shared_assignments` + `shared_consumers` 两表、7 条命令），跨节点互斥由 ra 的单线程 apply 保证；worker 的本地 ETS 行降级为只读镜像。
+- **开关**：`broker_subscription.cluster_shared_rebalance`，默认 `false`。**关时 `cross_node_subscribe_ok/2` 的代码路径与 D5 逐字相同**——拒绝 `{cross_node_shared_unsupported, P}`，零回归。开时才放行跨 owner 分区上的 shared join；本节点 `broker_cluster_meta` 不在跑仍拒成 `{shared_rebalance_unavailable, no_meta}`（**不**降级回本地 claim），组在跑但失多数派则是分配命令失败 + `shared_rebalance_no_quorum`。
+- **仍然是 D5 的边界**：不追求跨节点 exactly-once、owner 仍是读热点、默认关闭。放开的是「分配决策的跨节点串行化」，不是「第二套消息内核」。
+- **证据**：`broker_cluster_meta_SUITE`（两表 + 7 命令 + `shared_release_node`）、`broker_cluster_SUITE`（经真实 ra 的 claim/ack/release）、`broker_subscription_shared_dist_SUITE`（3 例：跨节点并发 claim 不重复、崩溃 offset 回池、阈值 reclaim 改派）、worker_SUITE 的 flag off/on 双路径。全量 `rebar3 ct` **1945/1945**（0 failed / 0 skipped）、dialyzer 0 warning。
+- **文档落点**：`docs/operations.md` §5.4 报错速查 + §5.4.1（运维口径）、`docs/architecture.md` §app 表与 §6 配置面、`docs/todo.md`（MQ-15 结案）。**ADR-034 的 D1~D9 裁决正文保持冻结**——本批注只是说明「v1 边界之后发生了什么」，不改写当年的裁决理由。

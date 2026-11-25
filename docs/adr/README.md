@@ -82,6 +82,8 @@
 | [035](035-cluster-distribution-tls.md) | 集群跨节点 / 复制通道 TLS：**OTP `-proto_dist inet_tls` + mTLS**，独立 `broker_cluster.dist_tls` 块、默认关闭、保留 cookie、选项只走 optfile、boot 期双向漂移校验。收口 `docs/security.md` §12 第 1 条。诚实边界：CA 是双向准入闸门，**拨出按 SAN 绑定对端、拨入不校验客户端 SAN** | 设计文档 `docs/superpowers/specs/2026-11-20-cluster-distribution-tls-design.md`；实现 `broker_cluster_dist_tls.erl`；CT 29 例（25 纯函数 + 2 真实分布 + 2 负向）；ADR-021/032/034 |
 
 > ADR-034 已于 2026-11-19 评审签认（四项待签认问题全部签认），裁决正文冻结；落地实现（D2/D3/D4/D5/D6/D8）已交付 dist CT **10 例**（语义 7 + 负载 2 + 容量 1），全量 `rebar3 ct` **1472/1472**，容量/延迟证据见 `docs/benchmarks/2026-11-19-s12d-cross-node-delivery.md`，详见 [ADR-034 文末](034-s12d-cross-node-delivery.md)。
+>
+> **2026-11-25（MQ-15）**：ADR-034 D5 里「放开 shared 跨节点需要分布式 claim」这句预留已由 **MQ-15 共享订阅集群再均衡**填上——分配决策进 ra 元数据组串行化（`shared_assignments`/`shared_consumers` 两表 + 7 命令），开关 `broker_subscription.cluster_shared_rebalance` **默认关闭**（关时与 D5 逐字相同）。MQ-15 以设计稿 + 计划推进、**未新增 ADR**，故 **D5 正文保持冻结**，放开说明见 [ADR-034 §「后续放开的裁决边界」](034-s12d-cross-node-delivery.md) 与 `docs/roadmap.md` §14.4。
 
 ## Gate S0 验收清单（roadmap §2）
 

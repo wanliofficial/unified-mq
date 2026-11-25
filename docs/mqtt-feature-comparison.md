@@ -93,7 +93,7 @@
 | 跨协议 | CloudEvents 统一消息模型；逐协议 `ce-*` Binding（S7 结案） |
 | 测试 | 帧层 CT + 真实 paho/mosquitto 逐帧字节一致（T15）+ 崩溃恢复（T14） |
 
-**已知对外限制**（与两项目对照时即为差距）：MQTT 5 子集里 Subscription Identifier / Will Delay / SUBSCRIBE 选项 / Topic Alias / AUTH / Request Response / CONNACK 能力回填均已补齐（见 §4.6，多数默认关闭需配置启用）；QoS2 跨崩溃非 exactly-once（至少一次，ADR-012/018）、无背压只有停投、无集群级共享订阅/桥接/规则引擎。
+**已知对外限制**（与两项目对照时即为差距）：MQTT 5 子集里 Subscription Identifier / Will Delay / SUBSCRIBE 选项 / Topic Alias / AUTH / Request Response / CONNACK 能力回填均已补齐（见 §4.6，多数默认关闭需配置启用）；QoS2 跨崩溃非 exactly-once（至少一次，ADR-012/018）、L1/L2 无背压只有停投（L3 shared 的 per-consumer 配额已于 2026-11-24 交付）、**集群级 `$share` 已于 2026-11-25 交付但默认关闭**、无桥接/规则引擎。
 
 ---
 
@@ -124,7 +124,7 @@
 ### 4.1 集群、复制与会话高可用
 
 - [ ] **P0 集群级 durable session 复制（2–7 副本，quorum）**：fss 默认 2 副本且 Acked 消息可幸存节点丢失；本仓库有 `replicated_commit` 但**未证明**跨节点会话/消息在 SIGKILL 下零丢失。待办：定义并测「节点丢失后 durable 消息与订阅集合不丢」的 harness（对标 fss 的 SIGKILL/partition harness）。**进展（2026-11-22）**：会话状态复制管线（订阅/inflight/游标 → 副本本地表）已在 Plan 1 落地，默认关闭（`broker_cluster, session_replication=false`）；SIGKILL/分区故障注入 harness 与透明接管仍待 Plan 2。
-- [ ] **P1 跨节点共享订阅（$share cluster-wide）**：当前 `$share` 在单节点语义内；需扩展到集群级消费组分发。
+- [x] **P1 跨节点共享订阅（$share cluster-wide）**：**已交付（2026-11-25，`53946f5`，默认关闭）**——跨节点 shared 分配进 ra 元数据组串行化（`shared_assignments` + `shared_consumers` 两表、7 条命令、崩溃回池 `shared_release_node/1`、阈值再均衡 `shared_reclaim/5`）；flag `broker_subscription.cluster_shared_rebalance` 默认 `false`，关时与 ADR-034 D5 逐字相同。与上面 P0 的「集群级 durable session 复制」不是同一件事：本条交付的是**分配决策**的集群化，不涉及会话持久化。
 - [ ] **P1 站点桥接（bridge）**：两项目均有；本仓库无 bridge 能力。待办：评估是否纳入 S7 之后路线。
 - [ ] **P2 集群扩容零会话丢失**：fss 实测 3→5→8 join 保住会话（其 8→12 有缺陷 #1218，可作反面教材）；本仓库需补 join/leave 的会话与消息不丢证明。
 
@@ -165,12 +165,13 @@
 - [ ] **QoS2 exactly-once 边界（MQ-08）**：本仓库明确「跨崩溃至少一次」（ADR-012/018），与 fss 的「acked QoS1/2 survives node loss（集群副本）」不同——本仓库是单节点 WAL 保证，非集群副本。文档红线已就位（§3 状态表 + 本表 QoS 行）；剩余是把集群副本下的 exactly-once 承诺写清，属集群副本工作项，非 MQTT 协议缺口。
 - [x] **发布侧重试语义（MQ-09）**：**连接内 ack 超时重试已实现且默认启用**（2026-11-24 核实）——`pull_round/1` 每 `pull_poll_interval_ms`（默认 1000ms）调 `report_ack_timeouts/1`，`ack_timeout_ms` 默认 30000ms；超时的 offset 写入 cursor `retries`，按 `min(retry_base_ms·2^(n-1), retry_max_delay_ms)` 退避，worker `retry_tick_ms`（1000ms）到点用**同一 packet id + DUP=1** 重发，`max_attempts`（默认 10）用尽转 DLQ。重连重发是另一条独立路径（inflight blob catch-up）。**两种重试形态**：exclusive/failover 单读者，超时后**原地 resend**；shared 的 offset 超时 release 回池、由任意成员**重新 claim**（新 packet id、DUP=0），避免与重 claim 的成员重复。核实稿见 `docs/superpowers/specs/2026-11-24-mq09-publish-retry-timer-reconcile-design.md`。
 - [x] **in-flight 刷盘窗口（MQ-10）**：`inflight_flush_interval_ms` 默认 100ms，窗口内崩溃可能让**不同消息**复用同一 packet id；`=0` 可压到最小。这是组提交刷盘延迟的权衡，配置可控，已选语义+测试覆盖。
-- [x] **停投而非背压（MQ-11）**：in-flight 默认 64，满了即停投、不通知发布者、不踢慢消费者。当前刻意只做「停投」；per-subscriber 背压/慢消费者隔离列为下方 P2 待办。
+- [x] **停投 + per-consumer 配额（MQ-11）**：in-flight 默认 64，满了即停投、不通知发布者、不踢慢消费者（L1/L2 语义未变）。**L3 shared 窗口的 per-consumer 配额已于 2026-11-24 交付（`b95a32a`）**：`broker_cursor:claim/7` 的 `PerConsumerMax` 让单个慢成员只能占到自己那份，撞限回 `{ok, quota_hit, Row}`（计 `shared_consumer_quota_hit`）而**不是**全组 `shared_window_full`；默认动态均分 `max(1, Limit div N)`，`shared_per_consumer_max > 0` 时用固定上限。retention 侧 `wal_gc:lag_bytes/2` + `retention_lag_bytes` gauge。设计见 `docs/superpowers/specs/2026-11-24-mq11-per-subscriber-backpressure-design.md`。
 - [x] **超大出站消息丢弃（MQ-12）**：超过客户端 Maximum Packet Size 的 PUBLISH 直接丢弃并计数，不拆包、不改错误码。这是线格式边界的刻意处理，已选语义+测试覆盖。
 - [x] **Will 不落盘（MQ-13）**：遗嘱只在连接进程内存里，broker 重启不补发；mosquitto 默认亦如此。要「进程被 kill 也发遗嘱」则需持久化，当前未做，已选语义+测试覆盖。
 - [x] **离线追赶无优先级（MQ-14）**：积压与新消息按 offset 混在同一序列，深度越大首条越慢；无独立离线队列。这是当前排序语义，已选语义+测试覆盖。
 - [x] **MQTT 3.1（Protocol Level 3 / `MQIsdp`，MQ-16）**：broker 接受 3.1 客户端的 CONNECT，并在 3.1 自己定义的语义上工作——ClientID 1–23（按 Unicode 码点计，超出回 CONNACK rc=2）、Will Message 为 UTF-8 字符串（零长度合法、非 ASCII 的合法 UTF-8 照常存储/发布）、凭据按 Remaining-Length 优先（flag 置位但字符串缺失视为匿名）、password-without-username 仍拒绝。3.1 与 3.1.1 在 CONNECT 之后的报文形状逐字节相同（CONNACK 首字节对 3.1 恒 0），故 WS/QUIC 入口自动继承。顺带按 MQTT-3.1.2-22 放宽 3.1.1/5.0 的 username-without-password（原先过严拒绝）。设计见 `docs/superpowers/specs/2026-11-21-mqtt31-design.md`。
-- [ ] **P2 背压（慢消费者隔离，MQ-11）**：在上方「停投」语义之上再引入流控/隔离；两项目有此能力。待办：评估 per-subscriber 背压。
+- [x] **P2 背压（慢消费者隔离，MQ-11）**：L3 shared 窗口的 per-consumer 配额**已交付（2026-11-24，`b95a32a`）**——见上方 §4.6 的 MQ-11 条目。跳过的（skip/丢弃）策略仍是显式 out-of-scope（设计 §10），L1 mailbox 断连与 L2 per-conn 停投本就是既有能力，未改。
+- [x] **MQ-15 共享订阅集群再均衡**：**已交付（2026-11-25，`53946f5`，默认关闭）**——跨节点 shared 分配进 ra 元数据组串行化（`shared_assignments` + `shared_consumers` 两表、7 条命令），含崩溃回池 `shared_release_node/1` 与阈值再均衡 `shared_reclaim/5`；flag `broker_subscription.cluster_shared_rebalance` 默认 `false`（关时与 ADR-034 D5 逐字相同、零回归），开时跨节点 `$share` 组是一个消费组而非每节点一组。范围限制：owner 读热点、不追求跨节点 exactly-once、需 `cross_node_delivery` 同开才有完整 body 投递。设计见 `docs/superpowers/specs/2026-11-24-mq15-shared-subscription-cluster-rebalance-design.md`，运维见 `docs/operations.md` §5.4.1。
 
 ### 4.7 测试资产（已在 `protocol-conformance-validation.md` 立项）
 

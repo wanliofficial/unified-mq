@@ -3,7 +3,7 @@
 > 生成：2026-11-24　|　状态口径：`[ ]` 未开始　`[~]` 进行中　`[x]` 已完成
 > 依据：`docs/compatibility/unifiedmq-mqtt-family-gap.md`、`docs/mqtt-feature-comparison.md`、`docs/roadmap.md`、`docs/security.md`、`docs/superpowers/specs/2026-11-2*.md`
 > 前提：**S0–S12 阶段已全部收口**（`docs/roadmap.md` §14、`progress.md:4`）。本文件只列阶段之外的剩余项，不重复已交付的阶段能力。
-> 测试数字一律以当次 `rebar3 ct` 为准；最近可查记录为 1705/1705（`docs/superpowers/specs/2026-11-22-session-state-replication-plan2-notes.md:169`）。
+> 测试数字一律以当次 `rebar3 ct` 为准；最近可查记录为 **1945/1945（2026-11-25，MQ-15 全量实跑，0 failed / 0 skipped）**，此前为 1705/1705（`docs/superpowers/specs/2026-11-22-session-state-replication-plan2-notes.md:169`）。
 
 ---
 
@@ -56,6 +56,8 @@
 
 ## P1 活跃功能缺口（已有设计稿，待 review → plan → 实现）
 
+> **2026-11-25 状态：本节已全部收口**——MQ-11（`b95a32a`）、MQ-15（`53946f5`）已实现并合入；MQ-09 为纯文档项，其「两种重试形态」说明已随 P0-1 落笔。本节不再有 `[ ]`。
+
 - [x] **MQ-11 per-subscriber 背压（慢消费者隔离）** ✅ 已实现并合入（2026-11-24，`b95a32a`）
   - 缺口定性：L1 mailbox 断连与 L2 per-conn in-flight 停投**均已存在且不是缺口**；真缺口只在 **L3 shared 窗口**——`shared_state_max=4096` 无 per-consumer 上限，一个慢消费者把 offset 钉在 `assigned` 即可拖停全组（`broker_subscription_worker.erl:552`、`:567`）。
   - 方案：fair-share 动态配额（固定小上限会浪费 97% 窗口，已被设计稿否决）+ retention 钉住可观测；skip 策略明确 out-of-scope。
@@ -63,15 +65,22 @@
   - 下一步：review 定稿 → writing-plans → 实现 + `broker_subscription_SUITE` 新例（含「快消费者不被慢的拖住」正控与「无配额时全组 overflow」负控）。
   - **落地记录（2026-11-24）**：`broker_cursor:claim/7`（`PerConsumerMax`）+ `{ok, quota_hit, Row}` 区分「本消费者到配额」vs「组满 overflow」；worker 按 `shared_per_consumer_max>0` 固定上限、否则 `max(1, Limit div N)` 动态均分；`claim/5`、`claim/6` 等价保留。retention 观测：`wal_gc:lag_bytes/2` + `retention_lag/0`，`sweep/1` 写 `retention_lag_bytes` gauge。指标闭集：`shared_consumer_quota_hit`、`retention_lag_bytes`（ADR-016 禁高基数，per-consumer `shared_consumer_assigned` gauge 未做，见设计 §10）。测试 +9；全量 ct 1930/1930，dialyzer 0 warning。
 
-- [ ] **MQ-15 共享订阅集群再均衡**
-  - 缺口定性：`cross_node_shared_ok/2` **显式拒绝**跨节点 shared 组（`broker_subscription_worker.erl:946-963`，`{error, {cross_node_shared_unsupported, P}}`）；原因是两节点独立 claim 会把同一 offset 派给两个消费者＝静默重复。
-  - 关键前提（已核实）：消息体跨节点读取路径**已存在**（S12-D 的 `broker_queue:read_from/3` + `route/3` 转发），缺的只是**分配决策的跨节点串行化**，不是 body 移动。
-  - 方案：`assigned` 表进 ra 串行化 + 混合再均衡（懒式 + 阈值触发）。
-  - 设计：`docs/superpowers/specs/2026-11-24-mq15-shared-subscription-cluster-rebalance-design.md`。
-  - 下一步：review 定稿 → writing-plans → 实现 + 真 3 peer dist CT（跨节点不重复投递、成员变更后再均衡、失多数派行为）。
+- [x] **MQ-15 共享订阅集群再均衡** ✅ 已实现并合入（2026-11-25，`53946f5`）
+  - 缺口定性（已闭合）：`cross_node_subscribe_ok/2` 曾显式拒绝跨节点 shared 组；根因是两节点独立 claim 会把同一 offset 派给两个消费者＝静默重复。消息体跨节点读取路径 S12-D 已存在，缺的只是**分配决策的跨节点串行化**。
+  - 方案：分配决策进 ra 串行化 + 混合再均衡（懒式 + 阈值触发）。无 epoch 围栏（单调集合运算，§9 决策 1）；快照不压缩（§9 决策 2）；reclaim 复用 poll tick（§9 决策 3）；worker `handle_call({claim|ack|release,...})` flag 双路径（§9 决策 4）。
+  - 设计：`docs/superpowers/specs/2026-11-24-mq15-shared-subscription-cluster-rebalance-design.md`；计划：`docs/superpowers/plans/2026-11-24-mq15-shared-subscription-cluster-rebalance.md`（7 task）。
+  - **落地记录（2026-11-25）**：
+    - **ra 元数据组**：新增 `shared_assignments` + `shared_consumers` 两表与 7 命令（`shared_claim/7`、`shared_ack/4`、`shared_release/3`、`shared_release_node/1`、`shared_reclaim/5`、`shared_join/3`、`shared_leave/2`），分配互斥由单线程 apply 保证；`snapshot_installed/5` 恢复两表；apply 返回干净 `{ok, Offsets}`（不回传内部表）。
+    - **worker 双路径**：`broker_subscription:cluster_shared_rebalance` 默认 `false`＝零回归；开时 claim/ack/release 经 ra 并把 committed row 从 cache mirror 回灌本地 `?CURSORS`。cross_node 放宽：flag 关保持原跨 owner 拒绝；开时放行（ra 串行保证不重复），但 ra 元数据组未运行则拒绝（`shared_rebalance_unavailable`）。
+    - **崩溃回池（§4.1(c)）**：`shared_release_node(Node)` 原子回池崩溃节点上全部 shared consumer 的 offset（跨所有 sub/partition）并清其 consumer 条目；`broker_cluster_nodedown:on_nodedown/1` 在分区迁移后追加该调用（仅 flag 开），复用既有去抖；`broker_cluster_nodedown_mon` 在 session_replication 或 cluster_shared_rebalance 任一开时即监视成员。
+    - **阈值再均衡（§4.1(b)）**：worker claim 得 `quota_hit` 后 `maybe_rebalance` 读镜像算每 consumer in-flight，当 `max-min > shared_rebalance_hysteresis` 且过 `shared_rebalance_cooldown_ms` 时经 `shared_reclaim` 把过载者超出均值的 offset 改派给最空闲者，inc `shared_reclaim`。复用 poll tick，无新进程。
+    - **指标闭集（ADR-016）**：新增 `shared_reclaim`、`shared_rebalance_no_quorum`。
+    - **测试**：`broker_cluster_meta_SUITE` +1（`shared_release_node` 跨两组释放 + survivor 保留 + consumer 表清理）；`broker_subscription_shared_dist_SUITE` 新建 3 例（跨节点并发 claim 不重复、崩溃 offset 回池可回收、阈值 reclaim 改派单 offset）；worker_SUITE +3（flag off 拒绝 / on 放宽 / non-shared 恒 ok）；broker_cluster_SUITE +2（经真实 ra claim/ack/release + consumers 表）；metrics_SUITE 同步。**全量 `rebar3 ct` 1945/1945、0 failed / 0 skipped，dialyzer 0 warning，xref 仅既有 unused-export。**
+  - 范围限制（与 ADR-034 S12-D 一致）：shared 组跨节点仅交付分配串行化与不重复投递；owner 读热点、shared 的 exactly-once 不追求、默认关闭。
 
-- [ ] **MQ-09 语义已闭环后的产品化取舍（非代码）**
+- [x] **MQ-09 语义已闭环后的产品化取舍（非代码）** ✅ 已随 P0-1 一并落笔（2026-11-24）
   - 实现已完整（见 P0-1），剩下的是与 fss/robustmq 对读时说明「exclusive/failover 原地 resend vs shared 重 claim」两种重试形态的差异。属文档，工作量极小，与 P0-1 合并执行即可。
+  - **已完成**：`docs/compatibility/unifiedmq-mqtt-family-gap.md:60`（MQ-09 行改为「已支持（2026-11-24 核实）」+ 完整链路与测试指针）、`:166`（重试路径逐环描述），`docs/mqtt-feature-comparison.md:166`（§4.6 改写为「连接内 ack 超时重试已实现且默认启用」，并显式写出**两种重试形态**：exclusive/failover 单读者原地 `resend`；shared 超时 `release` 回池由任意成员**重新 claim**，新 packet id、DUP=0 —— 这正是与 fss/robustmq 对读时需要的取舍说明）。核实稿：`docs/superpowers/specs/2026-11-24-mq09-publish-retry-timer-reconcile-design.md`（§3 第 3 条「可选」即本次落笔内容）。实现侧零改动。
 
 ---
 
@@ -105,7 +114,7 @@
 - **WebRTC / ICE** —— 媒体面、TURN over TCP/TLS/DTLS/5349、ICE-lite、Trickle、多人房间、速率限制闸门（`docs/security.md` §12.2/§12.3）。
 - **A2A / MCP / ACP** —— 18 条（SSE pending-bytes 闸门、ACP v2、JWT/JWKS/KMS 等，`docs/security.md` §12.1）。
 - **传输层** —— MQTT-SN Forwarder Encapsulation / 串口桥；QUIC 0-RTT / 多流 / 连接迁移；WS `permessage-deflate`。
-- **S12-D 跨节点投递** —— shared 组跨节点不交付、owner 读热点、默认关闭、不追求 exactly-once。
+- **S12-D 跨节点投递** —— owner 读热点、默认关闭、不追求 exactly-once。~~shared 组跨节点不交付~~ **（2026-11-25 批注：shared 组跨节点分配串行化已由 MQ-15 交付（`53946f5`），flag `cluster_shared_rebalance` 默认仍关；上列其余边界不变。）**
 - **MQTT 语义取舍项** —— MQ-08（QoS2 跨崩溃至少一次）、MQ-10（100ms 刷盘窗口）、MQ-12（超大出站丢弃）、MQ-13（Will 不落盘）、MQ-14（离线追赶无优先级）：已选语义 + 测试覆盖，**不是半成品**。
 
 ---
@@ -122,21 +131,26 @@
 ## 建议执行顺序
 
 1. ~~**P0-1 ~ P0-7**（纯文档，一次性提交；消除"已实现却记为缺口"的误报）~~ —— **已完成 2026-11-24**
-2. **MQ-11 → MQ-15**（唯一在推进的功能缺口；两者都涉及 `assigned` 窗口与 ra 串行化，MQ-11 先做可为 MQ-15 铺垫）—— **MQ-11 已完成 2026-11-24（`b95a32a`），下一步 MQ-15**
+2. ~~**MQ-11 → MQ-15**（唯一在推进的功能缺口；两者都涉及 `assigned` 窗口与 ra 串行化，MQ-11 先做可为 MQ-15 铺垫）~~ —— **均已交付：MQ-11 `b95a32a`（11-24）、MQ-15 `53946f5`（11-25）。P1 活跃功能缺口清空。**
 3. **P2 的 P0 三项**（是否立项需产品确认目标定位）
 4. **P4** 与容量报告合并做
+5. ~~**MQ-09 产品化取舍**（纯文档，与 P0-1 合并即可，无排期压力）~~ —— **已落笔 2026-11-24**
+
+> 当前状态（2026-11-25）：**P1 已无 `[ ]` 项**；剩余待办全部集中在 P2（需产品决策）与 P4（容量专项）。
 
 ---
 
 ## 核实记录（2026-11-24）
 
-> 对上方每一条 `[ ]` 做了一次「代码/产物 vs 文档口径」核对，判定分四类。**结论：P1 全部为真缺口；P2 中 Prometheus 导出为误报（已就地改），TLS1.3/mTLS、畸形包、ADR-007 三档为部分误报（已就地改并标注「能力已在、缺专项证据」）；其余 P0/P1/P2/P4 为真缺口。**
+> 对上方每一条 `[ ]` 做了一次「代码/产物 vs 文档口径」核对，判定分四类。**结论（2026-11-24 快照）：P1 全部为真缺口；P2 中 Prometheus 导出为误报（已就地改），TLS1.3/mTLS、畸形包、ADR-007 三档为部分误报（已就地改并标注「能力已在、缺专项证据」）；其余 P0/P1/P2/P4 为真缺口。**
+>
+> **2026-11-25 更新**：上句的「P1 全部为真缺口」已过期——**MQ-11（`b95a32a`）与 MQ-15（`53946f5`）均已交付**，MQ-09 的文档取舍也已随 P0-1 落笔，**P1 已无 `[ ]` 项**。表中 P1 三行已就地更新判定，其余行仍为 2026-11-24 判定。
 
 | 项 | 判定 | 证据（file:line / 产物） |
 |---|---|---|
 | P1 MQ-11 per-consumer 配额 | 真缺口 → ✅ 已交付（`b95a32a`） | `broker_cursor:claim/7`（`PerConsumerMax`）+ worker `shared_per_consumer_quota/2`；retention `wal_gc:lag_bytes/2` + `retention_lag_bytes` gauge |
-| P1 MQ-15 跨节点 shared | 真缺口 | `broker_subscription_worker.erl:961` `{error, {cross_node_shared_unsupported, P}}` |
-| P1 MQ-09 产品化取舍 | 真缺口（纯文档） | 机制已实现（P0-1），仅余对读说明 |
+| P1 MQ-15 跨节点 shared | 真缺口 → ✅ 已交付（`53946f5`） | 跨节点 shared 分配已进 ra 串行化（`broker_cluster_meta_machine` 的 `shared_assignments`/`shared_consumers` 两表 + 7 命令）；`cross_node_subscribe_ok/2` 在 `broker_subscription:cluster_shared_rebalance=true` 时放行，ra 组未运行则拒绝 `{shared_rebalance_unavailable, no_meta}`。默认关闭、零回归。 |
+| P1 MQ-09 产品化取舍 | 真缺口（纯文档）→ ✅ 已落笔（2026-11-24，随 P0-1） | `unifiedmq-mqtt-family-gap.md:60,166` + `mqtt-feature-comparison.md:166`（含 exclusive/failover 原地 resend vs shared 重 claim 两种形态对比）；核实稿 `2026-11-24-mq09-publish-retry-timer-reconcile-design.md` |
 | P2-P0 SIGKILL/网络分区 harness | 真缺口 | 仅 `broker_session_replica_SUITE:483` 优雅 `peer:stop`，无 SIGKILL/分区 |
 | P2-P0 OIDC/JWKS | 真缺口 | 全仓无 `oidc`/`jwks` |
 | P2-P0 防篡改审计 | 真缺口 | `security.md:24,255` 明列未实现 |

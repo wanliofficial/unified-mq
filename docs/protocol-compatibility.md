@@ -2163,6 +2163,8 @@ ADR-034 的跨节点投递是**节点间的路由选择**，不是新的协议�
 
 **处置**：把该 shared 组的消费者放到 owner 所在节点，或改用 exclusive/failover（这两类跨节点是正确的：一个读者、游标本地）。这是 v1 的**显式边界**，不是降级成「静默允许然后重复投递」——后者才是兼容性事故。
 
+> **2026-11-25 批注（MQ-15）**：上表描述的是 `broker_subscription.cluster_shared_rebalance = false`（默认）时的行为，**现在仍然是默认行为**。开启该 flag 后，分配决策改由 ra 元数据组串行化，跨节点 shared 订阅**被放行**，上表四行的错误码不再出现；此时唯一新错误是 `{shared_rebalance_unavailable, no_meta}`（本节点 ra 元数据组不在跑，此时仍拒绝而非静默重复；组在跑但失多数派是分配命令失败 + `shared_rebalance_no_quorum` 指标）。**帧格式、SUBACK 成功码、QoS 握手、ACK 语义全部不变**——放开的是「是否接受这次 shared join」，不是新的协议面。逐协议的「降级/拒绝」语义与 S12-D 当时一致。运维口径见 `docs/operations.md` §5.4.1。
+
 ### 4.26.2 不受影响、也不承诺的面
 
 - **不改任何协议的 QoS 承诺**：QoS1/2 的 ACK 仍代表 owner 的 WAL 已持久化（`replicated_commit` 下仍是多数派）——转发失败时**不 ACK**，与单节点「写失败不 ACK」是同一条规则。

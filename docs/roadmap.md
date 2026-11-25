@@ -550,6 +550,16 @@ S7 有两项交付：
 
 **OTP 29.1.2 复验（2026-11-20 追加）**：`main` 在本项落地后随即升到 OTP 29.1.2（`ca04f24`/`d26bb00`），故在新版本上重跑 `broker_cluster_dist_tls_SUITE`：**29/29 全绿**（0 failed / 0 skipped），CT `suite.log` 头部为 `=otp_release 29`、`=emulator_vsn 17.1.1`。真实分布式与两个负向用例均实跑（0.200 s / 0.232 s / 1.825 s / 1.412 s），D2 的「拨出按 SAN 绑定、拨入不校验」不对称在 29 上原样成立。详见 ADR-035「落地验证记录」的定稿说明。
 
+### 14.4 S12-D 边界的后续放开：MQ-15 共享订阅集群再均衡（2026-11-25 交付）
+
+上面 §14.2 的 S12-D 收口记录（`roadmap.md:527`、`:545`）与 ADR-034 D5 都把「**shared 组跨节点不交付**」记为 v1 边界，并写明*「放开它需要分布式 claim（新 ADR），本期不做」*。**2026-11-25 的 MQ-15 就是这里预留的那件事**——它没有改写 D5 的裁决正文，而是以独立设计稿 + 默认关闭的 feature flag 增量放开：
+
+- **交付**：`broker_subscription:claim/ack/release` 的分配决策搬进 ra 元数据组（`shared_assignments` + `shared_consumers` 两表、7 条命令：`shared_claim/7`、`shared_ack/4`、`shared_release/3`、`shared_release_node/1`、`shared_reclaim/5`、`shared_join/3`、`shared_leave/2`），跨节点互斥由 ra 单线程 apply 保证；worker 的本地 ETS 行降级为只读镜像。附崩溃回池（`broker_cluster_nodedown` 调 `shared_release_node/1`）与阈值再均衡（`quota_hit` 后按 `max-min > hysteresis` + cooldown 触发 `shared_reclaim`，复用 poll tick，无新进程）。
+- **开关**：`broker_subscription.cluster_shared_rebalance`，默认 `false`。**关时 `cross_node_subscribe_ok/2` 与 D5 逐字相同**（拒绝 `{cross_node_shared_unsupported, P}`，零回归）；开时才放行跨 owner 分区的 shared join。完整跨节点 body 投递还需 `broker_cluster.cross_node_delivery` 同开。
+- **仍是 D5 的边界**：不追求跨节点 exactly-once、owner 仍是读热点、默认关闭。放开的是「分配决策的跨节点串行化」，不是第二套消息内核。
+- **证据**：`broker_cluster_meta_SUITE`（两表 + 7 命令 + `shared_release_node`）、`broker_cluster_SUITE`（经真实 ra 的 claim/ack/release）、`broker_subscription_shared_dist_SUITE`（3 peer：跨节点并发 claim 不重复、崩溃 offset 回池可回收、阈值 reclaim 改派）、worker_SUITE 的 flag off/on 双路径。全量 `rebar3 ct` **1945/1945**（0 failed / 0 skipped）、dialyzer 0 warning、xref 仅既有 unused-export。
+- **同步落点**：`docs/operations.md` §5.4 + §5.4.1、`docs/architecture.md`（app 表 / §6 配置面 / §9 边界行）、`docs/security.md` §12.7 第 3 条、`docs/protocol-compatibility.md` §4.26.1、`docs/compatibility/unifiedmq-mqtt-family-gap.md` MQ-15 行、`docs/mqtt-feature-comparison.md` §4.1/§4.6、`docs/todo.md`。设计稿 `docs/superpowers/specs/2026-11-24-mq15-shared-subscription-cluster-rebalance-design.md`，计划 `docs/superpowers/plans/2026-11-24-mq15-shared-subscription-cluster-rebalance.md`（7 task）。
+
 ---
 
 ## 15. 附录

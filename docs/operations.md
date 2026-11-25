@@ -908,7 +908,8 @@ broker_rebalance:finish_pending().
 | `{error, {cross_node_unreachable, Node, Reason}}` | 转发时 owner 不可达（`Reason` 是 `badrpc` 的原因）。发布方**没有**在本地写任何记录，可以安全重试。先查 owner 是否活着、`epmd`/分布端口是否通 |
 | `{error, {not_owner, Owner}}` | 你的路由视图和对方不一致：调用被转发到的节点已不是 owner。会累加 `cluster_fencing_rejected`。等 `broker_cluster_cache` 追上元数据后重试；持续出现说明成员/元数据视图滞后，查 `GET /api/v1/node` 与 `broker_cluster:partition_view/0` |
 | `{error, {fenced, #{...}}}` | 写入携带的 epoch 或本节点归属已过期（`expected_epoch` / `actual_epoch` / `owner` 都在里面）。同属正常拒绝，不丢数据 |
-| `{error, {cross_node_shared_unsupported, Partition}}` | 跨节点 **shared** 订阅被拒（ADR-034 D5）：`claim/4` 在每节点独立分发 offset，跨节点会**静默重复投递**。把该 shared 组消费者放到 owner 所在节点，或改用 exclusive/failover（这两类跨节点是正确的） |
+| `{error, {cross_node_shared_unsupported, Partition}}` | 跨节点 **shared** 订阅被拒（ADR-034 D5）：`claim/4` 在每节点独立分发 offset，跨节点会**静默重复投递**。把该 shared 组消费者放到 owner 所在节点，或改用 exclusive/failover（这两类跨节点是正确的）。**（2026-11-25 批注：MQ-15 已交付跨节点 shared 分配串行化——`broker_subscription:cluster_shared_rebalance = true` 时该拒绝消失、claim/ack/release 改走 ra 元数据组；flag 默认 `false`，故默认部署下本条仍照旧生效。详见 §5.4.1。）** |
+| `{error, {shared_rebalance_unavailable, no_meta}}` | 仅 `cluster_shared_rebalance = true` 时出现：跨节点 shared 已放行，但 ra 元数据组进程在本节点不存在（未启动 / 已被清退），`ra_metadata_available/0` 为 false。**不要**降级为本地 claim——那会重复投递。先确认 `broker_cluster_meta` 在跑（`whereis(broker_cluster_meta)`）、`GET /api/v1/node` 与 `broker_cluster:partition_view/0` 正常，或临时关 flag 把消费者放回 owner 节点。组在跑但提交失败另见 `shared_rebalance_no_quorum` 指标 |
 
 `committed` 在这种模式下是**各节点候选游标的最小值**（D6）：只要还有任一节点的消费者没读过去，owner 就不会 GC 那段。**只有显式离开的节点会退出聚合**——对它调 `broker_cluster:leave/1`（ADR-033 的成员变更路径）会清掉它在这个节点上的候选条目；**仅仅是不可达的节点会保留最后一次上报的值**，它只能把 floor 压住（保守：绝不抬高，因此绝不会提前删数据），但不能自行释放。所以硬故障节点想释放 GC 必须补一次 `leave`，否则那个分区的 committed 会停在它最后的位置——**这是「不丢数据」换来的空间占用，不是缺陷**；需要空间时按本文件 §5.3 的节点下线流程显式摘除。
 
@@ -917,11 +918,48 @@ broker_rebalance:finish_pending().
 **边界（别指望它）**：
 
 - **不保证跨节点 exactly-once**。QoS0 广播是尽力而为；跨节点重试语义仍由各协议的 QoS 决定，本仓不新增去重层。
-- **不交付跨节点 shared 组**。见上表最后一行，是显式拒绝，不是静默降级。
+- **~~不交付跨节点 shared 组~~**（**2026-11-25 批注**：MQ-15 已放开——见下节 §5.4.1。flag 默认关时本条仍照旧生效）。
 - **owner 是读热点**。所有读汇聚到 owner，单次读便宜（~1.4 ms）但会随订阅者数量线性叠加——容量规划按 owner 侧 QPS 算，不要按「分摊到 N 节点」算。
 - **不搬活进程、不搬队列内容、不搬连接**。与 §5.3 同一限制（ADR-032 D5）。
 - **只有同主机证据**。跨机 / 跨 AZ 时转发 RPC 的 RTT 会成为主导项，本仓无跨机集群实测，不要把上面的毫秒数外推。
 - **关闭时不追求「灰度混跑」**。开关是节点级的，同一分区在「开」和「关」的节点之间会发生视图不一致的拒绝（`{not_owner, _}` / `{fenced, _}`），不会损坏数据，但会在滚动切换期间产生可见错误率。要开请**全组一起开**（滚动重启的窗口里如实计入错误率），不要长期半开半关。
+
+### 5.4.1 跨节点 shared 组（MQ-15，`cluster_shared_rebalance`）
+
+**默认关闭。**这是 §5.4 那条「跨节点 shared 显式拒绝」的解药，但**与 `cross_node_delivery` 是两个独立开关**：
+
+| 开关 | 位置 | 控制什么 |
+|---|---|---|
+| `broker_cluster.cross_node_delivery` | §5.4 | **消息体**能否跨节点 forward（非 owner 读转发到 owner） |
+| `broker_subscription.cluster_shared_rebalance` | 本节 | **分配决策**能否跨节点（claim/ack/release 经 ra 元数据组串行化） |
+
+完整跨节点 shared 投递需要**两个都开**。只开本节开关时分配已集群化，但非 owner 消费者取不到 body（会 stall）——是可观测、可接受的中间态（设计 §5.1）。
+
+```erlang
+%% 打开（默认 false）
+{broker_subscription, [{cluster_shared_rebalance, true},
+                       {shared_rebalance_hysteresis, 2},      %% 组内每消费者 in-flight 的极差阈值
+                       {shared_rebalance_cooldown_ms, 5000}]} %% 两次改派的最小间隔
+```
+
+**它做什么**：
+
+- **分配串行化**——claim/ack/release 从 `broker_subscription_worker` 的本地 ETS 改为经 ra 元数据组（`shared_assignments` + `shared_consumers` 两表）。ra 的单线程 apply 保证任一 offset 任一时刻只被一个 ClientId 持有，于是「两节点各投一次」这个静默重复被结构性根除。worker 的 `?CURSORS` 行降级为 ra 表的**本地只读镜像**（写一律经 ra 回来再覆盖），用来算 blocked 与本地快读。
+- **崩溃回池**——`broker_cluster_nodedown` 在分区迁移之后调 `broker_cluster:shared_release_node/1`，原子地把崩溃节点上全部 shared consumer 的 offset（跨所有 sub/partition）回池并清其 consumer 条目。复用既有去抖 handler，**不新增进程**。
+- **阈值再均衡**——某消费者 claim 撞到自己的 per-consumer 配额（MQ-11 的 `quota_hit`）时，复用 poll tick 读镜像算每消费者 in-flight；当 `max - min > hysteresis` 且距上次改派超过 cooldown，把过载者超出均值的 offset 经 `shared_reclaim` 改派给最空闲者，计 `shared_reclaim`。**没有独立的再均衡进程。**
+
+**开启前提**：本节点必须能访问 ra 元数据组——具体实现判据是 `broker_cluster_meta` 进程存在（`ra_metadata_available/0`）。不满足时跨节点 shared SUBSCRIBE 被拒成 `{error, {shared_rebalance_unavailable, no_meta}}`——**不要**因此降级回本地 claim，那正是要消除的重复投递。组存在但提交不上去（失多数派）时，分配命令失败并计 `shared_rebalance_no_quorum`。
+
+**新增指标**（ADR-016 闭集，无标签）：`shared_reclaim`（一次改派）、`shared_rebalance_no_quorum`（分配命令提交失败）。
+
+**边界（别指望它）**：
+
+- **不追求跨节点 exactly-once**。与 §5.4 同一姿态：交付的是「分配不重复」，不是端到端去重窗口。
+- **owner 仍是读热点**。body 仍从 owner 读（§5.4），本节只解决分配，没有解决读集中。
+- **ra 热路径开销**：每条 claim/ack/release 过一次 ra（已接受的代价），靠 `pull_page_limit` 批量摊薄。
+- **本地 retries/backoff 会随节点崩溃丢失**：offset 可被立即重新 claim，可能比退避更早重投——QoS1 语义允许，QoS0 无所谓。
+- **`low` 永不因再均衡回退**：改派只动 `assigned` 里的高 offset，已 ack 前缀不动。
+- **开关是节点级的**：要开请全组一起开（同 §5.4 最后一条）。
 
 ## 5.5 跨节点通道 TLS（`dist_tls`，ADR-035）
 
