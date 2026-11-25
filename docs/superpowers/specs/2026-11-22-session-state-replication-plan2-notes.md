@@ -116,6 +116,8 @@ Plan 2 把 Plan 1 的复制管线接到**接管**上：`mqtt_conn_fsm` 监视会
 
 > **2026-11-24 追加批注**：缺口 #5 已定稿（§12 未决点关闭）—— **会话副本集复用元数据表，不引入独立会话副本组**。核实结论：会话分区与 `broker_rebalance` 的队列/路由动态分区**共用同一张 ra 分区表**（`broker_cluster_meta_machine` 的 `partitions`，键 P → `#{owner,epoch,replicas}`），靠**号段隔离**——会话分区占稠密号段 `0..C-1`（缺口 #3 的 `broker_cluster_session_bootstrap` 保证建齐），rebalance 管另一号段，同号段内不重叠（会话 P 恒 `< C`）。故 `broker_cluster:replicas(P)`/`owner(P)`/`claim(P)` 命中的必是会话分区 P 的副本集/owner。缺口 #3 落地后此「同键假设」已从未决变为**成立**：bootstrap 让 `0..C-1` 每个会话分区都在元数据表里有行。三处副本集来源（`broker_cluster_session_rep:targeted_plan/1` 的路由、`replicate_session/2` 的并行复制、conn_fsm 内联 `claim/3` 的接管）统一读这同一张表，无需换源。改动：定稿 plan2-design §5（副本集来源）+ §12（三个未决点全关闭：同键复用 / C 随规模联动 / nodedown 触发与去抖），并把 `broker_cluster_session_rep.erl:79-80` 的「未决假设」注释改为已定稿描述。不引入新数据结构、不改任何运行逻辑（现状即定稿）。既有 `broker_cluster_session_rep_SUITE:targeted_routes_to_session_partition_only` 已覆盖同键路由，无需新增 CT。
 
+> **2026-11-25 追加批注**：缺口 #4 的「故障注入」侧补上 **SIGKILL 硬杀形态**。此前的透明接管 e2e CT（`broker_cluster_conn_fsm_takeover_dist_SUITE`）与本套件用例 1/3 都只用**优雅** `peer:stop`（节点跑 terminate、flush 后干净退出），证明不了「节点**突然丢失**（OS `kill -9`，无清理机会）后 durable 会话状态不丢」。新增两用例：`broker_session_replica_SUITE:subscription_set_survives_sigkill`（订阅集 + 游标在 owner 被硬杀后由副本恢复、游标不回退）与 `inflight_blob_survives_sigkill`（QoS2 in-flight blob 硬杀后原样恢复、无重复行）。两者沿用「先轮询副本表证明复制到达、再硬杀」的确定性结构，并经**源码级变异**验证非退化（把 `replicate_session_best_effort/1` 改成 no-op → 4 个依赖复制的用例全部超时变红）。网络分区 / 失多数派 / 无双 owner 分裂脑不重复证明，由 `broker_cluster_dist_SUITE:online_join_is_rejected_without_a_majority`、`broker_rebalance_dist_SUITE`（`no_quorum`）与本套件 `stale_owner_fenced` 覆盖；真网络分区曾尝试用 cookie 隔离构造，但 Erlang `global` 的 overlapping-partition 自愈会主动断链，无法稳定复现，故不引入脆弱用例（诚实记录）。套件用例数 6 → 8。
+
 ## 4. Plan 1 / Plan 2 对比
 
 | 维度 | Plan 1 | Plan 2 |

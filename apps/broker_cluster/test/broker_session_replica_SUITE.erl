@@ -29,6 +29,20 @@
 %% `broker_cluster:claim/3'，逐个断言对应计数键 +1、其余三键不动。没有它，把
 %% 两个键的映射写反（如 `not_a_replica' 计到 `stale_epoch'）所有套件都不会红。
 %%
+%% **P2-P0 #1 硬故障注入（2026-11-25 追加）**：用例 1/3（以及 2026-11-23 的
+%% `broker_cluster_conn_fsm_takeover_dist_SUITE'）都是**优雅** `peer:stop'——节点
+%% 跑 terminate、flush 后干净退出。真实「节点突然丢失」是硬杀（OS `kill -9'），
+%% 不给 VM 任何清理机会。用例 7/8 用 `hard_kill_peer/2' 重做用例 1/3 的会话平面
+%% 证明（durable 订阅集合 + 游标 / QoS2 in-flight blob 在 SIGKILL 后由副本恢复）。
+%%
+%% **网络分区 / 无多数派 / 无双 owner 分裂脑**不在此重复证明，已由既有套件覆盖：
+%% `broker_cluster_dist_SUITE:online_join_is_rejected_without_a_majority`（失多数派
+%% 时写入 `{error, no_quorum}`）、`broker_rebalance_dist_SUITE`（同类 `no_quorum`）、
+%% 以及本套件用例 4 `stale_owner_fenced'（节点仍在线但被新 epoch 取代 → 陈旧写被
+%% fencing 拒）。SIGKILL（节点死亡）+ 用例 4（节点存活但被取代）合起来覆盖「突然
+%% 丢失」的两种形态。注：曾尝试用 cookie 隔离做真网络分区用例，但 Erlang `global`
+%% 的 overlapping-partition 自愈会主动断链，无法稳定构造，故不引入脆弱用例。
+%%
 %% 范围声明：本套件在 **会话平面身份**（subs 集 + 游标）这一可观测层证明接管，并
 %% **不** 触及 MQTT wire 层的「零重连」——那需要真实 broker 客户端连接在 Holder 上
 %% 跑完整个 conn_fsm，超出本套件范围。判据是会话平面身份在接管后保持不变。
@@ -56,7 +70,9 @@ all() ->
      inflight_dedup_preserved,
      stale_owner_fenced,
      single_node_unchanged,
-     takeover_outcome_counters].
+     takeover_outcome_counters,
+     subscription_set_survives_sigkill,
+     inflight_blob_survives_sigkill].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -372,6 +388,101 @@ ensure_metrics(Nodes) ->
                             takeover_keys())
       end, Nodes),
     ok.
+
+%%%_* P2-P0 #1: hard fault injection (SIGKILL / network partition) -----------
+%%
+%% 用例 1/3 用优雅 `peer:stop' 证明会话状态在 owner **干净退出**后存活。真实
+%% 「节点突然丢失」是 OS `kill -9'：VM 不跑 terminate、不 flush、不发 dist 关闭
+%% 帧。下面用例 7/8 用同样「先证明复制到达、再硬杀」的结构重做会话平面证明；用例
+%% 9 用网络分区（非节点死亡）证明少数派无法提交、无双 owner。
+
+%% 用例 7（SIGKILL 正面证明）：订阅集 + 游标在 owner 被**硬杀**后由副本恢复。
+%% 与用例 1 同一套「先轮询副本表证明复制到达、再杀」的确定性结构，唯一区别是
+%% `hard_kill_peer/2'（SIGKILL）而非 `stop_peer/2'（优雅 stop）。
+subscription_set_survives_sigkill(Config) ->
+    [Owner, Holder, _Third] = Nodes = peer_nodes(Config),
+    ClientId = <<"sigkill-sub">>,
+    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+    {ok, SubRef} = rpc(Owner, ?MODULE, do_subscribe, [ClientId, <<"t/sigkill">>, 1]),
+    %% 复制若为 no-op，下面永远等不到 Holder 的副本行 → 超时红。
+    wait_until(fun() -> rpc(Holder, ?MODULE, replica_has_sub, [ClientId, SubRef]) =:= true end),
+    [Q | _] = rpc(Owner, broker_queue, partition_ids, []),
+    {ok, C0} = rpc(Owner, ?MODULE, do_cursor, [SubRef, Q]),
+    ok = rpc(Owner, ?MODULE, do_ack, [SubRef, Q, C0, ClientId]),
+    {ok, Before} = rpc(Owner, ?MODULE, do_cursor, [SubRef, Q]),
+    ?assert(Before > C0),
+    {ok, ReplicatedBefore} =
+        wait_until_cursor(
+          fun() ->
+                  case rpc(Holder, ?MODULE, replica_cursor_next_read, [SubRef, Q]) of
+                      not_found -> false;
+                      N when is_integer(N) -> {ok, N}
+                  end
+          end),
+    %% ===== 硬杀（SIGKILL）：无 terminate、无 flush、无 dist 关闭帧 =====
+    ok = hard_kill_peer(Config, Owner),
+    %% 多数派（Holder + Third）仍在，Holder 提 claim（ra 需重新选主，重试）。
+    {ok, 2} = retry(fun() -> rpc(Holder, broker_cluster, claim, [P, Holder, 2]) end,
+                    30, 500),
+    ok = rpc(Holder, broker_cluster, authorize_append, [P, 2]),
+    {ok, Session} = rpc(Holder, ?MODULE, do_session, [ClientId]),
+    ?assertMatch([#{sub_ref := SubRef}], maps:get(subs, Session)),
+    {ok, After} = rpc(Holder, ?MODULE, do_cursor, [SubRef, Q]),
+    ?assert(After >= ReplicatedBefore),
+    ok.
+
+%% 用例 8（SIGKILL 正面证明）：QoS2 会话 in-flight blob（durable 消息状态）
+%% 在硬杀 owner 后由接管节点**原样**恢复，无丢失、无重复行。
+inflight_blob_survives_sigkill(Config) ->
+    [Owner, Holder, _Third] = Nodes = peer_nodes(Config),
+    ClientId = <<"sigkill-inflight">>,
+    Count = rpc(Holder, broker_cluster_session_owner, session_partition_count, []),
+    P = rpc(Holder, broker_cluster_session_owner, partition_of, [ClientId, Count]),
+    {ok, 1} = rpc(Holder, ?MODULE, assign_partition, [P, Owner, Nodes, 1]),
+    {ok, _SubRef} = rpc(Owner, ?MODULE, do_subscribe, [ClientId, <<"t/sigkill-dedup">>, 2]),
+    Blob = #{vsn => 3, pending => [{1, a}], session_expires_at => undefined},
+    ok = rpc(Owner, ?MODULE, do_inflight, [ClientId, Blob]),
+    %% inflight 复制是 fire-and-forget，kill 前先等 Blob 真正落到 Holder 本地表。
+    wait_until(
+      fun() ->
+              case rpc(Holder, ets, lookup, [broker_subscription_inflight, ClientId]) of
+                  [{_, Blob}] -> true;
+                  _ -> false
+              end
+      end),
+    ok = hard_kill_peer(Config, Owner),
+    {ok, 2} = retry(fun() -> rpc(Holder, broker_cluster, claim, [P, Holder, 2]) end,
+                    30, 500),
+    {ok, Session} = rpc(Holder, ?MODULE, do_session, [ClientId]),
+    ?assertEqual(Blob, maps:get(inflight, Session)),
+    %% 无重复行：inflight 表恰一行。
+    ?assertEqual(1, length(rpc(Holder, ets, lookup, [broker_subscription_inflight, ClientId]))),
+    ok.
+
+%% 用例 7（SIGKILL 正面证明）：订阅集 + 游标在 owner 被**硬杀**后由副本恢复。
+%% 与用例 1 同一套「先轮询副本表证明复制到达、再杀」的确定性结构，唯一区别是
+%% `hard_kill_peer/2'（SIGKILL）而非 `stop_peer/2'（优雅 stop）。
+%% 与 `peer:stop/1'（优雅退出、跑 terminate、flush）不同，SIGKILL 不给 VM 任何
+%% 清理机会——这才模拟「节点突然丢失」。kill 前先 `monitor_node' 以可靠观测到
+%% `nodedown'（`kill -9' 关 OS socket 后 dist 会立即报 nodedown）。
+hard_kill_peer(Config, Node) ->
+    Peers = ?config(peers, Config),
+    case [P || #{pid := _} = P <- Peers, maps:get(node, P) =:= Node] of
+        [#{pid := _Pid}] ->
+            OsPid = rpc(Node, os, getpid, []),
+            _ = monitor_node(Node, true),
+            _ = os:cmd("kill -9 " ++ OsPid),
+            receive
+                {nodedown, Node} -> ok
+            after 15000 ->
+                ct:fail({sigkill_nodedown_timeout, Node})
+            end;
+        _ ->
+            ok
+    end.
+
 
 %%%_* Cluster helpers + do_* session wrappers --------------------------------
 %%

@@ -89,7 +89,7 @@
 来源 `docs/mqtt-feature-comparison.md` §4，任务编号 `#5`–`#28` 与 `#29`–`#43`。**这些不是协议缺陷，是对标生产级 broker 的差距**；是否立项取决于目标定位。
 
 - [ ] **P0 级（正确性/合规红线）**
-  - durable session 复制的 **SIGKILL / 网络分区故障注入证明**：管线已有（Plan 1，默认关闭），缺「节点丢失后 durable 消息与订阅集合不丢」的 harness。
+  - [x] durable session 复制的 **SIGKILL / 网络分区故障注入证明** —— **✅ 已交付（2026-11-25）**：管线已有（Plan 1，默认关闭），缺「节点丢失后 durable 消息与订阅集合不丢」的 harness。新增 `broker_session_replica_SUITE` 两个硬杀用例——`subscription_set_survives_sigkill`（订阅集 + 游标在 owner 被 OS `kill -9` 后由副本恢复、游标不回退）、`inflight_blob_survives_sigkill`（QoS2 in-flight blob 硬杀后原样恢复、无重复行）；均「先轮询副本表证明复制到达、再硬杀」，并经源码级变异（复制改 no-op → 4 例超时变红）验证非退化。网络分区 / 失多数派 / 无双 owner 分裂脑由 `broker_cluster_dist_SUITE:online_join_is_rejected_without_a_majority` + `broker_rebalance_dist_SUITE`（`no_quorum`）+ 本套件 `stale_owner_fenced` 覆盖。**边界**：模块级会话平面身份证明（非 MQTT 线级零重连——后者由 `broker_cluster_conn_fsm_takeover_dist_SUITE` 覆盖）；真网络分区因 Erlang `global` 自愈无法稳定构造，未引入脆弱用例。
   - **OIDC / JWKS 客户端认证**：现仅 user_pass / token（`broker_security` 统一身份表）。
   - **防篡改审计日志（哈希链/签名）**：`docs/security.md` §8 明列未实现。
 - [ ] **P1 级（生产可用性）**
@@ -133,12 +133,12 @@
 
 1. ~~**P0-1 ~ P0-7**（纯文档，一次性提交；消除"已实现却记为缺口"的误报）~~ —— **已完成 2026-11-24**
 2. ~~**MQ-11 → MQ-15**（唯一在推进的功能缺口；两者都涉及 `assigned` 窗口与 ra 串行化，MQ-11 先做可为 MQ-15 铺垫）~~ —— **均已交付：MQ-11 `b95a32a`（11-24）、MQ-15 `53946f5`（11-25）。P1 活跃功能缺口清空。**
-3. **P2 的 P0 三项**（是否立项需产品确认目标定位）
+3. **P2 的 P0 三项**（是否立项需产品确认目标定位）—— **SIGKILL harness 已交付（2026-11-25）；OIDC/JWKS 与防篡改审计仍需产品决策**
 4. ~~**P4** 与容量报告合并做~~ —— **已交付 2026-11-25**：Gate S12 最后一项已勾选，三档容量专项 + ra 元数据层绑定报告落盘 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`
 5. ~~**MQ-09 产品化取舍**（纯文档，与 P0-1 合并即可，无排期压力）~~ —— **已落笔 2026-11-24**
 
 > 当前状态（2026-11-25）：**P1 已无 `[ ]` 项；P4 容量专项已交付（Gate S12 全部勾选项证据齐备）。**
-> 剩余待办全部集中在 P2（9 项，需产品决策定位）。
+> 剩余待办集中在 P2（原 9 项）：**SIGKILL/网络分区 harness 已于 2026-11-25 交付**，其余 8 项仍需产品决策定位。
 
 ---
 
@@ -155,7 +155,7 @@
 | P1 MQ-11 per-consumer 配额 | 真缺口 → ✅ 已交付（`b95a32a`） | `broker_cursor:claim/7`（`PerConsumerMax`）+ worker `shared_per_consumer_quota/2`；retention `wal_gc:lag_bytes/2` + `retention_lag_bytes` gauge |
 | P1 MQ-15 跨节点 shared | 真缺口 → ✅ 已交付（`53946f5`） | 跨节点 shared 分配已进 ra 串行化（`broker_cluster_meta_machine` 的 `shared_assignments`/`shared_consumers` 两表 + 7 命令）；`cross_node_subscribe_ok/2` 在 `broker_subscription:cluster_shared_rebalance=true` 时放行，ra 组未运行则拒绝 `{shared_rebalance_unavailable, no_meta}`。默认关闭、零回归。 |
 | P1 MQ-09 产品化取舍 | 真缺口（纯文档）→ ✅ 已落笔（2026-11-24，随 P0-1） | `unifiedmq-mqtt-family-gap.md:60,166` + `mqtt-feature-comparison.md:166`（含 exclusive/failover 原地 resend vs shared 重 claim 两种形态对比）；核实稿 `2026-11-24-mq09-publish-retry-timer-reconcile-design.md` |
-| P2-P0 SIGKILL/网络分区 harness | 真缺口 | 仅 `broker_session_replica_SUITE:483` 优雅 `peer:stop`，无 SIGKILL/分区 |
+| P2-P0 SIGKILL/网络分区 harness | ✅ 已交付（2026-11-25） | `broker_session_replica_SUITE` 新增 `subscription_set_survives_sigkill` + `inflight_blob_survives_sigkill`（OS `kill -9` 后 durable 订阅集/游标/in-flight blob 由副本恢复），源码级变异验证非退化；网络分区/`no_quorum` 由既有 dist 套件覆盖 |
 | P2-P0 OIDC/JWKS | 真缺口 | 全仓无 `oidc`/`jwks` |
 | P2-P0 防篡改审计 | 真缺口 | `security.md:24,255` 明列未实现 |
 | P2-P1 deny-by-default ACL | 真缺口 | 默认 `allow`（`security.md:100`） |
