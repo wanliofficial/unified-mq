@@ -94,7 +94,7 @@
   - **防篡改审计日志（哈希链/签名）**：`docs/security.md` §8 明列未实现。
 - [ ] **P1 级（生产可用性）**
   - deny-by-default ACL 的默认姿态与推荐配置（当前默认 `allow` 为 legacy 兼容）。
-  - 客户端 listener 的 TLS 1.3 / mTLS **端到端证据**（2026-11-24 核实）。能力已在：`broker_security_tls.erl:43` 默认 `versions => ['tlsv1.2','tlsv1.3']`，mTLS 选项装配有单测 `broker_security_tls_SUITE:verify_peer_adds_the_client_ca`；缺的是 MQTT/WS listener 真握手断言（现有 `mqtt_tls_SUITE` 只跑 `verify_none`）。注意：**distribution 的 mTLS 已由 ADR-035 交付**，不要混为一谈。
+  - [x] 客户端 listener 的 TLS 1.3 / mTLS **端到端证据** —— **✅ 已交付（2026-11-25）**：`mqtt_tls_SUITE` 从只跑 `verify_none` 扩到 7 例，新增三条真握手证据——`negotiates_tls1_3_by_default`（客户端 pin `['tlsv1.3']` 握手成功 + `ssl:connection_information/2` 读回 `{protocol,'tlsv1.3'}` 钉死，再跑 CONNACK 证明 1.3 信道承载 MQTT）、`mtls_with_client_cert_completes_the_handshake`（服务端 `verify_peer`+`cacertfile`+`fail_if_no_peer_cert`，客户端出示 CA 链下合法证书握手+CONNACK）、`mtls_rejects_client_without_cert`（同 posture 下无证书客户端无法承载 MQTT：TLS1.2 连接即 `{error,alert}`、TLS1.3 连接报 ok 后被服务端 fatal `certificate_required` 告警拆链，二者皆非 CONNACK 即非绕过）。经**源码级变异**验证非退化：默认 `versions` 砍到 1.2-only → `negotiates_tls1_3` 红；`listener_opts` 强制 `verify_none` → 两 mTLS 例红；`listener_opts` 丢弃 `cacertfile` → 带证书例红。边界：本专项针对**客户端 listener（TCP/TLS）**；**distribution 的 mTLS 已由 ADR-035 交付**，QUIC 强制 TLS1.3（S8-D）、CoAP 仅 DTLS-PSK 无证书（S11-C）各自独立，不混。
   - 多模式存储后端（RocksDB / File / S3 冷分层）：现仅内存 + WAL。
   - ~~Prometheus / Grafana / OTel 导出：`broker_metrics` 有指标，无导出层。~~ **Prometheus 导出已交付（2026-11-24 核实）**：`GET /metrics` 返回 `200 text/plain; version=0.0.4`（`broker_admin_http.erl:68-69` 路由、`:305-325` 渲染，测试 `broker_admin_SUITE:metrics_endpoint_lists_the_closed_key_set`）。**仅剩** Grafana dashboard 与 OTel 导出未做。
   - 畸形包三类断言（静默关闭/拒绝/接受，借鉴 fss `wire.rs`）：MQTT **已覆盖主要异常路径**（`mqtt_conn_SUITE:1844` 非法 filter 断连无 SUBACK、`:1956` reserved QoS 位断连、`:2344` 超限 PUBLISH 断连；`mqtt_frame_SUITE:427` 截断包永不 OK、`:447` 固定头 flag 拒绝），缺 `test/conformance/mqtt/wire/` 下「三类逐条对账」独立套件（`test/conformance/` 目录不存在）。
@@ -149,6 +149,8 @@
 > **2026-11-25 更新**：上句的「P1 全部为真缺口」已过期——**MQ-11（`b95a32a`）与 MQ-15（`53946f5`）均已交付**，MQ-09 的文档取舍也已随 P0-1 落笔，**P1 已无 `[ ]` 项**。表中 P1 三行已就地更新判定，其余行仍为 2026-11-24 判定。
 >
 > **2026-11-25 再更新**：上句「其余……P4 为真缺口」也已过期——**P4（ADR-007 三档容量专项 + 绑定 S12 有状态服务）已交付**，`docs/roadmap.md` Gate S12 最后一项勾选，表中 P4 行已改为「✅ 已交付」。至此 `[ ]` 仅剩 P2 九项（需产品决策定位）。
+>
+> **2026-11-25 三更新**：P2 的两个**纯证据缺口**（能力已在、只缺专项证明）已交付——P2-P0 SIGKILL harness（表中行）与 **P2-P1 TLS1.3/mTLS 专项**（`mqtt_tls_SUITE` 新增三条真握手证据，源码级变异验证）。**P2 真产品定位决策项剩 7 项**（OIDC/JWKS、防篡改审计、deny-by-default ACL、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
 
 | 项 | 判定 | 证据（file:line / 产物） |
 |---|---|---|
@@ -159,7 +161,7 @@
 | P2-P0 OIDC/JWKS | 真缺口 | 全仓无 `oidc`/`jwks` |
 | P2-P0 防篡改审计 | 真缺口 | `security.md:24,255` 明列未实现 |
 | P2-P1 deny-by-default ACL | 真缺口 | 默认 `allow`（`security.md:100`） |
-| P2-P1 TLS1.3/mTLS 专项 | **部分误报** | 能力已在 `broker_security_tls.erl:43` + `broker_security_tls_SUITE:88`；缺 listener 端到端断言（已就地改） |
+| P2-P1 TLS1.3/mTLS 专项 | **部分误报** → ✅ 已交付（2026-11-25） | 能力已在 `broker_security_tls.erl:43` + `broker_security_tls_SUITE:88`；`mqtt_tls_SUITE` 新增 `negotiates_tls1_3_by_default` + `mtls_with_client_cert_completes_the_handshake` + `mtls_rejects_client_without_cert` 三条真握手断言，源码级变异验证非退化 |
 | P2-P1 多模式存储后端 | 真缺口 | 仅 memory + WAL，无 rocksdb/s3/file |
 | P2-P1 Prometheus 导出 | **误报（已交付）** | `broker_admin_http.erl:68-69,305-325` + `broker_admin_SUITE:152`（已就地改） |
 | P2-P1 畸形包三类断言 | **部分误报** | MQTT 已覆盖 `mqtt_conn_SUITE:1844/1956/2344`、`mqtt_frame_SUITE:427/447`；缺 conformance 三类对账套件（已就地改） |
