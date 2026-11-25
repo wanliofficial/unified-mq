@@ -97,8 +97,8 @@
   - [x] 客户端 listener 的 TLS 1.3 / mTLS **端到端证据** —— **✅ 已交付（2026-11-25）**：`mqtt_tls_SUITE` 从只跑 `verify_none` 扩到 7 例，新增三条真握手证据——`negotiates_tls1_3_by_default`（客户端 pin `['tlsv1.3']` 握手成功 + `ssl:connection_information/2` 读回 `{protocol,'tlsv1.3'}` 钉死，再跑 CONNACK 证明 1.3 信道承载 MQTT）、`mtls_with_client_cert_completes_the_handshake`（服务端 `verify_peer`+`cacertfile`+`fail_if_no_peer_cert`，客户端出示 CA 链下合法证书握手+CONNACK）、`mtls_rejects_client_without_cert`（同 posture 下无证书客户端无法承载 MQTT：TLS1.2 连接即 `{error,alert}`、TLS1.3 连接报 ok 后被服务端 fatal `certificate_required` 告警拆链，二者皆非 CONNACK 即非绕过）。经**源码级变异**验证非退化：默认 `versions` 砍到 1.2-only → `negotiates_tls1_3` 红；`listener_opts` 强制 `verify_none` → 两 mTLS 例红；`listener_opts` 丢弃 `cacertfile` → 带证书例红。边界：本专项针对**客户端 listener（TCP/TLS）**；**distribution 的 mTLS 已由 ADR-035 交付**，QUIC 强制 TLS1.3（S8-D）、CoAP 仅 DTLS-PSK 无证书（S11-C）各自独立，不混。
   - 多模式存储后端（RocksDB / File / S3 冷分层）：现仅内存 + WAL。
   - ~~Prometheus / Grafana / OTel 导出：`broker_metrics` 有指标，无导出层。~~ **Prometheus 导出已交付（2026-11-24 核实）**：`GET /metrics` 返回 `200 text/plain; version=0.0.4`（`broker_admin_http.erl:68-69` 路由、`:305-325` 渲染，测试 `broker_admin_SUITE:metrics_endpoint_lists_the_closed_key_set`）。**仅剩** Grafana dashboard 与 OTel 导出未做。
-  - 畸形包三类断言（静默关闭/拒绝/接受，借鉴 fss `wire.rs`）：MQTT **已覆盖主要异常路径**（`mqtt_conn_SUITE:1844` 非法 filter 断连无 SUBACK、`:1956` reserved QoS 位断连、`:2344` 超限 PUBLISH 断连；`mqtt_frame_SUITE:427` 截断包永不 OK、`:447` 固定头 flag 拒绝），缺 `test/conformance/mqtt/wire/` 下「三类逐条对账」独立套件（`test/conformance/` 目录不存在）。
-  - 外部 conformance 接入：L3 外部套件未建，当前只有设计稿 `docs/protocol-conformance-validation.md`（`test/conformance/` 目录不存在）——这是**真缺口**，与上面的畸形包已覆盖部分分开看。
+  - [x] 畸形包三类断言（静默关闭/拒绝/接受，借鉴 fss `wire.rs`）—— **✅ MQTT 已交付（2026-11-25）**：既有单元/活连接覆盖（`mqtt_conn_SUITE:1844` 非法 filter 断连无 SUBACK、`:1956` reserved QoS 位断连、`:2344` 超限 PUBLISH 断连；`mqtt_frame_SUITE:427` 截断包永不 OK、`:447` 固定头 flag 拒绝）之上，新增 `test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动「三类逐条对账」独立套件（7 行，注入活连接），源码级三向变异验证非退化。其余五协议（NATS/AMQP/Kafka/Pulsar/MQTT-SN）已各自自带 live 畸形包类别断言，无同类缺口。
+  - 外部 conformance 接入：L3 外部套件未建，当前只有设计稿 `docs/protocol-conformance-validation.md`（`test/conformance/` 已建、现有 MQTT 自研对账套件，但**尚未接第三方驱动**如 Paho）——这是**真缺口**，属产品决策，与上面的畸形包自研对账分开看。
 - [ ] **P2 级（增强）**
   - 规则引擎（filter / reshape / re-route + sinks）、Web 管理控制台、SBOM/SLSA/VEX 可复现构建、K8s operator/Helm、FIPS 变体、Edge-to-cloud 离线缓冲。
 - [x] **P0 吊销实时驱逐活动会话** —— 2026-11-22 已完成（`broker_revocation` + admin `/api/v1/revoke`）。**范围限制**：只在 MQTT 连接路径生效，其余协议认证入口不查吊销表；状态节点本地、粒度仅 principal。
@@ -167,7 +167,7 @@
 | P2-P1 多模式存储后端 | 真缺口 | 仅 memory + WAL，无 rocksdb/s3/file |
 | P2-P1 Prometheus 导出 | **误报（已交付）** | `broker_admin_http.erl:68-69,305-325` + `broker_admin_SUITE:152`（已就地改） |
 | P2-P1 畸形包三类断言 | **部分误报 → ✅ 已交付（2026-11-25）** | MQTT 已覆盖 `mqtt_conn_SUITE:1844/1956/2344`、`mqtt_frame_SUITE:427/447`；新落地 `test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动 conformance 对账套件（设计稿 `docs/protocol-conformance-validation.md §4.3.2` 落点），把 codec 会拒绝的畸形包**注入活连接**，逐条对账「静默关闭 / 带原因码拒绝 / 接受」三类 → MQTT 条款 → `docs/protocol-compatibility.md §4` 限制（7 行：错误 protocol NAME→refuse、overlong varint/截断/保留帧型/QoS3/NUL filter→close、非最小 varint→accept）；源码级三向变异验证非退化（`refuse(1)`→静默关令 refuse 行红、post-CONNECT 关连接→`keep_state` 令 close 行红、codec 过度严格→accept 行红） |
-| P2-P1 外部 conformance | 真缺口 | `test/conformance/` 不存在，仅设计稿 |
+| P2-P1 外部 conformance | 真缺口（产品决策） | `test/conformance/` 已建（MQTT 自研对账套件在），但**未接第三方驱动**如 Paho；仅设计稿 `protocol-conformance-validation.md` |
 | P2-P2 规则引擎/Web/SBOM/SLSA/VEX/K8s/FIPS/Edge | 真缺口 | 全仓均无（CI 无 sbom/slsa/vex/fips，无 Chart.yaml/k8s，无 offline buffer） |
 | P4 ADR-007 三档压测 | ✅ 已交付（2026-11-25） | 丢失边界 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md` + 容量专项 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`（`tools/bench/s12_adr007_capacity.erl`，真实 3 peer：三档容量天花板 + ra 元数据层绑定 + 失多数派拒绝） |
 
