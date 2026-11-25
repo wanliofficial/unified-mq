@@ -77,6 +77,8 @@ apply(#{index := Index}, Command, #{partitions := Ps} = State) ->
             shared_ack(Sub, P, Offset, ClientId, State);
         {shared_release, Sub, P, ClientId} ->
             shared_release(Sub, P, ClientId, State);
+        {shared_release_node, Node} ->
+            shared_release_node(Node, State);
         {shared_reclaim, Sub, P, FromId, ToId, Offsets} ->
             shared_reclaim(Sub, P, FromId, ToId, Offsets, State);
         {shared_join, Sub, ClientId, Node} ->
@@ -243,6 +245,41 @@ shared_release(Sub, P, ClientId, State) ->
             broker_cluster_cache:put_shared_assignments(As1),
             {State#{shared_assignments => As1}, {ok, Released}, []}
     end.
+
+%% @doc Crash-release: return every offset held by a consumer *hosted on `Node''
+%% to the pool, across all subs and partitions, and drop that node's consumer
+%% entries. One atomic ra command (the state machine owns both tables), so a node
+%% crash mid-release cannot leave a half-released table -- the same
+%% monotonic-set-op property the other shared commands rely on (§9 decision 1).
+%% Returns `{ok, Released}' (the number of offsets freed).
+shared_release_node(Node, State) ->
+    As = maps:get(shared_assignments, State, #{}),
+    Cs = maps:get(shared_consumers, State, #{}),
+    %% {Sub, ClientId} pairs hosted on the crashed node.
+    Targets = maps:from_list([{{Sub, C}, true}
+                              || {{Sub, C}, N} <- maps:to_list(Cs), N =:= Node]),
+    {As1, Released} =
+        maps:fold(
+          fun(Key = {Sub, _P}, Row, {Acc, Rel}) ->
+                  Assigned = maps:get(assigned, Row, #{}),
+                  {Keep, Gone} =
+                      maps:fold(
+                        fun(O, C, {K, G}) ->
+                                case maps:is_key({Sub, C}, Targets) of
+                                    true -> {K, G + 1};
+                                    false -> {K#{O => C}, G}
+                                end
+                        end, {#{}, 0}, Assigned),
+                  case Gone of
+                      0 -> {Acc, Rel};
+                      _ -> {Acc#{Key => Row#{assigned := Keep}}, Rel + Gone}
+                  end
+          end, {#{}, 0}, As),
+    Cs1 = maps:filter(fun({_Sub, _C}, N) -> N =/= Node end, Cs),
+    broker_cluster_cache:put_shared_assignments(As1),
+    broker_cluster_cache:put_shared_consumers(Cs1),
+    {State#{shared_assignments => As1, shared_consumers => Cs1},
+     {ok, Released}, []}.
 
 shared_reclaim(Sub, P, FromId, ToId, Offsets, State) ->
     As = maps:get(shared_assignments, State, #{}),

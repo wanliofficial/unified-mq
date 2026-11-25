@@ -754,6 +754,11 @@ claim_via_ra(SubRef, PartitionId, Max, Consumer, Row, Limit, State) ->
                     broker_metrics:inc(shared_claims),
                     {reply, {ok, Offsets}, State};
                 {ok, quota_hit} ->
+                    %% This consumer hit its own share while the group has room.
+                    %% §4.1(b): on flag-on, check the group's imbalance and reclaim
+                    %% from the most-loaded to the least-loaded consumer if past the
+                    %% hysteresis + cooldown (reuses the poll tick, no new process).
+                    maybe_rebalance(SubRef, PartitionId, Consumer),
                     broker_metrics:inc(shared_consumer_quota_hit),
                     {reply, {ok, []}, State};
                 {error, overflow} ->
@@ -1136,6 +1141,114 @@ reply_new_subscribe_for_test(SubRef, Partitions) ->
 
 cluster_flag() ->
     application:get_env(broker_subscription, cluster_shared_rebalance, false).
+
+%% MQ-15 §4.1(b): threshold-triggered rebalance. Fired from the claim path when a
+%% consumer hits its per-consumer quota (the group still has room, so someone else
+%% is under-loaded). Reads the committed mirror for the group's `assigned', and if
+%% the per-group imbalance (max held - min held) exceeds the hysteresis AND the
+%% reclaim cooldown has elapsed, reclaims the most-loaded consumer's offsets beyond
+%% the mean to the least-loaded one. Flag off (default) is a no-op: zero regression.
+maybe_rebalance(SubRef, PartitionId, Overloaded) ->
+    case cluster_flag() of
+        false -> ok;
+        true -> maybe_rebalance_via_ra(SubRef, PartitionId, Overloaded)
+    end.
+
+maybe_rebalance_via_ra(SubRef, PartitionId, _Overloaded) ->
+    case broker_cluster_cache:shared_assignment(SubRef, PartitionId) of
+        {ok, Row} ->
+            Assigned = maps:get(assigned, Row, #{}),
+            Counts = per_client_counts(Assigned),
+            case maps:size(Counts) < 2 of
+                true ->
+                    ok;
+                false ->
+                    {FromId, MaxN} = max_client(Counts),
+                    {ToId, MinN} = min_client(Counts),
+                    Hyst = rebalance_hysteresis(),
+                    Cooldown = rebalance_cooldown_ms(),
+                    case MaxN - MinN > Hyst andalso
+                         cooldown_elapsed(SubRef, PartitionId, Cooldown) of
+                        true ->
+                            Mean = mean_count(Counts),
+                            Offsets = pick_overloaded(Assigned, FromId, MaxN, Mean),
+                            case Offsets of
+                                [] -> ok;
+                                _ ->
+                                    mark_reclaim(SubRef, PartitionId),
+                                    _ = broker_cluster:shared_reclaim(
+                                          SubRef, PartitionId, FromId, ToId, Offsets),
+                                    update_shared_mirror(SubRef, PartitionId),
+                                    broker_metrics:inc(shared_reclaim),
+                                    ok
+                            end;
+                        false ->
+                            ok
+                    end
+            end;
+        not_found ->
+            ok
+    end.
+
+%% `Offset => ClientId' -> `#{ClientId => Held}'.
+per_client_counts(Assigned) ->
+    maps:fold(
+      fun(_O, C, Acc) ->
+              Acc#{C => maps:get(C, Acc, 0) + 1}
+      end, #{}, Assigned).
+
+max_client(Counts) -> max_client(maps:to_list(Counts), {undefined, 0}).
+max_client([{C, N} | Rest], {_, Best}) when N > Best -> max_client(Rest, {C, N});
+max_client([_ | Rest], Best) -> max_client(Rest, Best);
+max_client([], Best) -> Best.
+
+min_client(Counts) -> min_client(maps:to_list(Counts), {undefined, undefined}).
+min_client([{C, N} | Rest], {_, Best}) when Best =:= undefined; N < Best ->
+    min_client(Rest, {C, N});
+min_client([_ | Rest], Best) -> min_client(Rest, Best);
+min_client([], Best) -> Best.
+
+mean_count(Counts) ->
+    Total = maps:fold(fun(_C, N, Acc) -> Acc + N end, 0, Counts),
+    Total div maps:size(Counts).
+
+%% The `FromId' offsets beyond the mean, capped at a sane batch (never more than the
+%% per-consumer window), reclaimed to the least-loaded consumer. Only offsets
+%% `FromId' actually holds are chosen -- reclaim never invents an assignment.
+pick_overloaded(Assigned, FromId, MaxN, Mean) ->
+    Move = MaxN - Mean,
+    case Move =< 0 of
+        true -> [];
+        false ->
+            Cap = erlang:min(Move, MaxN),
+            Held = lists:sort(
+                     [O || {O, C} <- maps:to_list(Assigned), C =:= FromId]),
+            lists:sublist(Held, Cap)
+    end.
+
+%% Reclaim cooldown, process-local: persistent_term `{..., last_reclaim}' holds the
+%% last reclaim time per `{SubRef, PartitionId}'. No prior reclaim counts as elapsed.
+cooldown_elapsed(SubRef, PartitionId, Cooldown) ->
+    Key = {broker_subscription, last_reclaim, SubRef, PartitionId},
+    case persistent_term:get(Key, undefined) of
+        undefined -> true;
+        Last -> now_ms() - Last >= Cooldown
+    end.
+
+mark_reclaim(SubRef, PartitionId) ->
+    Key = {broker_subscription, last_reclaim, SubRef, PartitionId},
+    try
+        persistent_term:put(Key, now_ms())
+    catch
+        _:_ -> ok
+    end,
+    ok.
+
+rebalance_hysteresis() ->
+    application:get_env(broker_subscription, shared_rebalance_hysteresis, 2).
+
+rebalance_cooldown_ms() ->
+    application:get_env(broker_subscription, shared_rebalance_cooldown_ms, 5000).
 
 %% MQ-15: record that `ClientId' on this node joined/left a shared group, so a
 %% later node crash can release exactly the offsets that node's consumers held

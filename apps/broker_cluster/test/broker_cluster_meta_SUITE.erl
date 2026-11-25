@@ -20,6 +20,7 @@ all() -> [claim_moves_owner_when_holding_replica,
           shared_release_returns_all_of_a_consumer,
           shared_consumers_table_tracks_join_leave,
           shared_reclaim_moves_only_the_named_offsets,
+          shared_release_node_frees_every_offset_the_node_hosted,
           shared_assignments_survive_snapshot_install].
 
 %% 同 broker_cluster_session_owner_SUITE 的约定：apply/3 会镜像到本地 cache，
@@ -250,6 +251,49 @@ shared_reclaim_moves_only_the_named_offsets(_Config) ->
     Assigned = assigned_in(S2, Sub, 0),
     ?assertEqual(<<"c2">>, maps:get(2, Assigned)),
     ?assertEqual(<<"c1">>, maps:get(1, Assigned)),
+    ok.
+
+shared_release_node_frees_every_offset_the_node_hosted(_Config) ->
+    S0 = #{partitions => #{}},
+    SubA = {shared, <<"ga">>, <<"s/#">>},
+    SubB = {shared, <<"gb">>, <<"t/#">>},
+    %% c1 lives on N1, c2 on N2 -- across two different shared groups.
+    {S1, {ok, _}, []} =
+        broker_cluster_meta_machine:apply(
+          #{index => 1}, {shared_join, SubA, <<"c1">>, 'n1@host'}, S0),
+    {S2, {ok, _}, []} =
+        broker_cluster_meta_machine:apply(
+          #{index => 2}, {shared_join, SubA, <<"c2">>, 'n2@host'}, S1),
+    {S3, {ok, _}, []} =
+        broker_cluster_meta_machine:apply(
+          #{index => 3}, {shared_join, SubB, <<"c1">>, 'n1@host'}, S2),
+    %% c1 on N1 claims on both partitions; c2 on N2 claims one on SubA.
+    {S4, _, []} = broker_cluster_meta_machine:apply(
+                    #{index => 4},
+                    {shared_claim, SubA, 0, <<"c1">>, 3, 100, #{}, 0}, S3),
+    {S5, {ok, _}, []} = broker_cluster_meta_machine:apply(
+                          #{index => 5},
+                          {shared_claim, SubA, 0, <<"c2">>, 3, 100, #{}, 0}, S4),
+    {S6, {ok, _}, []} = broker_cluster_meta_machine:apply(
+                          #{index => 6},
+                          {shared_claim, SubB, 0, <<"c1">>, 2, 100, #{}, 0}, S5),
+    %% N1 crashes: every offset its consumers (c1 on both groups) held is freed.
+    {S7, {ok, Released}, []} =
+        broker_cluster_meta_machine:apply(
+          #{index => 7}, {shared_release_node, 'n1@host'}, S6),
+    %% 3 on SubA (c1) + 2 on SubB (c1) = 5 offsets returned to the pool.
+    ?assertEqual(5, Released),
+    %% SubA still holds the survivor c2's offsets; only c1's are gone.
+    ?assertEqual(#{4 => <<"c2">>, 5 => <<"c2">>, 6 => <<"c2">>},
+                 assigned_in(S7, SubA, 0)),
+    %% SubB had only c1, now emptied.
+    ?assertEqual(#{}, assigned_in(S7, SubB, 0)),
+    %% c2 on SubA is untouched: the survivor keeps its offsets (claimed 4,5,6).
+    ?assertEqual(#{4 => <<"c2">>, 5 => <<"c2">>, 6 => <<"c2">>},
+                 assigned_in(S7, SubA, 0)),
+    %% The crashed node's consumer entries are dropped; c2's (on n2) remains.
+    ?assertEqual([<<"c2">>], consumers_on(S7, 'n2@host')),
+    ?assertEqual([], consumers_on(S7, 'n1@host')),
     ok.
 
 shared_assignments_survive_snapshot_install(_Config) ->

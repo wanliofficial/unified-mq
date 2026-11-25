@@ -13,6 +13,8 @@
            %% `acked ∪ assigned'. A full window refuses further claims instead of
            %% evicting a live assignment.
            {shared_state_max, 4096},
+            {shared_rebalance_hysteresis, 2},
+            {shared_rebalance_cooldown_ms, 5000},
            %% S2-E (ADR-015 §15.2/§15.3): retry backoff, attempt budget and the
            %% dead-letter destination template.
            {retry_tick_ms, 1000},

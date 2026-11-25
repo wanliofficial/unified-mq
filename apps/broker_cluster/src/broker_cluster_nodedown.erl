@@ -32,6 +32,12 @@ pick_new_owner(Partition, DeadNode) ->
 
 %% @doc 收到 {nodedown, O}：遍历本地镜像里 O 拥有的分区，逐个提交迁移。
 %% fire-and-forget：迁移提交失败（无 quorum）不崩溃，等下次重试或恢复。
+%%
+%% MQ-15 §4.1(c)：崩溃回池与分区迁移正交。若 `broker_subscription:
+%% cluster_shared_rebalance' 开，追加把崩溃节点 O 的全部 shared consumer
+%% 占用的 offset 原子回池（`shared_release_node(O)'），存活消费者据此重新 claim，
+%% 不丢、不卡 `low'。复用现有去抖（见 broker_cluster_nodedown_mon），仅在
+%% 同一 handler 里追加这一步。
 -spec on_nodedown(node()) -> ok.
 on_nodedown(DeadNode) ->
     _ = try broker_cluster:partition_view() of
@@ -55,4 +61,18 @@ on_nodedown(DeadNode) ->
                           ok
                   end, View)
         catch _:_ -> ok end,
+    _ = release_shared_consumers(DeadNode),
     ok.
+
+%% 崩溃回池（MQ-15 §4.1(c)）：仅 cluster_shared_rebalance 开时生效。`shared_release_node'
+%% 经 ra 原子地把崩溃节点上全部 shared consumer 的 offset 回池。ra 缺失 / 无 quorum 时
+%% `command' 返回 {error,_}，吞掉——回池只是优化，等节点恢复或下次 nodedown 仍会补。
+release_shared_consumers(DeadNode) ->
+    case application:get_env(broker_subscription, cluster_shared_rebalance, false) of
+        true ->
+            _ = try broker_cluster:shared_release_node(DeadNode)
+                catch _:_ -> ok end,
+            ok;
+        _ ->
+            ok
+    end.

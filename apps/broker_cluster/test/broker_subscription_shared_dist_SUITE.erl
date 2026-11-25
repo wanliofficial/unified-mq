@@ -28,7 +28,8 @@
 
 all() ->
     [concurrent_claims_on_two_nodes_do_not_duplicate,
-     a_dead_nodes_offsets_are_released_to_the_survivor].
+     a_dead_nodes_offsets_are_released_to_the_survivor,
+     threshold_reclaim_moves_offsets_from_an_overloaded_consumer].
 
 %%%_* Fixtures --------------------------------------------------------------
 
@@ -120,6 +121,30 @@ a_dead_nodes_offsets_are_released_to_the_survivor(Config) ->
     ?assert(lists:member(1, Offsets)),
     ?assert(lists:member(2, Offsets)),
     ?assert(lists:member(3, Offsets)),
+    ok.
+
+%% MQ-15 §4.1(b): the reclaim command reassigns a named offset from an overloaded
+%% consumer to a freer one. c1 holds 1..4, c2 is idle; reclaiming offset 2 from c1
+%% to c2 must move exactly that offset and leave the rest with c1.
+threshold_reclaim_moves_offsets_from_an_overloaded_consumer(Config) ->
+    Members = members(Config),
+    [N1, N2 | _] = Members,
+    _ = N1, _ = N2,
+    ok = form_cluster(Config),
+    Sub = ?SUB,
+    {ok, _} = rpc(N1, broker_cluster, shared_join, [Sub, <<"c1">>, N1]),
+    {ok, _} = rpc(N2, broker_cluster, shared_join, [Sub, <<"c2">>, N2]),
+    %% c1 holds four in-flight offsets, c2 is idle.
+    {ok, _} = rpc(N1, broker_cluster, shared_claim,
+                  [Sub, 0, <<"c1">>, 4, 100, #{}, 0]),
+    %% Reclaim offset 2 from c1 to c2 (the threshold trigger's action, §4.1(b)).
+    {ok, [2]} = rpc(N1, broker_cluster, shared_reclaim,
+                    [Sub, 0, <<"c1">>, <<"c2">>, [2]]),
+    {ok, Row} = rpc(N1, broker_cluster_cache, shared_assignment, [Sub, 0]),
+    %% Exactly offset 2 moved; 1,3,4 stay with c1.
+    ?assertEqual(#{1 => <<"c1">>, 2 => <<"c2">>,
+                   3 => <<"c1">>, 4 => <<"c1">>},
+                 maps:get(assigned, Row)),
     ok.
 
 %%%_* Peers ----------------------------------------------------------------

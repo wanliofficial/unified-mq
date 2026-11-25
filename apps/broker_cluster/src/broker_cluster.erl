@@ -13,8 +13,8 @@
 -export([assign/4, migrate/4, finish_migration/2, remove/1, claim/3,
          set_session_partition_count/1]).
 %% MQ-15: shared assignment ra commands (the cross-node allocation truth).
--export([shared_claim/7, shared_ack/4, shared_release/3, shared_reclaim/5,
-         shared_join/3, shared_leave/2, shared_consumers_on/1]).
+-export([shared_claim/7, shared_ack/4, shared_release/3, shared_release_node/1,
+         shared_reclaim/5, shared_join/3, shared_leave/2, shared_consumers_on/1]).
 -export([join/1, join/2, leave/1, leave/2]).
 -export([owner/1, epoch/1, epoch_or_zero/1, replicas/1, snapshot/0,
          partition_view/0]).
@@ -102,6 +102,14 @@ shared_ack(Sub, Partition, Offset, ClientId) ->
 -spec shared_release(term(), non_neg_integer(), binary()) -> {ok, non_neg_integer()} | {error, term()}.
 shared_release(Sub, Partition, ClientId) ->
     command({shared_release, Sub, Partition, ClientId}).
+
+%% @doc Crash-release: atomically return every offset held by any consumer hosted
+%% on `Node' (across all subs/partitions) to the pool and drop that node's
+%% consumer entries. The nodedown handler calls this for a confirmed-dead node
+%% (MQ-15 §4.1(c)). One ra command => no half-released table.
+-spec shared_release_node(node()) -> {ok, non_neg_integer()} | {error, term()}.
+shared_release_node(Node) when is_atom(Node) ->
+    command({shared_release_node, Node}).
 
 %% @doc Threshold-triggered rebalance: move `Offsets' from `FromId' to `ToId',
 %% but only where `FromId' still holds them.

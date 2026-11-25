@@ -76,11 +76,21 @@ terminate(_Reason, #{monitored := Mon, pending := Pend}) ->
 
 %%%_* Internal ------------------------------------------------------------
 
-%% 开关开 → 监视当前成员；关 → 撤掉所有监视（I2 退化）。
+%% 开关开 → 监视当前成员；关 → 撤掉所有监视（I2 退化）。MQ-15 的崩溃回池
+%% (`broker_cluster:shared_release_node') 复用同一去抖/监视，故 cluster_shared_rebalance
+%% 开也要监视成员，否则收不到 {nodedown,_}。
 arm(St) ->
-    case application:get_env(broker_cluster, session_replication, false) of
+    case cluster_active() of
         true -> monitor_members(St);
         _ -> unmonitor_all(St)
+    end.
+
+%% 任一集群特性开了才需要成员监视（session 复制 OR MQ-15 共享再均衡）。
+cluster_active() ->
+    case application:get_env(broker_cluster, session_replication, false) of
+        true -> true;
+        _ ->
+            application:get_env(broker_subscription, cluster_shared_rebalance, false)
     end.
 
 monitor_members(#{monitored := Mon} = St) ->
