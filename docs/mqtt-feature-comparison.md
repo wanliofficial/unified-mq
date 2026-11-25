@@ -175,7 +175,7 @@
 
 ### 4.7 测试资产（已在 `protocol-conformance-validation.md` 立项）
 
-- [ ] **P1 畸形包/线格式专项（借鉴 fss `wire.rs`）**：本仓库 T15 已有逐帧字节对比；按 `docs/protocol-conformance-validation.md` §4.3.2 扩展「静默关闭/拒绝/接受」三类断言。
+- [x] **P1 畸形包/线格式专项（借鉴 fss `wire.rs`）**：本仓库 T15 已有逐帧字节对比；按 `docs/protocol-conformance-validation.md` §4.3.2 扩展「静默关闭/拒绝/接受」三类断言。**已交付（2026-11-25）**：`test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动对账套件，把 codec 会拒绝的畸形包**注入活连接**，逐条对账「静默关闭 / 带原因码拒绝 / 接受」三类 → MQTT 条款 → §4.2 对外限制（7 行，源码级三向变异验证）。注：外部 Paho/Python 驱动部分见下条（仍是产品决策项）。
 - [ ] **P1 外部客户端 conformance（`scripts/interop/run.sh` 思路）**：按 `docs/protocol-conformance-validation.md` 接入 Paho 互操作 + kafkatest。
 
 ---

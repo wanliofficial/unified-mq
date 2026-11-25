@@ -208,6 +208,10 @@ func (h *UnifiedMQHarness) LatestOffset(ctx context.Context, topic string, parti
 
 每条用例断言「服务端行为属于哪一类（静默关闭 / 拒绝 / 接受）」，与 `docs/protocol-compatibility.md` §4 的对外限制逐条对账。
 
+> **落地进度（2026-11-25 补注）**
+> - **纯 Erlang CT 侧已落地**（不引入任何外部 Python/Rust 依赖）：`test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl`，表驱动 7 行对账——错误 protocol NAME→拒绝（CONNACK rc=1/v5 0x84）、overlong varint / 截断 / 保留帧型 / QoS3 / filter 内嵌 NUL→静默关闭、非最小 varint→接受（PINGRESP）。每条把「异常 → 类别 → MQTT 条款 → §4 限制」打印进 CT 日志作可追溯证据。源码级三向变异验证非退化：`mqtt_conn_fsm:decode_error({unsupported_protocol,...})` 的 `refuse(1)`→静默关令 refuse 行红；post-CONNECT 关连接分支 `{stop,normal,D}`→`{keep_state,D}` 令 close 行红；`mqtt_frame:rl_decode` 过度严格拒绝非最小 varint 令 accept 行红。全量 ct 1951/1951（含本套件）。
+> - **仍待做（产品决策项）**：用 Python 在 `test/conformance/mqtt/wire/*.py` 拼字节的**外部驱动**，以及同目录的 Paho `client_test*.py` 互操作接入（§4.3.1）。本套件是该要求在仓库内 CT 侧的等价证据，与外部驱动互不替代——前者纳入 CI 默认门禁、无第三方依赖；后者提供「厂商中立客户端能否驱动本 Broker」的互操作视角。
+
 #### 4.3.3 验收口径
 
 - Paho `client_test.py` + `client_test5.py` 全绿（除文档声明的 SKIP）。

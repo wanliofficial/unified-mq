@@ -144,13 +144,13 @@
 
 ## 核实记录（2026-11-24）
 
-> 对上方每一条 `[ ]` 做了一次「代码/产物 vs 文档口径」核对，判定分四类。**结论（2026-11-24 快照）：P1 全部为真缺口；P2 中 Prometheus 导出为误报（已就地改），TLS1.3/mTLS、畸形包、ADR-007 三档为部分误报（已就地改并标注「能力已在、缺专项证据」）；其余 P0/P1/P2/P4 为真缺口。**
+> 对上方每一条 `[ ]` 做了一次「代码/产物 vs 文档口径」核对，判定分四类。**结论（2026-11-25 快照）：P1 全部为真缺口；P2 中 Prometheus 导出为误报（已就地改），TLS1.3/mTLS、畸形包三类 conformance、ADR-007 三档为「部分误报 → ✅ 已交付」（已就地改并标注「能力已在、缺专项证据」，三者均含源码级变异验证）；其余 P0/P1/P2/P4 为真缺口。**
 >
 > **2026-11-25 更新**：上句的「P1 全部为真缺口」已过期——**MQ-11（`b95a32a`）与 MQ-15（`53946f5`）均已交付**，MQ-09 的文档取舍也已随 P0-1 落笔，**P1 已无 `[ ]` 项**。表中 P1 三行已就地更新判定，其余行仍为 2026-11-24 判定。
 >
 > **2026-11-25 再更新**：上句「其余……P4 为真缺口」也已过期——**P4（ADR-007 三档容量专项 + 绑定 S12 有状态服务）已交付**，`docs/roadmap.md` Gate S12 最后一项勾选，表中 P4 行已改为「✅ 已交付」。至此 `[ ]` 仅剩 P2 九项（需产品决策定位）。
 >
-> **2026-11-25 三更新**：P2 的两个**纯证据缺口**（能力已在、只缺专项证明）已交付——P2-P0 SIGKILL harness（表中行）与 **P2-P1 TLS1.3/mTLS 专项**（`mqtt_tls_SUITE` 新增三条真握手证据，源码级变异验证）。**P2 真产品定位决策项剩 7 项**（OIDC/JWKS、防篡改审计、deny-by-default ACL、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
+> **2026-11-25 四更新**：P2 的三个**纯证据缺口**（能力已在、只缺专项证明，不需产品定位）已全部交付——P2-P0 SIGKILL harness（表中行）、**P2-P1 TLS1.3/mTLS 专项**（`mqtt_tls_SUITE` 新增三条真握手证据）、**P2-P1 畸形包三类 conformance 对账**（`test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动 7 行，源码级三向变异验证）；三者均经源码级变异验证非退化。**P2 真产品定位决策项剩 7 项**（OIDC/JWKS、防篡改审计、deny-by-default ACL、多存储后端、外部 conformance、规则引擎/Web/SBOM/K8s/FIPS/Edge）。
 
 | 项 | 判定 | 证据（file:line / 产物） |
 |---|---|---|
@@ -164,7 +164,7 @@
 | P2-P1 TLS1.3/mTLS 专项 | **部分误报** → ✅ 已交付（2026-11-25） | 能力已在 `broker_security_tls.erl:43` + `broker_security_tls_SUITE:88`；`mqtt_tls_SUITE` 新增 `negotiates_tls1_3_by_default` + `mtls_with_client_cert_completes_the_handshake` + `mtls_rejects_client_without_cert` 三条真握手断言，源码级变异验证非退化 |
 | P2-P1 多模式存储后端 | 真缺口 | 仅 memory + WAL，无 rocksdb/s3/file |
 | P2-P1 Prometheus 导出 | **误报（已交付）** | `broker_admin_http.erl:68-69,305-325` + `broker_admin_SUITE:152`（已就地改） |
-| P2-P1 畸形包三类断言 | **部分误报** | MQTT 已覆盖 `mqtt_conn_SUITE:1844/1956/2344`、`mqtt_frame_SUITE:427/447`；缺 conformance 三类对账套件（已就地改） |
+| P2-P1 畸形包三类断言 | **部分误报 → ✅ 已交付（2026-11-25）** | MQTT 已覆盖 `mqtt_conn_SUITE:1844/1956/2344`、`mqtt_frame_SUITE:427/447`；新落地 `test/conformance/mqtt/wire/mqtt_wire_conformance_SUITE.erl` 表驱动 conformance 对账套件（设计稿 `docs/protocol-conformance-validation.md §4.3.2` 落点），把 codec 会拒绝的畸形包**注入活连接**，逐条对账「静默关闭 / 带原因码拒绝 / 接受」三类 → MQTT 条款 → `docs/protocol-compatibility.md §4` 限制（7 行：错误 protocol NAME→refuse、overlong varint/截断/保留帧型/QoS3/NUL filter→close、非最小 varint→accept）；源码级三向变异验证非退化（`refuse(1)`→静默关令 refuse 行红、post-CONNECT 关连接→`keep_state` 令 close 行红、codec 过度严格→accept 行红） |
 | P2-P1 外部 conformance | 真缺口 | `test/conformance/` 不存在，仅设计稿 |
 | P2-P2 规则引擎/Web/SBOM/SLSA/VEX/K8s/FIPS/Edge | 真缺口 | 全仓均无（CI 无 sbom/slsa/vex/fips，无 Chart.yaml/k8s，无 offline buffer） |
 | P4 ADR-007 三档压测 | ✅ 已交付（2026-11-25） | 丢失边界 `docs/benchmarks/reliability/s2-b-osbuffer-loss.md` + 容量专项 `docs/benchmarks/reliability/s12-adr007-tier-capacity.md`（`tools/bench/s12_adr007_capacity.erl`，真实 3 peer：三档容量天花板 + ra 元数据层绑定 + 失多数派拒绝） |
