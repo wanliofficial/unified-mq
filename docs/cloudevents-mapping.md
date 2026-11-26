@@ -104,7 +104,11 @@ QoS 1 回 PUBACK `NOT_SUPPORTED`，QoS 0/2/−1 静默丢弃（QoS 2 不发 PUBR
 
 ## 5. 去重与隔离
 
-> **接线范围**：这两条只在 **MQTT 发布路径**（`mqtt_conn_fsm` 的 `handle_publish1`）调用。其余五个协议与 S8-C 的 MQTT-SN（`mqtt_sn_conn`）目前只调用 `broker_event:apply_policy/1`，不调用 `broker_event:duplicate/1` 与 `broker_event:quarantine/2`——即使配了 `dedup` / `quarantine`，WS/NATS/AMQP/Kafka/Pulsar/MQTT-SN 也不会去重、也不会写隔离副本。把这两个钩子推广到其余协议是 S7 之后的工作（已列入 `docs/security.md` §12 与 `docs/architecture.md` §9 的遗留清单）。
+> **接线范围（2026-11-26 更新：隔离已全协议化，去重仍仅 MQTT）**：
+> - **隔离（`quarantine`）**：**已接线到全部发布路径**。MQTT 在 `handle_publish1` 的拒绝分支调 `broker_event:quarantine/2`；**其余协议（WS/NATS/AMQP/Kafka/Pulsar/CoAP/MQTT-SN）经共享入口 `broker_event:apply_policy/1` 一并落地**——`apply_policy/1` 在拒绝时写隔离副本，因此即使配了 `quarantine`，任何协议的非法事件都会落隔离副本。`apply_policy/2` 仍是纯校验 seam，隔离副作用只在 `/1` 这一条所有发布路径共用的入口上。**边界**：隔离副本只 `broker_queue:append`，**不 live-dispatch**（与 MQTT 一致），订阅方下次拉取才会看到。证据：`broker_event_SUITE:apply_policy_quarantines_a_rejected_message` + `ws_conn_SUITE:policy_rejection_is_reported_and_quarantined`（真 WS 连接，拒绝上报 + 副本入队）。
+> - **去重（`duplicate`）**：**仍只接在 MQTT 发布路径**（`mqtt_conn_fsm` 的 `handle_publish1`）。其余协议目前只调用 `broker_event:apply_policy/1`，不调用 `broker_event:duplicate/1`——即使配了 `dedup`，WS/NATS/AMQP/Kafka/Pulsar/MQTT-SN 也不会去重。把去重推广到其余协议是 S7 之后的工作（已列入 `docs/security.md` §12 与 `docs/architecture.md` §9 的遗留清单）。
+>
+> 之所以分两期：隔离是**纯服务端、best-effort** 的副作用（`not_configured` 默认不变），接线零协议可见变化；去重是**协议可见**的「ACK 但不存储」——对有显式逐消息 ACK 的协议（WS 的 `puback.offsets`、MQTT-SN 的 QoS1/2 握手）需要为「重复但已 ack」定义 ack 形状，涉及该协议自有 op 的语义，属产品决策，故仍留 MQTT（其 `duplicate_publish/4` 已钉住该形状）。
 
 - **去重键**：`{Tenant, Destination, Source, Id}`，窗口由
   `broker_event.dedup` 的 `{Tenant, Destination, WindowMs}` 配置；

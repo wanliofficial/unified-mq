@@ -284,7 +284,7 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 2. Schema Registry 内容校验。
 3. 审计日志的**外部 KMS 托管与轮换**。~~审计日志的哈希链 + Ed25519 签名与防篡改~~ **已实现（2026-11-25，S13，`broker_audit`）**：安全事件走哈希链 + 非对称签名（见 §11.2），`verify` 可定位到首个被篡改的 `seq`，公钥经 `/api/v1/audit/pubkey` 暴露供离线校验。**边界照实说**：首版私钥来自配置/文件（未配置则 boot 生成临时密钥、不跨重启），**私钥托管/轮换/HSM 仍属本条未实现项**。
 4. 每条规则可配置的「未知扩展属性拒绝」策略。
-5. `broker_event:duplicate/1` / `quarantine/2` 仅接在 MQTT 发布路径，其余五协议与 S8-C 的 MQTT-SN 都未接（见 `docs/cloudevents-mapping.md` 的「接线范围」注）。
+5. `broker_event:duplicate/1` / `quarantine/2` 仅接在 MQTT 发布路径，其余五协议与 S8-C 的 MQTT-SN 都未接（见 `docs/cloudevents-mapping.md` 的「接线范围」注）。**（2026-11-26 部分结案）隔离 `quarantine/2` 已接线到全部发布路径**：MQTT 的 `handle_publish1` 拒绝分支照旧调 `quarantine/2`，其余协议经共享入口 `broker_event:apply_policy/1`（拒绝时写隔离副本）一并落地——`apply_policy/2` 仍是纯校验 seam。去重 `duplicate/1` 仍只接 MQTT，因推广它需为各协议「重复但已 ack」定义 ack 形状（WS 的 `puback.offsets`、MQTT-SN 的 QoS1/2 握手），属产品决策。见 `docs/cloudevents-mapping.md` §5。
 6. 可观测性导出层（OTel 等；`broker_metrics:snapshot/0` 之上）。
 7. （2026-11-26 已完成 `require_auth` 接入 MQTT CONNECT 路径，见 §2.2 现状边界第 2 条）`broker_meta` 的 `broker_user` 与数据面认证的接线（ADR-021 §D7 冻结后补充）；`topic_meta` / `queue_meta` / `binding_meta` 三张表的运行时读取方。
 8. **MQTT-SN：明文 UDP 默认 + DTLS-PSK 可选（2026-11-17 落地）**：`broker_security.tls.enabled` 仍不作用于 1884（该端口不用证书体系）；listener spec `transport => dtls` 启用 S11-C 模式的 DTLS-PSK——**身份即用户名**（`broker_security.mqttsn_psk_for_identity/1`，label `unifiedmq-mqttsn-psk`，realm 在 `broker_security.mqttsn #{realm => ...}`），握手证明的 identity 就是 principal、tenant 来自用户记录，ACL 生效；users 表为空时 DTLS listener 拒绝启动；明文 `transport => udp`（默认）行为不变，`require_auth` 含 `mqtt_sn` 仍整体拒绝启动。DTLS 断开 = 异常死亡（Will 触发）。边界与 §12.6 同口径：PSK-only 无证书、无会话恢复、握手串行、ADVERTISE 广播仅明文 listener、DTLS 证据为仓内 CT（mqtt-sn-tools 无 DTLS）。

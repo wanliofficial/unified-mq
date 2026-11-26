@@ -61,10 +61,26 @@ policies() ->
 
 %%%_* Policy application ------------------------------------------------------
 
-%% @doc Apply the configured policy to one inbound message.
+%% @doc Apply the configured policy to one inbound message, quarantining a
+%% rejection.
+%%
+%% A rejection is never silently promoted to accepted. If the operator has
+%% configured an isolation target (`broker_event.quarantine', ADR-020 §D8), the
+%% rejected message is also written there as a best-effort evidence copy. Every
+%% protocol's publish path shares this one entry point (MQTT, WS, NATS, AMQP,
+%% Kafka, Pulsar, CoAP, MQTT-SN), so quarantine is no longer MQTT-only. The
+%% copy never changes the outcome: the `{error, Reason}' return is the same
+%% whether the copy is written, skipped (`not_configured', the default) or
+%% fails. `apply_policy/2' stays the pure validation seam.
 -spec apply_policy(#broker_message{}) -> {ok, #broker_message{}} | {error, term()}.
 apply_policy(Msg) ->
-    apply_policy(Msg, policy_for(Msg)).
+    case apply_policy(Msg, policy_for(Msg)) of
+        {error, Reason} = Reject ->
+            _ = quarantine(Msg, Reason),
+            Reject;
+        Ok ->
+            Ok
+    end.
 
 %% @doc Apply a policy supplied by the caller (also the test seam).
 -spec apply_policy(#broker_message{}, policy() | term()) ->

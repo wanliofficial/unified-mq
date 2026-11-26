@@ -1266,8 +1266,9 @@ handle_publish_allowed(Topic, Payload, QoS, WirePid, Retain, Props, D) ->
                 end;
             {error, EventReason} ->
                 %% Reject: no ACK for the record. The optional isolation copy
-                %% is best-effort evidence, never a promotion to accepted.
-                _ = broker_event:quarantine(MsgA, EventReason),
+                %% is best-effort evidence, never a promotion to accepted; it
+                %% is written inside `broker_event:apply_policy/1' now (the
+                %% shared publish-path seam), so it is not repeated here.
                 reject_event(QoS, WirePid, EventReason, D)
         end
     catch

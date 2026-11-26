@@ -11,6 +11,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("broker_core/include/broker_message.hrl").
 
 -define(N, 2).
 -define(REF, {ws, 0}).
@@ -28,6 +29,7 @@ all() ->
      qos0_delivery_needs_no_ack,
      binary_frame_publish_and_delivery,
      cloudevent_headers_roundtrip,
+     policy_rejection_is_reported_and_quarantined,
      unsubscribe_stops_delivery,
      offline_catch_up_after_clean_false,
      clean_start_discards_the_session,
@@ -106,6 +108,11 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 20),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 20),
     ok = application:set_env(broker_event, policy, pass_through),
+    %% Per-destination policy rules and quarantine are both opt-in; a case (or
+    %% an earlier suite in the shared CT node) that configures them must not
+    %% leak into the cases that follow (the J10 cross-case env rule).
+    ok = application:set_env(broker_event, policies, []),
+    ok = application:set_env(broker_event, quarantine, []),
     %% README §10.2: trace propagation is opt-in; keep every other case on
     %% the default (off) even if a previous case enabled it.
     ok = application:set_env(broker_event, trace_context, off),
@@ -268,6 +275,31 @@ cloudevent_headers_roundtrip(Config) ->
     #{<<"op">> := <<"ackack">>} = recv_json(Sub),
     close(Sub),
     close(Publisher),
+    ok.
+
+%% A rejection is reported to the publisher AND, because quarantine is wired
+%% into the shared `broker_event:apply_policy/1' seam (not just MQTT), the
+%% rejected message is copied to the configured isolation target. `required'
+%% rejects a publish that carries none of the mandatory CloudEvents attributes.
+%% The copy is stored, not live-dispatched (``quarantine/2'' appends only), so
+%% this reads the queue rather than waiting on a subscriber.
+policy_rejection_is_reported_and_quarantined(Config) ->
+    ok = application:set_env(broker_event, policy, required),
+    ok = application:set_env(
+           broker_event, quarantine,
+           [{<<"t0">>, <<"ce/#">>, <<"quarantine/ws">>}]),
+    Pub = open(Config),
+    connack(Pub, <<"qpub">>),
+    #{<<"op">> := <<"error">>, <<"code">> := <<"cloudevent_rejected">>} =
+        request(Pub, #{<<"op">> => <<"publish">>, <<"id">> => 9,
+                       <<"destination">> => <<"ce/reject">>, <<"qos">> => 1,
+                       <<"payload_b64">> => base64:encode(<<"evidence">>)}),
+    Copies = [Copy || P <- broker_queue:partition_ids(),
+                      {ok, Rows, _} <- [broker_queue:read_from(P, 0, 10)],
+                      {_Offset, Copy} <- Rows],
+    [#broker_message{destination = <<"quarantine/ws">>,
+                     payload = <<"evidence">>}] = Copies,
+    close(Pub),
     ok.
 
 unsubscribe_stops_delivery(Config) ->

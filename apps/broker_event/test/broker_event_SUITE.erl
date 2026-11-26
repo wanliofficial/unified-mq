@@ -54,6 +54,8 @@ all() ->
      duplicate_is_off_by_default,
      duplicate_window_expires,
      quarantine_writes_a_durable_copy,
+     apply_policy_quarantines_a_rejected_message,
+     apply_policy_writes_no_copy_when_quarantine_is_unset,
      acl_does_not_trust_event_attributes].
 
 %%%_* Fixtures ----------------------------------------------------------------
@@ -76,6 +78,12 @@ init_per_testcase(_Case, Config) ->
 
 end_per_testcase(_Case, _Config) ->
     stop_dedup(),
+    %% `acl_does_not_trust_event_attributes' sets a per-destination rule and
+    %% `policy' cases set a global one; leaving either behind poisons the next
+    %% suite in the shared CT node (the J10 cross-suite rule, observed as a WS
+    %% publish silently taking the leftover `disabled' rule).
+    ok = application:set_env(broker_event, policies, []),
+    ok = application:unset_env(broker_event, policy),
     ok.
 
 %%%_* Policy basics -----------------------------------------------------------
@@ -534,6 +542,43 @@ quarantine_writes_a_durable_copy(Config) ->
     end,
     ok.
 
+%% `apply_policy/1' is the one seam every protocol's publish path shares, so a
+%% rejection there must write the isolation copy too -- quarantine is not
+%% MQTT-only. `required' rejects a plain (non-CloudEvents) message; the copy
+%% still lands on the configured target and the `{error, _}' return is
+%% unchanged by the copy being written.
+apply_policy_quarantines_a_rejected_message(Config) ->
+    Started = start_quarantine_node(Config),
+    try
+        ok = application:set_env(
+               broker_event, quarantine,
+               [{<<"default">>, <<"t11/#">>, <<"$invalid/{tenant}/{destination}">>}]),
+        ok = application:set_env(broker_event, policy, required),
+        {error, _} = broker_event:apply_policy(message(<<"raw-payload">>)),
+        {ok, [{_Offset, Copy}], _} = broker_queue:read_from(0, 0, 10),
+        <<"$invalid/default/t11/demo">> = Copy#broker_message.destination,
+        <<"raw-payload">> = Copy#broker_message.payload,
+        true = maps:is_key(event_rejection, Copy#broker_message.headers)
+    after
+        stop_quarantine_node(Started)
+    end,
+    ok.
+
+%% With no quarantine target the reject path writes nothing and still rejects:
+%% the copy is opt-in, and `apply_policy/1' keeps its default behaviour byte for
+%% byte (the integration suites that never configure quarantine rely on this).
+apply_policy_writes_no_copy_when_quarantine_is_unset(Config) ->
+    Started = start_quarantine_node(Config),
+    try
+        ok = application:set_env(broker_event, quarantine, []),
+        ok = application:set_env(broker_event, policy, required),
+        {error, _} = broker_event:apply_policy(message(<<"raw-payload">>)),
+        {ok, [], _} = broker_queue:read_from(0, 0, 10)
+    after
+        stop_quarantine_node(Started)
+    end,
+    ok.
+
 acl_does_not_trust_event_attributes(_Config) ->
     ok = application:set_env(broker_security, users,
                              [{<<"guest">>,
@@ -619,10 +664,18 @@ stop_dedup() ->
 %% later suite (CT runs all suites in one node).
 start_quarantine_node(Config) ->
     _ = stop_quarantine_node([]),
+    %% A previous case (or an earlier suite in the same CT node) may have left
+    %% the broker running with another data_dir; `ensure_all_started' would then
+    %% return `{ok, []}' and the partition would already exist. Stop them so the
+    %% per-case data_dir below is the one actually opened.
+    lists:foreach(fun(App) -> _ = application:stop(App) end,
+                  [broker_event, broker_queue, broker_router, broker_storage]),
     _ = application:load(broker_storage),
     _ = application:load(broker_router),
     _ = application:load(broker_queue),
-    DataDir = filename:join([?config(priv_dir, Config), "quarantine", "data"]),
+    DataDir = filename:join([?config(priv_dir, Config), "quarantine",
+                             integer_to_list(erlang:unique_integer([positive])),
+                             "data"]),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
     ok = application:set_env(broker_storage, data_dir, DataDir),
     ok = application:set_env(broker_storage, wal, #{require_durable_fs => false}),
