@@ -299,16 +299,30 @@ do_sub(Subject, <<>>, Sid, St) ->
 do_sub(Subject, Queue, Sid, St) ->
     case {valid_subject(Subject, filter), valid_sid(Sid), Queue} of
         {true, true, _} ->
-            case translate_filter(Subject) of
-                {ok, Filter} ->
-                    St1 = remove_sid(Sid, St),
-                    case open_subscription(Filter, Subject, Queue, St1) of
-                        {ok, Ref} ->
-                            Sub = #{ref => Ref, filter => Filter, subject => Subject,
-                                    queue => Queue, remaining => infinity},
-                            maybe_ok(St1#st{subs = (St1#st.subs)#{Sid => Sub}});
-                        {error, Reason} ->
-                            err_close(reason_bin(Reason), St1)
+            %% ACL gate on the subscription: same destination form the publisher
+            %% uses (`/`-normalised), same tenant the connection carries. An
+            %% anonymous connection (principal `undefined') is out of the ACL
+            %% under `allow'/rule-list postures and refused only under `deny' --
+            %% identical to CoAP over plain UDP, so a datagram channel cannot be
+            %% used to dodge the deny-by-default posture by switching protocol.
+            case acl_subscribe_allowed(Subject, St) of
+                false ->
+                    broker_metrics:inc(authz_failures),
+                    logger:warning("nats subscribe not authorized subject=~p "
+                                   "principal=~p", [Subject, St#st.principal]),
+                    err_close(<<"Authorization Violation">>, St);
+                true ->
+                    case translate_filter(Subject) of
+                        {ok, Filter} ->
+                            St1 = remove_sid(Sid, St),
+                            case open_subscription(Filter, Subject, Queue, St1) of
+                                {ok, Ref} ->
+                                    Sub = #{ref => Ref, filter => Filter, subject => Subject,
+                                            queue => Queue, remaining => infinity},
+                                    maybe_ok(St1#st{subs = (St1#st.subs)#{Sid => Sub}});
+                                {error, Reason} ->
+                                    err_close(reason_bin(Reason), St1)
+                            end
                     end
             end;
         {false, _, _} ->
@@ -316,6 +330,14 @@ do_sub(Subject, Queue, Sid, St) ->
         {_, false, _} ->
             err_close(<<"Protocol Violation">>, St)
     end.
+
+%% ACL gate on a subscription, mirroring `acl_publish_allowed/2' for the read
+%% side. The destination is the `/`-normalised subject the client addressed.
+acl_subscribe_allowed(Subject, #st{principal = Principal, tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => subscribe, tenant_id => Tenant,
+        destination => subject_to_destination(Subject)}) =:= allow.
 
 open_subscription(Filter, _Subject, undefined, St) ->
     broker_subscription:subscribe(St#st.client_id, Filter, 1, sub_tenant(St));
@@ -457,6 +479,21 @@ encode_header_block(Headers) ->
                 is_binary(K), is_binary(V)],
     iolist_to_binary([<<"NATS/1.0\r\n">>, Lines, <<"\r\n">>]).
 
+%% ACL gate on the client's own publish path. The destination handed to
+%% `authorize/2' is the `/`-normalised subject -- the same one `publish/5'
+%% stores -- so an ACL `pattern' matches what the client actually addressed.
+%% The tenant is the connection's own (set from its user record at CONNECT):
+%% `authorize/2' refuses a request whose tenant differs from the principal's
+%% before any rule runs. JetStream managed subjects (`$JS...') and their
+%% internal stream destinations are not gated here: they are broker-internal
+%% control traffic, not a client choosing a destination, and gating them on the
+%% publisher's principal would break the stream's own service account.
+acl_publish_allowed(Subject, #st{principal = Principal, tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => publish, tenant_id => Tenant,
+        destination => subject_to_destination(Subject)}) =:= allow.
+
 handle_pub(Subject, Reply, Headers, Payload, St) ->
     %% JetStream managed subject (M3): the write goes into the stream's own
     %% destination and the caller gets a PubAck on its reply inbox instead of
@@ -470,9 +507,17 @@ handle_pub(Subject, Reply, Headers, Payload, St) ->
                     err_close(reason_bin(Reason), St)
             end;
         nomatch ->
-            case publish(Subject, Reply, Headers, Payload, St) of
-                ok -> maybe_ok(St);
-                {error, Reason} -> err_close(reason_bin(Reason), St)
+            case acl_publish_allowed(Subject, St) of
+                false ->
+                    broker_metrics:inc(authz_failures),
+                    logger:warning("nats publish not authorized subject=~p "
+                                   "principal=~p", [Subject, St#st.principal]),
+                    err_close(<<"Authorization Violation">>, St);
+                true ->
+                    case publish(Subject, Reply, Headers, Payload, St) of
+                        ok -> maybe_ok(St);
+                        {error, Reason} -> err_close(reason_bin(Reason), St)
+                    end
             end
     end.
 

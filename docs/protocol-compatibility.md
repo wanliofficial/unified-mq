@@ -351,7 +351,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| NATS | 已支持 | core NATS：INFO/CONNECT/PING/PONG、PUB/SUB/UNSUB、MSG 投递、`*`/`>` 通配符、Queue Group（shared）、Request/Reply（reply subject 透传）、echo=false、token 认证、UNSUB max 自动退订、HPUB/HMSG（2.2 headers，`ce-*` → 消息头）；JetStream MVP（Stream CRUD、托管发布 + PubAck、Durable Pull Consumer、`MSG.NEXT` 批量拉取、`+ACK`/`-NAK`/`+TERM`、元数据持久化） | MVP 明确不含：push consumer、Dedup、`STREAM.MSG.GET/DIRECT`、`last_per_subject`/`by_start_time`、镜像/源、KV/Object Store（§4.6 边界）；core NATS 适配器写完 MSG 立即推进自己的 cursor（broker 仍先 fsync 落盘）；`foo.>` 的父级匹配与 NATS 有差异；未协商 `headers` 的客户端收 `MSG`，`ce-*` 属性丢失 | apps/broker_proto_nats/test/（`nats_conn_SUITE`、`nats_jetstream_SUITE`）、test/protocol-compatibility/nats/ |
+| NATS | 已支持 | core NATS：INFO/CONNECT/PING/PONG、PUB/SUB/UNSUB、MSG 投递、`*`/`>` 通配符、Queue Group（shared）、Request/Reply（reply subject 透传）、echo=false、token 认证、UNSUB max 自动退订、HPUB/HMSG（2.2 headers，`ce-*` → 消息头）；JetStream MVP（Stream CRUD、托管发布 + PubAck、Durable Pull Consumer、`MSG.NEXT` 批量拉取、`+ACK`/`-NAK`/`+TERM`、元数据持久化）；**ACL（`broker_security:authorize/2`）**（2026-11-27）：发布与订阅都过 ACL，目的地为 subject 的 `/` 归一化形（与存储一致）、租户为连接自身租户；拒绝回 `-ERR 'Authorization Violation'`（与 CONNECT 授权失败同形）+ 关连接，并 inc `authz_failures` | MVP 明确不含：push consumer、Dedup、`STREAM.MSG.GET/DIRECT`、`last_per_subject`/`by_start_time`、镜像/源、KV/Object Store（§4.6 边界）；core NATS 适配器写完 MSG 立即推进自己的 cursor（broker 仍先 fsync 落盘）；`foo.>` 的父级匹配与 NATS 有差异；未协商 `headers` 的客户端收 `MSG`，`ce-*` 属性丢失；**JetStream 托管发布（`$JS...` subject）不过客户端 ACL**（流内部流量，由流声明把关） | apps/broker_proto_nats/test/（`nats_conn_SUITE`、`nats_jetstream_SUITE`）、test/protocol-compatibility/nats/ |
 ```
 
 **JetStream MVP（2026-11-18 追加，NATS-JS-001~003 最小切片，`nats_jetstream.erl`）**：
@@ -381,7 +381,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 
 | 层 | 用例 |
 |---|---|
-| NATS 线协议/连接（`nats_conn_SUITE`） | **20 例（当前）**：S5 时点 15 例（INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK`）；S6 追加 `cloudevent_headers_roundtrip`（16）；S7 追加有效/错误凭据、`require_auth`（19）；trace context 追加 `HMSG` 往返（20） |
+| NATS 线协议/连接（`nats_conn_SUITE`） | **27 例（当前）**：S5 时点 15 例（INFO、CONNECT+PING/PONG、pub/sub、`*` 通配符、queue group 恰好一次、request/reply、不回放历史、unsubscribe、UNSUB max、echo=false、非法 subject、超限 payload、auth 失败、未知操作、verbose `+OK`）；S6 追加 `cloudevent_headers_roundtrip`（16）；S7 追加有效/错误凭据、`require_auth`（19）；trace context 追加 `HMSG` 往返（20）；S12-B 追加连接计数与准入闸门（23）；2026-11-27 追加跨租户订阅隔离（24）与 **ACL 发布/订阅拒绝 + 匿名不受规则列表影响**（27） |
 | 真实第三方客户端（`nats_compat.py` + `nats.go`） | 14/14 PASS（11 core + 3 JetStream，见上） |
 | JetStream 线协议（`nats_jetstream_SUITE`，2026-11-18） | **9 例**：core pubsub sanity、CREATE/INFO/NAMES/DELETE 往返、托管发布 PubAck seq 单调、pull fetch+ack floor、NAK 重投、filter_subject 跳过、DeliverPolicy new 不回放历史、DELETE 流连带消费者 404、元数据重启恢复（含 acked 不重投） |
 | 全量 | `rebar3 ct` **485/485**（470 + 15）；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |

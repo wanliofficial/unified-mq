@@ -128,6 +128,8 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 
 证据：`broker_security_acl_SUITE`（14 例，含 `deny_posture_refuses_named_principal_without_a_rule`、`deny_posture_refuses_anonymous_without_a_rule`、`deny_posture_is_explicitly_not_the_permissive_default` 钉住 `deny` 姿态对具名与匿名主体一律拒绝、与 `allow` 姿态有别）+ `broker_security_audit_SUITE` 的 `acl_bypass_by_unmatched_rule_is_denied`、`acl_bypass_by_action_swap_is_denied`、`acl_deny_precedes_a_later_allow`、`legacy_allow_is_explicit_not_a_fallback`；明文 CoAP 通道不被 ACL 拒绝由 `coap_dtls_SUITE:plain_udp_unaffected` 钉住。
 
+**接线范围（2026-11-27 补全）**：ACL 判定在各协议前端的接线口径——MQTT（`acl_publish`/`acl_subscribe`）、MQTT-SN、CoAP（`coap_resource:authorized/3`）、WebRTC 信令（join/relay/服务端 API）都已调 `broker_security:authorize/2`；**NATS 也于 2026-11-27 接入**（发布走 `acl_publish_allowed/2`、订阅走 `acl_subscribe_allowed/2`，目的地取 subject 的 `/` 归一化形、租户取连接自身租户，拒绝回 `-ERR 'Authorization Violation'` 并 inc `authz_failures`）。仍**未接**的是 Kafka / Pulsar——它们的消费侧 offset 语义未定（见 §12 第 10 条），发布侧 SASL 认证后的 destination 级 ACL 也未纳入判定，属后续项。匿名（未认证）通道一律不进 ACL（§上面那条 ADR-031 口径），故 NATS 的匿名连接在 `allow`/规则列表下放行、仅 `deny` 姿态拒绝，与明文 CoAP 一致。
+
 ---
 
 ## 5. CloudEvents 属性不绕过 ACL

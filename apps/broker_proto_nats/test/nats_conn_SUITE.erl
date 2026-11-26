@@ -38,6 +38,9 @@ all() ->
      a_valid_credential_is_accepted,
      a_wrong_credential_is_refused,
      tenant_isolation_scopes_subscriptions,
+     acl_denies_a_publish_outside_the_rule,
+     acl_denies_a_subscribe_outside_the_rule,
+     acl_anonymous_is_unaffected_under_a_rule_list,
      require_auth_refuses_an_anonymous_connect,
      trace_context_roundtrips_through_hmsg,
      connections_current_tracks_the_connection_lifecycle,
@@ -460,6 +463,58 @@ tenant_isolation_scopes_subscriptions(Config) ->
     {timeout, Bob4, _} = recv_msg_any(Bob3, Alice2, 300),
     close(Bob4),
     close(Alice2),
+    ok.
+
+%% ACL (docs/security.md §4): a named principal may only publish/subscribe the
+%% subjects an allow rule grants. NATS authenticated against the shared identity
+%% table but, before this, never consulted `broker_security:authorize/2' on its
+%% publish or subscribe path -- so an explicit deny rule was silently ignored
+%% and alice could publish anywhere. The refusal uses the same `-ERR` line the
+%% CONNECT path already uses for an authorization failure.
+acl_denies_a_publish_outside_the_rule(Config) ->
+    %% alice may only publish `t1/#'; a publish to `secret/#' matches no allow
+    %% rule and, under a rule list, no-match is deny.
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => publish,
+                                pattern => <<"t1/#">>}]),
+    Alice = open(Config, #{<<"user">> => <<"alice">>, <<"pass">> => <<"pw">>}),
+    Size = integer_to_binary(byte_size(<<"x">>)),
+    Alice1 = send_raw(Alice, [<<"PUB secret/x ">>, Size, <<"\r\n">>, <<"x">>, <<"\r\n">>]),
+    {Line, _Alice2} = recv_line(Alice1),
+    <<"-ERR 'Authorization Violation'", _/binary>> = Line,
+    ok.
+
+%% The read side: alice may subscribe `t1/#' but not `secret/#'. A denied
+%% subscription is refused with the same `-ERR` line and never registers a
+%% sid, so a later matching publish cannot reach her through it.
+acl_denies_a_subscribe_outside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => subscribe,
+                                pattern => <<"t1/#">>}]),
+    Alice = open(Config, #{<<"user">> => <<"alice">>, <<"pass">> => <<"pw">>}),
+    Alice1 = send_raw(Alice, [<<"SUB secret.> 1\r\n">>]),
+    {Line, _Alice2} = recv_line(Alice1),
+    <<"-ERR 'Authorization Violation'", _/binary>> = Line,
+    ok.
+
+%% ADR-031 / docs/security.md §4: an anonymous channel (no principal) is out of
+%% the ACL under a rule list -- it is allowed, not refused. This pins that the
+%% NATS gate did not accidentally pull an anonymous datagram/connection into the
+%% rule list the way `deny' would: anonymous NATS keeps the pre-S6 allow-all
+%% posture, exactly as plain-UDP CoAP does.
+acl_anonymous_is_unaffected_under_a_rule_list(Config) ->
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => publish,
+                                pattern => <<"t1/#">>}]),
+    %% No user/pass: anonymous CONNECT (require_auth is [] in this suite).
+    Anon = open(Config),
+    {<<"PONG">>, _} = pub(Anon, <<"anything.x">>, undefined, <<"x">>),
     ok.
 
 require_auth_refuses_an_anonymous_connect(Config) ->
