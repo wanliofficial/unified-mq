@@ -808,8 +808,18 @@ authenticate(#connect{keep_alive = KA, username = User, password = Pass}, D) ->
                     {undefined, undefined} ->
                         %% An anonymous CONNECT maps the client_id to itself as
                         %% principal (§4.3 freezes only the credentialed path;
-                        %% registered as a deviation in design §13).
-                        D#st.client_id;
+                        %% registered as a deviation in design §13) -- unless the
+                        %% deployment requires a credential. `mqtt' is in
+                        %% `credential_capable/0', so a `{require_auth, [<<"mqtt">>]
+                        %% must reject an anonymous CONNECT the same way it does
+                        %% for WS/NATS/AMQP/Kafka/Pulsar. Refusing with the
+                        %% same rc 4 as a wrong password keeps the "no
+                        %% enumeration" invariant: an operator cannot turn
+                        %% `require_auth' into a silent no-op by picking MQTT.
+                        case broker_security:auth_required(<<"mqtt">>) of
+                            true -> denied;
+                            false -> D#st.client_id
+                        end;
                     {U, P} ->
                         case broker_security:authenticate(U, P) of
                             {ok, Authenticated} -> Authenticated;

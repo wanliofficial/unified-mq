@@ -46,6 +46,10 @@
 all() ->
     [connect_anonymous_is_granted_with_session_present_zero,
      connect_with_bad_password_is_refused_4,
+     %% require_auth: with {require_auth, [<<"mqtt">>]} set, an anonymous
+     %% CONNECT is refused (rc 4) the same way WS/NATS/AMQP/Kafka/Pulsar do;
+     %% a credentialed CONNECT is still granted.
+     require_auth_refuses_an_anonymous_connect,
      %% MQ-17 #10: a revoked principal cannot reconnect.
      connect_for_a_revoked_principal_is_refused_4,
      connect_with_empty_client_id_is_refused_2,
@@ -238,6 +242,10 @@ init_per_testcase(Case, Config) ->
     ok = application:set_env(broker_subscription, cursor_flush_interval_ms, 100),
     ok = application:set_env(broker_subscription, inflight_flush_interval_ms, 100),
     ok = application:set_env(broker_security, users, ?USERS),
+    %% require_auth must be [] in every case: a case that turns on
+    %% `require_auth' for mqtt must not poison the anonymous CONNECT cases that
+    %% follow (the same J10 cross-case env-pollution rule as the other knobs).
+    ok = application:set_env(broker_security, require_auth, []),
     %% S12-B: the admission gate's budget. Written in every case so a case that
     %% pushed it down to one cannot starve the next one.
     ok = application:set_env(broker_security, limits,
@@ -414,6 +422,23 @@ connect_with_bad_password_is_refused_4(_Config) ->
     {ok, normal} = mqtt_close(Conn),
     {ok, normal} = mqtt_close(Conn2),
     {ok, normal} = mqtt_close(Conn3),
+    ok.
+
+%% `require_auth' must not be a silent no-op on MQTT. `mqtt' is in
+%% `credential_capable/0', so `{require_auth, [<<"mqtt">>]}' asks the CONNECT
+%% path to refuse an anonymous client -- the same posture every other protocol
+%% takes. The code is 4, the bad-password byte, so the refusal does not reveal
+%% that it was the policy, not the credentials, that said no; a client that
+%% presents valid credentials is still granted.
+require_auth_refuses_an_anonymous_connect(_Config) ->
+    ok = application:set_env(broker_security, require_auth, [<<"mqtt">>]),
+    ok = boot(),
+    {Conn, #connack{return_code = 4}} = mqtt_open(#{client_id => <<"anon">>}),
+    {ok, _} = mqtt_close(Conn),
+    {Conn2, #connack{return_code = 0}} =
+        mqtt_open(#{client_id => <<"alice-cred">>, username => <<"alice">>,
+                    password => <<"pw">>}),
+    {ok, normal} = mqtt_close(Conn2),
     ok.
 
 %% MQ-17 #10: revocation refuses the NEXT CONNECT of that principal. The code is
