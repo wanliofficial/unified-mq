@@ -318,9 +318,24 @@ do_sub(Subject, Queue, Sid, St) ->
     end.
 
 open_subscription(Filter, _Subject, undefined, St) ->
-    broker_subscription:subscribe(St#st.client_id, Filter, 1);
+    broker_subscription:subscribe(St#st.client_id, Filter, 1, sub_tenant(St));
 open_subscription(Filter, _Subject, Queue, St) ->
-    broker_subscription:join(shared, Queue, St#st.client_id, Filter, 1).
+    broker_subscription:join(shared, Queue, St#st.client_id, Filter, 1,
+                             sub_tenant(St)).
+
+%% The tenant a subscription is registered under.
+%%
+%% `subscribe/3' and `join/5' register `<<"*">>' ("visible to every tenant",
+%% the pre-S6 legacy form), which would let an authenticated principal receive
+%% messages published by *other* tenants to the same subject -- the
+%% data-layer half of tenant isolation (docs/security.md §3) never ran.
+%% Authenticated connections therefore register under their own tenant; an
+%% anonymous connection has no identity to isolate by and keeps the legacy
+%% wildcard (as does the internal JetStream control-plane subscriber).
+sub_tenant(#st{principal = undefined}) ->
+    <<"*">>;
+sub_tenant(#st{tenant = Tenant}) ->
+    Tenant.
 
 handle_unsub(Rest, St) ->
     case binary:split(Rest, <<" ">>, [global]) of

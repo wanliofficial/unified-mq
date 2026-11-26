@@ -37,6 +37,7 @@ all() ->
      verbose_sends_ok,
      a_valid_credential_is_accepted,
      a_wrong_credential_is_refused,
+     tenant_isolation_scopes_subscriptions,
      require_auth_refuses_an_anonymous_connect,
      trace_context_roundtrips_through_hmsg,
      connections_current_tracks_the_connection_lifecycle,
@@ -84,7 +85,8 @@ init_per_testcase(Case, Config) ->
     %% broker_security identity table, so the suite needs a user to
     %% authenticate as.
     ok = application:set_env(broker_security, users,
-                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}}]),
+                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}},
+                              {<<"bob">>, #{password => <<"pw">>, tenant_id => <<"t2">>}}]),
     ok = application:set_env(broker_security, acl, allow),
     %% S12-B: the admission gate's budget. Written in every case so a case that
     %% pushes it down to one cannot starve the next one.
@@ -433,6 +435,31 @@ a_wrong_credential_is_refused(Config) ->
     C1 = connect_raw(C0, #{<<"user">> => <<"alice">>, <<"pass">> => <<"wrong">>}),
     {Line, _C2} = recv_line(C1),
     <<"-ERR 'Authorization Violation'", _/binary>> = Line,
+    ok.
+
+%% The data layer scopes routing by tenant (docs/security.md §3), so a
+%% subscription must be registered under the connection's tenant.
+%% `subscribe/3' and `join/5' register `<<"*">>' ("visible to every tenant"),
+%% which let bob (t2) receive what alice (t1) published to the same subject --
+%% the read-side half of tenant isolation never ran for NATS.  Alice's own
+%% subscription on the same subject does receive it, so "bob got nothing" is
+%% isolation, not a broken route.
+tenant_isolation_scopes_subscriptions(Config) ->
+    Alice = open(Config, #{<<"user">> => <<"alice">>, <<"pass">> => <<"pw">>}),
+    AliceSub = open(Config, #{<<"user">> => <<"alice">>, <<"pass">> => <<"pw">>}),
+    Bob = open(Config, #{<<"user">> => <<"bob">>, <<"pass">> => <<"pw">>}),
+    {<<"PONG">>, AliceSub1} = sub(AliceSub, <<"iso.>">>, undefined, <<"1">>),
+    {<<"PONG">>, Bob1} = sub(Bob, <<"iso.>">>, undefined, <<"1">>),
+    {<<"PONG">>, Alice1} = pub(Alice, <<"iso.x">>, undefined, <<"t1-only">>),
+    {<<"iso.x">>, <<"1">>, undefined, <<"t1-only">>, AliceSub2} =
+        recv_msg(AliceSub1),
+    {timeout, Bob2, _} = recv_msg_any(Bob1, AliceSub2, 300),
+    %% Same for a queue group: `join/5' used to default the tenant to `*'.
+    {<<"PONG">>, Bob3} = sub(Bob2, <<"isq.>">>, <<"g1">>, <<"2">>),
+    {<<"PONG">>, Alice2} = pub(Alice1, <<"isq.x">>, undefined, <<"t1-only">>),
+    {timeout, Bob4, _} = recv_msg_any(Bob3, Alice2, 300),
+    close(Bob4),
+    close(Alice2),
     ok.
 
 require_auth_refuses_an_anonymous_connect(Config) ->

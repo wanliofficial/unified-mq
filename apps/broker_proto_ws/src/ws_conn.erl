@@ -361,6 +361,21 @@ finish({error, _}) -> {error, <<"bad_username_or_password">>}.
 anonymous_identity() ->
     #{principal => undefined, tenant_id => broker_security:default_tenant()}.
 
+%% The tenant a subscription is registered under.
+%%
+%% `broker_subscription:subscribe/3' registers `<<"*">>' ("visible to every
+%% tenant", the pre-S6 legacy form) and would let an authenticated principal
+%% receive messages published by *other* tenants to the same destination --
+%% the data-layer half of tenant isolation (docs/security.md §3) never ran.
+%% An authenticated connection therefore registers under its own tenant. An
+%% anonymous connection has no identity to isolate by, so it keeps the legacy
+%% wildcard: turning that into a tenant would silently drop every
+%% cross-protocol flow where the publisher is anonymous.
+sub_tenant(#st{principal = undefined}) ->
+    <<"*">>;
+sub_tenant(#st{tenant = Tenant}) ->
+    Tenant.
+
 maybe_takeover(Pid) when is_pid(Pid), Pid =/= self() ->
     Pid ! {ws_takeover, self()},
     ok;
@@ -383,7 +398,8 @@ do_subscribe(Map, St) ->
             Kind = maps:get(<<"kind">>, Map, <<"exclusive">>),
             case {valid_filter(Filter), valid_qos(QoS), Kind} of
                 {true, true, <<"exclusive">>} ->
-                    case broker_subscription:subscribe(St#st.client_id, Filter, QoS) of
+                    case broker_subscription:subscribe(St#st.client_id, Filter, QoS,
+                                                       sub_tenant(St)) of
                         {ok, Ref} ->
                             Subs = (St#st.subs)#{Ref => #{filter => Filter, qos => QoS}},
                             St1 = catch_up_ref(Ref, QoS, St#st{subs = Subs}),

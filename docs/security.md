@@ -87,6 +87,10 @@ NATS 的 `auth_token`（`broker_proto_nats.auth_token`）是 NATS 协议原生�
 1. **授权层**：`broker_security:authorize/2` 先比较请求的 `tenant_id` 与 principal 自身的租户。不同即 `deny`，**先于**任何 ACL 规则。ACL 只能放宽主题，永远不能越过租户边界。
 2. **数据层**：`broker_router_hash_store` 的索引键是 `{Tenant, Filter}`；`broker_router_hash:route/3` 按 `Ctx.tenant_id` 过滤。订阅实体与 `.subs` 持久化都带 `tenant_id`，重启回填也按租户重建。`<<"*">>` 是 legacy 通配（S1 单租户布局），不是「跨租户读」。
 
+   **数据层只有在订阅侧把租户传对时才生效（2026-11-27）**：审计发现 **WS 与 NATS** 的订阅注册调用的是 `broker_subscription:subscribe/3` / `join/5`，租户被写成 `<<"*">>`（对所有租户可见）——认证租户被丢弃，`bob`（t2）能收到 `alice`（t1）发到同一 destination/subject 的消息。已修复：两协议在 `principal =/= undefined` 时用连接自己的 `tenant` 注册（各自的 `sub_tenant/1`），匿名连接仍用 `<<"*">>`（匿名没有身份可隔离；改成默认租户会静默切断所有「匿名发布者 → 认证订阅者」的跨协议流）。证据：`ws_conn_SUITE:tenant_isolation_scopes_subscriptions`、`nats_conn_SUITE:tenant_isolation_scopes_subscriptions`（都含正控：同租户订阅者收到、异租户收不到；NATS 还覆盖 queue-group 的 `join/6`），源码级变异（`sub_tenant/1` 恒返回 `<<"*">>`）两例均变红。MQTT / MQTT-SN / CoAP / AMQP 一直传租户。
+
+   **仍未闭合**：**Kafka / Pulsar 不经过订阅索引**，它们直接读分区日志，fetch 只按 `destination` 过滤、不按 `tenant_id` 过滤（`kafka_conn:topic_entries/collect_page`、`pulsar_conn` 的 count/read 路径），因此两个租户使用同一 destination 时，任一租户的消费者都能读到对方的记录。修复需要把租户过滤穿进这两条直读路径（下一步）。
+
 MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连接状态，之后 PUBLISH/SUBSCRIBE 都用它构造 `#route_ctx{}` 与授权请求。
 
 证据：`broker_security_audit_SUITE` 的 `tenant_escalation_publish_is_denied` / `tenant_escalation_subscribe_is_denied`（即使 ACL 是 `allow * * #` 也拒绝跨租户）。
@@ -289,6 +293,7 @@ MQTT 连接在 CONNECT 时把 `broker_security:tenant_id(Principal)` 写进连�
 7. （2026-11-26 已完成 `require_auth` 接入 MQTT CONNECT 路径，见 §2.2 现状边界第 2 条）`broker_meta` 的 `broker_user` 与数据面认证的接线（ADR-021 §D7 冻结后补充）；`topic_meta` / `queue_meta` / `binding_meta` 三张表的运行时读取方。
 8. **MQTT-SN：明文 UDP 默认 + DTLS-PSK 可选（2026-11-17 落地）**：`broker_security.tls.enabled` 仍不作用于 1884（该端口不用证书体系）；listener spec `transport => dtls` 启用 S11-C 模式的 DTLS-PSK——**身份即用户名**（`broker_security.mqttsn_psk_for_identity/1`，label `unifiedmq-mqttsn-psk`，realm 在 `broker_security.mqttsn #{realm => ...}`），握手证明的 identity 就是 principal、tenant 来自用户记录，ACL 生效；users 表为空时 DTLS listener 拒绝启动；明文 `transport => udp`（默认）行为不变，`require_auth` 含 `mqtt_sn` 仍整体拒绝启动。DTLS 断开 = 异常死亡（Will 触发）。边界与 §12.6 同口径：PSK-only 无证书、无会话恢复、握手串行、ADVERTISE 广播仅明文 listener、DTLS 证据为仓内 CT（mqtt-sn-tools 无 DTLS）。
 9. **MQTT over QUIC 的 0-RTT early data 与多流模式未实现**（S8-D 只做 CN Draft 3 的单流模式）：0-RTT 是 CN 的可选项，本轮不接收；多流是 EMQX 私有扩展，不在规范内。QUIC 本身**强制 TLS 1.3**（无明文模式），证书来源见 §9 与 `docs/operations.md` §1.2——`tls.enabled` 对它是「证书来源」而不是开关。另：quicer 0.4.12 不支持运行期补充流信用，`max_streams_per_conn` 是建连时的一次性配额。
+10. **Kafka / Pulsar 的读侧租户过滤（2026-11-27 立）**：这两条协议不经过 `broker_subscription` 的租户索引，而是直接读分区日志；fetch 只按 `destination` 过滤，不按 `tenant_id` 过滤（`kafka_conn` 的 `topic_entries/collect_page`、`pulsar_conn` 的 count/read 路径）。两个租户使用同一 destination 时，任一租户的消费者都能读到对方的记录。**已闭合的一半**：WS / NATS 的订阅索引租户已于 2026-11-27 修复（见 §3 数据层），MQTT / MQTT-SN / CoAP / AMQP 一直传租户。修复 Kafka/Pulsar 需要把租户过滤穿进两条直读路径（含匿名连接的兼容取舍）。
 
 六协议统一走 `broker_security` 身份表已于 2026-11-09 完成，见 §2.1，不再列为待办。
 

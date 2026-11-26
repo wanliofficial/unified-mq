@@ -42,6 +42,7 @@ all() ->
      a_valid_credential_is_accepted,
      a_wrong_credential_is_refused,
      a_client_supplied_tenant_is_ignored,
+     tenant_isolation_scopes_subscriptions,
      require_auth_refuses_an_anonymous_connect,
      trace_context_roundtrips_through_a_delivery,
      trace_context_is_stripped_when_propagation_is_off,
@@ -312,10 +313,10 @@ unsubscribe_stops_delivery(Config) ->
                           <<"destination">> => <<"u/1">>}),
     #{<<"op">> := <<"unsuback">>} = recv_json(Sub),
     publish(Publisher, <<"u/1">>, 1, <<"gone">>),
-    receive
-        {ws_frame, _} -> ct:fail(unexpected_delivery)
-    after 300 -> ok
-    end,
+    %% `recv_frame' reads the socket directly; there is no `{ws_frame, _}'
+    %% message to receive, so the old `receive' here could never fire and the
+    %% test only checked that nothing crashed.
+    {error, timeout} = gen_tcp:recv(Sub, 0, 300),
     close(Sub),
     close(Publisher),
     ok.
@@ -439,27 +440,56 @@ a_client_supplied_tenant_is_ignored(Config) ->
                      <<"username">> => <<"alice">>, <<"password">> => <<"pw">>,
                      <<"tenant">> => <<"t2">>}),
     close(S),
-    %% alice's tenant is t1, so a message published as her lands in t1 --
-    %% not in the t2 the frame asked for.
-    Pub = open(Config),
-    #{<<"op">> := <<"connack">>} =
-        request(Pub, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"cp">>,
-                       <<"username">> => <<"alice">>, <<"password">> => <<"pw">>}),
-    ok = send_json(Pub, #{<<"op">> => <<"publish">>, <<"destination">> => <<"t/x">>,
-                          <<"payload_b64">> => base64:encode(<<"hi">>), <<"qos">> => 1}),
-    #{<<"op">> := <<"puback">>} = recv_json(Pub),
-    %% bob (tenant t2) must not see it.
-    Other = open(Config),
-    #{<<"op">> := <<"connack">>} =
-        request(Other, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"co">>,
-                         <<"username">> => <<"bob">>, <<"password">> => <<"pw">>}),
-    ok = send_json(Other, #{<<"op">> => <<"subscribe">>, <<"destination">> => <<"t/#">>,
-                            <<"id">> => 1, <<"qos">> => 1}),
-    #{<<"op">> := <<"suback">>} = recv_json(Other),
-    close(Other),
+    %% alice's tenant is t1, so a message published as her lands in t1 -- not
+    %% in the t2 the frame asked for.  Both subscribers are registered before
+    %% the publish (a fresh subscription never replays history): alice's own
+    %% proves the message exists, bob (t2) proves it did not land in t2.
+    Sub = authed_open(Config, <<"ct-sub">>, <<"alice">>),
+    suback(Sub, <<"t/#">>, 0),
+    Bob = authed_open(Config, <<"ct-bob">>, <<"bob">>),
+    suback(Bob, <<"t/#">>, 0),
+    Pub = authed_open(Config, <<"ct-pub">>, <<"alice">>),
+    publish(Pub, <<"t/x">>, 0, <<"hi">>),
+    #{<<"op">> := <<"message">>, <<"destination">> := <<"t/x">>} =
+        message_header(recv_message(Sub)),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 300),
+    close(Bob),
+    close(Sub),
     close(Pub),
-    close(S),
     ok.
+
+%% The data layer scopes routing by tenant (docs/security.md §3), so a
+%% subscription must be registered under the connection's tenant.
+%% `subscribe/3' registers `<<"*">>' ("visible to every tenant", the pre-S6
+%% legacy form), which let bob (t2) receive a message alice (t1) published to
+%% the same destination -- the read-side half of tenant isolation never ran
+%% for WS.  Alice's own subscription on the same filter receives it, so "bob
+%% got nothing" is isolation, not a broken route.
+tenant_isolation_scopes_subscriptions(Config) ->
+    Alice = authed_open(Config, <<"iso-alice">>, <<"alice">>),
+    AliceSub = authed_open(Config, <<"iso-alice-sub">>, <<"alice">>),
+    Bob = authed_open(Config, <<"iso-bob">>, <<"bob">>),
+    suback(AliceSub, <<"iso/#">>, 0),
+    suback(Bob, <<"iso/#">>, 0),
+    publish(Alice, <<"iso/x">>, 0, <<"t1-only">>),
+    #{<<"op">> := <<"message">>, <<"destination">> := <<"iso/x">>} =
+        message_header(recv_message(AliceSub)),
+    %% `recv_frame' reads the socket directly (no `{ws_frame, _}' message), so
+    %% the absence of a delivery is "this socket has nothing to read".
+    {error, timeout} = gen_tcp:recv(Bob, 0, 300),
+    close(Bob),
+    close(AliceSub),
+    close(Alice),
+    ok.
+
+%% Connect over a real socket with a credential from the shared identity
+%% table; the tenant is then whatever that user record says.
+authed_open(Config, ClientId, User) ->
+    S = open(Config),
+    #{<<"op">> := <<"connack">>} =
+        request(S, #{<<"op">> => <<"connect">>, <<"client_id">> => ClientId,
+                     <<"username">> => User, <<"password">> => <<"pw">>}),
+    S.
 
 require_auth_refuses_an_anonymous_connect(Config) ->
     application:set_env(broker_security, require_auth, [<<"ws">>]),
