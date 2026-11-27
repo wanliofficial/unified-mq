@@ -417,7 +417,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、`start-ok` 的 SASL/PLAIN 凭据（走统一身份表）+ capabilities 宣告、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、**publisher confirm**、**mandatory→basic.return**、**basic properties 全量往返**、字段表全类型、prefetch 限流、多通道隔离、协议错误可见（540/503/406/404） | `basic.get` 回 get-empty（积压读取受"消费者加入前消息不回放"限制约束）；事务显式 540 拒绝（不假装支持）；无 headers exchange 路由；拓扑瞬态（重启不保留 exchange/queue/binding）；redelivered 位连接内跟踪（跨连接不携带）；heartbeat 固定 0（接受对端心跳帧但不检测）；未配 `require_auth` 时匿名连接按部署默认租户运行 | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
+| AMQP | 部分支持 | AMQP 0-9-1 子集：connection/channel 握手、`start-ok` 的 SASL/PLAIN 凭据（走统一身份表）+ capabilities 宣告、direct/fanout/topic exchange、queue declare/bind/unbind/purge/delete、basic.qos/consume/cancel/publish/deliver/ack/nack/reject/recover、**publisher confirm**、**mandatory→basic.return**、**basic properties 全量往返**、字段表全类型、prefetch 限流、多通道隔离、协议错误可见（540/503/406/404）、**ACL（`broker_security:authorize/2`）**（2026-11-27）：认证后发布在 `publish/8` 对全部绑定队列的 `amqp/<queue>` 目的地先预判再落盘（任一被拒即整条拒绝、不半写、回通道级 403 `ACCESS_REFUSED`），订阅在 `basic.consume` 的 join 前判定（拒绝 403、不注册 consumer） | `basic.get` 回 get-empty（积压读取受"消费者加入前消息不回放"限制约束）；事务显式 540 拒绝（不假装支持）；无 headers exchange 路由；拓扑瞬态（重启不保留 exchange/queue/binding）；redelivered 位连接内跟踪（跨连接不携带）；heartbeat 固定 0（接受对端心跳帧但不检测）；未配 `require_auth` 时匿名连接按部署默认租户运行 | apps/broker_proto_amqp/test/、test/protocol-compatibility/amqp/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -439,7 +439,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 | 层 | 用例 |
 |---|---|
 | AMQP 帧/字段表（`amqp_codec_SUITE`） | 15 例（S5 时点 14 例；S6 追加 `properties_roundtrip_with_ce_headers`；2026-11-17 全类型字段表改造后全绿）：帧往返、半帧、错误帧尾、方法、shortstr/longstr、bits LSB-first、重复 bit、字段表、嵌套表、空表、content header |
-| AMQP 连接/通道（`amqp_conn_SUITE`） | **31 例（当前）**：S5 时点 14 例 + S7 凭据三例；2026-11-17 整改追加 14 例：close 帧编码（short 403）、mandatory/basic.return、immediate 540、confirm ack 序列、tx 540、recover + redelivered、nack requeue redelivered、properties 往返、未知 method 540、未知 delivery-tag 406、未知 consumer tag 404、字段表类型往返、未知类型字节 503、capabilities 宣告 |
+| AMQP 连接/通道（`amqp_conn_SUITE`） | **46 例（当前）**：S5 时点 14 例 + S7 凭据三例；2026-11-17 整改追加 14 例：close 帧编码（short 403）、mandatory/basic.return、immediate 540、confirm ack 序列、tx 540、recover + redelivered、nack requeue redelivered、properties 往返、未知 method 540、未知 delivery-tag 406、未知 consumer tag 404、字段表类型往返、未知类型字节 503、capabilities 宣告（31）；S12-B 追加连接计数与准入闸门三例（34）；其余兼容补测（backlog 预消费投递、basic.get 积压读取、cancel 保留在途、跨通道 claim、通道关闭重投等）（41）；2026-11-27 追加 **ACL 发布/订阅拒绝（403）+ 规则内放行（发布/订阅各一）+ fanout 整条拒绝不半写** 五例（46） |
 | 真实第三方客户端（`amqp_compat.py` + `amqp091-go`） | 13/13 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：
@@ -2207,7 +2207,7 @@ ADR-034 的跨节点投递是**节点间的路由选择**，不是新的协议�
 | WS + S1 集成 | 33 | 33 |
 | MQTT-SN 三套件 | 84 | **90**（+6：Will Delay ×6，2026-11-20 追加；本表其余为 2026-11-17 整改当时事实） |
 | `amqp_codec_SUITE` | 15 | 15 |
-| `amqp_conn_SUITE` | 17 | **31**（+14，见上） |
+| `amqp_conn_SUITE` | 17 | **46**（+29：S7/整改/S12-B 兼容补测 + 2026-11-27 ACL 发布/订阅五例，见上） |
 | amqp091-go 真实客户端 | 13/13（拒绝帧当时无法被客户端解码的场景未覆盖） | **13/13**（`amqp-nack-requeue` 断言 `redelivered:true`） |
 
 配套文件：`apps/broker_proto_mqtt/src/mqtt_will_server.erl`（新增）、`apps/broker_proto_mqtt/src/{mqtt_frame,mqtt_conn_fsm,broker_proto_mqtt_sup}.erl`、`apps/broker_proto_amqp/src/{amqp_codec,amqp_conn}.erl`、`test/protocol-compatibility/amqp/amqp_broker_boot.erl`（身份表与 CT 套件对齐，空表会拒绝一切凭据）。

@@ -480,23 +480,43 @@ handle_channel_method(Channel, 60, 20, Args, St) ->
             channel_error(Channel, 404, <<"NOT_FOUND - no queue">>, 60, 20, St);
         true ->
             Filter = queue_filter(Queue),
-            %% RQ-01: an AMQP queue is queue state, not a live feed -- the
-            %% group anchors at 0 at entity birth so messages published before
-            %% the first consumer joined stay deliverable.
-            case broker_subscription:join(shared, Queue, St#st.client_id,
-                                          Filter, 1, St#st.tenant,
-                                          #{anchor => earliest}) of
-                {ok, Ref} ->
-                    Consumer = #{ref => Ref, queue => Queue, no_ack => NoAck,
-                                 no_local => NoLocal},
-                    Ch = ch(Channel, St),
-                    Ch1 = Ch#ch{consumers = (Ch#ch.consumers)#{Tag => Consumer}},
-                    St1 = put_ch(Channel, Ch1, St),
-                    St2 = reply_ok(Channel, 60, 21, NoWait,
-                                   amqp_codec:encode_shortstr(Tag), St1),
-                    {noreply, arm_tick(pull_all(St2))};
-                {error, Reason} ->
-                    channel_error(Channel, 406, reason(Reason), 60, 20, St)
+            %% ACL gate on the subscribe: same gap as the publish path had --
+            %% an authenticated user could consume any queue's backlog
+            %% regardless of the rule list. authorize(subscribe, amqp/<queue>)
+            %% with the connection principal/tenant, refusing with AMQP's own
+            %% channel-level access-refusal (403) and registering no consumer.
+            %% Anonymous stays out of the ACL under `allow'/rule-list postures,
+            %% refused only under `deny', matching the publish gate and the
+            %% other protocols.
+            case acl_allowed(subscribe, Filter, St) of
+                false ->
+                    broker_metrics:inc(authz_failures),
+                    logger:warning("amqp subscribe not authorized queue=~p "
+                                   "principal=~p", [Queue, St#st.principal]),
+                    channel_error(Channel, 403,
+                                  <<"ACCESS_REFUSED - subscribe not authorized">>,
+                                  60, 20, St);
+                true ->
+                    %% RQ-01: an AMQP queue is queue state, not a live feed --
+                    %% the group anchors at 0 at entity birth so messages
+                    %% published before the first consumer joined stay
+                    %% deliverable.
+                    case broker_subscription:join(shared, Queue, St#st.client_id,
+                                                  Filter, 1, St#st.tenant,
+                                                  #{anchor => earliest}) of
+                        {ok, Ref} ->
+                            Consumer = #{ref => Ref, queue => Queue,
+                                         no_ack => NoAck, no_local => NoLocal},
+                            Ch = ch(Channel, St),
+                            Ch1 = Ch#ch{consumers =
+                                            (Ch#ch.consumers)#{Tag => Consumer}},
+                            St1 = put_ch(Channel, Ch1, St),
+                            St2 = reply_ok(Channel, 60, 21, NoWait,
+                                           amqp_codec:encode_shortstr(Tag), St1),
+                            {noreply, arm_tick(pull_all(St2))};
+                        {error, Reason} ->
+                            channel_error(Channel, 406, reason(Reason), 60, 20, St)
+                    end
             end
     end;
 handle_channel_method(Channel, 60, 30, Args, St) ->
@@ -725,19 +745,55 @@ publish(Channel, Exchange, RK, Mandatory, Body, Headers, Props, St0) ->
               true -> basic_return(Channel, Exchange, RK, Body, Props, St0);
               false -> St0
           end,
-    {St2, Ok} =
-        lists:foldl(
-          fun(Q, {Acc, AllOk}) ->
-                  case publish_to_queue(Channel, Q, Exchange, RK, Body,
-                                        Headers, Props, Acc) of
-                      {ok, Acc1} -> {Acc1, AllOk};
-                      {{error, Reason}, Acc1} ->
-                          logger:log(warning, "amqp publish to ~ts failed: ~p",
-                                     [Q, Reason]),
-                          {Acc1, false}
-                  end
-          end, {St1, true}, Queues),
-    {St2, Ok}.
+    %% ACL gate (broker_security:authorize/2): AMQP authenticates a principal and
+    %% tenant at connection start-ok but, before this, the publish and subscribe
+    %% paths never consulted the ACL -- an authenticated user could write any
+    %% queue regardless of the rule list, and only the bare `deny' posture at
+    %% CONNECT bit. A publish fans out to every bound queue, and the destination
+    %% the message is stored/fetched under is per queue (`amqp/<queue>',
+    %% amqp_conn:queue_filter/1), so authorise the write against each target
+    %% destination. Check them all *before* storing to any: a denial on one
+    %% bound queue refuses the whole publish with AMQP's own channel-level
+    %% access-refusal (403) and stores nothing, rather than half-writing it.
+    %% An anonymous connection (principal undefined) stays out of the ACL under
+    %% `allow' and rule-list postures and is refused only under `deny', identical
+    %% to NATS/Kafka/Pulsar, so the default `allow' posture does not break
+    %% anonymous produce.
+    case first_denied_queue(Queues, St1) of
+        none ->
+            {St2, Ok} =
+                lists:foldl(
+                  fun(Q, {Acc, AllOk}) ->
+                          case publish_to_queue(Channel, Q, Exchange, RK, Body,
+                                                Headers, Props, Acc) of
+                              {ok, Acc1} -> {Acc1, AllOk};
+                              {{error, Reason}, Acc1} ->
+                                  logger:log(warning,
+                                             "amqp publish to ~ts failed: ~p",
+                                             [Q, Reason]),
+                                  {Acc1, false}
+                          end
+                  end, {St1, true}, Queues),
+            {St2, Ok};
+        DeniedQ ->
+            broker_metrics:inc(authz_failures),
+            logger:warning("amqp publish not authorized queue=~p principal=~p",
+                           [DeniedQ, St1#st.principal]),
+            {send_channel_error(Channel, 403,
+                                <<"ACCESS_REFUSED - publish not authorized">>,
+                                60, 40, St1), false}
+    end.
+
+%% The first target queue whose `amqp/<queue>' destination the ACL refuses, or
+%% `none' if every target is allowed. Checked up front so a multi-queue fanout
+%% is refused whole (no partial write).
+first_denied_queue([], _St) ->
+    none;
+first_denied_queue([Q | Qs], St) ->
+    case acl_allowed(publish, queue_filter(Q), St) of
+        true -> first_denied_queue(Qs, St);
+        false -> Q
+    end.
 
 basic_return(Channel, Exchange, RK, Body, Props, St) ->
     %% basic.return = reply-code + reply-text + exchange + routing-key, then
@@ -1277,6 +1333,20 @@ ensure_client(St) ->
 
 queue_filter(Queue) ->
     <<"amqp/", Queue/binary>>.
+
+%% ACL decision for an AMQP publish/subscribe, same shape as the other
+%% protocols' gate: authorize/2 with the connection principal and tenant, and
+%% the `/`-normalised destination (here `amqp/<queue>', already the routing key
+%% and the form messages are stored and fetched under). An anonymous connection
+%% (principal undefined) is out of the ACL under `allow' and rule-list postures
+%% and refused only under `deny', identical to NATS/Kafka/Pulsar/CoAP, so the
+%% default `allow' posture does not break anonymous traffic.
+acl_allowed(Action, Destination, #st{principal = Principal,
+                                     tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => Action, tenant_id => Tenant, destination => Destination})
+        =:= allow.
 
 arm_tick(#st{} = St) ->
     case St#st.tick of

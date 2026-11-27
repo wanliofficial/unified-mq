@@ -60,7 +60,13 @@ all() ->
      unknown_table_type_closes_with_503,
      basic_get_reads_the_backlog_and_then_answers_empty,
      backlog_published_before_consume_is_delivered,
-     start_declares_implemented_capabilities].
+     start_declares_implemented_capabilities,
+     %% docs/security.md §4: the ACL gate on the publish and subscribe paths.
+     acl_denies_a_publish_outside_the_rule,
+     acl_allows_a_publish_inside_the_rule,
+     acl_denies_a_subscribe_outside_the_rule,
+     acl_allows_a_subscribe_inside_the_rule,
+     acl_denies_a_fanout_publish_without_a_partial_write].
 
 suite() -> [{timetrap, {seconds, 90}}].
 
@@ -831,6 +837,113 @@ start_declares_implemented_capabilities(Config) ->
     close(C1),
     ok.
 
+%%%_* docs/security.md §4: the ACL gate on publish and subscribe -----------
+
+%% ACL rule list: the guest principal may publish and subscribe on the two
+%% "ok" queues, and nothing else. A destination is the `amqp/<queue>' form
+%% messages are stored and fetched under (amqp_conn:queue_filter/1), so the
+%% patterns name the real destinations, not the bare queue name. Each of the
+%% four cases below points at a destination these rules do NOT name to prove
+%% the refusal, and at one they DO name as the positive control.
+acl_allow_rules() ->
+    [#{effect => allow, principal => <<"guest">>, action => publish,
+       pattern => <<"amqp/ct.aclpub.ok">>},
+     #{effect => allow, principal => <<"guest">>, action => subscribe,
+       pattern => <<"amqp/ct.aclpub.ok">>},
+     #{effect => allow, principal => <<"guest">>, action => publish,
+       pattern => <<"amqp/ct.aclsub.ok">>},
+     #{effect => allow, principal => <<"guest">>, action => subscribe,
+       pattern => <<"amqp/ct.aclsub.ok">>}].
+
+acl_denies_a_publish_outside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl, acl_allow_rules()),
+    C0 = open_channel(connect(Config), 1),
+    {_, C1} = declare_queue(C0, 1, <<"ct.aclpub.deny">>),
+    %% The publish to a destination no allow rule names is refused with AMQP's
+    %% own channel-level access-refusal (403) and nothing is appended.
+    C2 = publish(C1, 1, <<>>, <<"ct.aclpub.deny">>, <<"nope">>),
+    {1, 20, 40, CloseArgs, _C3} = recv_method(C2),
+    <<403:16, _/binary>> = CloseArgs,
+    %% The refusal is the ACL, not a missing route or a dropped connection: the
+    %% channel is closed but the connection is alive and the queue stays empty.
+    ?assertEqual(timeout, recv_frame(C2, 400)),
+    close(C2),
+    ok.
+
+acl_allows_a_publish_inside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl, acl_allow_rules()),
+    C0 = open_channel(connect(Config), 1),
+    {_, C1} = declare_queue(C0, 1, <<"ct.aclpub.ok">>),
+    {_, C2} = consume(C1, 1, <<"ct.aclpub.ok">>, <<"aclpub">>, false),
+    %% The destination matches an allow rule, so the message is stored and
+    %% delivered exactly as without the gate -- the positive control.
+    C3 = publish(C2, 1, <<>>, <<"ct.aclpub.ok">>, <<"yes">>),
+    {D, C4} = recv_deliver(C3),
+    ?assertEqual(<<"yes">>, maps:get(body, D)),
+    close(C4),
+    ok.
+
+acl_denies_a_subscribe_outside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl, acl_allow_rules()),
+    C0 = open_channel(connect(Config), 1),
+    {_, C1} = declare_queue(C0, 1, <<"ct.aclsub.deny">>),
+    %% A consume of a destination no subscribe rule names is refused with a 403
+    %% channel error; the consumer is never registered (the channel error
+    %% aborts the method, so no delivery can reach this channel).
+    C2 = consume_expect_error(C1, 1, <<"ct.aclsub.deny">>, <<"deny-tag">>, 403),
+    %% Nothing further arrives on the dead channel, and the connection itself is
+    %% still usable (a channel error, not a connection close).
+    ?assertEqual(timeout, recv_frame(C2, 400)),
+    _ = open_channel(C2, 2),
+    close(C2),
+    ok.
+
+acl_allows_a_subscribe_inside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl, acl_allow_rules()),
+    C0 = open_channel(connect(Config), 1),
+    {_, C1} = declare_queue(C0, 1, <<"ct.aclsub.ok">>),
+    %% The destination matches a subscribe allow rule, so the consumer is
+    %% registered and the publish delivered to it -- the positive control.
+    {<<"ok-tag">>, C2} = consume(C1, 1, <<"ct.aclsub.ok">>, <<"ok-tag">>, false),
+    C3 = publish(C2, 1, <<>>, <<"ct.aclsub.ok">>, <<"recv">>),
+    {D, C4} = recv_deliver(C3),
+    ?assertEqual(<<"recv">>, maps:get(body, D)),
+    close(C4),
+    ok.
+
+%% The publish gate authorises every bound queue *before* storing to any, so a
+%% fanout that reaches one denied queue is refused whole -- no partial write. A
+%% rule list that allows publish to ct.aclfan.a but not ct.aclfan.b proves it:
+%% the publish to the fanout exchange 403s, and neither queue (not even the
+%% allowed a) receives the message.
+acl_denies_a_fanout_publish_without_a_partial_write(Config) ->
+    ok = application:set_env(
+           broker_security, acl,
+           [#{effect => allow, principal => <<"guest">>, action => publish,
+              pattern => <<"amqp/ct.aclfan.a">>},
+            #{effect => allow, principal => <<"guest">>, action => subscribe,
+              pattern => <<"amqp/ct.aclfan.a">>},
+            #{effect => allow, principal => <<"guest">>, action => subscribe,
+              pattern => <<"amqp/ct.aclfan.b">>}]),
+    C0 = open_channel(connect(Config), 1),
+    C1 = declare_exchange(C0, 1, <<"ct.aclfan">>, <<"fanout">>),
+    {_, C2} = declare_queue(C1, 1, <<"ct.aclfan.a">>),
+    {_, C3} = declare_queue(C2, 1, <<"ct.aclfan.b">>),
+    C4 = bind(C3, 1, <<"ct.aclfan.a">>, <<"ct.aclfan">>, <<>>),
+    C5 = bind(C4, 1, <<"ct.aclfan.b">>, <<"ct.aclfan">>, <<>>),
+    %% The publish fans out to both; the fanout exchange names no queue on the
+    %% wire, so the gate pre-checks every bound destination and refuses whole.
+    C6 = publish(C5, 1, <<"ct.aclfan">>, <<"ignored">>, <<"partial">>),
+    {1, 20, 40, CloseArgs, C7} = recv_method(C6),
+    <<403:16, _/binary>> = CloseArgs,
+    %% No partial write: the allowed queue a is empty too. Re-open channel 1
+    %% (the 403 closed it) and pull with basic.get -- get-empty means nothing
+    %% was stored.
+    C8 = open_channel(C7, 1),
+    {1, 60, 72, <<0>>, C9} = basic_get(C8, 1, <<"ct.aclfan.a">>),
+    close(C9),
+    ok.
+
 connect(Config) ->
     C2 = connect_with(Config, <<"guest">>, <<"guest">>),
     {0, 10, 30, _Tune, C3} = recv_method(C2),
@@ -936,6 +1049,18 @@ queue_delete(C, Ch, Queue) ->
              (amqp_codec:encode_bits([false, false, false]))/binary>>,
     C1 = send_method(C, Ch, 50, 40, Args),
     {Ch, 50, 41, _, C2} = recv_method(C1),
+    C2.
+
+%% basic.consume that the broker must refuse: expect a channel.close with the
+%% given reply code instead of consume-ok (used by the ACL subscribe gate test).
+consume_expect_error(C, Ch, Queue, Tag, Code) ->
+    Args = <<0:16, (amqp_codec:encode_shortstr(Queue))/binary,
+             (amqp_codec:encode_shortstr(Tag))/binary,
+             (amqp_codec:encode_bits([false, false, false, false]))/binary,
+             (amqp_codec:encode_table(#{}))/binary>>,
+    C1 = send_method(C, Ch, 60, 20, Args),
+    {Ch, 20, 40, CloseArgs, C2} = recv_method(C1),
+    <<Code:16, _/binary>> = CloseArgs,
     C2.
 
 consume(C, Ch, Queue, Tag, NoAck) ->
