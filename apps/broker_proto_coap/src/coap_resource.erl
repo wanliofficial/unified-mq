@@ -35,7 +35,7 @@
 %%     datagram arrived here. Neither shape is "QoS 1".
 -module(coap_resource).
 
--export([handle/3, well_known/1, entries/1]).
+-export([handle/3, well_known/2, entries/2]).
 
 -include_lib("broker_core/include/broker_message.hrl").
 -include_lib("broker_router/include/broker_router.hrl").
@@ -65,7 +65,8 @@ handle(Req, Cfg, Ctx) ->
 get(Req, Cfg, Ctx) ->
     case coap_codec:destination(Req) of
         <<".well-known/core">> ->
-            Body = well_known(Cfg),
+            %% Discovery is not a free pass around the ACL: see `entries/2'.
+            Body = well_known(Cfg, Ctx),
             {reply, {response, 2, 5},
              [{content_format, coap_codec:content_format_id(link_format)}], Body};
         Destination ->
@@ -301,14 +302,23 @@ forbidden(Destination, Action, Method) ->
 %% that currently holds retained state -- those are the resources a GET can
 %% actually answer for. The well-known resource itself is included, which
 %% RFC 6690 §4.1 recommends.
--spec well_known(map()) -> binary().
-well_known(Cfg) ->
-    coap_codec:link_format(entries(Cfg)).
+-spec well_known(map(), ctx()) -> binary().
+well_known(Cfg, Ctx) ->
+    coap_codec:link_format(entries(Cfg, Ctx)).
 
--spec entries(map()) -> [map()].
-entries(Cfg) ->
+-spec entries(map(), ctx()) -> [map()].
+entries(Cfg, Ctx) ->
     Static = [normalise_entry(E) || E <- maps:get(resources, Cfg, [])],
-    Retained = [entry_for(Topic) || {Topic, _} <- retained_entries()],
+    %% Dynamic entries come from the retained store, which is destination-keyed
+    %% and shared across tenants. Listing every destination here would leak the
+    %% destination set past the per-destination GET gate: an authenticated client
+    %% on a restrictive rule list (or anyone under the `deny' posture) could
+    %% enumerate resources it is not allowed to read. So a retained destination
+    %% is listed only when the same `subscribe' decision the per-destination GET
+    %% (`read_resource/2') would make allows it. Static `resources' are
+    %% operator-declared configuration, not tenant data, so they stay visible.
+    Retained = [entry_for(Topic) || {Topic, _} <- retained_entries(),
+                                    authorized(Ctx, subscribe, Topic)],
     Deduped = dedupe([well_known_entry() | Static ++ Retained]),
     lists:sort(fun(#{path := A}, #{path := B}) -> A =< B end, Deduped).
 

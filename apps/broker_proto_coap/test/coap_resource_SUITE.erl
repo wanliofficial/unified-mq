@@ -48,6 +48,8 @@ all() ->
      put_to_root_destination_is_400,
      well_known_lists_retained_destinations,
      well_known_includes_static_resources,
+     well_known_filters_retained_by_acl,
+     well_known_deny_posture_lists_no_retained,
      non_write_dispatches_without_appending,
      get_reads_only_retained_not_the_log,
      observe_option_is_ignored_not_rejected,
@@ -177,6 +179,43 @@ well_known_includes_static_resources(_) ->
         coap_resource:handle(Req, Cfg, ?CTX),
     ?assertNotEqual(nomatch, binary:match(Body, <<"sensors/door">>)),
     ?assertNotEqual(nomatch, binary:match(Body, <<"door.sensor">>)).
+
+%% Discovery must not become a way around the per-destination ACL. Two retained
+%% destinations exist, one under each "tenant" name; with a rule list that lets
+%% alice (t1) subscribe only to `t1/#', the link-format document lists the t1
+%% resource and NOT the t2 one -- the same `subscribe' decision a plain GET on
+%% each destination would make.
+well_known_filters_retained_by_acl(_) ->
+    put(<<"t1/x">>, <<"t1-data">>),
+    put(<<"t2/y">>, <<"t2-data">>),
+    ok = application:set_env(broker_security, users,
+                             [{<<"alice">>, #{password => <<"pw">>, tenant_id => <<"t1">>}}]),
+    ok = application:set_env(broker_security, acl,
+                             [acl_rule(allow, <<"alice">>, subscribe, <<"t1/#">>)]),
+    Req = request(con, get, 1, [{uri_path, <<".well-known">>}, {uri_path, <<"core">>}]),
+    {reply, {response, 2, 5}, [{content_format, _}], Body} =
+        coap_resource:handle(Req, ?CFG, alice_ctx()),
+    %% Positive control: the allowed destination is listed.
+    ?assertNotEqual(nomatch, binary:match(Body, <<"t1/x">>)),
+    %% The disallowed one is not.
+    ?assertEqual(nomatch, binary:match(Body, <<"t2/y">>)).
+
+%% Under deny-by-default the anonymous door is documented as closed: a plain GET
+%% is refused (4.03). The discovery document must not leak the retained
+%% destination set anyway -- it lists none of them.
+well_known_deny_posture_lists_no_retained(_) ->
+    put(<<"leak/canary">>, <<"secret">>),
+    ok = application:set_env(broker_security, acl, deny),
+    Req = request(con, get, 2, [{uri_path, <<".well-known">>}, {uri_path, <<"core">>}]),
+    {reply, {response, 2, 5}, _, Body} = coap_resource:handle(Req, ?CFG, ?CTX),
+    ?assertEqual(nomatch, binary:match(Body, <<"leak/canary">>)).
+
+alice_ctx() ->
+    #{endpoint => {?HOST, 0}, tenant => <<"t1">>, principal => <<"alice">>}.
+
+acl_rule(Effect, Principal, Action, Pattern) ->
+    #{effect => Effect, principal => Principal,
+      action => Action, pattern => Pattern}.
 
 non_write_dispatches_without_appending(_) ->
     %% A NON PUT updates retained state (so a later GET sees it) but is
