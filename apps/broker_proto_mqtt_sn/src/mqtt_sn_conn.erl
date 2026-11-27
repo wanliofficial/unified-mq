@@ -103,15 +103,34 @@ publish_stateless(#{topic_id_type := Type, topic_id := Ref, payload := Payload,
                     retain := Retain} = Packet, Cfg) ->
     case stateless_topic(Type, Ref, Cfg) of
         {ok, Topic} ->
-            Msg = new_message(broker_security:default_tenant(), Topic, Payload,
-                              -1, Retain),
-            case publish_routed(Msg, -1, Retain) of
-                ok ->
-                    ok;
-                {error, Reason} ->
-                    broker_metrics:inc(protocol_errors),
-                    logger:warning("mqtt_sn stateless publish dropped: ~p",
-                                   [Reason])
+            %% A sessionless QoS -1 publish carries no credential: it has no
+            %% CONNECT, so it is an anonymous publish and its tenant is the
+            %% default one (the same derivation `init/1' makes for a session).
+            %% It must still pass the same ACL every other publish does -- under
+            %% the `deny' posture the anonymous door is documented as closed, so
+            %% a stateless publish is dropped rather than routed, exactly as the
+            %% stateful path rejects with `not_authorized'. Under `allow' and
+            %% under a rule list an undefined principal is allowed by default, so
+            %% there this gate is a no-op.
+            Principal = maps:get(principal, Cfg, undefined),
+            Tenant = maps:get(tenant_id, Cfg, broker_security:default_tenant()),
+            case broker_security:authorize(
+                   Principal, #{action => publish, tenant_id => Tenant,
+                                destination => Topic}) of
+                allow ->
+                    Msg = new_message(Tenant, Topic, Payload, -1, Retain),
+                    case publish_routed(Msg, -1, Retain) of
+                        ok ->
+                            ok;
+                        {error, Reason} ->
+                            broker_metrics:inc(protocol_errors),
+                            logger:warning("mqtt_sn stateless publish dropped: ~p",
+                                           [Reason])
+                    end;
+                deny ->
+                    broker_metrics:inc(authz_failures),
+                    logger:warning("mqtt_sn stateless publish not authorized "
+                                   "topic=~p tenant=~p", [Topic, Tenant])
             end;
         {error, Reason} ->
             broker_metrics:inc(protocol_errors),

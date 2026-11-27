@@ -50,6 +50,7 @@ all() ->
      takeover_closes_the_old_session_without_a_will,
      sleep_then_pingreq_wakes_and_delivers_the_backlog,
      qos_minus1_publishes_without_a_connection,
+     stateless_publish_is_refused_under_deny,
      keepalive_timeout_ends_the_session,
      searchgw_answers_gwinfo,
      advertise_is_broadcast_on_the_configured_interval,
@@ -83,7 +84,8 @@ init_per_testcase(Case, Config0) ->
     %% teardown would capture what the case just wrote and leak into every suite
     %% that runs later in the shared CT node.
     Saved = #{require_auth => env(broker_security, require_auth),
-              predefined => env(broker_proto_mqtt_sn, predefined_topics)},
+              predefined => env(broker_proto_mqtt_sn, predefined_topics),
+              acl => env(broker_security, acl)},
     DataDir = filename:join([?config(priv_dir, Config0), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -163,9 +165,10 @@ case_env(_Case, _Config) ->
 env(App, Key) ->
     application:get_env(App, Key, undefined).
 
-restore_env(#{require_auth := Auth, predefined := Pre}) ->
+restore_env(#{require_auth := Auth, predefined := Pre, acl := Acl}) ->
     set_or_unset(broker_security, require_auth, Auth),
     set_or_unset(broker_proto_mqtt_sn, predefined_topics, Pre),
+    set_or_unset(broker_security, acl, Acl),
     ok.
 
 set_or_unset(App, Key, undefined) ->
@@ -663,6 +666,31 @@ qos_minus1_publishes_without_a_connection(Config) ->
     Bare = open(),
     publish(Bare, Port, short, <<"m1">>, -1, 0, <<"stateless">>),
     #{type := publish, payload := <<"stateless">>} = expect(Sub, publish),
+    close(Sub),
+    close(Bare).
+
+%% A sessionless QoS -1 publish is an anonymous publish, so it must pass the
+%% same ACL every other publish does. Under the `deny' posture the anonymous door
+%% is closed: the stateless publish is dropped (and counted) instead of routed,
+%% consistent with the stateful path's `not_authorized' rejection. Under `allow'
+%% it is delivered -- which the positive control at the end re-checks, so the
+%% earlier silence is proven to be the ACL and not a dead subscriber.
+stateless_publish_is_refused_under_deny(Config) ->
+    Port = ?config(port, Config),
+    Sub = open(),
+    connect(Sub, Port, <<"sn-deny-sub">>),
+    _ = subscribe(Sub, Port, short, <<"m1">>, 1),
+    Bare = open(),
+    %% Anonymous + deny posture: the fire-and-forget publish carries no session
+    %% and no credential, so it is dropped before it reaches the router.
+    ok = application:set_env(broker_security, acl, deny),
+    publish(Bare, Port, short, <<"m1">>, -1, 0, <<"blocked">>),
+    refute(Sub, publish, 200),
+    %% Positive control: back under allow, the very same stateless publish
+    %% arrives, proving the earlier silence was the ACL boundary.
+    ok = application:set_env(broker_security, acl, allow),
+    publish(Bare, Port, short, <<"m1">>, -1, 1, <<"allowed">>),
+    #{type := publish, payload := <<"allowed">>} = expect(Sub, publish),
     close(Sub),
     close(Bare).
 
