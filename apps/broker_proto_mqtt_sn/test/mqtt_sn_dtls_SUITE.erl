@@ -25,7 +25,8 @@ all() ->
      tenant_isolation_from_the_identity,
      unknown_identity_is_indistinguishable,
      dtls_without_users_refuses_to_start,
-     plaintext_listener_coexists].
+     plaintext_listener_coexists,
+     named_principal_subscribe_and_publish_are_acl_gated].
 
 suite() -> [{timetrap, {seconds, 120}}].
 
@@ -46,6 +47,10 @@ end_per_suite(_Config) ->
 
 init_per_testcase(Case, Config0) ->
     stop_all(),
+    %% Snapshot the node-global ACL posture: a case below flips it to `deny`, and
+    %% `stop_all/0' does not reset `acl', so without this the last case's value
+    %% would leak into the next suite in the shared CT node.
+    SavedAcl = application:get_env(broker_security, acl, undefined),
     DataDir = filename:join([?config(priv_dir, Config0), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -106,13 +111,21 @@ init_per_testcase(Case, Config0) ->
     %% A refused boot has no listener to report and no port to hand out: the
     %% case asserts the refusal, it does not connect. Asking for the port here
     %% would make the very case under test fail in `init_per_testcase'.
-    case Case of
-        dtls_without_users_refuses_to_start -> [{port, 0} | Config0];
-        _ -> [{port, listener_port()} | Config0]
-    end.
+    PortEntry = case Case of
+                    dtls_without_users_refuses_to_start -> {port, 0};
+                    _ -> {port, listener_port()}
+                end,
+    [{saved_acl, SavedAcl}, PortEntry | Config0].
 
-end_per_testcase(_Case, _Config) ->
+end_per_testcase(_Case, Config) ->
     stop_all(),
+    %% Restore the ACL posture the case ran under (a case below set it to `deny');
+    %% `stop_all/0' does not reset it, so this stops the `deny' leaking into the
+    %% next suite in the shared CT node.
+    case ?config(saved_acl, Config) of
+        undefined -> _ = application:unset_env(broker_security, acl);
+        Value -> ok = application:set_env(broker_security, acl, Value)
+    end,
     ok.
 
 create_partitions() ->
@@ -219,6 +232,53 @@ tenant_isolation_from_the_identity(Config) ->
     {error, timeout} = ssl:recv(Sub, 0, 800),
     ssl:close(Sub),
     ssl:close(Other),
+    ok.
+
+%% The DTLS handshake proves a real principal/tenant, so the *sessioned* ACL
+%% gate (mqtt_sn_conn:acl_subscribe/2 and acl_publish/2 -> broker_security:authorize/2)
+%% finally has a named subject to judge -- the plain-UDP path is always
+%% anonymous and only ever exercises the `deny'-posture blanket refusal. Under
+%% a `deny' rule list a named device's subscribe is refused (suback carries a
+%% non-accepted return code) and, because it is never registered, a publish to
+%% the same topic delivers nothing; flipping to `allow' lets the same two calls
+%% through. This is the named-principal complement to the conn suite's
+%% stateless_publish_is_refused_under_deny.
+named_principal_subscribe_and_publish_are_acl_gated(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sub} = connect(<<"device-01">>, <<"secret-01">>, Port),
+    ok = ssl_send(Sub, #{type => connect, protocol_id => 1,
+                         clean_session => true, duration => 60,
+                         client_id => <<"sn-acl-sub">>}),
+    #{type := connack, return_code := 0} = ssl_expect(Sub, connack),
+    {ok, Pub} = connect(<<"device-02">>, <<"secret-02">>, Port),
+    ok = ssl_send(Pub, #{type => connect, protocol_id => 1,
+                         clean_session => true, duration => 60,
+                         client_id => <<"sn-acl-pub">>}),
+    #{type := connack, return_code := 0} = ssl_expect(Pub, connack),
+    %% The predefined topic id for <<"sn/dtls">> (config 1 => <<"sn/dtls">>).
+    TopicId = 1,
+    %% deny posture: the subscribe is refused (non-accepted return code) ...
+    ok = application:set_env(broker_security, acl, deny),
+    ok = ssl_send(Sub, #{type => subscribe, msg_id => 1, qos => 1,
+                         topic_id_type => predefined, topic => TopicId}),
+    #{type := suback, return_code := SubRC} = expect(Sub, suback),
+    ?assertNotEqual(0, SubRC),
+    %% ... so a publish to the same topic reaches nobody registered there.
+    ok = ssl_send(Pub, #{type => publish, qos => 0, topic_id_type => predefined,
+                         topic_id => TopicId, msg_id => 0,
+                         payload => <<"denied">>}),
+    {error, timeout} = ssl:recv(Sub, 0, 800),
+    %% allow posture: the identical subscribe is granted and the publish lands.
+    ok = application:set_env(broker_security, acl, allow),
+    ok = ssl_send(Sub, #{type => subscribe, msg_id => 2, qos => 1,
+                         topic_id_type => predefined, topic => TopicId}),
+    #{type := suback, return_code := 0} = expect(Sub, suback),
+    ok = ssl_send(Pub, #{type => publish, qos => 0, topic_id_type => predefined,
+                         topic_id => TopicId, msg_id => 0,
+                         payload => <<"allowed">>}),
+    #{type := publish, payload := <<"allowed">>} = expect(Sub, publish),
+    ssl:close(Sub),
+    ssl:close(Pub),
     ok.
 
 %% An unknown identity and a wrong password die at the same Finished check

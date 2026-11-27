@@ -625,6 +625,11 @@ on_pubrel(#{msg_id := MsgId}, St) ->
 
 %%%_* SUBSCRIBE / UNSUBSCRIBE / REGISTER ------------------------------------
 
+%% Every branch -- granted or refused -- must answer `{noreply, State}`.
+%% `suback/6' returns the bare connection state (the grant path threads it
+%% through `replay_retained'), so a refusal returned without the `{noreply, _}'
+%% wrapper is a bad gen_server callback return and kills the session instead of
+%% telling the client it was refused.
 on_subscribe(#{topic_id_type := Type, topic := Ref, msg_id := MsgId,
                qos := QoS}, St) ->
     case resolve_filter(Type, Ref, St) of
@@ -634,12 +639,13 @@ on_subscribe(#{topic_id_type := Type, topic := Ref, msg_id := MsgId,
                     subscribe_allowed(Filter, QoS, Type, MsgId, St1);
                 false ->
                     %% QoS -1 is not a subscription level.
-                    suback(MsgId, Type, Ref, QoS, ?RC_NOT_SUPPORTED, St1)
+                    {noreply, suback(MsgId, Type, Ref, QoS,
+                                     ?RC_NOT_SUPPORTED, St1)}
             end;
         {error, Reason} ->
             broker_metrics:inc(protocol_errors),
             logger:warning("mqtt_sn subscribe with bad topic: ~p", [Reason]),
-            suback(MsgId, Type, Ref, QoS, ?RC_INVALID_TOPIC_ID, St)
+            {noreply, suback(MsgId, Type, Ref, QoS, ?RC_INVALID_TOPIC_ID, St)}
     end.
 
 subscribe_allowed(Filter, QoS, Type, MsgId, St) ->
@@ -652,14 +658,15 @@ subscribe_allowed(Filter, QoS, Type, MsgId, St) ->
                 {error, Reason} ->
                     logger:warning("mqtt_sn subscribe ~p refused: ~p",
                                    [Filter, Reason]),
-                    suback(MsgId, Type, 0, QoS, ?RC_NOT_SUPPORTED, St)
+                    {noreply, suback(MsgId, Type, 0, QoS,
+                                     ?RC_NOT_SUPPORTED, St)}
             end;
         {deny, _} ->
             broker_metrics:inc(authz_failures),
             logger:warning("mqtt_sn subscribe not authorized ~p", [Filter]),
-            suback(MsgId, Type, 0, QoS, ?RC_NOT_SUPPORTED, St);
+            {noreply, suback(MsgId, Type, 0, QoS, ?RC_NOT_SUPPORTED, St)};
         {_, {error, _Reason}} ->
-            suback(MsgId, Type, 0, QoS, ?RC_NOT_SUPPORTED, St)
+            {noreply, suback(MsgId, Type, 0, QoS, ?RC_NOT_SUPPORTED, St)}
     end.
 
 grant(SubRef, Filter, QoS, Type, MsgId, St) ->

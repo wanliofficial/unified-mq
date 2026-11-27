@@ -33,6 +33,7 @@ all() ->
     [connect_returns_connack,
      clean_session_drops_previous_subscriptions,
      subscribe_assigns_a_normal_topic_id,
+     refused_subscribe_returns_a_code_and_keeps_the_session,
      publish_qos0_reaches_a_subscriber,
      publish_qos1_is_acked_and_delivered,
      publish_qos2_handshake_delivers_once,
@@ -372,6 +373,26 @@ subscribe_assigns_a_normal_topic_id(Config) ->
     %% Publishing to the id the SUBACK just handed out is the contract.
     publish(S, Port, normal, Id, 1, 7, <<"via-id">>),
     #{type := puback, return_code := 0, msg_id := 7} = expect(S, puback),
+    close(S).
+
+%% A refused SUBSCRIBE must answer with a non-accepted return code and leave the
+%% session alive -- the refusal reaches the client, it does not drop the
+%% transport. Without this the refusal branches returned a bare connection state
+%% that gen_server rejected as a bad callback return, killing the session mid-
+%% refusal (the ACL-deny twin is named_principal_..._acl_gated over DTLS).
+refused_subscribe_returns_a_code_and_keeps_the_session(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    connect(S, Port, <<"sn-refuse">>),
+    %% QoS -1 is not a subscription level (§6.10); the gateway must refuse it.
+    send(S, Port, #{type => subscribe, dup => false, qos => -1,
+                    topic_id_type => normal, msg_id => 1,
+                    topic => <<"sn/refuse/t">>}),
+    #{type := suback, return_code := RC} = expect(S, suback),
+    ?assertNotEqual(0, RC),
+    %% The same socket still answers: the refusal did not end the session.
+    send(S, Port, #{type => pingreq, client_id => <<"sn-refuse">>}),
+    #{type := pingresp} = expect(S, pingresp),
     close(S).
 
 publish_qos0_reaches_a_subscriber(Config) ->
