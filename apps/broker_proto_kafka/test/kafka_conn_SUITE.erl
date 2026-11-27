@@ -34,6 +34,9 @@ all() ->
      sasl_plain_authenticates_against_the_shared_table,
      sasl_plain_with_a_wrong_password_is_refused,
      sasl_plain_with_an_unknown_mechanism_is_refused,
+     %% docs/security.md §4: the ACL gate on the produce path.
+     acl_denies_a_produce_outside_the_rule,
+     acl_allows_a_produce_inside_the_rule,
      connections_current_tracks_the_connection_lifecycle,
      %% S12-B (ADR-032 D7): the node-level admission gate.
      over_capacity_is_refused_in_the_api_versions_response,
@@ -391,6 +394,57 @@ sasl_plain_with_an_unknown_mechanism_is_refused(Config) ->
     <<ErrorCode:16/signed, _/binary>> = Handshake,
     %% 33 = UNSUPPORTED_SASL_MECHANISM.
     ?assertEqual(33, ErrorCode),
+    ok.
+
+%%%_* docs/security.md §4: the ACL gate on the produce path --------------------
+%% Before this, a SASL-authenticated producer could write to any topic: the
+%% produce path consulted the event policy (apply_policy) but never
+%% broker_security:authorize/2. Under a rule list with no matching allow rule
+%% the produce must now be refused with Kafka's own authorization-failure code
+%% 29 (TOPIC_AUTHORIZATION_FAILED), and nothing may be appended. The positive
+%% control (a topic the rule allows) proves the gate is not refusing everybody.
+
+%% An SASL-authenticated connection (alice, tenant t1) from the shared table.
+authed_connect(Config, User, Pass) ->
+    C = connect(Config),
+    <<0:16/signed, _/binary>> = request(C, 17, 1, kafka_codec:string(<<"PLAIN">>)),
+    <<0:16/signed, _/binary>> = request(C, 36, 1, kafka_codec:bytes(<<0, User/binary, 0, Pass/binary>>)),
+    C.
+
+acl_denies_a_produce_outside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => publish,
+                                %% The destination a Kafka record is stored and
+                                %% fetched under is `kafka/<topic>' (see
+                                %% `kafka_conn:destination/1'); an ACL pattern
+                                %% matches that same form.
+                                pattern => <<"kafka/aclprod.ok">>}]),
+    C = authed_connect(Config, <<"alice">>, <<"pw">>),
+    %% `kafka/aclprod.deny' matches no allow rule -> no-match is deny under a rule list.
+    {29, _Base} = produce_batch(C, <<"aclprod.deny">>, 0,
+                                iolist_to_binary(kafka_codec:encode_record_batch(
+                                                 0, [#{offset => 0, timestamp => 0,
+                                                       key => undefined, value => <<"x">>,
+                                                       headers => []}]))),
+    ok.
+
+acl_allows_a_produce_inside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => publish,
+                                pattern => <<"kafka/aclprod.ok">>}]),
+    C = authed_connect(Config, <<"alice">>, <<"pw">>),
+    %% Exact destination match; error 0 and a real base offset prove the message
+    %% was appended, not silently dropped.
+    {0, Base} = produce_batch(C, <<"aclprod.ok">>, 0,
+                              iolist_to_binary(kafka_codec:encode_record_batch(
+                                               0, [#{offset => 0, timestamp => 0,
+                                                     key => undefined, value => <<"x">>,
+                                                     headers => []}]))),
+    ?assert(Base >= 0),
     ok.
 
 %%%_* Byte-level client ----------------------------------------------------

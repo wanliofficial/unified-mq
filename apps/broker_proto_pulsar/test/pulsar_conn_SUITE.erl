@@ -39,6 +39,8 @@ all() ->
      sasl_token_authenticates_against_the_shared_table,
      sasl_token_with_a_wrong_secret_is_refused,
      sasl_plain_authenticates_against_the_shared_table,
+     acl_denies_a_send_outside_the_rule,
+     acl_allows_a_send_inside_the_rule,
      connections_current_tracks_the_connection_lifecycle,
      %% S12-B (ADR-032 D7): the node-level admission gate.
      over_capacity_is_refused_with_an_error_command,
@@ -384,6 +386,56 @@ sasl_plain_authenticates_against_the_shared_table(Config) ->
     C = connect(Config),
     send_simple(C, connect_fields(<<"plain">>, <<0, "alice", 0, "pw">>)),
     #{type := connected} = recv(C),
+    ok.
+
+%%%_* docs/security.md §4: the ACL gate on the send path ---------------------
+%% Before this a SASL-authenticated producer could publish to any topic: the
+%% send path ran the event policy but never broker_security:authorize/2. Under
+%% a rule list with no matching allow rule a send must now be refused with
+%% Pulsar's own authorization-failure code 4 (AuthorizationError) for that
+%% message's sequence id, and nothing appended. The positive control (a topic
+%% the rule allows) proves the gate is not refusing everybody.
+
+%% An SASL-authenticated connection (alice, tenant t1). require_auth is left at
+%% its default [] so the anonymous CONNECT path stays available to other cases;
+%% presenting credentials is what makes this connection authenticated.
+authed_connect(Config) ->
+    C = connect(Config),
+    send_simple(C, connect_fields(<<"plain">>, <<0, "alice", 0, "pw">>)),
+    #{type := connected} = recv(C),
+    C.
+
+acl_denies_a_send_outside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => publish,
+                                %% The destination a Pulsar message is stored
+                                %% and fetched under is `pulsar/<topic>' (see
+                                %% `pulsar_conn:destination/1'); an ACL pattern
+                                %% matches that same form exactly.
+                                pattern => <<"pulsar/persistent://t0/ns/ok">>}]),
+    C = authed_connect(Config),
+    #{type := producer_success} =
+        producer(C, <<"persistent://t0/ns/deny">>, 1, 1, <<"p-deny">>),
+    %% `pulsar/persistent://t0/ns/deny' matches no allow rule -> deny. The
+    %% refused send comes back as the error frame `send_one' already reads.
+    #{type := error, error := 4} = send_one(C, 1, 7, <<"x">>),
+    ok.
+
+acl_allows_a_send_inside_the_rule(Config) ->
+    ok = application:set_env(broker_security, acl,
+                             [#{effect => allow,
+                                principal => <<"alice">>,
+                                action => publish,
+                                pattern => <<"pulsar/persistent://t0/ns/ok">>}]),
+    C = authed_connect(Config),
+    #{type := producer_success} =
+        producer(C, <<"persistent://t0/ns/ok">>, 1, 1, <<"p-ok">>),
+    %% Exact destination match; a send receipt proves the message was appended,
+    %% not silently dropped.
+    #{type := send_receipt, producer_id := 1, sequence_id := 0} =
+        send_one(C, 1, 0, <<"x">>),
     ok.
 
 %%%_* Byte-level client -----------------------------------------------------

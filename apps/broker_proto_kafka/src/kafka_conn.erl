@@ -434,13 +434,42 @@ produce_partition(Topic, {Index, Records}, St) ->
         false ->
             produce_error(Index, 3);                    % UNKNOWN_TOPIC_OR_PARTITION
         true ->
-            case kafka_codec:decode_record_batches(Records) of
-                {ok, Batches, _Tail} ->
-                    append_batches(Topic, Index, Batches, St);
-                {error, _Reason} ->
-                    produce_error(Index, 2)                 % CORRUPT_MESSAGE
+            %% ACL gate on the topic a record would be written to. The
+            %% destination is the same `kafka/<topic>' form routing and
+            %% fetching use, so an ACL `pattern' matches what the client
+            %% addressed; the tenant is the connection's own (set from its
+            %% SASL identity, or the default tenant when anonymous). A denied
+            %% produce is refused with the Kafka wire protocol's own
+            %% authorization-failure code 29 (TOPIC_AUTHORIZATION_FAILED) per
+            %% partition, exactly as a real broker answers it -- no append, so
+            %% the topic's shared offset counter does not advance.
+            case acl_produce_allowed(Topic, St) of
+                false ->
+                    broker_metrics:inc(authz_failures),
+                    logger:warning("kafka produce not authorized topic=~p "
+                                   "principal=~p", [Topic, St#st.principal]),
+                    produce_error(Index, 29);            % TOPIC_AUTHORIZATION_FAILED
+                true ->
+                    case kafka_codec:decode_record_batches(Records) of
+                        {ok, Batches, _Tail} ->
+                            append_batches(Topic, Index, Batches, St);
+                        {error, _Reason} ->
+                            produce_error(Index, 2)         % CORRUPT_MESSAGE
+                    end
             end
     end.
+
+%% ACL decision for a produce to `Topic'. Same shape as the other protocols'
+%% publish gate: authorize/2 with the connection principal and tenant, and the
+%% `/`-normalised destination (here `kafka/<topic>', already the routing key).
+%% An anonymous connection (principal `undefined') is out of the ACL under
+%% `allow' and rule-list postures and refused only under `deny' -- identical to
+%% NATS/CoAP, so the default `allow' posture does not break anonymous produce.
+acl_produce_allowed(Topic, #st{principal = Principal, tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => publish, tenant_id => Tenant,
+        destination => destination(Topic)}) =:= allow.
 
 %% Kafka offsets are per topic-partition and start at 0. The broker partition
 %% is shared by every topic, so the Kafka offset of a record is its index

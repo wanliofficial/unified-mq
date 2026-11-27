@@ -470,7 +470,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| Kafka | 部分支持 | Produce/Fetch/Metadata/ListOffsets、经典消费组（FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup）、OffsetCommit/OffsetFetch、RecordBatch v2（key/value/headers/timestamp）、多分区、`SaslHandshake`/`SaslAuthenticate`（SASL/PLAIN，走统一身份表） | 单节点协调器、offset 内存态（重启丢）、无 `__consumer_offsets`、无事务/幂等去重、无压缩、无 Admin API（CreateTopics/DeleteTopics 等）；TLS 由 S6 的 `broker_security_tls` 统一覆盖；未配 `require_auth` 时不带凭据的连接按部署默认租户匿名运行 | apps/broker_proto_kafka/test/、test/protocol-compatibility/kafka/ |
+| Kafka | 部分支持 | Produce/Fetch/Metadata/ListOffsets、经典消费组（FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup）、OffsetCommit/OffsetFetch、RecordBatch v2（key/value/headers/timestamp）、多分区、`SaslHandshake`/`SaslAuthenticate`（SASL/PLAIN，走统一身份表）；**ACL（`broker_security:authorize/2`）**（2026-11-27）：SASL 认证后的 produce 经 `acl_produce_allowed/2` 前置判定，拒绝用 Kafka 自身的错误码 29（`TOPIC_AUTHORIZATION_FAILED`）per-partition、不 append | 单节点协调器、offset 内存态（重启丢）、无 `__consumer_offsets`、无事务/幂等去重、无压缩、无 Admin API（CreateTopics/DeleteTopics 等）；TLS 由 S6 的 `broker_security_tls` 统一覆盖；未配 `require_auth` 时不带凭据的连接按部署默认租户匿名运行；**消费侧不按租户过滤（offset 语义待定，见 `docs/security.md` §12 第 10 条）** | apps/broker_proto_kafka/test/、test/protocol-compatibility/kafka/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -492,7 +492,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 | 层 | 用例 |
 |---|---|
 | Kafka 原语/RecordBatch（`kafka_codec_SUITE`） | 11 例：uvarint/varint/varlong、string/bytes/array、compact 值、CRC32C 已知向量、批次往返、多记录偏移、headers/timestamp、CRC 篡改检测、截断批次、空批次 |
-| Kafka 连接/协议（`kafka_conn_SUITE`） | **17 例（当前）**：S5 时点 14 例（ApiVersions v0/v3、Metadata、Produce→Fetch、topic 相对 offset、批次连续 offset、ListOffsets earliest/latest、空 topic、非法分区、FindCoordinator、Join/Sync/Heartbeat、OffsetCommit/Fetch、LeaveGroup、correlation id 回显）；S7 追加 SASL/PLAIN 握手、错误密码拒绝、未知机制拒绝三例 |
+| Kafka 连接/协议（`kafka_conn_SUITE`） | **22 例（当前）**：S5 时点 14 例（ApiVersions v0/v3、Metadata、Produce→Fetch、topic 相对 offset、批次连续 offset、ListOffsets earliest/latest、空 topic、非法分区、FindCoordinator、Join/Sync/Heartbeat、OffsetCommit/Fetch、LeaveGroup、correlation id 回显）；S7 追加 SASL/PLAIN 握手、错误密码拒绝、未知机制拒绝三例（17）；S12-B 追加连接计数与准入闸门三例（20）；2026-11-27 追加 **ACL 发布拒绝（错误码 29）+ 规则列表内发布放行** 两例（22） |
 | 真实第三方客户端（`kafka_compat.py` + `kafka-clients` 3.7.1） | 12/12 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：
@@ -526,7 +526,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| Pulsar | 部分支持 | 官方 Java Client 的 Connect/Lookup/PartitionedMetadata/Producer/Send（含 batch）/Subscribe/Flow/Ack/Seek/Unsubscribe/Ping/GetLastMessageId；properties、key、event_time、sequence_id；CONNECT `auth_method_name`/`auth_data`（`token` 与 SASL/PLAIN，走统一身份表） | 无 BookKeeper/ledger（ADR-006）；无事务、无压缩、无 Key_Shared hash range、无 read-compacted、无 schema；TLS 由 S6 的 `broker_security_tls` 统一覆盖；订阅游标内存态（重启重置）；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0 | apps/broker_proto_pulsar/test/、test/protocol-compatibility/pulsar/ |
+| Pulsar | 部分支持 | 官方 Java Client 的 Connect/Lookup/PartitionedMetadata/Producer/Send（含 batch）/Subscribe/Flow/Ack/Seek/Unsubscribe/Ping/GetLastMessageId；properties、key、event_time、sequence_id；CONNECT `auth_method_name`/`auth_data`（`token` 与 SASL/PLAIN，走统一身份表）；**ACL（`broker_security:authorize/2`）**（2026-11-27）：认证后的 send 经 `acl_publish_allowed/2` 在解析 producer 后前置判定，拒绝用 Pulsar 自身的错误码 4（`AuthorizationError`）、不 append | 无 BookKeeper/ledger（ADR-006）；无事务、无压缩、无 Key_Shared hash range、无 read-compacted、无 schema；TLS 由 S6 的 `broker_security_tls` 统一覆盖；订阅游标内存态（重启重置）；未配 `require_auth` 时匿名连接按部署默认租户运行、全部写入分区 0；**消费侧不按租户过滤（offset 语义待定，见 `docs/security.md` §12 第 10 条）** | apps/broker_proto_pulsar/test/、test/protocol-compatibility/pulsar/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -547,7 +547,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 | 层 | 用例 |
 |---|---|
 | Pulsar 编解码（`pulsar_codec_SUITE`） | 15 例：CRC32C 已知向量、command_size 前缀、CONNECT/PRODUCER/SUBSCRIBE/SEND/ACK/SEEK 解码、payload 往返、CRC 篡改检测、无 magic 旧格式、batch 负载、MessageMetadata/SingleMessageMetadata 往返、CONNECTED 帧 |
-| Pulsar 连接/订阅（`pulsar_conn_SUITE`） | **19 例（当前）**：S5 时点 16 例（connect、partitioned-metadata=0、lookup broker URL、producer success、单发/批量 SEND→receipt、subscribe/flow 顺序投递、ack 后 unacked 清零、ack response 回显 request id、未 ack 关闭后重投、seek 回放、ping/pong、last-message-id、close producer、unsubscribe、未知 producer 报错）；S7 追加 token/SASL-PLAIN 认证、错误 token 拒绝三例 |
+| Pulsar 连接/订阅（`pulsar_conn_SUITE`） | **24 例（当前）**：S5 时点 16 例（connect、partitioned-metadata=0、lookup broker URL、producer success、单发/批量 SEND→receipt、subscribe/flow 顺序投递、ack 后 unacked 清零、ack response 回显 request id、未 ack 关闭后重投、seek 回放、ping/pong、last-message-id、close producer、unsubscribe、未知 producer 报错）；S7 追加 token/SASL-PLAIN 认证、错误 token 拒绝三例（19）；S12-B 追加连接计数与准入闸门三例（22）；2026-11-27 追加 **ACL send 拒绝（错误码 4）+ 规则列表内 send 放行** 两例（24） |
 | 真实第三方客户端（`pulsar_compat.py` + `pulsar-client` 3.3.1） | 8/8 PASS（见上） |
 
 **实现期修复**（测试暴露的真实缺陷，已修）：

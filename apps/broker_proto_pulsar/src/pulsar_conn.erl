@@ -303,38 +303,68 @@ handle_send(Cmd, Tail, St) ->
             send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
                        <<"unknown producer">>, St);
         {ok, Topic} ->
-            case pulsar_codec:decode_payload(Tail) of
-                {ok, Meta, Payload} ->
-                    Records = split_records(Meta, Payload,
-                                            maps:get(num_messages, Cmd)),
-                    Base = topic_count(destination(Topic)),
-                    Results = lists:map(
-                                fun({Index, Record}) ->
-                                        append_record(Topic, Base + Index, Record,
-                                                      St#st.tenant)
-                                end,
-                                lists:zip(lists:seq(0, length(Records) - 1),
-                                          Records)),
-                    case first_error(Results) of
-                        ok ->
-                            Receipt = pulsar_codec:encode_send_receipt(
-                                        ProducerId,
-                                        maps:get(sequence_id, Cmd),
-                                        Base,
-                                        maps:get(highest_sequence_id, Cmd, 0)),
-                            send(Receipt, St);
-                        {error, {cloudevent_rejected, Reason}} ->
+            %% ACL gate on the topic a message would be published to. The
+            %% destination is the same `pulsar/<topic>' form the message is
+            %% stored and fetched under; the tenant is the connection's own
+            %% (set from its auth identity at CONNECT, or the default tenant
+            %% when anonymous). A denied produce is refused with the Pulsar
+            %% wire protocol's own authorization-failure code 4
+            %% (AuthorizationError) for the message's sequence id, exactly as
+            %% a real broker answers it -- nothing is appended. An anonymous
+            %% connection (principal `undefined') stays out of the ACL under
+            %% `allow' and rule-list postures and is refused only under `deny',
+            %% identical to NATS/CoAP/Kafka.
+            case acl_publish_allowed(Topic, St) of
+                false ->
+                    broker_metrics:inc(authz_failures),
+                    logger:warning("pulsar produce not authorized topic=~p "
+                                   "principal=~p", [Topic, St#st.principal]),
+                    send_error(maps:get(sequence_id, Cmd), ?ERROR_AUTHORIZATION,
+                               <<"authorization failed">>, St);
+                true ->
+                    case pulsar_codec:decode_payload(Tail) of
+                        {ok, Meta, Payload} ->
+                            Records = split_records(Meta, Payload,
+                                                    maps:get(num_messages, Cmd)),
+                            Base = topic_count(destination(Topic)),
+                            Results = lists:map(
+                                        fun({Index, Record}) ->
+                                                append_record(Topic, Base + Index, Record,
+                                                              St#st.tenant)
+                                        end,
+                                        lists:zip(lists:seq(0, length(Records) - 1),
+                                                  Records)),
+                            case first_error(Results) of
+                                ok ->
+                                    Receipt = pulsar_codec:encode_send_receipt(
+                                                ProducerId,
+                                                maps:get(sequence_id, Cmd),
+                                                Base,
+                                                maps:get(highest_sequence_id, Cmd, 0)),
+                                    send(Receipt, St);
+                                {error, {cloudevent_rejected, Reason}} ->
+                                    send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
+                                               reason_bin(Reason), St);
+                                {error, Reason} ->
+                                    send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
+                                               reason_bin(Reason), St)
+                            end;
+                        {error, _Reason} ->
                             send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
-                                       reason_bin(Reason), St);
-                        {error, Reason} ->
-                            send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
-                                       reason_bin(Reason), St)
-                    end;
-                {error, _Reason} ->
-                    send_error(maps:get(sequence_id, Cmd), ?ERROR_UNKNOWN,
-                               <<"bad payload">>, St)
+                                       <<"bad payload">>, St)
+                    end
             end
     end.
+
+%% ACL decision for a produce to `Topic'. Same shape as Kafka's produce gate
+%% and the other protocols': authorize/2 with the connection principal and
+%% tenant, and the `/`-normalised destination (`pulsar/<topic>', the routing
+%% and retention key). Anonymous stays out of the ACL under `allow'/rule-list.
+acl_publish_allowed(Topic, #st{principal = Principal, tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => publish, tenant_id => Tenant,
+        destination => destination(Topic)}) =:= allow.
 
 %% A SEND with num_messages > 1 carries a batch: each entry is
 %% [metadata_size][SingleMessageMetadata][payload].
