@@ -305,7 +305,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 **能力矩阵行**（追加进 §2 末尾）：
 
 ```
-| WebSocket | 已支持 | RFC 6455 传输 + connect/connack、subscribe/suback、publish(qos0/1)/puback、message 二进制投递、ack/ackack、unsubscribe/unsuback、ping/pong、clean_start=false 会话 + 离线追赶、同 client_id takeover | v1 仅 QoS0/1（无 QoS2 握手）；v1 不支持 shared 订阅（明确拒绝）；二进制投递帧（op=3）无 MQTT 风格 QoS2；无 retained/will（归 MQTT 侧） | apps/broker_proto_ws/test/、test/protocol-compatibility/ws/ |
+| WebSocket | 已支持 | RFC 6455 传输 + connect/connack、subscribe/suback、publish(qos0/1)/puback、message 二进制投递、ack/ackack、unsubscribe/unsuback、ping/pong、clean_start=false 会话 + 离线追赶、同 client_id takeover、**ACL（`broker_security:authorize/2`）**（2026-11-27）：发布走 `acl_publish_allowed/2` 落盘前判定、订阅走 `acl_subscribe_allowed/2` 在注册订阅前判定；目的地取客户端寻址的原始 destination/filter（无 per-protocol 前缀，规则按客户端可见串书写）、租户取连接自身租户；拒绝用自有协议形状——发布回 `error/code=forbidden`「not authorized」、订阅回 `suback` `granted=false` + `reason=forbidden`，均不落盘/不注册、inc `authz_failures`；匿名连接不进 ACL（`allow`/规则列表下放行、仅 `deny` 姿态拒），与 NATS/Kafka/Pulsar/AMQP/CoAP 一致 | v1 仅 QoS0/1（无 QoS2 握手）；v1 不支持 shared 订阅（明确拒绝）；二进制投递帧（op=3）无 MQTT 风格 QoS2；无 retained/will（归 MQTT 侧） | apps/broker_proto_ws/test/、test/protocol-compatibility/ws/ |
 ```
 
 **已知限制（协议对端可观察，不是内部 TODO）**：
@@ -314,6 +314,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 2. **shared 订阅明确拒绝**：`subscribe` 带 `kind=shared` ⇒ `suback` 返回 `granted=false` + reason（不是断连，也不是静默）。
 3. **二进制投递帧无 QoS2 语义**：投递帧（op=3）是「消息」投递，其 `qos` 只取订阅侧 0/1。
 4. **retained / will 不在 WS 侧**：这两项由 MQTT 侧 `broker_retain` / 连接 FSM 拥有；WS v1 不复制它们。
+5. **ACL（2026-11-27 接入）**：认证后的发布/订阅都过 `broker_security:authorize/2`。目的地是客户端寻址的原始 destination/filter（WS 是项目定义协议，无 per-protocol 前缀，故规则直接按客户端可见串书写），租户取连接自身租户。拒绝形状：发布回 `error` 帧 `code=forbidden`「not authorized」（对应认证失败的 `unauthorized` 帧，401/403 语义），订阅回 `suback` `granted=false` + `reason=forbidden`（对应 shared/非法 filter 的既有拒绝）；两向都不落盘、不注册订阅、inc `authz_failures`。匿名（未认证）连接不进 ACL：`allow`/规则列表下放行、仅 `deny` 姿态拒（与 NATS/MQTT/明文 CoAP 一致）。
 
 **真实第三方客户端证据**（Gate S5「真实第三方客户端集成测试，无自编客户端互测」）：
 
@@ -328,7 +329,7 @@ MCP `mcp 2.3.0`（§4.17.9）、ACP `agent-client-protocol 1.0.0`（§4.18.8）�
 | 层 | 用例 |
 |---|---|
 | WS 帧编解码（`ws_frame_SUITE`） | 9 例：握手 accept、掩码/分片、控制帧、close 载荷 |
-| WS 连接/应用协议（`ws_conn_SUITE`） | **23 例（当前）**：S5 时点 14 例（connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack、明文 HTTP 拒绝）；S6 追加 `cloudevent_headers_roundtrip`（15）；S7 追加凭据解析、错误凭据拒绝、客户端自带租户被忽略、`require_auth` 四例（19）；trace context 追加往返、`off` 时剥离、非法 `traceparent` 不传播三例（22）；S8-B 追加 `wss_is_served_when_tls_is_enabled`（23，`mqtt_ws` 与自有 `ws` 同端口同 TLS 开关的回归用例） |
+| WS 连接/应用协议（`ws_conn_SUITE`） | **31 例（当前）**：S5 时点 14 例（connect/connack、qos1 往返+ack、qos0 无 ack、二进制帧、unsubscribe、clean=false 追赶、clean 丢弃、非法 filter/shared/超限拒绝、ping/pong、未知 delivery ack、明文 HTTP 拒绝）；S6 追加 `cloudevent_headers_roundtrip`（15）；S7 追加凭据解析、错误凭据拒绝、客户端自带租户被忽略、`require_auth` 四例（19）；trace context 追加往返、`off` 时剥离、非法 `traceparent` 不传播三例（22）；S8-B 追加 `wss_is_served_when_tls_is_enabled`（23）；S12-B 追加连接计数与准入闸门两例（25）；S12-D 追加 `connections_current_tracks_the_connection_lifecycle`（26）；**2026-11-27 追加 ACL 三例**——`acl_denies_a_publish_outside_the_rule`（规则列表内发布放行 + 投递、规则外 `forbidden` 不落盘）、`acl_denies_a_subscribe_outside_the_rule`（规则外 `suback granted=false reason=forbidden` 不注册、规则内投递）、`acl_anonymous_is_not_gated_under_a_rule_list`（匿名连接不进 ACL，规则列表不拒匿名），含正控（31） |
 | 真实第三方客户端（`ws_compat.py`） | 10/10 PASS（见上） |
 | 全量 | `rebar3 ct` **470/470**；`dialyzer` 0 warnings；`xref` 仅预期 unused-export |
 

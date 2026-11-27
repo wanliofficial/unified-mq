@@ -376,6 +376,30 @@ sub_tenant(#st{principal = undefined}) ->
 sub_tenant(#st{tenant = Tenant}) ->
     Tenant.
 
+%% ACL gate on a publish, mirroring `acl_subscribe_allowed/2' for the read side.
+%% The destination is the client-addressed destination the message is stored
+%% under -- no per-protocol prefix, because WS is the project-defined protocol
+%% and its destinations are raw (like MQTT topic filters), so an ACL rule is
+%% written against the same string the client sees. The tenant is the
+%% connection's own. An anonymous connection (principal `undefined') is out of
+%% the ACL under the `allow'/rule-list postures and refused only under the
+%% `deny' posture, identical to NATS/MQTT and plaintext CoAP: a datagram-style
+%% channel cannot be used to dodge the deny-by-default posture by switching
+%% protocol.
+acl_publish_allowed(Destination, #st{principal = Principal, tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => publish, tenant_id => Tenant,
+        destination => Destination}) =:= allow.
+
+%% ACL gate on a subscription, mirroring `acl_publish_allowed/2'. The
+%% destination is the client-addressed filter (raw, like MQTT topic filters).
+acl_subscribe_allowed(Filter, #st{principal = Principal, tenant = Tenant}) ->
+    broker_security:authorize(
+      Principal,
+      #{action => subscribe, tenant_id => Tenant,
+        destination => Filter}) =:= allow.
+
 maybe_takeover(Pid) when is_pid(Pid), Pid =/= self() ->
     Pid ! {ws_takeover, self()},
     ok;
@@ -398,20 +422,40 @@ do_subscribe(Map, St) ->
             Kind = maps:get(<<"kind">>, Map, <<"exclusive">>),
             case {valid_filter(Filter), valid_qos(QoS), Kind} of
                 {true, true, <<"exclusive">>} ->
-                    case broker_subscription:subscribe(St#st.client_id, Filter, QoS,
-                                                       sub_tenant(St)) of
-                        {ok, Ref} ->
-                            Subs = (St#st.subs)#{Ref => #{filter => Filter, qos => QoS}},
-                            St1 = catch_up_ref(Ref, QoS, St#st{subs = Subs}),
+                    %% ACL gate before the subscription is registered: a refused
+                    %% subscribe never reaches `broker_subscription', so the
+                    %% client gets no usable `SubRef' (mirrors NATS/CoAP, and
+                    %% AMQP's consume gate). The `suback' carries `granted =>
+                    %% false' with reason `forbidden', the same refusal shape the
+                    %% shared/invalid-filter cases use.
+                    case acl_subscribe_allowed(Filter, St) of
+                        false ->
+                            broker_metrics:inc(authz_failures),
+                            logger:warning("ws subscribe not authorized "
+                                           "filter=~p principal=~p",
+                                           [Filter, St#st.principal]),
                             {noreply, send_json(#{<<"op">> => <<"suback">>,
                                                   <<"id">> => Id,
                                                   <<"destination">> => Filter,
-                                                  <<"qos">> => QoS}, St1)};
-                        {error, Reason} ->
-                            {noreply, send_json(#{<<"op">> => <<"suback">>, <<"id">> => Id,
-                                                  <<"destination">> => Filter,
                                                   <<"granted">> => false,
-                                                  <<"reason">> => reason_bin(Reason)}, St)}
+                                                  <<"reason">> => <<"forbidden">>}, St)};
+                        true ->
+                            case broker_subscription:subscribe(St#st.client_id,
+                                                               Filter, QoS,
+                                                               sub_tenant(St)) of
+                                {ok, Ref} ->
+                                    Subs = (St#st.subs)#{Ref => #{filter => Filter, qos => QoS}},
+                                    St1 = catch_up_ref(Ref, QoS, St#st{subs = Subs}),
+                                    {noreply, send_json(#{<<"op">> => <<"suback">>,
+                                                          <<"id">> => Id,
+                                                          <<"destination">> => Filter,
+                                                          <<"qos">> => QoS}, St1)};
+                                {error, Reason} ->
+                                    {noreply, send_json(#{<<"op">> => <<"suback">>, <<"id">> => Id,
+                                                          <<"destination">> => Filter,
+                                                          <<"granted">> => false,
+                                                          <<"reason">> => reason_bin(Reason)}, St)}
+                            end
                     end;
                 {true, true, _} ->
                     {noreply, send_json(#{<<"op">> => <<"suback">>, <<"id">> => Id,
@@ -457,7 +501,24 @@ do_publish(Map, St) ->
             MaxBytes = max_publish_bytes(),
             case {valid_qos(QoS), payload(Map)} of
                 {true, {ok, Payload}} when byte_size(Payload) =< MaxBytes ->
-                    publish(Destination, QoS, Payload, Id, ce_headers(Map), St);
+                    %% ACL gate before anything is stored or routed: an
+                    %% authenticated principal may only publish to a destination
+                    %% its rules allow (the same gate NATS/Kafka/Pulsar/AMQP
+                    %% run). Anonymous connections stay out of the ACL under the
+                    %% `allow'/rule-list postures and are refused only under the
+                    %% `deny' posture, so a WS client cannot dodge the posture by
+                    %% switching protocol.
+                    case acl_publish_allowed(Destination, St) of
+                        false ->
+                            broker_metrics:inc(authz_failures),
+                            logger:warning("ws publish not authorized "
+                                           "destination=~p principal=~p",
+                                           [Destination, St#st.principal]),
+                            {noreply, send_error(<<"forbidden">>,
+                                                 <<"not authorized">>, St)};
+                        true ->
+                            publish(Destination, QoS, Payload, Id, ce_headers(Map), St)
+                    end;
                 {true, {ok, _TooBig}} ->
                     {noreply, send_error(<<"payload_too_large">>, <<"max_publish_bytes">>, St)};
                 {true, {error, Reason}} ->

@@ -51,7 +51,13 @@ all() ->
      connections_current_tracks_the_connection_lifecycle,
      %% S12-B (ADR-032 D7): the node-level admission gate.
      over_capacity_is_refused_before_the_upgrade,
-     a_released_slot_is_usable_again].
+     a_released_slot_is_usable_again,
+     %% ACL (broker_security:authorize/2): WS authenticates but, until now, never
+     %% enforced the ACL -- the one client-facing front end that carried a
+     %% principal without gating publish/subscribe on it.
+     acl_denies_a_publish_outside_the_rule,
+     acl_denies_a_subscribe_outside_the_rule,
+     acl_anonymous_is_not_gated_under_a_rule_list].
 
 %% S12-B (ADR-032 D7): before this, only the MQTT front ends wrote
 %% `connections_current', so the gauge did not describe the node. This is the
@@ -149,6 +155,11 @@ end_per_testcase(_Case, Config) ->
     %% shared CT node inherits "capacity 1" and its second connection is refused.
     ok = application:set_env(broker_security, limits,
                              #{max_connections => infinity}),
+    %% J10: `acl' is node state too. The ACL cases below set a rule list; a
+    %% suite that runs later in the same shared node (broker_security_SUITE's
+    %% `authorize_stub_always_allows') relies on the permissive default, so the
+    %% rule list must not leak out of this suite.
+    ok = application:set_env(broker_security, acl, allow),
     restore_tls(?config(saved_tls, Config)),
     ok.
 
@@ -619,6 +630,87 @@ a_released_slot_is_usable_again(Config) ->
         request(Again, #{<<"op">> => <<"connect">>, <<"client_id">> => <<"g2">>}),
     close(Again),
     ok.
+
+%%%_* ACL (broker_security:authorize/2) ----------------------------------------
+%%
+%% WS authenticates a principal (from the shared identity table) but, unlike
+%% MQTT/MQTT-SN/CoAP/WebRTC/NATS/Kafka/Pulsar/AMQP, never ran the ACL: an
+%% authenticated client could publish or subscribe to any destination with no
+%% rule check at all. These cases pin the gate on both paths. The destinations
+%% are raw (the client-addressed string, no per-protocol prefix) because WS is
+%% the project-defined protocol, so an ACL rule is written against exactly what
+%% the client sees.
+
+acl_denies_a_publish_outside_the_rule(Config) ->
+    %% A rule list with one allow rule for each direction: alice (t1) may
+    %% publish and subscribe only under `t1/pub/'. A publish elsewhere is
+    %% refused with the protocol's `forbidden' error frame and is never stored
+    %% (the subscriber receives nothing), while a publish inside the rule is
+    %% accepted and delivered -- so "denied" is the ACL, not a broken route.
+    application:set_env(broker_security, acl,
+                         [rule(allow, <<"alice">>, publish, <<"t1/pub/#">>),
+                          rule(allow, <<"alice">>, subscribe, <<"t1/pub/#">>)]),
+    Pub = authed_open(Config, <<"acl-pub">>, <<"alice">>),
+    Sub = authed_open(Config, <<"acl-pub-sub">>, <<"alice">>),
+    suback(Sub, <<"t1/pub/#">>, 0),
+    %% Outside the rule: refused, and nothing is stored or routed.
+    #{<<"op">> := <<"error">>, <<"code">> := <<"forbidden">>} =
+        request(Pub, #{<<"op">> => <<"publish">>, <<"id">> => 1,
+                       <<"destination">> => <<"t1/other">>, <<"qos">> => 0,
+                       <<"payload_b64">> => base64:encode(<<"no">>)}),
+    {error, timeout} = gen_tcp:recv(Sub, 0, 300),
+    %% Inside the rule: accepted, and the same-tenant subscriber receives it.
+    publish(Pub, <<"t1/pub/x">>, 0, <<"yes">>),
+    #{<<"op">> := <<"message">>, <<"destination">> := <<"t1/pub/x">>} =
+        message_header(recv_message(Sub)),
+    close(Sub),
+    close(Pub),
+    ok.
+
+acl_denies_a_subscribe_outside_the_rule(Config) ->
+    %% The read side of the same gate: a refused subscribe never reaches
+    %% `broker_subscription', so the client gets a `suback' with
+    %% `granted => false' + reason `forbidden' and no usable SubRef -- the same
+    %% refusal shape the shared/invalid-filter cases use. A publish allow rule is
+    %% included so the in-rule positive control can actually deliver.
+    application:set_env(broker_security, acl,
+                         [rule(allow, <<"alice">>, publish, <<"t1/pub/#">>),
+                          rule(allow, <<"alice">>, subscribe, <<"t1/pub/#">>)]),
+    Sub = authed_open(Config, <<"acl-sub">>, <<"alice">>),
+    #{<<"op">> := <<"suback">>, <<"destination">> := <<"t1/other">>,
+      <<"granted">> := false, <<"reason">> := <<"forbidden">>} =
+        request(Sub, #{<<"op">> => <<"subscribe">>, <<"id">> => 1,
+                       <<"destination">> => <<"t1/other">>, <<"qos">> => 0}),
+    %% Inside the rule: granted, and a same-tenant publish is delivered.
+    suback(Sub, <<"t1/pub/x">>, 0),
+    Pub = authed_open(Config, <<"acl-sub-pub">>, <<"alice">>),
+    publish(Pub, <<"t1/pub/x">>, 0, <<"yes">>),
+    #{<<"op">> := <<"message">>, <<"destination">> := <<"t1/pub/x">>} =
+        message_header(recv_message(Sub)),
+    close(Pub),
+    close(Sub),
+    ok.
+
+acl_anonymous_is_not_gated_under_a_rule_list(Config) ->
+    %% An anonymous connection (no principal) stays out of the ACL under the
+    %% `allow' posture and a rule list alike, exactly as NATS/MQTT/CoAP: a rule
+    %% list refuses only a *named* principal it does not name, and an
+    %% unauthenticated client is allowed. The one lever that also refuses the
+    %% anonymous door is the explicit `deny' posture. This pins that boundary so
+    %% a future "deny anonymous" change is a deliberate one.
+    application:set_env(broker_security, acl,
+                         [rule(allow, <<"alice">>, publish, <<"t1/#">>)]),
+    Anon = open(Config),
+    connack(Anon, <<"acl-anon">>),
+    %% The default tenant is t0; the rule does not name the anonymous client, yet
+    %% the publish is still allowed because the rule list never applies to it.
+    publish(Anon, <<"t0/anything">>, 0, <<"anon-ok">>),
+    close(Anon),
+    ok.
+
+rule(Effect, Principal, Action, Pattern) ->
+    #{effect => Effect, principal => Principal,
+      action => Action, pattern => Pattern}.
 
 wait_admission(Expected) ->
     wait_admission(Expected, 200).
