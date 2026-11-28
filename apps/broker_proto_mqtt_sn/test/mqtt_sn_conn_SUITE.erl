@@ -53,6 +53,7 @@ all() ->
      sleep_then_pingreq_wakes_and_delivers_the_backlog,
      sleep_drops_qos0_but_delivers_qos1_after_wake,
      sleep_cap_denies_the_second_sleeper,
+     sleep_expires_the_session_if_the_client_never_wakes,
      qos_minus1_publishes_without_a_connection,
      stateless_publish_is_refused_under_deny,
      keepalive_timeout_ends_the_session,
@@ -783,6 +784,29 @@ sleep_cap_denies_the_second_sleeper(Config) ->
     #{type := disconnect, duration := 0} = expect(B, disconnect),
     close(A),
     close(B).
+
+%% A client that asks to sleep and never comes back: once the requested duration
+%% elapses the session dies (sleep_expired -> stop normal). The conn stops
+%% cleanly -- no Will, because `normal' is not abnormal -- and the listener
+%% forgets it, so a later PINGREQ finds no session and is told so with
+%% DISCONNECT 0 (MQTT-SN §6.13). The durable messages are still in the
+%% partitions for a future reconnect, but the sleeping session itself is gone.
+%% The sleep tests above only ever wake the client; this one never does.
+sleep_expires_the_session_if_the_client_never_wakes(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    connect(S, Port, <<"sn-exp-sub">>, #{duration => 30}),
+    _ = subscribe(S, Port, <<"sn/exp/t">>, 1),
+    %% Ask to sleep for 1 second and then go silent.
+    send(S, Port, #{type => disconnect, duration => 1}),
+    #{type := disconnect, duration := 1} = expect(S, disconnect),
+    %% Past the 1s sleep duration: the session expired and was forgotten.
+    timer:sleep(1500),
+    %% PINGREQ finds no session: the gateway says so with DISCONNECT rather
+    %% than leaving it pinging (§6.13).
+    send(S, Port, #{type => pingreq, client_id => <<"sn-exp-sub">>}),
+    #{type := disconnect, duration := 0} = expect(S, disconnect),
+    close(S).
 
 qos_minus1_publishes_without_a_connection(Config) ->
     Port = ?config(port, Config),
