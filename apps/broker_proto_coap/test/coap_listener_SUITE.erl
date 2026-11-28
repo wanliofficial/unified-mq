@@ -34,6 +34,7 @@ all() ->
     [con_get_returns_piggybacked_content,
      duplicate_con_is_answered_with_the_original_ack,
      non_put_dispatches_without_a_response,
+     non_policy_rejection_returns_rst,
      block1_reassembles_a_multidatagram_body,
      block1_keyed_by_request_tag_across_changing_tokens,
      token_bucket_bounds_a_flood,
@@ -84,7 +85,11 @@ init_per_testcase(Case, Config0) ->
               max_observes => env(broker_proto_coap, max_observes),
               ack_timeout => env(broker_proto_coap, observe_ack_timeout_ms),
               max_retrans => env(broker_proto_coap, observe_max_retrans),
-              max_age => env(broker_proto_coap, observe_max_age_s)},
+              max_age => env(broker_proto_coap, observe_max_age_s),
+              policy => env(broker_event, policy),
+              policies => env(broker_event, policies),
+              quarantine => env(broker_event, quarantine),
+              trace_context => env(broker_event, trace_context)},
     DataDir = filename:join([?config(priv_dir, Config0), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -97,6 +102,10 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_security, users, []),
     ok = application:set_env(broker_security, acl, allow),
     ok = application:set_env(broker_security, require_auth, []),
+    ok = application:set_env(broker_event, policy, pass_through),
+    ok = application:set_env(broker_event, policies, []),
+    ok = application:set_env(broker_event, quarantine, []),
+    ok = application:set_env(broker_event, trace_context, off),
     %% The app under test. `token_bucket_bounds_a_flood' pins `max_requests_per_second'
     %% to 2 and `oversized_datagram_is_dropped' shrinks `max_message_bytes' below
     %% the shipped default, both before the listener starts.
@@ -156,7 +165,9 @@ env(App, Key) ->
 restore_env(#{acl := Acl, require_auth := Auth, users := Users,
               max_rps := Rps, max_msg := MaxMsg,
               max_observes := MaxObs, ack_timeout := AckTO,
-              max_retrans := MaxRetrans, max_age := MaxAge}) ->
+              max_retrans := MaxRetrans, max_age := MaxAge,
+              policy := Policy, policies := Policies, quarantine := Quarantine,
+              trace_context := Trace}) ->
     set_or_unset(broker_security, acl, Acl),
     set_or_unset(broker_security, require_auth, Auth),
     set_or_unset(broker_security, users, Users),
@@ -166,6 +177,10 @@ restore_env(#{acl := Acl, require_auth := Auth, users := Users,
     set_or_unset(broker_proto_coap, observe_ack_timeout_ms, AckTO),
     set_or_unset(broker_proto_coap, observe_max_retrans, MaxRetrans),
     set_or_unset(broker_proto_coap, observe_max_age_s, MaxAge),
+    set_or_unset(broker_event, policy, Policy),
+    set_or_unset(broker_event, policies, Policies),
+    set_or_unset(broker_event, quarantine, Quarantine),
+    set_or_unset(broker_event, trace_context, Trace),
     ok.
 
 set_or_unset(_App, _Key, undefined) -> ok;
@@ -339,6 +354,17 @@ non_put_dispatches_without_a_response(Config) ->
     #{payload := <<"body">>} = expect(G, ack, {response, 2, 5}),
     close(W),
     close(G).
+
+non_policy_rejection_returns_rst(Config) ->
+    Port = ?config(port, Config),
+    ok = application:set_env(broker_event, policy, required),
+    S = open(),
+    send(S, Port, request(non, put, 3, [{uri_path, <<"reject">>},
+                                       {uri_path, <<"wire">>}], <<"ordinary">>)),
+    #{type := rst, code := {response, 5, 0}, id := 3} =
+        expect(S, rst, {response, 5, 0}),
+    ?assertEqual(error, broker_retain:lookup(<<"reject/wire">>)),
+    close(S).
 
 %% RFC 7959 draft §2.1 (ADR-031 §D7): a body larger than one datagram arrives
 %% as a sequence of Block1 messages. The first (M=1) is answered with a 2.31

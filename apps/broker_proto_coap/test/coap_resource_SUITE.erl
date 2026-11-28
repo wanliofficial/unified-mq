@@ -26,6 +26,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("broker_core/include/broker_message.hrl").
 
 -define(N, 2).
 -define(HOST, {127, 0, 0, 1}).
@@ -51,6 +52,12 @@ all() ->
      well_known_filters_retained_by_acl,
      well_known_deny_posture_lists_no_retained,
      non_write_dispatches_without_appending,
+     non_policy_rejection_has_no_side_effects,
+     non_policy_rejection_preserves_old_representation,
+     non_policy_rejection_can_quarantine,
+     con_policy_rejection_is_500,
+     non_normalize_dispatches_accepted_event,
+     non_post_dispatches_without_retaining,
      get_reads_only_retained_not_the_log,
      observe_option_is_ignored_not_rejected,
      observe_1_returns_representation_without_option].
@@ -79,7 +86,11 @@ init_per_testcase(Case, Config0) ->
     stop_all(),
     Saved = #{acl => env(broker_security, acl),
               require_auth => env(broker_security, require_auth),
-              users => env(broker_security, users)},
+              users => env(broker_security, users),
+              policy => env(broker_event, policy),
+              policies => env(broker_event, policies),
+              quarantine => env(broker_event, quarantine),
+              trace_context => env(broker_event, trace_context)},
     DataDir = filename:join([?config(priv_dir, Config0), atom_to_list(Case), "data"]),
     ok = filelib:ensure_dir(filename:join([DataDir, "x"])),
     ok = application:set_env(broker_storage, backend, broker_storage_wal),
@@ -92,6 +103,10 @@ init_per_testcase(Case, Config0) ->
     ok = application:set_env(broker_security, users, []),
     ok = application:set_env(broker_security, acl, allow),
     ok = application:set_env(broker_security, require_auth, []),
+    ok = application:set_env(broker_event, policy, pass_through),
+    ok = application:set_env(broker_event, policies, []),
+    ok = application:set_env(broker_event, quarantine, []),
+    ok = application:set_env(broker_event, trace_context, off),
     %% Start storage first, create the queue partitions, then start the rest of
     %% the kernel via the app under test -- `broker_queue' boots its partition
     %% workers against handles that `create_partitions/0' just created (the same
@@ -220,13 +235,86 @@ acl_rule(Effect, Principal, Action, Pattern) ->
 non_write_dispatches_without_appending(_) ->
     %% A NON PUT updates retained state (so a later GET sees it) but is
     %% at-most-once: it is dispatched live and NOT appended to the log (§D3).
-    %% We assert the retained half here; the no-append half is the listener's
-    %% concern and is covered by `coap_listener_SUITE'.
     Req = request(non, put, 1, [{uri_path, <<"a">>}], <<"live">>),
     {reply, {response, 2, 4}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
     GetReq = request(con, get, 2, [{uri_path, <<"a">>}]),
     {reply, {response, 2, 5}, _, <<"live">>} =
-        coap_resource:handle(GetReq, ?CFG, ?CTX).
+        coap_resource:handle(GetReq, ?CFG, ?CTX),
+    ?assertEqual([], queue_rows()).
+
+non_policy_rejection_has_no_side_effects(_) ->
+    ok = application:set_env(broker_event, policy, required),
+    _ = subscribe_live(<<"reject/a">>),
+    Req = request(non, put, 1, [{uri_path, <<"reject">>}, {uri_path, <<"a">>}],
+                  <<"ordinary">>),
+    {reply, {response, 5, 0}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
+    ?assertEqual(error, broker_retain:lookup(<<"reject/a">>)),
+    ?assertEqual([], queue_rows()),
+    ?assertEqual(timeout, live_delivery(200)).
+
+non_policy_rejection_preserves_old_representation(_) ->
+    put(<<"reject/old">>, <<"accepted">>),
+    ok = application:set_env(broker_event, policy, required),
+    Req = request(non, put, 2, [{uri_path, <<"reject">>}, {uri_path, <<"old">>}],
+                  <<"replacement">>),
+    {reply, {response, 5, 0}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
+    {ok, #broker_message{payload = <<"accepted">>}} =
+        broker_retain:lookup(<<"reject/old">>),
+    ?assertEqual([], queue_rows()).
+
+non_policy_rejection_can_quarantine(_) ->
+    ok = application:set_env(broker_event, policy, required),
+    ok = application:set_env(
+           broker_event, quarantine,
+           [{<<"coap-test">>, <<"reject/q">>, <<"quarantine/non">>}]),
+    _ = subscribe_live(<<"reject/q">>),
+    Req = request(non, put, 1, [{uri_path, <<"reject">>}, {uri_path, <<"q">>}],
+                  <<"evidence">>),
+    {reply, {response, 5, 0}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
+    ?assertEqual(error, broker_retain:lookup(<<"reject/q">>)),
+    ?assertEqual(timeout, live_delivery(200)),
+    [#broker_message{destination = <<"quarantine/non">>,
+                     payload = <<"evidence">>,
+                     persistence = durable,
+                     reliability = fsync,
+                     headers := #{event_rejection := _,
+                                  original_destination := <<"reject/q">>}}] =
+        queue_rows().
+
+con_policy_rejection_is_500(_) ->
+    ok = application:set_env(broker_event, policy, required),
+    Req = request(con, put, 1, [{uri_path, <<"reject">>}, {uri_path, <<"con">>}],
+                  <<"ordinary">>),
+    {reply, {response, 5, 0}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
+    ?assertEqual(error, broker_retain:lookup(<<"reject/con">>)),
+    ?assertEqual([], queue_rows()).
+
+non_normalize_dispatches_accepted_event(_) ->
+    ok = application:set_env(broker_event, policy, normalize),
+    _ = subscribe_live(<<"events/non">>),
+    Payload = cloud_event_payload(),
+    Req = request(non, put, 1, [{uri_path, <<"events">>}, {uri_path, <<"non">>}],
+                  Payload),
+    {reply, {response, 2, 4}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
+    {ok, #broker_message{payload = Payload,
+                         event = #{id := <<"non-event">>}}} =
+        broker_retain:lookup(<<"events/non">>),
+    {broker_deliver, _, 0, _, {undefined, undefined,
+                              #broker_message{payload = Payload,
+                                              event = #{id := <<"non-event">>}}}} =
+        live_delivery(1000),
+    ?assertEqual([], queue_rows()).
+
+non_post_dispatches_without_retaining(_) ->
+    _ = subscribe_live(<<"events/post">>),
+    Req = request(non, post, 1, [{uri_path, <<"events">>}, {uri_path, <<"post">>}],
+                  <<"notification">>),
+    {reply, {response, 2, 1}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
+    ?assertEqual(error, broker_retain:lookup(<<"events/post">>)),
+    {broker_deliver, _, 0, _, {undefined, undefined,
+                              #broker_message{payload = <<"notification">>}}} =
+        live_delivery(1000),
+    ?assertEqual([], queue_rows()).
 
 get_reads_only_retained_not_the_log(_) ->
     %% POST appends to the log but does not retain, so a GET (which reads only
@@ -281,14 +369,47 @@ request(Type, Method, Id, Options, Payload) ->
 env(App, Key) ->
     application:get_env(App, Key, undefined).
 
-restore_env(#{acl := Acl, require_auth := Auth, users := Users}) ->
+restore_env(#{acl := Acl, require_auth := Auth, users := Users,
+              policy := Policy, policies := Policies, quarantine := Quarantine,
+              trace_context := Trace}) ->
     set_or_unset(broker_security, acl, Acl),
     set_or_unset(broker_security, require_auth, Auth),
     set_or_unset(broker_security, users, Users),
+    set_or_unset(broker_event, policy, Policy),
+    set_or_unset(broker_event, policies, Policies),
+    set_or_unset(broker_event, quarantine, Quarantine),
+    set_or_unset(broker_event, trace_context, Trace),
     ok.
 
 set_or_unset(_App, _Key, undefined) -> ok;
 set_or_unset(App, Key, Value) -> application:set_env(App, Key, Value).
+
+subscribe_live(Destination) ->
+    {ok, SubRef} = broker_subscription:join(
+                     shared, Destination, <<"coap-live">>, Destination, 0,
+                     <<"coap-test">>, #{anchor => tail}),
+    {ok, undefined} = broker_subscription:attach(<<"coap-live">>, self(), false),
+    SubRef.
+
+live_delivery(Timeout) ->
+    receive
+        {broker_deliver, _, _, _, _} = Delivery -> Delivery
+    after Timeout ->
+        timeout
+    end.
+
+cloud_event_payload() ->
+    iolist_to_binary(
+      json:encode(#{<<"specversion">> => <<"1.0">>,
+                    <<"id">> => <<"non-event">>,
+                    <<"source">> => <<"/coap-test">>,
+                    <<"type">> => <<"com.example.non">>,
+                    <<"data">> => <<"payload">>})).
+
+queue_rows() ->
+    [Row || P <- broker_queue:partition_ids(),
+            {ok, Rows, _} <- [broker_queue:read_from(P, 0, 100)],
+            Row <- Rows].
 
 create_partitions() ->
     lists:foreach(
