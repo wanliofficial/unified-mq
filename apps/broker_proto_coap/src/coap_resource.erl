@@ -173,13 +173,18 @@ new_message(Destination, Payload, Req, Ctx, Retain) ->
 %% not append to the log (ADR-031 §D3). A CON write takes the kernel's
 %% configured tier and follows ADR-018's append -> retain -> dispatch order.
 deliver(Msg0, non, Retain) ->
-    _ = retain_update(Msg0, Retain, async),
-    _ = try
-        broker_subscription:dispatch([], {undefined, undefined, Msg0})
-    catch
-        _:_ -> ok
-    end,
-    dispatch_routes(Msg0, non, Retain);
+    case broker_event:apply_policy(Msg0) of
+        {ok, Accepted} ->
+            _ = retain_update(Accepted, Retain, async),
+            _ = try
+                broker_subscription:dispatch([], {undefined, undefined, Accepted})
+            catch
+                _:_ -> ok
+            end,
+            dispatch_routes(Accepted, non, Retain);
+        {error, Reason} ->
+            {error, {event_policy, Reason}}
+    end;
 deliver(Msg0, _Type, Retain) ->
     dispatch_routes(Msg0, sync, Retain).
 
