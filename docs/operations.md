@@ -770,7 +770,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | retention | 完全由 `broker_storage.retention`（`max_bytes` / `max_age_ms`）决定，**没有 A2A 专用保留策略**。按 §9 的同一公式估算 |
 | 容量估算 | `每任务字节 ≈ 4 × (payload + ~200 B 消息头)`；一个 1 KiB 回包的任务约 5 KiB。100 万任务 ≈ 5 GB，需按 `max_bytes` 预留 |
 | 投影 | 在 shard 的 ETS 里（Task 数 × 约 1–2 KiB，含 history）。随 retention 一起被约束——创建事件被 GC 后，下次 boot replay 会把该 Task 判为 `history_lost` 并补 `FAILED` |
-| 重启成本 | boot 全量重放扫全部分区（从 S9-B 起的正确性基线，S9-F 定稿继续沿用）。节点上有 N GB 日志时启动时间是分钟级，**不是秒级**；不存在 checkpoint 环境变量——S9-B 声明但从未被读的两个 env 已在 S9-F 作为死配置删除 |
+| 重启成本 | boot 全量重放扫全部分区（从 S9-B 起的正确性基线，S9-F 定稿继续沿用）。节点上有 N GB 日志时启动时间是分钟级，**不是秒级**；不存在 checkpoint 环境变量——S9-B 声明但从未被读的两个 env 已在 S9-F 作为死配置删除。该路径由 `a2a_task_recovery_SUITE`（4 例）覆盖：offset 0 重建、非法迁移只记日志、`history_lost` 一条终态修复、重复 boot 幂等 |
 | 删除 | 没有单独的"删任务"接口：靠 retention 覆盖。删除 `$a2a/` 前缀数据只能走运维侧的 retention 配置 |
 
 ### 5.2 A2A 出站 Push 的运维面（S9-C）
