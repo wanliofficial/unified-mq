@@ -277,9 +277,9 @@ non_policy_rejection_can_quarantine(_) ->
                      payload = <<"evidence">>,
                      persistence = durable,
                      reliability = fsync,
-                     headers := #{event_rejection := _,
-                                  original_destination := <<"reject/q">>}}] =
-        queue_rows().
+                     headers = Headers}] = queue_rows(),
+    ?assertMatch(#{event_rejection := _,
+                   original_destination := <<"reject/q">>}, Headers).
 
 con_policy_rejection_is_500(_) ->
     ok = application:set_env(broker_event, policy, required),
