@@ -51,6 +51,7 @@ all() ->
      will_delay_cancelled_by_reconnect,
      takeover_closes_the_old_session_without_a_will,
      sleep_then_pingreq_wakes_and_delivers_the_backlog,
+     sleep_drops_qos0_but_delivers_qos1_after_wake,
      qos_minus1_publishes_without_a_connection,
      stateless_publish_is_refused_under_deny,
      keepalive_timeout_ends_the_session,
@@ -714,6 +715,38 @@ sleep_then_pingreq_wakes_and_delivers_the_backlog(Config) ->
     %% PINGREQ names the client, which is how a sleeping client comes back.
     send(Sub, Port, #{type => pingreq, client_id => <<"sn-sleep-sub">>}),
     #{type := publish, payload := <<"while-asleep">>} = expect(Sub, publish),
+    #{type := pingresp} = expect(Sub, pingresp),
+    close(Sub),
+    close(Pub).
+
+%% A sleeping session is detached: nothing is buffered per session, and QoS 0
+%% "never enters storage" by design (enter_sleep/1 states this explicitly).
+%% Publish a QoS 0 message while the subscriber is asleep, then wake it: the
+%% QoS 0 message must NOT appear in the backlog, while a QoS 1 message published
+%% in the same window IS stored and delivered on wake. Without this case a
+%% regression that accidentally persists QoS 0 during the sleep window would
+%% ship silently.
+sleep_drops_qos0_but_delivers_qos1_after_wake(Config) ->
+    Port = ?config(port, Config),
+    Sub = open(),
+    Pub = open(),
+    connect(Sub, Port, <<"sn-q0-sub">>, #{duration => 30}),
+    connect(Pub, Port, <<"sn-q0-pub">>),
+    _ = subscribe(Sub, Port, <<"sn/q0/t">>, 1),
+    PubId = register_topic(Pub, Port, <<"sn/q0/t">>),
+    send(Sub, Port, #{type => disconnect, duration => 30}),
+    #{type := disconnect, duration := 30} = expect(Sub, disconnect),
+    timer:sleep(200),
+    %% QoS 0 while asleep: fire-and-forget, must never enter storage.
+    publish(Pub, Port, normal, PubId, 0, 1, <<"q0-dropped">>),
+    %% QoS 1 while asleep: durable, stored in the partition for catch_up.
+    publish(Pub, Port, normal, PubId, 1, 2, <<"q1-backlog">>),
+    #{type := puback} = expect(Pub, puback),
+    refute(Sub, publish, 200),
+    %% Wake: catch_up replays what the partition holds. QoS 1 arrives;
+    %% QoS 0 is gone.
+    send(Sub, Port, #{type => pingreq, client_id => <<"sn-q0-sub">>}),
+    #{type := publish, payload := <<"q1-backlog">>} = expect(Sub, publish),
     #{type := pingresp} = expect(Sub, pingresp),
     close(Sub),
     close(Pub).
