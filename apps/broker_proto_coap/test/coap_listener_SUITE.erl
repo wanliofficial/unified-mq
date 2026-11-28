@@ -42,6 +42,7 @@ all() ->
      observe_ack_and_rst_are_not_requests,
      observe_con_notifies_and_acks,
      observe_con_retries_then_gives_up,
+     observe_give_up_of_one_keeps_the_other,
      observe_non_is_at_most_once,
      observe_deregister_with_observe_1,
      observe_rst_deregisters,
@@ -122,6 +123,11 @@ case_env(oversized_datagram_is_dropped, _Config) ->
     ok = application:set_env(broker_proto_coap, max_message_bytes, 16);
 %% The retry case pins a short retransmit timeout so it does not sit on 2 s.
 case_env(observe_con_retries_then_gives_up, _Config) ->
+    ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
+    ok = application:set_env(broker_proto_coap, observe_max_retrans, 2);
+case_env(observe_give_up_of_one_keeps_the_other, _Config) ->
+    %% Same short budget as the single-observer give-up case: A must exhaust its
+    %% retransmit budget within the window, but the assertion is about B.
     ok = application:set_env(broker_proto_coap, observe_ack_timeout_ms, 300),
     ok = application:set_env(broker_proto_coap, observe_max_retrans, 2);
 case_env(observe_con_notifies_and_acks, _Config) ->
@@ -512,6 +518,87 @@ observe_con_retries_then_gives_up(Config) ->
     _ = expect(S, ack, {response, 2, 4}),
     refute(S, con, {response, 2, 5}, 600),
     close(S).
+
+%% Two CON observers on the SAME destination. One (A) never ACKs and exhausts its
+%% retransmit budget; the other (B) ACKs every notification and stays healthy.
+%% A's give-up must NOT disturb B: every CoAP observation of a destination shares
+%% one exclusive subscription, so tearing down A's relationship must not
+%% unsubscribe the filter or detach the shared session while B still needs it --
+%% otherwise B's stream silently starves. The retransmit/pending maps are keyed by
+%% {IP,Port,Id}, so A's budget must not be spent by B's traffic and vice versa.
+%% (The single-observer give-up case proves A is torn down; this proves B survives
+%% it. Neither cancels a shared resource the other still needs.)
+observe_give_up_of_one_keeps_the_other(Config) ->
+    Port = ?config(port, Config),
+    A = open(),
+    B = open(),
+    TA = <<"isoa">>,
+    TB = <<"isob">>,
+    %% Both observers register a CON observation on the same destination.
+    send(A, Port, request(con, put, 1, [{uri_path, <<"iso">>}], <<"init">>)),
+    _ = expect(A, ack, {response, 2, 4}),
+    send(A, Port, (request(con, get, 2, [{uri_path, <<"iso">>}, {observe, 0}]))
+                   #{token => TA}),
+    _ = expect(A, ack, {response, 2, 5}),
+    send(B, Port, request(con, put, 3, [{uri_path, <<"iso">>}], <<"init">>)),
+    _ = expect(B, ack, {response, 2, 4}),
+    send(B, Port, (request(con, get, 4, [{uri_path, <<"iso">>}, {observe, 0}]))
+                   #{token => TB}),
+    _ = expect(B, ack, {response, 2, 5}),
+    %% First publish: both are notified. A ignores it; B ACKs and stays healthy.
+    send(A, Port, request(con, put, 5, [{uri_path, <<"iso">>}], <<"v1">>)),
+    _ = expect(A, ack, {response, 2, 4}),
+    _NA1 = expect(A, con, {response, 2, 5}),
+    send(B, Port, request(con, put, 6, [{uri_path, <<"iso">>}], <<"v1">>)),
+    _ = expect(B, ack, {response, 2, 4}),
+    NB1 = expect(B, con, {response, 2, 5}),
+    ?assertEqual(TB, coap_codec:token(NB1)),
+    send(B, Port, ack_of(NB1)),
+    %% Second publish: same split. A still ignores; B ACKs again.
+    send(A, Port, request(con, put, 7, [{uri_path, <<"iso">>}], <<"v2">>)),
+    _ = expect(A, ack, {response, 2, 4}),
+    _NA2 = expect(A, con, {response, 2, 5}),
+    send(B, Port, request(con, put, 8, [{uri_path, <<"iso">>}], <<"v2">>)),
+    _ = expect(B, ack, {response, 2, 4}),
+    NB2 = expect(B, con, {response, 2, 5}),
+    send(B, Port, ack_of(NB2)),
+    %% A has now missed its notifications. Drain its own retransmits (the un-acked
+    %% v2 note repeats at 300ms and 600ms) for longer than the give-up budget
+    %% (~900ms) so the relationship is actually torn down before the decisive
+    %% assertion. A is the only one ignoring, so every con on A's socket is its own
+    %% retransmit -- discarding them is exactly "let A give up".
+    drain_con(A, 1200),
+    %% The decisive assertion: A is gone, but B -- on the SAME shared
+    %% subscription -- still receives a fresh notification.
+    send(B, Port, request(con, put, 9, [{uri_path, <<"iso">>}], <<"v3">>)),
+    _ = expect(B, ack, {response, 2, 4}),
+    NB3 = expect(B, con, {response, 2, 5}),
+    ?assertEqual(TB, coap_codec:token(NB3)),
+    %% A later observe sequence than NB2 proves this is a fresh notification,
+    %% generated after A's relationship was already torn down.
+    ?assert(coap_codec:option(observe, NB3) > coap_codec:option(observe, NB2)),
+    send(B, Port, ack_of(NB3)),
+    close(A),
+    close(B).
+
+%% Consume any CON notification frames (A's own un-acked retransmits) for
+%% `WindowMs', so a misbehaving peer's budget can fully exhaust. Unlike `refute',
+%% this does not fail when a frame arrives -- it expects them.
+drain_con(S, WindowMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + WindowMs,
+    drain_con_loop(S, Deadline).
+
+drain_con_loop(S, Deadline) ->
+    Left = Deadline - erlang:monotonic_time(millisecond),
+    case Left > 0 of
+        false -> ok;
+        true ->
+            case recv(S, Left) of
+                timeout -> ok;
+                #{type := con, code := {response, 2, 5}} -> drain_con_loop(S, Deadline);
+                _Other -> drain_con_loop(S, Deadline)
+            end
+    end.
 
 %% A NON Observe=0 gets at most one notification: no retransmit timer, no retry.
 observe_non_is_at_most_once(Config) ->
