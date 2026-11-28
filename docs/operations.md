@@ -784,7 +784,7 @@ erl -pa _build/default/lib/*/ebin -noshell -eval \
 | 出站目标 | 只连**已解析并校验过的 IP**（pin），带 `Host` 头；`https` 为默认，明文要 `push_allow_http => true` |
 | 重定向 | 3xx 一律当失败（不跟随），杜绝"白名单 host 把我们 302 到内网" |
 | 响应处理 | 只读状态行判成败，不解析响应体；响应体上限 `push_max_response_bytes`（64 KiB） |
-| 重试语义 | `push_max_attempts` 次指数退避（`push_base_backoff_ms × 2^attempt`，封顶 `push_max_backoff_ms`）；超过 `push_ttl_ms` 放弃。端点的幂等性由它自己按 `X-A2A-Task-Id`/`X-A2A-Config-Id`/`X-A2A-Nonce` 保证 |
+| 重试语义 | `push_max_attempts` 次指数退避（`push_base_backoff_ms × 2^attempt`，封顶 `push_max_backoff_ms`）；超过 `push_ttl_ms` 放弃。端点的幂等性由它自己按 `X-A2A-Task-Id`/`X-A2A-Config-Id`/`X-A2A-Nonce` 保证。**退避属于一条投递，不属于 worker 队列**（2026-11-28）：每条在途行带自己的到期时间、按到期排序、单一定时器永远为上膛最早的那一条。旧行为（单一 FIFO + 取队头）会让一条在退避等待的旧投递把**新任务的首次投递**堵在后面，并让队头那条被新投递的唤醒**早于自身退避**重试 |
 | 签名 | 客户端声明 `authentication.scheme`，服务端用 `push_auth_secrets[scheme]` 的密钥签 `X-A2A-Signature: sha256=HMAC(timestamp "." nonce "." body)`；声明了未配置的 scheme → **跳过投递**（不降级明文） |
 | DLQ | 耗尽/过期写 `$a2a/push/dlq/<tenant>`（一条普通消息，`message_id` = taskId）。**没有自动重投**：谁订阅谁负责。它的 retention 与 §5.1 同一套 |
 | 容量 | DLQ 每条约几百字节；失败率高的部署要盯它，别让它悄悄占满分区 |

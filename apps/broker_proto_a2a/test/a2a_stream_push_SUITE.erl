@@ -40,7 +40,9 @@ groups() ->
        create_get_list_delete_roundtrip,
        push_config_is_tenant_scoped,
        delivery_posts_terminal_event,
-       delivery_retries_then_writes_dlq]},
+       delivery_retries_then_writes_dlq,
+       a_fresh_delivery_is_not_queued_behind_a_backing_off_one,
+       a_retry_waits_for_its_own_backoff]},
      {guard, [sequence],
       [ssrf_refuses_private_address,
        ssrf_refuses_when_allowlist_is_empty,
@@ -367,6 +369,86 @@ delivery_retries_then_writes_dlq(_Config) ->
     Dlq = wait_for_dlq(<<"t1">>, TaskId, 15000),
     ?assertMatch([_ | _], Dlq),
     stop_receiver(Receiver).
+
+%% ADR-015's backoff belongs to *one* delivery, not to the worker's queue. A
+%% task that finishes while an older webhook is sleeping out a retry must not
+%% wait for that retry: the newer, first-attempt push is due immediately and is
+%% the next thing the worker should send. (Before this case, a single FIFO queue
+%% plus one timer meant the next wake-up sent whoever was at the head -- the
+%% older retry -- and the fresh delivery waited for the older one's backoff.)
+a_fresh_delivery_is_not_queued_behind_a_backing_off_one(_Config) ->
+    ok = application:set_env(broker_proto_a2a, task_auto_complete, false),
+    {Failing, FailingPort} = start_receiver_with_status(500),
+    {Healthy, HealthyPort} = start_receiver(),
+    FailingUrl = iolist_to_binary(["http://127.0.0.1:",
+                                   integer_to_list(FailingPort), "/fail"]),
+    HealthyUrl = iolist_to_binary(["http://127.0.0.1:",
+                                   integer_to_list(HealthyPort), "/ok"]),
+    ok = enable_push_localhost(HealthyUrl),
+    %% A long base backoff makes the two schedules far apart: the buggy FIFO
+    %% takes ~5s to reach the healthy endpoint, the per-delivery schedule ~0ms.
+    ok = application:set_env(broker_proto_a2a, push_max_attempts, 5),
+    ok = application:set_env(broker_proto_a2a, push_base_backoff_ms, 5000),
+    ok = application:set_env(broker_proto_a2a, push_max_backoff_ms, 30000),
+    ok = application:set_env(broker_proto_a2a, push_ttl_ms, 600000),
+    {Port, _} = start_listener_with_push(),
+    %% Task A: a webhook that always answers 500, so its delivery is retried.
+    {200, RespA} = rpc(Port, <<"SendMessage">>, params(unique(<<"ctx-busy">>)), 1),
+    BusyTask = maps:get(<<"id">>, task(RespA)),
+    {200, _} = rpc(Port, <<"CreateTaskPushNotificationConfig">>,
+                   push_params(BusyTask, FailingUrl), 2),
+    {200, _} = rpc(Port, <<"CancelTask">>, #{<<"id">> => BusyTask}, 3),
+    %% The first attempt has landed (and failed), so A is queued with a 5s
+    %% backoff before we enqueue anything else.
+    _ = receive_delivery(Failing, 10000),
+    %% Task B: a healthy webhook, due immediately.
+    {200, RespB} = rpc(Port, <<"SendMessage">>, params(unique(<<"ctx-fresh">>)), 4),
+    FreshTask = maps:get(<<"id">>, task(RespB)),
+    {200, _} = rpc(Port, <<"CreateTaskPushNotificationConfig">>,
+                   push_params(FreshTask, HealthyUrl), 5),
+    Started = erlang:monotonic_time(millisecond),
+    {200, _} = rpc(Port, <<"CancelTask">>, #{<<"id">> => FreshTask}, 6),
+    Request = receive_delivery(Healthy, 3000),
+    Elapsed = erlang:monotonic_time(millisecond) - Started,
+    ?assert(binary:match(maps:get(body, Request), FreshTask) =/= nomatch),
+    ?assert(Elapsed < 3000),
+    %% Leave no retry ladder behind for the next case in the group: the worker
+    %% is a permanent supervisor child, so killing it empties the queue and the
+    %% supervisor restarts it.
+    stop_receiver(Failing),
+    stop_receiver(Healthy),
+    exit(whereis(a2a_push_worker), kill).
+
+%% The other half of the same rule: a wake-up must not send a row before that
+%% row's own backoff. A 1s base backoff is short enough to keep the case quick
+%% but long enough that an early retry (the old `head of the FIFO' behaviour) is
+%% visible inside a 500ms quiet window.
+a_retry_waits_for_its_own_backoff(_Config) ->
+    ok = application:set_env(broker_proto_a2a, task_auto_complete, false),
+    {Failing, FailingPort} = start_receiver_with_status(500),
+    Url = iolist_to_binary(["http://127.0.0.1:",
+                            integer_to_list(FailingPort), "/fail"]),
+    ok = enable_push_localhost(Url),
+    ok = application:set_env(broker_proto_a2a, push_max_attempts, 5),
+    ok = application:set_env(broker_proto_a2a, push_base_backoff_ms, 1000),
+    ok = application:set_env(broker_proto_a2a, push_max_backoff_ms, 30000),
+    ok = application:set_env(broker_proto_a2a, push_ttl_ms, 600000),
+    {Port, _} = start_listener_with_push(),
+    {200, Resp} = rpc(Port, <<"SendMessage">>, params(unique(<<"ctx-backoff">>)), 1),
+    TaskId = maps:get(<<"id">>, task(Resp)),
+    {200, _} = rpc(Port, <<"CreateTaskPushNotificationConfig">>,
+                   push_params(TaskId, Url), 2),
+    {200, _} = rpc(Port, <<"CancelTask">>, #{<<"id">> => TaskId}, 3),
+    _ = receive_delivery(Failing, 10000),
+    %% Half of the base backoff has not elapsed, so nothing may be sent yet.
+    receive
+        {delivery, Failing, _Attempt, _Req} -> ct:fail(retried_before_backoff)
+    after 500 ->
+            ok
+    end,
+    _ = receive_delivery(Failing, 3000),
+    stop_receiver(Failing),
+    exit(whereis(a2a_push_worker), kill).
 
 %%%_* Guards ----------------------------------------------------------------
 

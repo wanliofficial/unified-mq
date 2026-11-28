@@ -12,6 +12,12 @@
 %% exhausted (or the TTL has passed) the last attempt's error is written to
 %% `$a2a/push/dlq/<tenant>' as an ordinary message, which is subscribable and
 %% auditable exactly like `$dlq/...'.
+%%
+%% Backoff belongs to a **delivery**, not to the worker: each pending row carries
+%% its own `due' time and the queue is ordered by it, so the single timer is
+%% always armed for the earliest due row. A fresh push is therefore never held
+%% behind an older row that is sleeping out a retry, and a wake-up never sends a
+%% row before its own backoff has elapsed.
 -module(a2a_push_worker).
 
 -behaviour(gen_server).
@@ -35,10 +41,16 @@
                   payload :: binary(),
                   headers :: [{binary(), binary()}],
                   attempt = 0 :: non_neg_integer(),
-                  deadline :: integer()}).
+                  deadline :: integer(),
+                  due = 0 :: integer()}).
 
--record(state, {queue = queue:new() :: queue:queue(),
+%% `queue' is ordered by `#pending.due' ascending, so the head is always the
+%% next delivery that may run. `epoch' tags the one armed timer: a message from
+%% a superseded timer (`arm/1' cancelled it too late) is ignored instead of
+%% delivering a row early.
+-record(state, {queue = [] :: [#pending{}],
                 timer :: reference() | undefined,
+                epoch = 0 :: non_neg_integer(),
                 delivered = 0 :: non_neg_integer(),
                 failed = 0 :: non_neg_integer(),
                 dropped = 0 :: non_neg_integer()}).
@@ -68,7 +80,7 @@ handle_call(stats, _From, State) ->
     {reply, #{delivered => State#state.delivered,
               failed => State#state.failed,
               dropped => State#state.dropped,
-              pending => queue:len(State#state.queue)}, State};
+              pending => length(State#state.queue)}, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unsupported_operation}, State}.
 
@@ -84,18 +96,19 @@ handle_cast({enqueue, TenantId, TaskId, Rows, Body}, State) ->
                           Acc
                   end
           end, State, Rows),
-    {noreply, State1};
+    {noreply, arm(State1)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(attempt, State) ->
-    case queue:out(State#state.queue) of
-        {empty, _} ->
-            {noreply, State#state{timer = undefined}};
-        {{value, Pending}, Rest} ->
-            State1 = State#state{queue = Rest, timer = undefined},
-            {noreply, retry_or_drop(Pending, State1)}
-    end;
+handle_info({attempt, Epoch}, #state{epoch = Epoch} = State) ->
+    %% The live timer fired: run every row whose own backoff has elapsed, then
+    %% arm the next one for whatever is left.
+    {noreply, arm(run_due(State#state{timer = undefined}))};
+handle_info({attempt, _Superseded}, State) ->
+    %% A stale wake-up (its timer was cancelled after the message had already
+    %% been queued by the runtime). The live timer will come; sending now would
+    %% deliver a row before its backoff.
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -103,6 +116,19 @@ terminate(_Reason, _State) ->
     ok.
 
 %%%_* Delivery loop ---------------------------------------------------------
+
+%% Run the rows at the head of the queue whose `due' has passed, in due order.
+%% Rows that are still backing off stay put; `arm/1' wakes us for the earliest.
+run_due(#state{queue = []} = State) ->
+    State;
+run_due(#state{queue = [#pending{due = Due} | _]} = State) ->
+    case erlang:system_time(millisecond) >= Due of
+        true ->
+            [Pending | Rest] = State#state.queue,
+            run_due(retry_or_drop(Pending, State#state{queue = Rest}));
+        false ->
+            State
+    end.
 
 retry_or_drop(#pending{deadline = Deadline} = Pending, State) ->
     case erlang:system_time(millisecond) > Deadline of
@@ -127,10 +153,32 @@ retry_or_drop(#pending{deadline = Deadline} = Pending, State) ->
             end
     end.
 
+%% Compute this row's own next attempt time and put it back in due order. The
+%% timer is (re)armed by the caller once the whole batch is done.
 schedule(#pending{attempt = Attempt} = Pending, State) ->
-    Delay = backoff(Attempt),
-    Ref = erlang:send_after(Delay, self(), attempt),
-    State#state{queue = queue:in(Pending, State#state.queue), timer = Ref}.
+    Due = erlang:system_time(millisecond) + backoff(Attempt),
+    insert(Pending#pending{due = Due}, State).
+
+insert(#pending{} = Pending, #state{queue = Queue} = State) ->
+    State#state{queue = lists:sort(fun(#pending{due = A},
+                                       #pending{due = B}) -> A =< B end,
+                                   [Pending | Queue])}.
+
+%% Exactly one armed timer, for the earliest due row. A previous timer (an
+%% enqueue that landed while one was armed) is cancelled first.
+arm(#state{queue = []} = State) ->
+    disarm(State);
+arm(#state{queue = [#pending{due = Due} | _], epoch = Epoch} = State) ->
+    State1 = disarm(State),
+    Delay = max(0, Due - erlang:system_time(millisecond)),
+    Ref = erlang:send_after(Delay, self(), {attempt, Epoch + 1}),
+    State1#state{timer = Ref, epoch = Epoch + 1}.
+
+disarm(#state{timer = undefined} = State) ->
+    State;
+disarm(#state{timer = Ref} = State) ->
+    _ = erlang:cancel_timer(Ref),
+    State#state{timer = undefined}.
 
 backoff(0) -> 0;
 backoff(Attempt) ->
