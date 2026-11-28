@@ -47,6 +47,7 @@ all() ->
      will_is_published_when_the_session_dies,
      will_delay_zero_publishes_immediately,
      will_delay_defers_the_publish,
+     will_delay_fires_the_nearest_first_and_re_arms_for_the_rest,
      will_delay_cancelled_by_reconnect,
      takeover_closes_the_old_session_without_a_will,
      sleep_then_pingreq_wakes_and_delivers_the_backlog,
@@ -609,6 +610,45 @@ will_delay_defers_the_publish(Config) ->
     #{type := publish, payload := <<"later">>} = expect(Sub, publish),
     close(Sub),
     close(W).
+
+%% Two deferred Wills with different delays stack in the listener's table.
+%% `nearest_due_ms/2' must arm the timer for the EARLIEST deadline, fire only
+%% that one, then RE-ARM for the survivor on the next scan -- not fire both at
+%% once and not strand the later one by re-arming to `infinity'. The single-
+%% will cases above never exercise the ordering or the re-arm loop.
+will_delay_fires_the_nearest_first_and_re_arms_for_the_rest(Config) ->
+    Port = ?config(port, Config),
+    Sub = open(),
+    connect(Sub, Port, <<"sn-dw2-sub">>),
+    _ = subscribe(Sub, Port, <<"sn/dw2/a">>, 0),
+    _ = subscribe(Sub, Port, <<"sn/dw2/b">>, 0),
+    Before = conn_pids(),
+    %% A's Will is due in 1s, B's in 4s. The gap between them is what the two
+    %% refute windows below probe: B must not arrive until its own deadline.
+    A = open(),
+    connect_with_will_delay(A, Port, <<"sn-dw2-a">>, <<"sn/dw2/a">>,
+                            <<"A">>, 1),
+    B = open(),
+    connect_with_will_delay(B, Port, <<"sn-dw2-b">>, <<"sn/dw2/b">>,
+                            <<"B">>, 4),
+    New = conn_pids() -- Before,
+    [PidA, PidB] = lists:sort(fun(PA, PB) -> PA =< PB end, New),
+    %% Kill both owners abnormally; each casts its deferred will to the listener.
+    ok = gen_server:stop(PidA, boom, 1000),
+    ok = gen_server:stop(PidB, boom, 1000),
+    %% Inside a window that spans A's 1s deadline but not B's 4s, exactly A's
+    %% Will has arrived and nothing else has. `refute' is the timing probe: if
+    %% the ordering were wrong (both fire at once, or B fires first), either the
+    %% payload would not be A or B would arrive inside this window.
+    #{type := publish, payload := <<"A">>} = expect(Sub, publish),
+    refute(Sub, publish, 2000),
+    %% Past A's deadline but still short of B's: nothing more.
+    refute(Sub, publish, 500),
+    %% Now B's Will arrives once its own deadline elapses.
+    #{type := publish, payload := <<"B">>} = expect(Sub, publish),
+    close(Sub),
+    close(A),
+    close(B).
 
 will_delay_cancelled_by_reconnect(Config) ->
     Port = ?config(port, Config),
