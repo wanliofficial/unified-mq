@@ -34,7 +34,7 @@ all() ->
     [con_get_returns_piggybacked_content,
      duplicate_con_is_answered_with_the_original_ack,
      non_put_dispatches_without_a_response,
-     non_policy_rejection_returns_rst,
+     non_policy_rejection_returns_error_response,
      block1_reassembles_a_multidatagram_body,
      block1_keyed_by_request_tag_across_changing_tokens,
      token_bucket_bounds_a_flood,
@@ -355,14 +355,14 @@ non_put_dispatches_without_a_response(Config) ->
     close(W),
     close(G).
 
-non_policy_rejection_returns_rst(Config) ->
+non_policy_rejection_returns_error_response(Config) ->
     Port = ?config(port, Config),
     ok = application:set_env(broker_event, policy, required),
     S = open(),
     send(S, Port, request(non, put, 3, [{uri_path, <<"reject">>},
                                        {uri_path, <<"wire">>}], <<"ordinary">>)),
-    #{type := rst, code := {response, 5, 0}, id := 3} =
-        expect(S, rst, {response, 5, 0}),
+    #{type := non, code := {response, 5, 0}, id := 3} =
+        expect(S, non, {response, 5, 0}),
     ?assertEqual(error, broker_retain:lookup(<<"reject/wire">>)),
     close(S).
 
