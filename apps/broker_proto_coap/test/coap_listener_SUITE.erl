@@ -51,6 +51,7 @@ all() ->
      observe_rst_is_endpoint_scoped,
      observe_plain_udp_principal_is_allowed,
      observe_max_age_expires_relationship,
+     observe_max_age_renews_on_notification,
      observe_two_observers_same_dest_both_notified].
 
 %%%_* Fixtures --------------------------------------------------------------
@@ -144,6 +145,8 @@ case_env(observe_bounded_table_refuses, _Config) ->
 %% The max-age case sweeps after one second instead of thirty.
 case_env(observe_max_age_expires_relationship, _Config) ->
     ok = application:set_env(broker_proto_coap, observe_max_age_s, 1);
+case_env(observe_max_age_renews_on_notification, _Config) ->
+    ok = application:set_env(broker_proto_coap, observe_max_age_s, 3);
 case_env(_Case, _Config) ->
     ok.
 
@@ -792,6 +795,41 @@ observe_max_age_expires_relationship(Config) ->
     send(S, Port, request(con, put, 4, [{uri_path, <<"mx">>}], <<"b">>)),
     _ = expect(S, ack, {response, 2, 4}),
     refute(S, con, {response, 2, 5}, 400),
+    close(S).
+
+%% The Max-Age window is "time since the LAST notification", not since
+%% registration: next_seq/3 stamps last_notified on every notification, so each
+%% one renews the window. The expiry case above proves a silent relationship
+%% dies; this proves an active one survives. With a 3 s window: notify at ~0 s
+%% (stamps last_notified), wait 2 s, notify again at ~2 s (renews to expire at
+%% ~5 s), wait 2 s more (~4 s total, only ~2 s since the last notification --
+%% inside the window). A PUT then must still reach the observer. Without the
+%% renewal (last_notified frozen at registration), ~4 s would already exceed
+%% the 3 s window and the relationship would be gone.
+observe_max_age_renews_on_notification(Config) ->
+    Port = ?config(port, Config),
+    S = open(),
+    send(S, Port, request(con, put, 1, [{uri_path, <<"mr">>}], <<"init">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    send(S, Port, request(con, get, 2, [{uri_path, <<"mr">>}, {observe, 0}])),
+    _ = expect(S, ack, {response, 2, 5}),
+    %% First notification stamps last_notified ~0.
+    send(S, Port, request(con, put, 3, [{uri_path, <<"mr">>}], <<"v1">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    %% Halfway into the 3 s window: a second notification renews last_notified.
+    timer:sleep(2000),
+    send(S, Port, request(con, put, 4, [{uri_path, <<"mr">>}], <<"v2">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    _ = expect(S, con, {response, 2, 5}),
+    %% ~2 s since the renewal (well inside 3 s) but ~4 s since registration --
+    %% past the window if last_notified had not been refreshed. The relationship
+    %% must still be live.
+    timer:sleep(2000),
+    send(S, Port, request(con, put, 5, [{uri_path, <<"mr">>}], <<"v3">>)),
+    _ = expect(S, ack, {response, 2, 4}),
+    N3 = expect(S, con, {response, 2, 5}),
+    ?assertEqual(<<"v3">>, coap_codec:payload(N3)),
     close(S).
 
 %% Two observers on the SAME destination (distinct tokens, one socket) share one
