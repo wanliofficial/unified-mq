@@ -254,13 +254,14 @@ non_policy_rejection_has_no_side_effects(_) ->
 
 non_policy_rejection_preserves_old_representation(_) ->
     put(<<"reject/old">>, <<"accepted">>),
+    RowsBefore = queue_rows(),
     ok = application:set_env(broker_event, policy, required),
     Req = request(non, put, 2, [{uri_path, <<"reject">>}, {uri_path, <<"old">>}],
                   <<"replacement">>),
     {reply, {response, 5, 0}, _, _} = coap_resource:handle(Req, ?CFG, ?CTX),
     {ok, #broker_message{payload = <<"accepted">>}} =
         broker_retain:lookup(<<"reject/old">>),
-    ?assertEqual([], queue_rows()).
+    ?assertEqual(RowsBefore, queue_rows()).
 
 non_policy_rejection_can_quarantine(_) ->
     ok = application:set_env(broker_event, policy, required),
@@ -409,7 +410,7 @@ cloud_event_payload() ->
 queue_rows() ->
     [Row || P <- broker_queue:partition_ids(),
             {ok, Rows, _} <- [broker_queue:read_from(P, 0, 100)],
-            Row <- Rows].
+            {_Offset, Row} <- Rows].
 
 create_partitions() ->
     lists:foreach(
