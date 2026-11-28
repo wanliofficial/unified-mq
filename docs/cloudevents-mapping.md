@@ -79,9 +79,9 @@ S6 的统一头通道扩展（[`protocol-compatibility.md`](protocol-compatibili
 
 ## 4. 策略
 
-`broker_event:apply_policy/1` 在执行存储前运行，六个协议发布路径都调用它
-（S8-C 的 MQTT-SN 也调用同一个 seam，`mqtt_sn_conn.erl:1027`）；
-默认 `pass_through` 是恒等变换（不解析、不改字节）。
+`broker_event:apply_policy/1` 在执行存储、retained 更新或实时投递等副作用前运行；
+CON 与 NON 发布路径都调用它（S8-C 的 MQTT-SN 也调用同一个 seam，
+`mqtt_sn_conn.erl:1027`）；默认 `pass_through` 是恒等变换（不解析、不改字节）。
 
 | 策略 | 行为 |
 |---|---|
@@ -97,7 +97,9 @@ S6 的统一头通道扩展（[`protocol-compatibility.md`](protocol-compatibili
 
 **拒绝路径**按协议语义表达：MQTT 5 `0x83`；WS `cloudevent_rejected` 错误帧；
 NATS `-ERR` 并断开；AMQP channel 406；Kafka `INVALID_RECORD`（87）；
-Pulsar `SendError`。拒绝的消息不写 WAL、不 ACK。MQTT-SN 没有通用错误通道：
+Pulsar `SendError`；CoAP `5.00`（CON 走 ACK，NON 走独立 NON 错误响应）。
+被拒绝的原始消息不写 WAL、不更新 retained、不实时投递；配置隔离目标时，
+只有隔离副本写入 WAL。MQTT-SN 没有通用错误通道：
 QoS 1 回 PUBACK `NOT_SUPPORTED`，QoS 0/2/−1 静默丢弃（QoS 2 不发 PUBREC，客户端重试）。
 
 ---
