@@ -52,6 +52,7 @@ all() ->
      takeover_closes_the_old_session_without_a_will,
      sleep_then_pingreq_wakes_and_delivers_the_backlog,
      sleep_drops_qos0_but_delivers_qos1_after_wake,
+     sleep_cap_denies_the_second_sleeper,
      qos_minus1_publishes_without_a_connection,
      stateless_publish_is_refused_under_deny,
      keepalive_timeout_ends_the_session,
@@ -162,6 +163,8 @@ case_env(predefined_topic_publish_reaches_a_subscriber, _Config) ->
                              #{1 => <<"sn/pre">>});
 case_env(require_auth_refuses_to_start, _Config) ->
     ok = application:set_env(broker_security, require_auth, [<<"mqtt_sn">>]);
+case_env(sleep_cap_denies_the_second_sleeper, _Config) ->
+    ok = application:set_env(broker_proto_mqtt_sn, max_asleep_clients, 1);
 case_env(_Case, _Config) ->
     ok.
 
@@ -750,6 +753,36 @@ sleep_drops_qos0_but_delivers_qos1_after_wake(Config) ->
     #{type := pingresp} = expect(Sub, pingresp),
     close(Sub),
     close(Pub).
+
+%% The listener caps concurrent sleepers (`max_asleep_clients`). The first client
+%% to ask to sleep takes the slot; the second is REFUSED -- the conn stops like
+%% a normal disconnect rather than pretending to sleep and silently losing every
+%% message published meanwhile (the comment in handle_cast({sn_sleep,...}) is
+%% explicit about this trade). The refusal is observable: a refused client's
+%% PINGREQ afterwards finds no session (the listener answers DISCONNECT 0 per
+%% MQTT-SN §6.13), while the granted sleeper's PINGREQ wakes it normally.
+sleep_cap_denies_the_second_sleeper(Config) ->
+    Port = ?config(port, Config),
+    A = open(),
+    connect(A, Port, <<"sn-cap-a">>),
+    %% A asks to sleep and takes the only slot.
+    send(A, Port, #{type => disconnect, duration => 30}),
+    #{type := disconnect, duration := 30} = expect(A, disconnect),
+    timer:sleep(300),
+    %% B asks to sleep too; the cap is full so its sleep is refused.
+    B = open(),
+    connect(B, Port, <<"sn-cap-b">>),
+    send(B, Port, #{type => disconnect, duration => 30}),
+    #{type := disconnect, duration := 30} = expect(B, disconnect),
+    timer:sleep(300),
+    %% A is a known sleeper: PINGREQ wakes it.
+    send(A, Port, #{type => pingreq, client_id => <<"sn-cap-a">>}),
+    #{type := pingresp} = expect(A, pingresp),
+    %% B's session was forgotten on refusal: PINGREQ finds nothing.
+    send(B, Port, #{type => pingreq, client_id => <<"sn-cap-b">>}),
+    #{type := disconnect, duration := 0} = expect(B, disconnect),
+    close(A),
+    close(B).
 
 qos_minus1_publishes_without_a_connection(Config) ->
     Port = ?config(port, Config),
